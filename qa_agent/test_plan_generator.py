@@ -1,0 +1,142 @@
+import json
+from dataclasses import dataclass
+
+from qa_agent.llm.router import LLMRouter
+from qa_agent.models import (
+    DiscoveryResult,
+    QATestPlan,
+    TestPlan,
+    TestPlanVersion,
+    TestStep,
+)
+
+
+@dataclass(frozen=True)
+class GeneratedTestPlan:
+    """The created TestPlan and its version, linked without copying either."""
+
+    test_plan: TestPlan
+    test_plan_version: TestPlanVersion
+
+    def __post_init__(self) -> None:
+        if self.test_plan_version.test_plan_id != self.test_plan.id:
+            raise ValueError("TestPlanVersion must reference the supplied TestPlan.")
+
+
+class TestPlanGenerator:
+    """Boundary for creating executable plan versions from atomic test steps.
+
+    The default implementation is intentionally a placeholder until a concrete
+    generation strategy is selected and connected.
+    """
+
+    def generate(
+        self,
+        test_step: TestStep,
+        discovery_result: DiscoveryResult,
+    ) -> TestPlanVersion:
+        """Generate a versioned executable plan for ``test_step``.
+
+        Args:
+            test_step: The atomic behavior or check to implement.
+            discovery_result: Typed browser discovery data available to a future
+                deterministic or LLM-backed generation strategy.
+
+        """
+        return self.generate_with_plan(test_step, discovery_result).test_plan_version
+
+    def generate_with_plan(
+        self,
+        test_step: TestStep,
+        discovery_result: DiscoveryResult,
+        *,
+        existing_test_plan: TestPlan | None = None,
+        version_number: int = 1,
+    ) -> GeneratedTestPlan:
+        """Generate a version while retaining its owning TestPlan object."""
+        raise NotImplementedError(
+            "Test plan generation is not implemented; no executable plan was created."
+        )
+
+
+class LLMTestPlanGenerator(TestPlanGenerator):
+    """Generate an executable plan version through the configured LLM Router."""
+
+    def __init__(self, router: LLMRouter) -> None:
+        self._router = router
+
+    def generate_with_plan(
+        self,
+        test_step: TestStep,
+        discovery_result: DiscoveryResult,
+        *,
+        existing_test_plan: TestPlan | None = None,
+        version_number: int = 1,
+    ) -> GeneratedTestPlan:
+        task = self._build_task_context(test_step, discovery_result)
+        page_snapshot = self._build_discovery_context(discovery_result)
+        router_result = self._router.create_test_plan(
+            task=task,
+            target_url=discovery_result.url,
+            page_snapshot=page_snapshot,
+        )
+
+        # Validate at this boundary as well, so a nonconforming Router
+        # implementation cannot create a version from invalid plan data.
+        executable_plan = QATestPlan.model_validate(router_result)
+        if existing_test_plan is not None:
+            if existing_test_plan.test_step_id != test_step.id:
+                raise ValueError("Existing TestPlan belongs to a different TestStep.")
+            test_plan = existing_test_plan
+        else:
+            test_plan = TestPlan(
+                test_step_id=test_step.id,
+                name=test_step.name,
+            )
+        version = TestPlanVersion(
+            test_plan_id=test_plan.id,
+            version=version_number,
+            qa_test_plan=executable_plan,
+        )
+        return GeneratedTestPlan(test_plan=test_plan, test_plan_version=version)
+
+    @staticmethod
+    def _build_task_context(
+        test_step: TestStep,
+        discovery_result: DiscoveryResult,
+    ) -> str:
+        return (
+            "Generate an executable Playwright-oriented QATestPlan for this "
+            "single atomic TestStep only. Do not generate a TestCase, split the "
+            "step, or add unrelated checks. Use only selectors and URLs present "
+            "in the supplied discovery context.\n"
+            f"TestStep order: {test_step.order}\n"
+            f"TestStep name: {test_step.name}\n"
+            f"TestStep description: {test_step.description}\n"
+            f"Expected result: {test_step.expected}\n"
+            f"Discovery status: {discovery_result.status.value}\n"
+            f"Discovery warnings: {json.dumps(discovery_result.warnings, ensure_ascii=False)}"
+        )
+
+    @staticmethod
+    def _build_discovery_context(discovery_result: DiscoveryResult) -> str:
+        snapshot = dict(discovery_result.snapshot)
+        # The typed fields are authoritative, while retaining all other data
+        # from the existing structured snapshot unchanged.
+        snapshot.update(
+            {
+                "url": discovery_result.url,
+                "title": discovery_result.title,
+                "navigation_paths": [
+                    path.model_dump(mode="json")
+                    for path in discovery_result.navigation_paths
+                ],
+                "direct_navigation_paths": [
+                    path.model_dump(mode="json")
+                    for path in discovery_result.direct_navigation_paths
+                ],
+                "warnings": discovery_result.warnings,
+                "strategies_used": discovery_result.strategies_used,
+            }
+        )
+        return json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))

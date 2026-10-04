@@ -1,0 +1,273 @@
+import inspect
+import json
+import unittest
+from typing import get_type_hints
+from unittest.mock import patch
+
+from pydantic import ValidationError
+
+from qa_agent.models import (
+    DiscoveryResult,
+    DiscoveryStatus,
+    QATestPlan,
+    QATestStep,
+    TestPlan as DomainTestPlan,
+    TestPlanVersion as DomainTestPlanVersion,
+    TestStep as DomainTestStep,
+)
+from qa_agent.test_plan_generator import LLMTestPlanGenerator, TestPlanGenerator
+
+
+class TestPlanGeneratorTests(unittest.TestCase):
+    def make_test_step(self) -> DomainTestStep:
+        return DomainTestStep(
+            name="Check homepage",
+            description="Open the homepage",
+            expected="The homepage is loaded",
+            order=0,
+        )
+
+    def test_generator_exposes_expected_interface(self) -> None:
+        method = TestPlanGenerator.generate
+        signature = inspect.signature(method)
+        hints = get_type_hints(method)
+
+        self.assertEqual(list(signature.parameters), ["self", "test_step", "discovery_result"])
+        self.assertIs(hints["test_step"], DomainTestStep)
+        self.assertIs(hints["discovery_result"], DiscoveryResult)
+        self.assertIs(hints["return"], DomainTestPlanVersion)
+
+    def test_generate_accepts_a_test_step_and_discovery_result(self) -> None:
+        step = self.make_test_step()
+        result = DiscoveryResult(
+            status=DiscoveryStatus.PARTIAL,
+            url="https://example.com",
+            snapshot={"url": "https://example.com", "links": []},
+        )
+
+        with self.assertRaisesRegex(NotImplementedError, "no executable plan was created"):
+            TestPlanGenerator().generate(step, result)
+
+    def test_unimplemented_generation_fails_predictably(self) -> None:
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            "Test plan generation is not implemented",
+        ):
+            TestPlanGenerator().generate(
+                self.make_test_step(),
+                DiscoveryResult(status=DiscoveryStatus.PARTIAL, url="https://example.com"),
+            )
+
+    def test_existing_domain_models_remain_compatible(self) -> None:
+        test_step = self.make_test_step()
+        test_plan = DomainTestPlan(test_step_id=test_step.id, name="Homepage plan")
+        executable = QATestPlan(
+            url="https://example.com",
+            steps=[QATestStep(action="navigate", parameters={"url": "https://example.com"})],
+        )
+        version = DomainTestPlanVersion(
+            test_plan_id=test_plan.id,
+            version=1,
+            qa_test_plan=executable,
+        )
+
+        self.assertEqual(test_plan.test_step_id, test_step.id)
+        self.assertIs(version.qa_test_plan, executable)
+        self.assertNotIn("actual_result", type(test_step).model_fields)
+
+
+class LLMTestPlanGeneratorTests(unittest.TestCase):
+    def make_test_step(self) -> DomainTestStep:
+        return DomainTestStep(
+            name="Verify Boliglån page",
+            description="Open Lån → Boliglån",
+            expected="Boliglån page is displayed",
+            order=2,
+        )
+
+    def make_discovery_result(self) -> DiscoveryResult:
+        return DiscoveryResult(
+            status=DiscoveryStatus.SUCCESS,
+            url="https://www.dnb.no/",
+            title="DNB",
+            snapshot={"headings": [{"selector": "h1", "text": "Boliglån"}]},
+            navigation_paths=[
+                {
+                    "menu_button_selector": "#menu-button-open",
+                    "menu_tab_text": "Privat",
+                    "menu_tab_selector": "#header-navigation-menu-tab-1",
+                    "menu_item_text": "Lån",
+                    "menu_item_selector": '#main-menu a[role="menuitem"][href="/lan"]',
+                    "submenu_text": "Boliglån",
+                    "submenu_selector": 'main li a[href="/lan/boliglan"]',
+                    "expected_url": "https://www.dnb.no/lan/boliglan",
+                    "heading_text": "Boliglån",
+                    "heading_selector": 'h1:has-text("Boliglån")',
+                }
+            ],
+            direct_navigation_paths=[
+                {
+                    "strategy": "direct_nav",
+                    "root_url": "https://www.finn.no/",
+                    "steps": [
+                        {"text": "Reise", "selector": 'a[href="/reise"]',
+                         "href": "/reise", "resolved_url": "https://www.finn.no/reise/"},
+                        {"text": "Restplasser", "selector": 'nav a[href="/reise/restplasser/"]',
+                         "href": "/reise/restplasser/",
+                         "resolved_url": "https://www.finn.no/reise/restplasser/"},
+                    ],
+                    "expected_url": "https://www.finn.no/reise/restplasser/",
+                    "heading_text": "Restplasser",
+                    "heading_selector": 'h1:has-text("Restplasser")',
+                }
+            ],
+            warnings=["Partial page data"],
+            strategies_used=["menu_navigation", "direct_navigation"],
+        )
+
+    def test_successful_generation_creates_linked_plan_version(self) -> None:
+        step = self.make_test_step()
+        executable = QATestPlan(
+            url="https://www.dnb.no/",
+            steps=[
+                QATestStep(action="navigate", parameters={"url": "https://www.dnb.no/"}),
+                QATestStep(action="click", parameters={"selector": 'main li a[href="/lan/boliglan"]'}),
+                QATestStep(action="assert_url", parameters={"expected": "https://www.dnb.no/lan/boliglan"}),
+                QATestStep(action="assert_visible", parameters={
+                    "selector": 'h1:has-text("Boliglån")', "expected_text": "Boliglån"
+                }),
+            ],
+        )
+        router = _StubRouter(executable)
+        created_plans: list[DomainTestPlan] = []
+
+        def create_test_plan_model(**values: object) -> DomainTestPlan:
+            plan = DomainTestPlan(**values)
+            created_plans.append(plan)
+            return plan
+
+        with patch(
+            "qa_agent.test_plan_generator.TestPlan",
+            side_effect=create_test_plan_model,
+        ) as plan_factory:
+            version = LLMTestPlanGenerator(router).generate(step, self.make_discovery_result())
+
+        self.assertIsInstance(version, DomainTestPlanVersion)
+        self.assertIsNotNone(version.test_plan_id)
+        self.assertEqual(version.test_plan_id, created_plans[0].id)
+        self.assertEqual(plan_factory.call_args.kwargs["test_step_id"], step.id)
+        self.assertEqual(version.qa_test_plan, executable)
+        self.assertEqual(len(version.qa_test_plan.steps), 4)
+
+    def test_generate_with_plan_returns_the_created_plan_and_its_version(self) -> None:
+        step = self.make_test_step()
+        executable = QATestPlan(
+            url="https://www.dnb.no/",
+            steps=[QATestStep(action="assert_page_loaded")],
+        )
+
+        generated = LLMTestPlanGenerator(_StubRouter(executable)).generate_with_plan(
+            step,
+            self.make_discovery_result(),
+        )
+
+        self.assertEqual(generated.test_plan.test_step_id, step.id)
+        self.assertEqual(generated.test_plan_version.test_plan_id, generated.test_plan.id)
+        self.assertIs(generated.test_plan_version.qa_test_plan, executable)
+
+    def test_regeneration_reuses_plan_and_creates_requested_next_version(self) -> None:
+        step = self.make_test_step()
+        generator = LLMTestPlanGenerator(_StubRouter(QATestPlan(
+            url="https://www.dnb.no/",
+            steps=[QATestStep(action="assert_page_loaded")],
+        )))
+        first = generator.generate_with_plan(step, self.make_discovery_result())
+        second = generator.generate_with_plan(
+            step,
+            self.make_discovery_result(),
+            existing_test_plan=first.test_plan,
+            version_number=2,
+        )
+
+        self.assertIs(second.test_plan, first.test_plan)
+        self.assertEqual(second.test_plan_version.test_plan_id, first.test_plan.id)
+        self.assertEqual(second.test_plan_version.version, 2)
+
+    def test_router_failure_propagates_without_masking(self) -> None:
+        error = RuntimeError("router failed")
+        router = _StubRouter(error=error)
+
+        with self.assertRaisesRegex(RuntimeError, "router failed") as raised:
+            LLMTestPlanGenerator(router).generate(self.make_test_step(), self.make_discovery_result())
+
+        self.assertIs(raised.exception, error)
+
+    def test_invalid_router_plan_fails_validation_before_version_creation(self) -> None:
+        router = _StubRouter({"url": "", "steps": []})
+
+        with patch("qa_agent.test_plan_generator.TestPlan") as plan_factory:
+            with self.assertRaises(ValidationError):
+                LLMTestPlanGenerator(router).generate(self.make_test_step(), self.make_discovery_result())
+
+        plan_factory.assert_not_called()
+
+    def test_discovery_context_and_single_step_task_are_passed_to_router(self) -> None:
+        router = _StubRouter(QATestPlan(
+            url="https://www.dnb.no/",
+            steps=[QATestStep(action="assert_page_loaded")],
+        ))
+        step = self.make_test_step()
+        result = self.make_discovery_result()
+
+        LLMTestPlanGenerator(router).generate(step, result)
+
+        self.assertEqual(len(router.calls), 1)
+        call = router.calls[0]
+        self.assertEqual(call["target_url"], result.url)
+        self.assertIn("single atomic TestStep only", call["task"])
+        self.assertIn(step.name, call["task"])
+        self.assertIn(step.description, call["task"])
+        self.assertIn(step.expected, call["task"])
+        self.assertIn(f"TestStep order: {step.order}", call["task"])
+
+        context = json.loads(call["page_snapshot"])
+        self.assertEqual(context["url"], result.url)
+        self.assertEqual(context["navigation_paths"][0]["expected_url"],
+                         "https://www.dnb.no/lan/boliglan")
+        self.assertEqual(context["direct_navigation_paths"][0]["strategy"], "direct_nav")
+        self.assertEqual(context["headings"], result.snapshot["headings"])
+        self.assertEqual(context["warnings"], result.warnings)
+
+    def test_only_the_supplied_test_step_is_used_for_one_router_request(self) -> None:
+        router = _StubRouter(QATestPlan(
+            url="https://www.dnb.no/",
+            steps=[QATestStep(action="assert_page_loaded")],
+        ))
+        step = self.make_test_step()
+
+        LLMTestPlanGenerator(router).generate(step, self.make_discovery_result())
+
+        self.assertEqual(len(router.calls), 1)
+        self.assertEqual(router.calls[0]["task"].count("TestStep order:"), 1)
+        self.assertIn("Do not generate a TestCase, split the step", router.calls[0]["task"])
+
+
+class _StubRouter:
+    def __init__(self, result: object = None, error: Exception | None = None) -> None:
+        self.result = result
+        self.error = error
+        self.calls: list[dict[str, str]] = []
+
+    def create_test_plan(self, *, task: str, target_url: str, page_snapshot: str) -> object:
+        self.calls.append({
+            "task": task,
+            "target_url": target_url,
+            "page_snapshot": page_snapshot,
+        })
+        if self.error:
+            raise self.error
+        return self.result
+
+
+if __name__ == "__main__":
+    unittest.main()
