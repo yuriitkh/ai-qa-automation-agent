@@ -5,13 +5,7 @@ from qa_agent.gemini_client import create_test_plan, get_selected_provider_name
 from qa_agent.browser_runner import run_test_plan
 
 task = (
-    "Verify that https://www.nav.no/ loads successfully. If the cookie consent "
-    "banner is visible, accept strictly necessary cookies using the discovered "
-    "selector. Using at least three distinct navigation_paths from the browser "
-    "snapshot, test each discovered menu and submenu combination: open the menu, "
-    "select its discovered tab when present, click the discovered top-level menu "
-    "item and submenu, then verify the exact expected URL and destination heading. "
-    "Do not use menu positions or invent selectors or URLs."
+    'Open https://www.selenium.dev/selenium/web/web-form.html. Verify that the input labeled "Disabled input" is disabled.'
 )
 
 plan = create_test_plan(task)

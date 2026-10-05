@@ -9,6 +9,31 @@ from .base import LLMProvider
 from .errors import NonRetryableLLMError, RetryableLLMError
 
 
+def _raise_for_gemini_error(error: Exception, operation: str) -> None:
+    if isinstance(error, (httpx.TimeoutException, TimeoutError)):
+        raise RetryableLLMError(f"Gemini {operation} timed out: {error}") from error
+
+    status_code = getattr(error, "status_code", None)
+    if status_code is None:
+        status_code = getattr(error, "code", None)
+    if status_code is None:
+        response = getattr(error, "response", None)
+        if response is None:
+            response = getattr(error, "raw_response", None)
+        status_code = getattr(response, "status_code", None)
+
+    if status_code in (408, 429) or (
+        isinstance(status_code, int) and status_code >= 500
+    ):
+        raise RetryableLLMError(
+            f"Gemini {operation} failed with HTTP {status_code}: {error}"
+        ) from error
+
+    raise NonRetryableLLMError(
+        f"Gemini {operation} failed: {type(error).__name__}: {error}"
+    ) from error
+
+
 class GeminiProvider(LLMProvider):
     def __init__(self) -> None:
         self._api_key = os.environ.get("GEMINI_API_KEY")
@@ -16,12 +41,18 @@ class GeminiProvider(LLMProvider):
             genai.Client(
                 api_key=self._api_key,
                 http_options=types.HttpOptions(
-                    retry_options=types.HttpRetryOptions(attempts=1)
+                    retry_options=types.HttpRetryOptions(attempts=0)
                 ),
             )
             if self._api_key
             else None
         )
+        if self._client is not None:
+            # google-genai 2.25.0 mutates attempts=0 to attempts=1 while
+            # configuring its legacy retry policy. The public Client stores
+            # HttpOptions on its internal BaseApiClient, which Interactions
+            # later translates into a separate RetryConfig.
+            self._client._api_client._http_options.retry_options.attempts = 0
 
     @property
     def is_available(self) -> bool:
@@ -49,7 +80,8 @@ class GeminiProvider(LLMProvider):
                     "Return that URL and ordered executable test steps. "
                     "Allowed actions are ONLY: navigate, assert_page_loaded, "
                     "assert_title, assert_visible, click, fill, assert_hidden, "
-                    "and assert_url. "
+                    "assert_url, select_option, assert_text_contains, assert_checked, "
+                    "assert_selected, assert_enabled, and assert_disabled. "
                     "Never invent, rename, or substitute action names. Use this "
                     "exact parameter contract: "
                     "navigate uses parameters {url: target URL}; "
@@ -60,6 +92,11 @@ class GeminiProvider(LLMProvider):
                     "{selector: CSS selector, expected_text: expected visible text}. "
                     "click uses parameters {selector: CSS selector}; "
                     "fill uses parameters {selector: CSS selector, value: text to fill}; "
+                    "select_option uses {selector: CSS selector, option_label: visible option label}; "
+                    "assert_text_contains uses {expected_text: required substring} and optional selector. "
+                    "assert_checked verifies checkbox/radio checked state. assert_selected uses "
+                    "selector and expected selected option label or value. "
+                    "assert_enabled and assert_disabled verify actual enabled state. "
                     "assert_hidden uses parameters {selector: CSS selector}. "
                     "assert_url uses parameters {expected: expected current URL}. "
                     'The assert_url parameter name MUST be exactly "expected". '
@@ -107,29 +144,8 @@ class GeminiProvider(LLMProvider):
                 response_format=response_format,
             )
             return QATestPlan.model_validate_json(interaction.output_text)
-        except (httpx.TimeoutException, TimeoutError) as error:
-            raise RetryableLLMError(f"Gemini request timed out: {error}") from error
         except Exception as error:
-            status_code = getattr(error, "status_code", None)
-            if status_code is None:
-                status_code = getattr(error, "code", None)
-            if status_code is None:
-                response = getattr(error, "response", None)
-                if response is None:
-                    response = getattr(error, "raw_response", None)
-                status_code = getattr(response, "status_code", None)
-
-            if status_code == 408 or status_code == 429 or (
-                isinstance(status_code, int) and status_code >= 500
-            ):
-                raise RetryableLLMError(
-                    f"Gemini request failed with HTTP {status_code}: {error}"
-                ) from error
-
-            raise NonRetryableLLMError(
-                f"Gemini request or response was not retryable: "
-                f"{type(error).__name__}: {error}"
-            ) from error
+            _raise_for_gemini_error(error, "request")
 
     def create_discovery(self, task: str, target_url: str, page_snapshot: str) -> AIDiscoveryResult:
         if self._client is None:
@@ -144,7 +160,5 @@ class GeminiProvider(LLMProvider):
                                  "schema": AIDiscoveryResult.model_json_schema()},
             )
             return AIDiscoveryResult.model_validate_json(response.output_text)
-        except (httpx.TimeoutException, TimeoutError) as error:
-            raise RetryableLLMError(f"Gemini request timed out: {error}") from error
         except Exception as error:
-            raise NonRetryableLLMError(f"Gemini Discovery response was invalid: {error}") from error
+            _raise_for_gemini_error(error, "Discovery request")

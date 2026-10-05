@@ -38,6 +38,39 @@ _SNAPSHOT_SCRIPT = r"""() => {
         }
         return rect.width > 0 && rect.height > 0;
   };
+    const verifiedSelector = (element) => {
+        const tag = element.tagName.toLowerCase();
+        const isExactMatch = (selector) => {
+            try {
+                const matches = document.querySelectorAll(selector);
+                return matches.length === 1 && matches[0] === element;
+            } catch (_) {
+                return false;
+            }
+        };
+        if (element.id) {
+            const idSelector = `#${CSS.escape(element.id)}`;
+            if (isExactMatch(idSelector)) return idSelector;
+        }
+        const name = element.getAttribute("name");
+        if (name) {
+            const nameSelector = `${tag}[name="${CSS.escape(name)}"]`;
+            if (isExactMatch(nameSelector)) return nameSelector;
+        }
+        const path = [];
+        let current = element;
+        while (current && current !== document.body) {
+            const currentTag = current.tagName.toLowerCase();
+            const siblings = Array.from(current.parentElement.children)
+                .filter((sibling) => sibling.tagName === current.tagName);
+            const position = siblings.indexOf(current) + 1;
+            path.unshift(siblings.length > 1 ? `${currentTag}:nth-of-type(${position})` : currentTag);
+            current = current.parentElement;
+        }
+        if (current !== document.body || !path.length) return null;
+        const selector = `body > ${path.join(" > ")}`;
+        return isExactMatch(selector) ? selector : null;
+    };
   const describe = (element) => {
     const tag = element.tagName.toLowerCase();
     const id = element.id || "";
@@ -75,13 +108,27 @@ _SNAPSHOT_SCRIPT = r"""() => {
   };
     const textSelector = (element) => {
         const tag = element.tagName.toLowerCase();
-        if (element.id) return `#${CSS.escape(element.id)}`;
+        const isExactMatch = (selector) => {
+            try {
+                const matches = document.querySelectorAll(selector);
+                return matches.length === 1 && matches[0] === element;
+            } catch (_) {
+                return false;
+            }
+        };
+        if (element.id) {
+            const idSelector = `#${CSS.escape(element.id)}`;
+            if (isExactMatch(idSelector)) return idSelector;
+        }
         const name = element.getAttribute("name");
-        if (name) return `${tag}[name="${CSS.escape(name)}"]`;
+        if (name) {
+            const nameSelector = `${tag}[name="${CSS.escape(name)}"]`;
+            if (isExactMatch(nameSelector)) return nameSelector;
+        }
 
         const path = [];
         let current = element;
-        while (current && current !== document.body && path.length < 4) {
+        while (current && current !== document.body) {
             const currentTag = current.tagName.toLowerCase();
             const siblings = Array.from(current.parentElement.children)
                 .filter((sibling) => sibling.tagName === current.tagName);
@@ -89,7 +136,9 @@ _SNAPSHOT_SCRIPT = r"""() => {
             path.unshift(siblings.length > 1 ? `${currentTag}:nth-of-type(${position})` : currentTag);
             current = current.parentElement;
         }
-        return `body > ${path.join(" > ")}`.slice(-180);
+        if (current !== document.body || !path.length) return null;
+        const selector = `body > ${path.join(" > ")}`;
+        return isExactMatch(selector) ? selector : null;
     };
     const collectVisibleText = () => {
         const selector = "h1, h2, h3, h4, h5, h6, p, li, td, th, blockquote, pre, figcaption, label, summary, dt, dd, div, span";
@@ -121,9 +170,11 @@ _SNAPSHOT_SCRIPT = r"""() => {
             if (!generic && candidates.some((child) => child !== element && element.contains(child) &&
                     !["div", "span"].includes(child.tagName.toLowerCase()) && hasUsefulText(child))) continue;
 
+            const selector = textSelector(element);
+            if (!selector) continue;
             elements.push({
                 tag,
-                selector: textSelector(element),
+                selector,
                 text: element.innerText.trim().slice(0, 120),
                 visible: true,
             });
@@ -142,7 +193,10 @@ _SNAPSHOT_SCRIPT = r"""() => {
     const collectInteractive = () => {
         const selector = 'a[href], button, input:not([type=hidden]), select, textarea, [role]';
         return Array.from(document.querySelectorAll(selector)).filter(isVisible).slice(0, 32).map((element) => {
+            const selector = verifiedSelector(element);
+            if (!selector || selector.length > 180) return null;
             const item = describe(element);
+            item.selector = selector;
             const tag = element.tagName.toLowerCase();
             const role = element.getAttribute('role') || '';
             const type = (element.getAttribute('type') || '').toLowerCase();
@@ -153,7 +207,7 @@ _SNAPSHOT_SCRIPT = r"""() => {
             item.visible = true;
             item.enabled = !element.disabled && element.getAttribute('aria-disabled') !== 'true';
             return item;
-        });
+        }).filter(Boolean);
     };
     const visibleHeadingElements = Array.from(
         document.querySelectorAll("h1, h2, h3, h4, h5, h6")

@@ -5,6 +5,8 @@ import unittest
 from contextlib import redirect_stdout
 from unittest.mock import MagicMock, patch
 
+import httpx
+
 from qa_agent.llm.gemini import GeminiProvider
 from qa_agent.llm.errors import NonRetryableLLMError, RetryableLLMError
 from qa_agent.llm.groq import GroqProvider
@@ -33,6 +35,10 @@ class LLMProviderContractTests(unittest.TestCase):
                 },
                 {"action": "assert_hidden", "parameters": {"selector": "#notice"}},
                 {"action": "assert_url", "parameters": {"expected": "https://example.com/lan"}},
+                {"action": "assert_disabled", "parameters": {"selector": "input"}},
+                {"action": "select_option", "parameters": {
+                    "selector": "select", "option_label": "Two"
+                }},
             ],
         )
 
@@ -51,7 +57,6 @@ class LLMProviderContractTests(unittest.TestCase):
 
         for parameter_contract in (
             "{url: target URL}",
-            "assert_page_loaded uses parameters {}",
             "{expected: expected page title}",
             "{selector: CSS selector, expected_text: expected visible text}",
             "click uses parameters {selector: CSS selector}",
@@ -91,21 +96,93 @@ class LLMProviderContractTests(unittest.TestCase):
         self.assertEqual(plan, self.plan)
         call = client.interactions.create.call_args.kwargs
         self._assert_prompt_contract(call["input"])
+        self.assertIn("assert_page_loaded uses parameters {}", call["input"])
         self.assertEqual(
             call["response_format"]["schema"], QATestPlan.model_json_schema()
         )
 
-    def test_gemini_client_is_configured_for_one_sdk_attempt(self) -> None:
-        with (
-            patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}, clear=True),
-            patch("qa_agent.llm.gemini.genai.Client") as client_constructor,
-        ):
+    def test_gemini_interactions_retry_config_disables_sdk_retries(self) -> None:
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}, clear=True):
             provider = GeminiProvider()
 
         self.assertTrue(provider.is_available)
-        client_constructor.assert_called_once()
-        http_options = client_constructor.call_args.kwargs["http_options"]
-        self.assertEqual(http_options.retry_options.attempts, 1)
+        client = provider._client
+        self.assertEqual(client._api_client._http_options.retry_options.attempts, 0)
+        interactions = client.interactions
+        retry_config = interactions.sdk_configuration.retry_config
+        self.assertEqual(retry_config.max_retries, 0)
+
+    def test_gemini_transient_http_statuses_are_retryable(self) -> None:
+        for status_code in (408, 429, 500, 503):
+            error = RuntimeError(f"HTTP {status_code}")
+            error.status_code = status_code
+            client = MagicMock()
+            client.interactions.create.side_effect = error
+            provider = GeminiProvider()
+            provider._client = client
+
+            with self.subTest(status_code=status_code), self.assertRaises(RetryableLLMError):
+                provider.create_test_plan(self.task, self.target_url, self.snapshot)
+
+    def test_gemini_429_uses_one_sdk_request_without_sleep(self) -> None:
+        requests: list[httpx.Request] = []
+
+        def return_rate_limit(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(
+                429,
+                json={
+                    "error": {
+                        "code": 429,
+                        "message": "Rate limit exceeded",
+                        "status": "RESOURCE_EXHAUSTED",
+                    }
+                },
+                request=request,
+            )
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}, clear=True):
+            provider = GeminiProvider()
+
+        client = provider._client
+        api_client = client._api_client
+        original_http_client = api_client._httpx_client
+        mock_http_client = httpx.Client(
+            transport=httpx.MockTransport(return_rate_limit)
+        )
+        api_client._httpx_client = mock_http_client
+        try:
+            with (
+                patch("google.genai._gaos.utils.retries.time.sleep") as sdk_sleep,
+                self.assertRaises(RetryableLLMError),
+            ):
+                provider.create_test_plan(self.task, self.target_url, self.snapshot)
+        finally:
+            mock_http_client.close()
+            original_http_client.close()
+
+        self.assertEqual(len(requests), 1)
+        sdk_sleep.assert_not_called()
+
+    def test_gemini_non_transient_http_status_is_non_retryable(self) -> None:
+        error = RuntimeError("HTTP 400")
+        error.status_code = 400
+        provider = GeminiProvider()
+        provider._client = MagicMock()
+        provider._client.interactions.create.side_effect = error
+
+        with self.assertRaises(NonRetryableLLMError):
+            provider.create_test_plan(self.task, self.target_url, self.snapshot)
+
+    def test_gemini_discovery_http_429_is_retryable(self) -> None:
+        error = RuntimeError("HTTP 429")
+        error.status_code = 429
+        provider = GeminiProvider()
+        provider._client = MagicMock()
+        provider._client.interactions.create.side_effect = error
+
+        with self.assertRaises(RetryableLLMError):
+            provider.create_discovery(self.task, self.target_url, self.snapshot)
 
     def test_groq_prompt_and_schema_cover_all_actions(self) -> None:
         response = MagicMock()
@@ -138,20 +215,44 @@ class LLMProviderContractTests(unittest.TestCase):
         )
         schema = request["response_format"]["json_schema"]["schema"]
         schema_text = json.dumps(schema)
-        for unsupported in ("$ref", "$defs", "anyOf", "oneOf"):
+        for unsupported in ("$ref", "$defs", "oneOf"):
             self.assertNotIn(unsupported, schema_text)
-        parameters_schema = schema["properties"]["steps"]["items"]["properties"]["parameters"]
+        variants = schema["properties"]["steps"]["items"]["anyOf"]
+        by_action = {
+            variant["properties"]["action"]["enum"][0]: variant["properties"]["parameters"]
+            for variant in variants
+        }
+        common_fields = ["url", "expected", "selector", "expected_text", "value"]
+        self.assertEqual(by_action["navigate"]["required"], common_fields)
+        self.assertEqual(by_action["assert_page_loaded"]["required"], common_fields)
+        self.assertEqual(by_action["assert_disabled"]["required"], common_fields)
+        for action, parameters_schema in by_action.items():
+            self.assertEqual(
+                list(parameters_schema["properties"]),
+                common_fields + (["option_label"] if action == "select_option" else []),
+            )
+            if action != "select_option":
+                self.assertNotIn("option_label", parameters_schema["properties"])
         self.assertEqual(
-            parameters_schema["required"],
-            ["url", "expected", "selector", "expected_text", "value"],
+            by_action["select_option"]["required"], common_fields + ["option_label"]
         )
-        self.assertFalse(parameters_schema["additionalProperties"])
-        for field_schema in parameters_schema["properties"].values():
-            self.assertEqual(field_schema["type"], ["string", "null"])
-        self.assertEqual(
-            schema["properties"]["steps"]["items"]["additionalProperties"],
-            False,
-        )
+        self.assertEqual(by_action["select_option"]["properties"]["option_label"]["type"], "string")
+
+        def assert_groq_strict_objects(node: object) -> None:
+            if isinstance(node, dict):
+                if node.get("type") == "object":
+                    self.assertIn("properties", node)
+                    self.assertTrue(node["properties"])
+                    self.assertIn("required", node)
+                    self.assertEqual(set(node["required"]), set(node["properties"]))
+                    self.assertIs(node.get("additionalProperties"), False)
+                for value in node.values():
+                    assert_groq_strict_objects(value)
+            elif isinstance(node, list):
+                for value in node:
+                    assert_groq_strict_objects(value)
+
+        assert_groq_strict_objects(schema)
         self.assertEqual(schema["required"], ["url", "steps"])
         self.assertFalse(schema["additionalProperties"])
         prompt = request["messages"][0]["content"]
@@ -160,6 +261,9 @@ class LLMProviderContractTests(unittest.TestCase):
         self.assertIn("fields MUST be exactly url and steps", prompt)
         self.assertIn("one object containing action and parameters together", prompt)
         self.assertIn("Output no Markdown", prompt)
+        self.assertIn("assert_page_loaded uses all five common keys set to null", prompt)
+        self.assertIn("Include option_label only for select_option", prompt)
+        self.assertIn("set fields unused by an action to JSON null", prompt)
 
     def test_groq_rejects_root_array_without_rewriting_it(self) -> None:
         array_response = json.dumps([self.plan.model_dump()])

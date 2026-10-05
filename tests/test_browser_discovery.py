@@ -579,6 +579,43 @@ class BrowserDiscoveryTests(unittest.TestCase):
             [{"tag": "p", "selector": "p.visible", "text": "Example Domain"}],
         )
 
+    def test_selenium_disabled_input_visible_text_selector_matches_its_element(self) -> None:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.goto("https://www.selenium.dev/selenium/web/web-form.html")
+                snapshot = page.evaluate(_SNAPSHOT_SCRIPT)
+                target = next(
+                    item for item in snapshot["visible_text_elements"]
+                    if item["text"] == "Disabled input"
+                )
+                control = next(
+                    item for item in snapshot["interactive_elements"]
+                    if item["accessible_name"] == "Disabled input"
+                )
+
+                matches = page.locator(target["selector"])
+                self.assertGreaterEqual(matches.count(), 1)
+                self.assertEqual(matches.count(), 1)
+                self.assertEqual(matches.first.inner_text().strip(), "Disabled input")
+                self.assertEqual(control["selector"], 'input[name="my-disabled"]')
+                self.assertEqual(page.locator(control["selector"]).count(), 1)
+                self.assertEqual(
+                    page.locator(control["selector"]).get_attribute("name"),
+                    "my-disabled",
+                )
+                text_input = next(
+                    item for item in snapshot["interactive_elements"]
+                    if item.get("id") == "my-text-id"
+                )
+                self.assertEqual(text_input["selector"], "#my-text-id")
+                for item in snapshot["interactive_elements"]:
+                    with self.subTest(control=item["accessible_name"]):
+                        self.assertEqual(page.locator(item["selector"]).count(), 1)
+            finally:
+                browser.close()
+
     def test_heading_beyond_headings_limit_is_grounded_without_duplicate_headings(self) -> None:
         headings = [
             {"tag": "h2", "selector": f"#heading-{index}", "text": f"Heading {index}"}

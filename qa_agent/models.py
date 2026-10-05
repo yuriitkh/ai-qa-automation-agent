@@ -1,12 +1,29 @@
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class QATestStep(BaseModel):
+    ACTION_PARAMETER_FIELDS: ClassVar[dict[str, tuple[str, ...]]] = {
+        "navigate": ("url",),
+        "assert_page_loaded": (),
+        "assert_title": ("expected",),
+        "assert_visible": ("selector", "expected_text"),
+        "click": ("selector",),
+        "fill": ("selector", "value"),
+        "assert_hidden": ("selector",),
+        "assert_url": ("expected",),
+        "select_option": ("selector", "option_label"),
+        "assert_text_contains": ("expected_text",),
+        "assert_checked": ("selector",),
+        "assert_selected": ("selector", "expected"),
+        "assert_enabled": ("selector",),
+        "assert_disabled": ("selector",),
+    }
+
     action: Literal[
         "navigate",
         "assert_page_loaded",
@@ -16,8 +33,30 @@ class QATestStep(BaseModel):
         "fill",
         "assert_hidden",
         "assert_url",
+        "select_option",
+        "assert_text_contains",
+        "assert_checked",
+        "assert_selected",
+        "assert_enabled",
+        "assert_disabled",
     ]
     parameters: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_capability_parameters(self) -> "QATestStep":
+        selector = self.parameters.get("selector")
+        if self.action in {"select_option", "assert_selected", "assert_checked", "assert_enabled", "assert_disabled"}:
+            if not isinstance(selector, str) or not selector.strip():
+                raise ValueError(f"{self.action} requires a selector.")
+        if self.action == "select_option" and not isinstance(self.parameters.get("option_label"), str):
+            raise ValueError("select_option requires option_label (the visible option label).")
+        if self.action != "select_option" and "option_label" in self.parameters:
+            raise ValueError("option_label is only valid for select_option.")
+        if self.action == "assert_text_contains" and not isinstance(self.parameters.get("expected_text"), str):
+            raise ValueError("assert_text_contains requires expected_text.")
+        if self.action == "assert_selected" and not isinstance(self.parameters.get("expected"), str):
+            raise ValueError("assert_selected requires expected (option label or value).")
+        return self
 
 
 class QATestPlan(BaseModel):

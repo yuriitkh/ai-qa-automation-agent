@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from qa_agent.models import (
     DiscoveryResult,
     DiscoveryStatus,
+    InteractiveElement,
     QATestPlan,
     QATestStep,
     TestPlan as DomainTestPlan,
@@ -250,6 +251,47 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
         self.assertEqual(len(router.calls), 1)
         self.assertEqual(router.calls[0]["task"].count("TestStep order:"), 1)
         self.assertIn("Do not generate a TestCase, split the step", router.calls[0]["task"])
+
+    def test_enabled_state_assertions_require_matching_discovered_input_selector(self) -> None:
+        selector = 'input[name="my-disabled"]'
+        discovery = DiscoveryResult(
+            status=DiscoveryStatus.SUCCESS,
+            url="https://www.selenium.dev/selenium/web/web-form.html",
+            interactive_elements=[
+                InteractiveElement(
+                    kind="input", tag="input", selector=selector,
+                    accessible_name="Disabled input", name="my-disabled",
+                    enabled=False,
+                ),
+                InteractiveElement(
+                    kind="input", tag="input", selector='input[name="my-text"]',
+                    accessible_name="Text input", name="my-text", enabled=True,
+                ),
+            ],
+        )
+
+        for action in ("assert_disabled", "assert_enabled"):
+            with self.subTest(action=action):
+                step = DomainTestStep(
+                    name="Check Disabled input",
+                    description="Verify the input labeled Disabled input",
+                    expected="Disabled input is disabled",
+                    order=0,
+                )
+                plan = QATestPlan(
+                    url=discovery.url,
+                    steps=[QATestStep(action=action, parameters={"selector": "input"})],
+                )
+
+                with self.assertRaisesRegex(ValueError, "deterministic Discovery selector"):
+                    LLMTestPlanGenerator(_StubRouter(plan)).generate(step, discovery)
+
+                plan.steps[0].parameters["selector"] = "#my-disabled"
+                with self.assertRaisesRegex(ValueError, "deterministic Discovery selector"):
+                    LLMTestPlanGenerator(_StubRouter(plan)).generate(step, discovery)
+
+                plan.steps[0].parameters["selector"] = selector
+                LLMTestPlanGenerator(_StubRouter(plan)).generate(step, discovery)
 
 
 class _StubRouter:

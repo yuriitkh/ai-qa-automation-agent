@@ -85,6 +85,15 @@ def run_test_plan(
                                 f"Could not fill element matching selector "
                                 f"{selector!r}: {error}"
                             ) from error
+                    elif step.action == "select_option":
+                        selector = step.parameters["selector"]
+                        label = step.parameters["option_label"]
+                        try:
+                            page.locator(selector).select_option(label=label)
+                        except Exception as error:
+                            raise AssertionError(
+                                f"Could not select option label {label!r} in {selector!r}: {error}"
+                            ) from error
                     elif step.action == "assert_page_loaded":
                         page.wait_for_load_state("load")
                     elif step.action == "assert_title":
@@ -112,14 +121,12 @@ def run_test_plan(
                             raise AssertionError(
                                 f"Selector {selector!r} was not found on the page."
                             )
-
                         element = element.first
                         if not element.is_visible():
                             raise AssertionError(
                                 f"Element matching selector {selector!r} exists "
                                 "but is not visible."
                             )
-
                         try:
                             actual_text = element.inner_text(timeout=1000)
                         except Exception as error:
@@ -134,6 +141,41 @@ def run_test_plan(
                                 f"as the exact visible text for {selector!r}; "
                                 f"got {actual_text!r}."
                             )
+                    elif step.action == "assert_text_contains":
+                        expected_text = step.parameters["expected_text"].replace("\\n", "\n")
+                        selector = step.parameters.get("selector")
+                        actual_text = (
+                            page.locator(selector).inner_text(timeout=1000)
+                            if selector else page.locator("body").inner_text(timeout=1000)
+                        )
+                        if expected_text not in actual_text:
+                            raise AssertionError(
+                                f"Expected text {expected_text!r} to be contained in visible text"
+                                f"{f' for {selector!r}' if selector else ''}; got {actual_text!r}."
+                            )
+                    elif step.action == "assert_checked":
+                        selector = step.parameters["selector"]
+                        if not page.locator(selector).is_checked():
+                            raise AssertionError(f"Expected checkbox/radio {selector!r} to be checked.")
+                    elif step.action == "assert_selected":
+                        selector, expected = step.parameters["selector"], step.parameters["expected"]
+                        selected = page.locator(selector).locator("option:checked").first
+                        actual_label = selected.inner_text()
+                        actual_value = selected.get_attribute("value")
+                        if expected not in {actual_label, actual_value}:
+                            raise AssertionError(
+                                f"Expected selected option {expected!r} for {selector!r}, "
+                                f"got label={actual_label!r}, value={actual_value!r}."
+                            )
+                    elif step.action in {"assert_enabled", "assert_disabled"}:
+                        selector = step.parameters["selector"]
+                        enabled = page.locator(selector).is_enabled()
+                        expected_enabled = step.action == "assert_enabled"
+                        if enabled != expected_enabled:
+                            state = "enabled" if enabled else "disabled"
+                            wanted = "enabled" if expected_enabled else "disabled"
+                            raise AssertionError(f"Expected {selector!r} to be {wanted}, but it is {state}.")
+
                     elif step.action == "assert_hidden":
                         selector = step.parameters["selector"]
                         try:

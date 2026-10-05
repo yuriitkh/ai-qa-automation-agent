@@ -4,7 +4,7 @@ from typing import Any
 
 import httpx
 
-from ..models import AIDiscoveryResult, QATestPlan
+from ..models import AIDiscoveryResult, QATestPlan, QATestStep
 from .base import LLMProvider
 from .errors import NonRetryableLLMError, RetryableLLMError
 
@@ -15,37 +15,44 @@ class GroqProvider(LLMProvider):
 
     @staticmethod
     def _response_schema() -> dict[str, Any]:
-        """Return the explicit strict-mode JSON Schema accepted by Groq."""
-        parameters_schema = {
-            "type": "object",
-            "properties": {
-                "url": {"type": ["string", "null"]},
-                "expected": {"type": ["string", "null"]},
-                "selector": {"type": ["string", "null"]},
-                "expected_text": {"type": ["string", "null"]},
-                "value": {"type": ["string", "null"]},
-            },
-            "required": ["url", "expected", "selector", "expected_text", "value"],
-            "additionalProperties": False,
-        }
+        """Return strict variants with an explicit common parameter shape."""
+        step_variants = []
+        for action in QATestStep.ACTION_PARAMETER_FIELDS:
+            # Groq strict mode needs a non-empty properties map for every
+            # object. These five common nullable fields match the existing
+            # plan wire format; option_label is included only for select_option.
+            parameter_fields = ("url", "expected", "selector", "expected_text", "value")
+            if action == "select_option":
+                parameter_fields += ("option_label",)
+            parameters_schema = {
+                "type": "object",
+                "properties": {
+                    field: (
+                        {"type": "string"}
+                        if field == "option_label"
+                        else {"type": ["string", "null"]}
+                    )
+                    for field in parameter_fields
+                },
+                "required": list(parameter_fields),
+                "additionalProperties": False,
+            }
+            step_variants.append({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": [action]},
+                    "parameters": parameters_schema,
+                },
+                "required": ["action", "parameters"],
+                "additionalProperties": False,
+            })
         return {
             "type": "object",
             "properties": {
                 "url": {"type": "string"},
                 "steps": {
                     "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "action": {
-                                "type": "string",
-                                "enum": ["navigate", "assert_page_loaded", "assert_title", "assert_visible", "click", "fill", "assert_hidden", "assert_url"],
-                            },
-                            "parameters": parameters_schema,
-                        },
-                        "required": ["action", "parameters"],
-                        "additionalProperties": False,
-                    },
+                    "items": {"anyOf": step_variants},
                 },
             },
             "required": ["url", "steps"],
@@ -84,30 +91,26 @@ class GroqProvider(LLMProvider):
             "Return that URL and ordered executable test steps. "
             "Allowed actions are ONLY: navigate, assert_page_loaded, "
             "assert_title, assert_visible, click, fill, assert_hidden, and "
-            "assert_url. "
+            "assert_url, select_option, assert_text_contains, assert_checked, "
+            "assert_selected, assert_enabled, and assert_disabled. "
             "Never invent, rename, or substitute action names. Every parameters "
-            "object MUST contain exactly these five keys: url, expected, selector, "
-            "expected_text, value. Never omit a key. The action mappings below "
-            "identify the only non-null fields; every other field MUST be JSON null. "
-            "navigate uses parameters {url: target URL}; expected, selector, "
-            "expected_text, and value are null. "
-            "The shorthand 'assert_page_loaded uses parameters {}' is forbidden; "
-            "assert_page_loaded has url, expected, selector, expected_text, and "
-            "value all set to null. "
-            "assert_title uses parameters {expected: expected page title}; url, "
-            "selector, expected_text, and value are null. "
+            "object MUST contain exactly these five common keys: url, expected, "
+            "selector, expected_text, and value. Include option_label only for "
+            "select_option, where it is required; omit it for every other action. "
+            "For the five common keys, set fields unused by an action to JSON null. "
+            "navigate uses {url: target URL}; assert_page_loaded uses all five common "
+            "keys set to null. assert_title uses {expected: expected page title}. "
             'The assert_title parameter name MUST be exactly "expected"; '
             "never use expected_title. assert_visible uses parameters "
-            "{selector: CSS selector, expected_text: expected visible text}; url, "
-            "expected, and value are null. "
-            "click uses parameters {selector: CSS selector}; url, expected, "
-            "expected_text, and value are null. "
-            "fill uses parameters {selector: CSS selector, value: text to fill}; "
-            "url, expected, and expected_text are null. "
-            "assert_hidden uses parameters {selector: CSS selector}; url, expected, "
-            "expected_text, and value are null. "
-            "assert_url uses parameters {expected: expected current URL}; url, "
-            "selector, expected_text, and value are null. "
+            "{selector: CSS selector, expected_text: expected visible text}. "
+            "click uses parameters {selector: CSS selector}. "
+            "fill uses {selector: CSS selector, value: text to fill}. "
+            "select_option uses {selector, option_label}; option_label is the visible option text. "
+            "For assert_text_contains use expected_text and optionally selector. "
+            "assert_checked, assert_selected, assert_enabled, and assert_disabled use selector; "
+            "assert_selected uses expected as the selected option label or value. "
+            "assert_hidden uses parameters {selector: CSS selector}. "
+            "assert_url uses parameters {expected: expected current URL}. "
             'The assert_url parameter name MUST be exactly "expected". '
             "Use only a URL supported by the task or browser context; never "
             "invent an expected URL. "

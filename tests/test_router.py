@@ -1,12 +1,13 @@
 import importlib
 import io
+import json
 import os
 import unittest
 from contextlib import redirect_stdout
 from unittest.mock import MagicMock, patch
 
 from qa_agent.llm.base import LLMProvider
-from qa_agent.llm.errors import RetryableLLMError
+from qa_agent.llm.errors import NonRetryableLLMError, RetryableLLMError
 from qa_agent.llm.gemini import GeminiProvider
 from qa_agent.llm.groq import GroqProvider
 from qa_agent.llm.router import LLMRouter
@@ -81,6 +82,104 @@ class RouterTests(unittest.TestCase):
             output.getvalue(),
         )
 
+    def test_gemini_429_falls_back_to_groq_for_test_plan(self) -> None:
+        calls: list[str] = []
+        gemini_client = MagicMock()
+        gemini_error = RuntimeError("HTTP 429")
+        gemini_error.status_code = 429
+
+        def gemini_request(**kwargs):
+            calls.append("Gemini")
+            raise gemini_error
+
+        def groq_request(*args, **kwargs):
+            calls.append("Groq")
+            return groq_response
+
+        gemini_client.interactions.create.side_effect = gemini_request
+        groq_response = MagicMock()
+        groq_response.status_code = 200
+        groq_response.is_error = False
+        groq_response.json.return_value = {
+            "choices": [{"message": {"content": self.plan.model_dump_json()}}]
+        }
+
+        with (
+            patch.dict(
+                os.environ,
+                {"GEMINI_API_KEY": "gemini-test", "GROQ_API_KEY": "groq-test"},
+                clear=True,
+            ),
+            patch("qa_agent.llm.gemini.genai.Client", return_value=gemini_client),
+            patch("qa_agent.llm.groq.httpx.post", side_effect=groq_request),
+            redirect_stdout(io.StringIO()),
+        ):
+            gemini = GeminiProvider()
+            groq = GroqProvider()
+            router = LLMRouter([gemini, groq])
+            result = router.create_test_plan(self.task, self.target_url, self.snapshot)
+
+        self.assertEqual(result, self.plan)
+        self.assertEqual(calls, ["Gemini", "Groq"])
+        self.assertEqual(router.selected_provider_name, "GroqProvider")
+        gemini_client.interactions.create.assert_called_once()
+
+    def test_gemini_400_does_not_fall_back_to_groq(self) -> None:
+        gemini_client = MagicMock()
+        gemini_error = RuntimeError("HTTP 400")
+        gemini_error.status_code = 400
+        gemini_client.interactions.create.side_effect = gemini_error
+
+        with (
+            patch.dict(os.environ, {"GEMINI_API_KEY": "gemini-test"}, clear=True),
+            patch("qa_agent.llm.gemini.genai.Client", return_value=gemini_client),
+        ):
+            router = LLMRouter([GeminiProvider(), GroqProvider()])
+            with patch.object(router._providers[1], "create_test_plan") as groq_call:
+                with self.assertRaises(NonRetryableLLMError):
+                    router.create_test_plan(self.task, self.target_url, self.snapshot)
+
+        gemini_client.interactions.create.assert_called_once()
+        groq_call.assert_not_called()
+
+    def test_gemini_discovery_429_falls_back_to_groq(self) -> None:
+        calls: list[str] = []
+        gemini_client = MagicMock()
+        gemini_error = RuntimeError("HTTP 429")
+        gemini_error.status_code = 429
+
+        def gemini_request(**kwargs):
+            calls.append("Gemini")
+            raise gemini_error
+
+        def groq_request(*args, **kwargs):
+            calls.append("Groq")
+            return groq_response
+
+        gemini_client.interactions.create.side_effect = gemini_request
+        groq_response = MagicMock()
+        groq_response.status_code = 200
+        groq_response.is_error = False
+        groq_response.json.return_value = {
+            "choices": [{"message": {"content": "{}"}}]
+        }
+
+        with (
+            patch.dict(
+                os.environ,
+                {"GEMINI_API_KEY": "gemini-test", "GROQ_API_KEY": "groq-test"},
+                clear=True,
+            ),
+            patch("qa_agent.llm.gemini.genai.Client", return_value=gemini_client),
+            patch("qa_agent.llm.groq.httpx.post", side_effect=groq_request),
+        ):
+            router = LLMRouter([GeminiProvider(), GroqProvider()])
+            result = router.create_discovery(self.task, self.target_url, self.snapshot)
+
+        self.assertEqual(calls, ["Gemini", "Groq"])
+        self.assertEqual(router.selected_provider_name, "GroqProvider")
+        self.assertEqual(result.navigation_paths, [])
+
     def test_retryable_fallback_message_redacts_api_keys(self) -> None:
         secret = "unit-test-secret-key"
         first = RetryableProvider(f"HTTP 503 response included {secret}")
@@ -135,6 +234,7 @@ class RouterTests(unittest.TestCase):
     def test_groq_without_key_is_unavailable_and_skipped(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             groq = GroqProvider()
+            self.assertFalse(groq.is_available)
             router = LLMRouter([groq])
             with patch("qa_agent.llm.groq.httpx.post") as groq_post:
                 with self.assertRaisesRegex(RuntimeError, "GroqProvider"):
@@ -142,7 +242,6 @@ class RouterTests(unittest.TestCase):
                         self.task, self.target_url, self.snapshot
                     )
 
-        self.assertFalse(groq.is_available)
         groq_post.assert_not_called()
 
     def test_both_configured_providers_keep_gemini_first(self) -> None:
@@ -211,6 +310,40 @@ class RouterTests(unittest.TestCase):
         discover.assert_called_once_with(self.target_url)
         route.assert_called_once_with(self.task, self.target_url, self.snapshot)
         self.assertEqual(output.getvalue(), f"PAGE SNAPSHOT\n{self.snapshot}\n")
+
+    def test_public_planner_rejects_selector_not_verified_by_discovery(self) -> None:
+        task = (
+            'Open https://example.com and verify that "Disabled input" is disabled.'
+        )
+        discovery_snapshot = json.dumps({
+            "url": self.target_url,
+            "title": "Example",
+            "interactive_elements": [{
+                "kind": "input",
+                "selector": 'input[name="my-disabled"]',
+                "accessible_name": "Disabled input",
+                "tag": "input",
+                "name": "my-disabled",
+                "visible": True,
+                "enabled": False,
+            }],
+        })
+        invalid_plan = QATestPlan(
+            url=self.target_url,
+            steps=[{
+                "action": "assert_disabled",
+                "parameters": {"selector": "#my-disabled"},
+            }],
+        )
+        gemini_client = importlib.import_module("qa_agent.gemini_client")
+
+        with (
+            patch.object(gemini_client, "extract_target_url", return_value=self.target_url),
+            patch.object(gemini_client, "capture_page_snapshot", return_value=discovery_snapshot),
+            patch.object(gemini_client._router, "create_test_plan", return_value=invalid_plan),
+            self.assertRaisesRegex(ValueError, "deterministic Discovery selector"),
+        ):
+            gemini_client.create_test_plan(task)
 
 
 if __name__ == "__main__":

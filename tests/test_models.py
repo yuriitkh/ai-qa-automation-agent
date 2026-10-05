@@ -33,16 +33,49 @@ class QATestStepTests(unittest.TestCase):
             "fill",
             "assert_hidden",
             "assert_url",
+            "select_option", "assert_text_contains", "assert_checked",
+            "assert_selected", "assert_enabled", "assert_disabled",
         )
 
+        parameters_by_action = {
+            "select_option": {"selector": "select", "option_label": "Two"},
+            "assert_text_contains": {"expected_text": "required phrase"},
+            "assert_checked": {"selector": "#choice"},
+            "assert_selected": {"selector": "select", "expected": "Two"},
+            "assert_enabled": {"selector": "#control"},
+            "assert_disabled": {"selector": "#control"},
+        }
         for action in actions:
             with self.subTest(action=action):
-                step = QATestStep(action=action)
+                step = QATestStep(
+                    action=action,
+                    parameters=parameters_by_action.get(action, {}),
+                )
                 self.assertEqual(step.action, action)
 
     def test_unknown_action_is_rejected(self) -> None:
         with self.assertRaises(ValidationError):
             QATestStep(action="delete")
+
+    def test_select_option_requires_a_selector_and_visible_option_label(self) -> None:
+        with self.assertRaises(ValidationError):
+            QATestStep(action="select_option", parameters={"selector": "select"})
+        with self.assertRaises(ValidationError):
+            QATestStep(action="select_option", parameters={"option_label": "Two"})
+
+    def test_option_label_is_rejected_for_non_select_actions(self) -> None:
+        for action, parameters in (
+            ("navigate", {"url": "https://example.test"}),
+            ("assert_page_loaded", {}),
+            ("assert_disabled", {"selector": "#control"}),
+        ):
+            with self.subTest(action=action):
+                QATestStep(action=action, parameters=parameters)
+                with self.assertRaises(ValidationError):
+                    QATestStep(
+                        action=action,
+                        parameters={**parameters, "option_label": None},
+                    )
 
 
 class DomainModelTests(unittest.TestCase):

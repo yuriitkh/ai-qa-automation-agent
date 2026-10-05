@@ -94,6 +94,47 @@ class BrowserRunnerActionTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertIn("https://www.dnb.no/lan/extra", result["steps"][0]["error"])
 
+    def test_assert_text_contains_passes_for_substring(self) -> None:
+        self.locator.inner_text.return_value = "Documentation examples are allowed without needing permission today."
+        result = self.run_steps({"action": "assert_text_contains", "parameters": {"expected_text": "without needing permission"}})
+        self.assertEqual(result["status"], "passed")
+
+    def test_assert_text_contains_fails_without_substring(self) -> None:
+        self.locator.inner_text.return_value = "Different page content"
+        result = self.run_steps({"action": "assert_text_contains", "parameters": {"expected_text": "missing phrase"}})
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("to be contained", result["steps"][0]["error"])
+
+    def test_checked_assertion_handles_checkbox_and_radio(self) -> None:
+        for selector in ("#checkbox", "#radio"):
+            with self.subTest(selector=selector):
+                self.locator.is_checked.return_value = True
+                result = self.run_steps(
+                    {"action": "click", "parameters": {"selector": selector}},
+                    {"action": "assert_checked", "parameters": {"selector": selector}},
+                )
+                self.assertEqual(result["status"], "passed")
+                self.locator.is_checked.assert_called()
+
+    def test_select_option_and_assert_selected(self) -> None:
+        self.locator.locator.return_value = self.locator
+        self.locator.first = self.locator
+        self.locator.inner_text.return_value = "Two"
+        self.locator.get_attribute.return_value = "2"
+        result = self.run_steps(
+            {"action": "select_option", "parameters": {"selector": "select", "option_label": "Two"}},
+            {"action": "assert_selected", "parameters": {"selector": "select", "expected": "Two"}},
+        )
+        self.assertEqual(result["status"], "passed")
+        self.locator.select_option.assert_called_once_with(label="Two")
+
+    def test_enabled_and_disabled_assertions(self) -> None:
+        for action, actual, expected_status in (("assert_disabled", False, "passed"), ("assert_enabled", True, "passed"), ("assert_disabled", True, "failed")):
+            with self.subTest(action=action, actual=actual):
+                self.locator.is_enabled.return_value = actual
+                result = self.run_steps({"action": action, "parameters": {"selector": "#input"}})
+                self.assertEqual(result["status"], expected_status)
+
     def test_assert_visible_matches_literal_escaped_newline(self) -> None:
         self.locator.first.inner_text.return_value = "Godta alle\nlukk popup"
 

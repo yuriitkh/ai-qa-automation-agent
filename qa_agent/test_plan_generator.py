@@ -84,6 +84,7 @@ class LLMTestPlanGenerator(TestPlanGenerator):
         # Validate at this boundary as well, so a nonconforming Router
         # implementation cannot create a version from invalid plan data.
         executable_plan = QATestPlan.model_validate(router_result)
+        self._validate_discovery_capabilities(executable_plan, discovery_result, test_step)
         if existing_test_plan is not None:
             if existing_test_plan.test_step_id != test_step.id:
                 raise ValueError("Existing TestPlan belongs to a different TestStep.")
@@ -108,8 +109,13 @@ class LLMTestPlanGenerator(TestPlanGenerator):
         return (
             "Generate an executable Playwright-oriented QATestPlan for this "
             "single atomic TestStep only. Do not generate a TestCase, split the "
-            "step, or add unrelated checks. Use only selectors and URLs present "
-            "in the supplied discovery context.\n"
+            "step, or add unrelated checks. Preserve every requested action and "
+            "verification from the TestStep. Treat deterministic interactive_elements "
+            "as authoritative: when a requested control matches an accessible_name, "
+            "use its exact selector unchanged. Use select_option for selects, "
+            "assert_checked for checkbox/radio, assert_selected for select state, "
+            "assert_enabled/assert_disabled for enabled state, and "
+            "assert_text_contains for substring requirements.\n"
             f"TestStep order: {test_step.order}\n"
             f"TestStep name: {test_step.name}\n"
             f"TestStep description: {test_step.description}\n"
@@ -135,8 +141,48 @@ class LLMTestPlanGenerator(TestPlanGenerator):
                     path.model_dump(mode="json")
                     for path in discovery_result.direct_navigation_paths
                 ],
+                "interactive_elements": [element.model_dump(mode="json") for element in discovery_result.interactive_elements],
+                "navigation": [sequence.model_dump(mode="json") for sequence in discovery_result.navigation],
                 "warnings": discovery_result.warnings,
                 "strategies_used": discovery_result.strategies_used,
             }
         )
         return json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+
+    @staticmethod
+    def _validate_discovery_capabilities(
+        plan: QATestPlan, discovery: DiscoveryResult, test_step: TestStep | str
+    ) -> None:
+        elements = {element.selector: element for element in discovery.interactive_elements}
+        intent = (
+            test_step.casefold()
+            if isinstance(test_step, str)
+            else f"{test_step.name} {test_step.description} {test_step.expected}".casefold()
+        )
+        for step in plan.steps:
+            selector = step.parameters.get("selector")
+            element = elements.get(selector) if isinstance(selector, str) else None
+            relevant_actions = {
+                "checkbox": {"click", "assert_checked"},
+                "radio": {"click", "assert_checked"},
+                "select": {"select_option", "assert_selected"},
+                "input": {"assert_enabled", "assert_disabled"},
+            }
+            for discovered in discovery.interactive_elements:
+                label = discovered.accessible_name.casefold()
+                actions = next((allowed for kind, allowed in relevant_actions.items()
+                                if kind in (discovered.kind + " " + discovered.tag + " " + discovered.role).casefold()), set())
+                if label and label in intent and step.action in actions and selector != discovered.selector:
+                    raise ValueError(
+                        f"Plan must use deterministic Discovery selector {discovered.selector!r} "
+                        f"for {discovered.accessible_name!r}, not {selector!r}."
+                    )
+            if element is None:
+                continue
+            kind = (element.kind + " " + element.tag + " " + element.role).casefold()
+            if step.action == "select_option" and "select" not in kind:
+                raise ValueError(f"select_option selector {selector!r} targets discovered {element.kind!r}, not a select.")
+            if step.action == "assert_selected" and "select" not in kind:
+                raise ValueError(f"assert_selected selector {selector!r} does not target a discovered select.")
+            if step.action == "assert_checked" and not any(token in kind for token in ("checkbox", "radio")):
+                raise ValueError(f"assert_checked selector {selector!r} does not target a checkbox or radio.")
