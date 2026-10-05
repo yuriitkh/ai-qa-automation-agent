@@ -14,6 +14,8 @@ from qa_agent.models import (
     TestStep as DomainTestStep,
 )
 from qa_agent.execution_repository import InMemoryExecutionRepository
+from qa_agent.execution_trace import TraceStatus
+from qa_agent.locator_recovery import RecoveryStatus
 from qa_agent.pipeline import PipelineResult, PipelineStageError, QATestPipeline
 from qa_agent.plan_store import InMemoryPlanStore
 from qa_agent.test_case_decomposer import TestCaseDecomposer
@@ -114,6 +116,94 @@ class QATestPipelineTests(unittest.TestCase):
                     plan_generator=generator, runner=runner, plan_store=store).run("Check")
                 self.assertEqual(len(generator.calls), 1)
                 self.assertEqual([p.test_plan_version.version for p in result.test_plans], [1, 2])
+
+    def test_regeneration_failure_raises_stage_error_and_keeps_version_one(
+        self,
+    ) -> None:
+        step = self.make_step(0)
+        case = DomainTestCase(
+            name="Flow",
+            description="Check",
+            base_url="https://example.com/",
+            steps=[step],
+        )
+        cached_plan = DomainTestPlan(test_step_id=step.id, name=step.name)
+        version_one = DomainTestPlanVersion(
+            test_plan_id=cached_plan.id,
+            version=1,
+            qa_test_plan=QATestPlan(url="https://example.com/", steps=[
+                QATestStep(action="click", parameters={"selector": "#old", "text": "Continue"})]),
+        )
+        store = InMemoryPlanStore()
+        store.save(step.id, version_one, test_plan=cached_plan)
+
+        # Deterministic rediscovery finds no candidate, so recovery is NOT_FOUND
+        # and the pipeline proceeds to LLM regeneration.
+        discovery_result = DiscoveryResult(
+            status=DiscoveryStatus.SUCCESS,
+            url="https://example.com/",
+            interactive_elements=[],
+        )
+        repository = InMemoryExecutionRepository()
+        events: list[tuple[Any, ...]] = []
+        generator = _FakeGenerator(
+            events, error=RuntimeError("LLM regeneration failed")
+        )
+
+        def stale_runner(plan: QATestPlan) -> dict[str, Any]:
+            return {"status": "failed", "steps": [{
+                "action": "click", "status": "failed",
+                "error": "Selector '#old' was not found on the page."}]}
+
+        pipeline = QATestPipeline(
+            decomposer=_FakeDecomposer(case, events),
+            discovery=lambda _: discovery_result,
+            plan_generator=generator,
+            runner=stale_runner,
+            plan_store=store,
+            execution_repository=repository,
+        )
+
+        with self.assertRaises(PipelineStageError) as raised:
+            pipeline.run("Check")
+
+        error = raised.exception
+        self.assertIn("regeneration", error.stage)
+
+        # The run's trace is finalized as ERROR and attached to the error.
+        trace = error.trace
+        self.assertIsNotNone(trace)
+        self.assertEqual(trace.status, TraceStatus.ERROR)
+        self.assertIn("regeneration", trace.error_stage or "")
+        self.assertIsNotNone(trace.error)
+
+        # Recovery ran, but no successful regeneration was recorded.
+        step_trace = trace.steps[0]
+        self.assertEqual(
+            step_trace.locator_recovery.status, RecoveryStatus.NOT_FOUND
+        )
+        self.assertIsNone(step_trace.regeneration)
+        self.assertIsNone(step_trace.plan_generation)
+        self.assertEqual(trace.totals.regenerations, 0)
+
+        # Exactly one regeneration attempt: the failure never retries.
+        self.assertEqual(len(generator.calls), 1)
+
+        # No v2 was saved; the plan store still points at v1.
+        current = store.find(step.id)
+        self.assertIsNotNone(current)
+        self.assertEqual(current.id, version_one.id)
+        self.assertEqual(current.version, 1)
+        self.assertIsNotNone(store.get_version(version_one.id))
+
+        # The original v1 failed Execution remains persisted.
+        persisted = repository.list_for_test_step(step.id)
+        self.assertEqual(len(persisted), 1)
+        self.assertEqual(persisted[0].status, ExecutionStatus.FAILED)
+        self.assertEqual(persisted[0].test_plan_version_id, version_one.id)
+        self.assertEqual(
+            persisted[0].error, "Selector '#old' was not found on the page."
+        )
 
     def test_infrastructure_click_failure_does_not_trigger_locator_recovery(self) -> None:
         one_step_case = DomainTestCase(name="Flow", description="Check", base_url="https://example.com/", steps=[self.make_step(0)])
