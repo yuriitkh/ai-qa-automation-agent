@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 
 from qa_agent.llm.gemini import GeminiProvider
-from qa_agent.llm.errors import NonRetryableLLMError, RetryableLLMError
+from qa_agent.llm.errors import RetryableLLMError
 from qa_agent.llm.groq import GroqProvider
 from qa_agent.models import QATestPlan
 
@@ -166,14 +166,14 @@ class LLMProviderContractTests(unittest.TestCase):
         self.assertEqual(len(requests), 1)
         sdk_sleep.assert_not_called()
 
-    def test_gemini_non_transient_http_status_is_non_retryable(self) -> None:
+    def test_gemini_non_transient_http_status_is_retryable(self) -> None:
         error = RuntimeError("HTTP 400")
         error.status_code = 400
         provider = GeminiProvider()
         provider._client = MagicMock()
         provider._client.interactions.create.side_effect = error
 
-        with self.assertRaises(NonRetryableLLMError):
+        with self.assertRaises(RetryableLLMError):
             provider.create_test_plan(self.task, self.target_url, self.snapshot)
 
     def test_gemini_discovery_http_429_is_retryable(self) -> None:
@@ -280,7 +280,7 @@ class LLMProviderContractTests(unittest.TestCase):
             patch.dict(os.environ, {"GROQ_API_KEY": "test-key"}, clear=True),
             patch("qa_agent.llm.groq.httpx.post", return_value=response),
             redirect_stdout(io.StringIO()),
-            self.assertRaises(NonRetryableLLMError),
+            self.assertRaises(RetryableLLMError),
         ):
             GroqProvider().create_test_plan(
                 self.task, self.target_url, self.snapshot

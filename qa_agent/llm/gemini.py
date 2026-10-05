@@ -29,7 +29,7 @@ def _raise_for_gemini_error(error: Exception, operation: str) -> None:
             f"Gemini {operation} failed with HTTP {status_code}: {error}"
         ) from error
 
-    raise NonRetryableLLMError(
+    raise RetryableLLMError(
         f"Gemini {operation} failed: {type(error).__name__}: {error}"
     ) from error
 

@@ -148,7 +148,7 @@ class GroqProvider(LLMProvider):
                 f"Groq request failed with HTTP {response.status_code}."
             )
         if response.is_error:
-            raise NonRetryableLLMError(
+            raise RetryableLLMError(
                 f"Groq request failed with HTTP {response.status_code}."
             )
 
@@ -158,7 +158,7 @@ class GroqProvider(LLMProvider):
             plan = QATestPlan.model_validate_json(output_text)
             return plan
         except Exception as error:
-            raise NonRetryableLLMError(
+            raise RetryableLLMError(
                 f"Groq returned an invalid QA test plan: "
                 f"{type(error).__name__}: {error}"
             ) from error
@@ -187,9 +187,9 @@ class GroqProvider(LLMProvider):
         if response.status_code in (401, 403):
             raise RetryableLLMError(f"Groq request failed with HTTP {response.status_code}.")
         if response.is_error:
-            raise NonRetryableLLMError(f"Groq request failed with HTTP {response.status_code}.")
+            raise RetryableLLMError(f"Groq request failed with HTTP {response.status_code}.")
         try:
             output = response.json()["choices"][0]["message"]["content"]
             return AIDiscoveryResult.model_validate_json(output)
         except Exception as error:
-            raise NonRetryableLLMError(f"Groq returned invalid Discovery data: {error}") from error
+            raise RetryableLLMError(f"Groq returned invalid Discovery data: {error}") from error

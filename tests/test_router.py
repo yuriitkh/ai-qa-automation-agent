@@ -10,6 +10,7 @@ from qa_agent.llm.base import LLMProvider
 from qa_agent.llm.errors import NonRetryableLLMError, RetryableLLMError
 from qa_agent.llm.gemini import GeminiProvider
 from qa_agent.llm.groq import GroqProvider
+from qa_agent.llm.openai_compatible import OpenAICompatibleProvider
 from qa_agent.llm.registry import configured_provider_order, create_router
 from qa_agent.llm.router import LLMRouter
 from qa_agent.models import QATestPlan
@@ -126,23 +127,71 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(router.selected_provider_name, "GroqProvider")
         gemini_client.interactions.create.assert_called_once()
 
-    def test_gemini_400_does_not_fall_back_to_groq(self) -> None:
+    def test_gemini_400_falls_back_to_groq(self) -> None:
         gemini_client = MagicMock()
         gemini_error = RuntimeError("HTTP 400")
         gemini_error.status_code = 400
         gemini_client.interactions.create.side_effect = gemini_error
 
+        groq_response = MagicMock()
+        groq_response.status_code = 200
+        groq_response.is_error = False
+        groq_response.json.return_value = {
+            "choices": [{"message": {"content": self.plan.model_dump_json()}}]
+        }
+
         with (
-            patch.dict(os.environ, {"GEMINI_API_KEY": "gemini-test"}, clear=True),
+            patch.dict(
+                os.environ,
+                {"GEMINI_API_KEY": "gemini-test", "GROQ_API_KEY": "groq-test"},
+                clear=True,
+            ),
             patch("qa_agent.llm.gemini.genai.Client", return_value=gemini_client),
+            patch("qa_agent.llm.groq.httpx.post", return_value=groq_response),
+            redirect_stdout(io.StringIO()),
         ):
             router = LLMRouter([GeminiProvider(), GroqProvider()])
-            with patch.object(router._providers[1], "create_test_plan") as groq_call:
-                with self.assertRaises(NonRetryableLLMError):
-                    router.create_test_plan(self.task, self.target_url, self.snapshot)
+            result = router.create_test_plan(self.task, self.target_url, self.snapshot)
 
+        self.assertEqual(result, self.plan)
+        self.assertEqual(router.selected_provider_name, "GroqProvider")
         gemini_client.interactions.create.assert_called_once()
-        groq_call.assert_not_called()
+
+    def test_groq_invalid_output_falls_back_to_openai_compatible(self) -> None:
+        array_response = json.dumps([self.plan.model_dump()])
+        groq_response = MagicMock()
+        groq_response.status_code = 200
+        groq_response.is_error = False
+        groq_response.json.return_value = {
+            "choices": [{"message": {"content": array_response}}]
+        }
+
+        openai_response = MagicMock()
+        openai_response.choices[0].message.content = self.plan.model_dump_json()
+
+        with (
+            patch.dict(
+                os.environ,
+                {"GROQ_API_KEY": "groq-test", "OPENAI_API_KEY": "openai-test"},
+                clear=True,
+            ),
+            patch("qa_agent.llm.groq.httpx.post", return_value=groq_response),
+            patch("qa_agent.llm.openai_compatible.OpenAI") as client_cls,
+            redirect_stdout(io.StringIO()),
+        ):
+            client_cls.return_value.chat.completions.create.return_value = openai_response
+            router = LLMRouter(
+                [
+                    GroqProvider(),
+                    OpenAICompatibleProvider(
+                        "openai", "OPENAI_API_KEY", "gpt-test"
+                    ),
+                ]
+            )
+            result = router.create_test_plan(self.task, self.target_url, self.snapshot)
+
+        self.assertEqual(result, self.plan)
+        self.assertEqual(router.selected_provider_name, "openai")
 
     def test_gemini_discovery_429_falls_back_to_groq(self) -> None:
         calls: list[str] = []

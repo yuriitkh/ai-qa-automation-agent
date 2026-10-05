@@ -75,7 +75,7 @@ class OpenAICompatibleProvider(LLMProvider):
             if status is not None or error.__class__.__module__.startswith("openai"):
                 detail = f"HTTP {status}" if status else type(error).__name__
                 raise RetryableLLMError(f"{self.name}: request failed ({detail}).") from error
-            raise NonRetryableLLMError(f"{self.name}: invalid response ({type(error).__name__}).") from error
+            raise RetryableLLMError(f"{self.name}: invalid response ({type(error).__name__}).") from error
 
     def create_test_plan(self, task: str, target_url: str, page_snapshot: str) -> QATestPlan:
         prompt = (
@@ -99,7 +99,7 @@ class OpenAICompatibleProvider(LLMProvider):
         except (RetryableLLMError, NonRetryableLLMError):
             raise
         except Exception as error:
-            raise NonRetryableLLMError(f"{self.name}: returned an invalid QA test plan.") from error
+            raise RetryableLLMError(f"{self.name}: returned an invalid QA test plan.") from error
 
     def create_discovery(self, task: str, target_url: str, page_snapshot: str) -> AIDiscoveryResult:
         prompt = (
@@ -112,5 +112,5 @@ class OpenAICompatibleProvider(LLMProvider):
         except (RetryableLLMError, NonRetryableLLMError):
             raise
         except Exception as error:
-            raise NonRetryableLLMError(f"{self.name}: returned invalid Discovery data.") from error
+            raise RetryableLLMError(f"{self.name}: returned invalid Discovery data.") from error
 
