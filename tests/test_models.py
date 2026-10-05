@@ -63,6 +63,12 @@ class QATestStepTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             QATestStep(action="select_option", parameters={"option_label": "Two"})
 
+    def test_assert_selected_accepts_radio_selector_without_select_expected(self) -> None:
+        step = QATestStep(
+            action="assert_selected", parameters={"selector": "#default-radio"}
+        )
+        self.assertEqual(step.parameters, {"selector": "#default-radio"})
+
     def test_option_label_is_rejected_for_non_select_actions(self) -> None:
         for action, parameters in (
             ("navigate", {"url": "https://example.test"}),

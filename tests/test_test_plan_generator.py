@@ -293,6 +293,42 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
                 plan.steps[0].parameters["selector"] = selector
                 LLMTestPlanGenerator(_StubRouter(plan)).generate(step, discovery)
 
+    def test_radio_assert_selected_requires_concrete_discovered_selector(self) -> None:
+        selector = "#my-radio-2"
+        discovery = DiscoveryResult(
+            status=DiscoveryStatus.SUCCESS,
+            url="https://www.selenium.dev/selenium/web/web-form.html",
+            interactive_elements=[
+                InteractiveElement(
+                    kind="radio", tag="input", selector=selector,
+                    accessible_name="Default radio", id="my-radio-2",
+                ),
+                InteractiveElement(
+                    kind="radio", tag="input", selector="#my-radio-1",
+                    accessible_name="Checked radio", id="my-radio-1",
+                ),
+            ],
+        )
+        test_step = DomainTestStep(
+            name="Select Default radio",
+            description="Click the radio button labeled Default radio",
+            expected="Default radio is selected",
+            order=0,
+        )
+        plan = QATestPlan(
+            url=discovery.url,
+            steps=[
+                QATestStep(action="click", parameters={"selector": selector}),
+                QATestStep(action="assert_selected", parameters={"selector": selector}),
+            ],
+        )
+
+        LLMTestPlanGenerator(_StubRouter(plan)).generate(test_step, discovery)
+
+        plan.steps[1].parameters["selector"] = "input[type=radio]"
+        with self.assertRaisesRegex(ValueError, "deterministic Discovery selector"):
+            LLMTestPlanGenerator(_StubRouter(plan)).generate(test_step, discovery)
+
 
 class _StubRouter:
     def __init__(self, result: object = None, error: Exception | None = None) -> None:

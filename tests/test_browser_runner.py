@@ -117,6 +117,7 @@ class BrowserRunnerActionTests(unittest.TestCase):
                 self.locator.is_checked.assert_called()
 
     def test_select_option_and_assert_selected(self) -> None:
+        self.locator.evaluate.return_value = {"tag": "select", "type": "select-one"}
         self.locator.locator.return_value = self.locator
         self.locator.first = self.locator
         self.locator.inner_text.return_value = "Two"
@@ -127,6 +128,17 @@ class BrowserRunnerActionTests(unittest.TestCase):
         )
         self.assertEqual(result["status"], "passed")
         self.locator.select_option.assert_called_once_with(label="Two")
+
+    def test_assert_selected_checks_radio_state(self) -> None:
+        self.locator.evaluate.return_value = {"tag": "input", "type": "radio"}
+        self.locator.is_checked.return_value = True
+
+        result = self.run_steps(
+            {"action": "assert_selected", "parameters": {"selector": "#default-radio"}}
+        )
+
+        self.assertEqual(result["status"], "passed")
+        self.locator.is_checked.assert_called_once_with()
 
     def test_enabled_and_disabled_assertions(self) -> None:
         for action, actual, expected_status in (("assert_disabled", False, "passed"), ("assert_enabled", True, "passed"), ("assert_disabled", True, "failed")):

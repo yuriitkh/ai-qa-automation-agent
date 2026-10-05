@@ -164,7 +164,7 @@ class LLMTestPlanGenerator(TestPlanGenerator):
             element = elements.get(selector) if isinstance(selector, str) else None
             relevant_actions = {
                 "checkbox": {"click", "assert_checked"},
-                "radio": {"click", "assert_checked"},
+                "radio": {"click", "assert_selected"},
                 "select": {"select_option", "assert_selected"},
                 "input": {"assert_enabled", "assert_disabled"},
             }
@@ -182,7 +182,14 @@ class LLMTestPlanGenerator(TestPlanGenerator):
             kind = (element.kind + " " + element.tag + " " + element.role).casefold()
             if step.action == "select_option" and "select" not in kind:
                 raise ValueError(f"select_option selector {selector!r} targets discovered {element.kind!r}, not a select.")
-            if step.action == "assert_selected" and "select" not in kind:
-                raise ValueError(f"assert_selected selector {selector!r} does not target a discovered select.")
-            if step.action == "assert_checked" and not any(token in kind for token in ("checkbox", "radio")):
-                raise ValueError(f"assert_checked selector {selector!r} does not target a checkbox or radio.")
+            if step.action == "assert_selected":
+                if "radio" in kind:
+                    if step.parameters.get("expected") is not None:
+                        raise ValueError("assert_selected for a radio must not include expected.")
+                elif "select" in kind:
+                    if not isinstance(step.parameters.get("expected"), str):
+                        raise ValueError("assert_selected for a select requires an expected option label or value.")
+                else:
+                    raise ValueError(f"assert_selected selector {selector!r} does not target a radio or select.")
+            if step.action == "assert_checked" and "checkbox" not in kind:
+                raise ValueError(f"assert_checked selector {selector!r} does not target a checkbox.")

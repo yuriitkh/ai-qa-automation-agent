@@ -158,14 +158,35 @@ def run_test_plan(
                         if not page.locator(selector).is_checked():
                             raise AssertionError(f"Expected checkbox/radio {selector!r} to be checked.")
                     elif step.action == "assert_selected":
-                        selector, expected = step.parameters["selector"], step.parameters["expected"]
-                        selected = page.locator(selector).locator("option:checked").first
-                        actual_label = selected.inner_text()
-                        actual_value = selected.get_attribute("value")
-                        if expected not in {actual_label, actual_value}:
+                        selector = step.parameters["selector"]
+                        element = page.locator(selector)
+                        element_info = element.evaluate(
+                            "element => ({tag: element.tagName.toLowerCase(), type: element.type})"
+                        )
+                        expected = step.parameters.get("expected")
+                        if element_info["tag"] == "input" and element_info["type"] == "radio":
+                            if expected is not None:
+                                raise AssertionError(
+                                    f"assert_selected for radio {selector!r} does not take expected."
+                                )
+                            if not element.is_checked():
+                                raise AssertionError(f"Expected radio {selector!r} to be selected.")
+                        elif element_info["tag"] == "select":
+                            if not isinstance(expected, str):
+                                raise AssertionError(
+                                    f"assert_selected for select {selector!r} requires expected option label or value."
+                                )
+                            selected = element.locator("option:checked").first
+                            actual_label = selected.inner_text()
+                            actual_value = selected.get_attribute("value")
+                            if expected not in {actual_label, actual_value}:
+                                raise AssertionError(
+                                    f"Expected selected option {expected!r} for {selector!r}, "
+                                    f"got label={actual_label!r}, value={actual_value!r}."
+                                )
+                        else:
                             raise AssertionError(
-                                f"Expected selected option {expected!r} for {selector!r}, "
-                                f"got label={actual_label!r}, value={actual_value!r}."
+                                f"assert_selected selector {selector!r} must target a radio or select."
                             )
                     elif step.action in {"assert_enabled", "assert_disabled"}:
                         selector = step.parameters["selector"]

@@ -107,8 +107,9 @@ class GroqProvider(LLMProvider):
             "fill uses {selector: CSS selector, value: text to fill}. "
             "select_option uses {selector, option_label}; option_label is the visible option text. "
             "For assert_text_contains use expected_text and optionally selector. "
-            "assert_checked, assert_selected, assert_enabled, and assert_disabled use selector; "
-            "assert_selected uses expected as the selected option label or value. "
+            "assert_checked verifies checkbox state; assert_selected verifies radio state "
+            "using selector with expected null, or select state using selector and expected "
+            "option label or value. assert_enabled and assert_disabled use selector. "
             "assert_hidden uses parameters {selector: CSS selector}. "
             "assert_url uses parameters {expected: expected current URL}. "
             'The assert_url parameter name MUST be exactly "expected". '

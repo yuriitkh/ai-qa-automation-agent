@@ -19,7 +19,7 @@ class QATestStep(BaseModel):
         "select_option": ("selector", "option_label"),
         "assert_text_contains": ("expected_text",),
         "assert_checked": ("selector",),
-        "assert_selected": ("selector", "expected"),
+        "assert_selected": ("selector",),
         "assert_enabled": ("selector",),
         "assert_disabled": ("selector",),
     }
@@ -54,8 +54,10 @@ class QATestStep(BaseModel):
             raise ValueError("option_label is only valid for select_option.")
         if self.action == "assert_text_contains" and not isinstance(self.parameters.get("expected_text"), str):
             raise ValueError("assert_text_contains requires expected_text.")
-        if self.action == "assert_selected" and not isinstance(self.parameters.get("expected"), str):
-            raise ValueError("assert_selected requires expected (option label or value).")
+        if self.action == "assert_selected":
+            expected = self.parameters.get("expected")
+            if expected is not None and not isinstance(expected, str):
+                raise ValueError("assert_selected expected must be a string or null.")
         return self
 
 

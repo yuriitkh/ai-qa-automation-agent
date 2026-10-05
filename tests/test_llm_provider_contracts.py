@@ -83,6 +83,8 @@ class LLMProviderContractTests(unittest.TestCase):
         self.assertIn("at least three distinct records", prompt)
         self.assertIn("Never select menu items by their order", prompt)
         self.assertIn('assert_url parameter name MUST be exactly "expected"', prompt)
+        self.assertIn("assert_selected", prompt)
+        self.assertIn("radio", prompt)
         self.assertIn("never invent an expected URL", prompt)
 
     def test_gemini_prompt_and_plan_cover_all_actions(self) -> None:
