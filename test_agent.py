@@ -5,7 +5,8 @@ from qa_agent.gemini_client import create_test_plan, get_selected_provider_name
 from qa_agent.browser_runner import run_test_plan
 
 task = (
-    'Open https://www.selenium.dev/selenium/web/web-form.html. Verify that the input labeled "Disabled input" is disabled.'
+    "Open https://www.selenium.dev/selenium/web/web-form.html, click the checkbox labeled 'Default checkbox', "
+    "and verify that it is checked."
 )
 
 plan = create_test_plan(task)
