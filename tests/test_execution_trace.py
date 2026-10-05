@@ -1,0 +1,915 @@
+import io
+import os
+import unittest
+from contextlib import redirect_stdout
+from datetime import datetime, timezone
+from typing import Any
+from unittest.mock import Mock, patch
+
+from qa_agent.execution_trace import (
+    ExecutionTrace,
+    ExecutionTraceRecorder,
+    ProviderAttemptOutcome,
+    RequestKind,
+    RecoveryStatus,
+    TraceStatus,
+    active_trace_recorder,
+)
+from qa_agent.llm.base import LLMProvider
+from qa_agent.llm.errors import NonRetryableLLMError, RetryableLLMError
+from qa_agent.llm.router import LLMRouter
+from qa_agent.models import (
+    AIDiscoveryResult,
+    DiscoveryResult,
+    DiscoveryStatus,
+    ExecutionStatus,
+    InteractiveElement,
+    QATestPlan,
+    QATestStep,
+    TestCase as DomainTestCase,
+    TestPlan as DomainTestPlan,
+    TestPlanVersion as DomainTestPlanVersion,
+    TestStep as DomainTestStep,
+)
+from qa_agent.pipeline import PipelineResult, PipelineStageError, QATestPipeline
+from qa_agent.plan_store import InMemoryPlanStore
+from qa_agent.test_plan_generator import GeneratedTestPlan, LLMTestPlanGenerator
+
+
+def _make_step(order: int) -> DomainTestStep:
+    return DomainTestStep(
+        name=f"Step {order}",
+        description=f"Perform check {order}",
+        expected=f"Check {order} passes",
+        order=order,
+    )
+
+
+def _test_step() -> DomainTestStep:
+    return DomainTestStep(
+        name="Check",
+        description="Perform check",
+        expected="Check passes",
+        order=0,
+    )
+
+
+def _plan() -> QATestPlan:
+    return QATestPlan(
+        url="https://example.com/",
+        steps=[QATestStep(action="assert_page_loaded")],
+    )
+
+
+class _FakeDecomposer:
+    def __init__(
+        self,
+        result: DomainTestCase | None = None,
+        events: list[tuple[Any, ...]] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.result = result
+        self.events = events if events is not None else []
+        self.error = error
+
+    def decompose(self, task: str, base_url: str | None = None) -> DomainTestCase:
+        self.events.append(("decomposer", task, base_url))
+        if self.error is not None:
+            raise self.error
+        assert self.result is not None
+        return self.result
+
+
+class _FakeGenerator:
+    def __init__(self, events: list[tuple[Any, ...]] | None = None) -> None:
+        self.events = events if events is not None else []
+        self.calls: list[tuple[DomainTestStep, DiscoveryResult, int]] = []
+        self.generated: list[GeneratedTestPlan] = []
+        self.versions: list[DomainTestPlanVersion] = []
+
+    def generate_with_plan(
+        self,
+        test_step: DomainTestStep,
+        discovery_result: DiscoveryResult,
+        *,
+        existing_test_plan: DomainTestPlan | None = None,
+        version_number: int = 1,
+    ) -> GeneratedTestPlan:
+        self.events.append(("generator", test_step, discovery_result))
+        self.calls.append((test_step, discovery_result, version_number))
+        plan = existing_test_plan or DomainTestPlan(
+            test_step_id=test_step.id, name=test_step.name
+        )
+        version = DomainTestPlanVersion(
+            test_plan_id=plan.id,
+            version=version_number,
+            qa_test_plan=QATestPlan(
+                url=discovery_result.url,
+                steps=[QATestStep(action="assert_page_loaded")],
+            ),
+        )
+        self.versions.append(version)
+        generated = GeneratedTestPlan(test_plan=plan, test_plan_version=version)
+        self.generated.append(generated)
+        return generated
+
+
+class _StubProvider(LLMProvider):
+    def __init__(
+        self,
+        name: str,
+        *,
+        plan: QATestPlan | None = None,
+        error: Exception | None = None,
+        available: bool = True,
+        model: str | None = None,
+    ) -> None:
+        self.name = name
+        self.plan = plan if plan is not None else _plan()
+        self.error = error
+        self.available = available
+        self.model = model if model is not None else f"{name}-model"
+
+    @property
+    def is_available(self) -> bool:
+        return self.available
+
+    def create_test_plan(
+        self, task: str, target_url: str, page_snapshot: str
+    ) -> QATestPlan:
+        if self.error is not None:
+            raise self.error
+        return self.plan
+
+    def create_discovery(
+        self, task: str, target_url: str, page_snapshot: str
+    ) -> AIDiscoveryResult:
+        if self.error is not None:
+            raise self.error
+        return AIDiscoveryResult()
+
+
+class ExecutionTracePipelineTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.events: list[tuple[Any, ...]] = []
+        self.steps = [_make_step(1), _make_step(0)]
+        self.test_case = DomainTestCase(
+            name="Example flow",
+            description="Open the example homepage.",
+            base_url="https://example.com/",
+            steps=self.steps,
+        )
+        self.discovery_result = DiscoveryResult(
+            status=DiscoveryStatus.PARTIAL,
+            url="https://example.com/",
+            title="Example",
+        )
+        self.decomposer = _FakeDecomposer(self.test_case, self.events)
+        self.generator = _FakeGenerator(self.events)
+        self.runner_calls: list[QATestPlan] = []
+
+        def discover(url: str) -> DiscoveryResult:
+            self.events.append(("discovery", url))
+            return self.discovery_result
+
+        def run(plan: QATestPlan) -> dict[str, Any]:
+            self.events.append(("runner", plan))
+            self.runner_calls.append(plan)
+            return {
+                "status": "passed",
+                "url": plan.url,
+                "steps": [
+                    {"action": "assert_page_loaded", "status": "passed", "error": ""}
+                ],
+            }
+
+        self.discover = discover
+        self.run_plan = run
+
+    def _pipeline(self, **overrides: Any) -> QATestPipeline:
+        params: dict[str, Any] = dict(
+            decomposer=self.decomposer,
+            discovery=self.discover,
+            plan_generator=self.generator,
+            runner=self.run_plan,
+        )
+        params.update(overrides)
+        return QATestPipeline(**params)
+
+    def test_trace_is_created_for_successful_run(self) -> None:
+        result = self._pipeline().run("Open the example homepage.")
+
+        trace = result.trace
+        self.assertIsInstance(trace, ExecutionTrace)
+        self.assertEqual(trace.task, "Open the example homepage.")
+        self.assertEqual(trace.target_url, "https://example.com/")
+        self.assertEqual(trace.status, TraceStatus.PASSED)
+        self.assertIsNotNone(trace.started_at)
+        self.assertIsNotNone(trace.finished_at)
+        self.assertIsNotNone(trace.duration_ms)
+        self.assertIsNone(trace.error)
+        self.assertIsNone(trace.error_stage)
+        self.assertEqual(trace.schema_version, "1")
+
+        decomposition = trace.decomposition
+        assert decomposition is not None
+        self.assertEqual(decomposition.test_case_id, self.test_case.id)
+        self.assertEqual(decomposition.name, "Example flow")
+        self.assertEqual(decomposition.base_url, "https://example.com/")
+        self.assertEqual(
+            [step.order for step in decomposition.steps], [0, 1]
+        )
+        self.assertIsNotNone(decomposition.duration_ms)
+
+        self.assertEqual(len(trace.steps), 2)
+        for step_trace in trace.steps:
+            self.assertEqual(len(step_trace.discoveries), 1)
+            discovery = step_trace.discoveries[0]
+            self.assertEqual(discovery.status, DiscoveryStatus.PARTIAL)
+            self.assertEqual(discovery.url, "https://example.com/")
+            self.assertEqual(discovery.title, "Example")
+            self.assertIsNotNone(discovery.duration_ms)
+            self.assertEqual(step_trace.plan_cache.hit, False)
+            self.assertIsNone(step_trace.plan_cache.version_id)
+            self.assertIsNone(step_trace.discovery_fallback)
+            self.assertEqual(step_trace.provider_attempts, [])
+            self.assertIsNotNone(step_trace.plan_generation)
+            self.assertEqual(step_trace.plan_generation.version_number, 1)
+            self.assertEqual(step_trace.plan_generation.steps_count, 1)
+            self.assertIsNotNone(step_trace.plan_generation.duration_ms)
+            self.assertEqual(len(step_trace.execution_attempts), 1)
+            attempt = step_trace.execution_attempts[0]
+            self.assertEqual(attempt.status, ExecutionStatus.PASSED)
+            self.assertEqual(attempt.plan_version_number, 1)
+            self.assertIsNone(attempt.error)
+            self.assertEqual(attempt.runner_steps[0].action, "assert_page_loaded")
+            self.assertEqual(attempt.runner_steps[0].status, "passed")
+            self.assertIsNone(step_trace.locator_recovery)
+            self.assertIsNone(step_trace.regeneration)
+
+        self.assertEqual(trace.totals.steps, 2)
+        self.assertEqual(trace.totals.execution_attempts, 2)
+        self.assertEqual(trace.totals.provider_attempts, 0)
+        self.assertEqual(trace.totals.locator_recoveries, 0)
+        self.assertEqual(trace.totals.regenerations, 0)
+
+    def test_trace_is_created_for_failed_run(self) -> None:
+        def failing_runner(plan: QATestPlan) -> dict[str, Any]:
+            return {
+                "status": "failed",
+                "url": plan.url,
+                "steps": [
+                    {
+                        "action": "assert_visible",
+                        "status": "failed",
+                        "error": "wrong title",
+                    }
+                ],
+            }
+
+        result = self._pipeline(runner=failing_runner).run(
+            "Open the example homepage."
+        )
+
+        trace = result.trace
+        assert trace is not None
+        self.assertEqual(trace.status, TraceStatus.FAILED)
+        self.assertIsNone(trace.error)
+        for step_trace in trace.steps:
+            self.assertEqual(len(step_trace.execution_attempts), 1)
+            attempt = step_trace.execution_attempts[0]
+            self.assertEqual(attempt.status, ExecutionStatus.FAILED)
+            self.assertEqual(attempt.error, "wrong title")
+            self.assertEqual(attempt.runner_steps[0].action, "assert_visible")
+            self.assertEqual(attempt.runner_steps[0].status, "failed")
+            self.assertEqual(attempt.runner_steps[0].error, "wrong title")
+            # Assertion failures must not trigger recovery or regeneration.
+            self.assertIsNone(step_trace.locator_recovery)
+            self.assertIsNone(step_trace.regeneration)
+        self.assertEqual(trace.totals.execution_attempts, 2)
+        self.assertEqual(result.test_run.status, ExecutionStatus.FAILED)
+
+    def test_trace_is_attached_to_pipeline_stage_error(self) -> None:
+        def failed_discovery(url: str) -> DiscoveryResult:
+            return DiscoveryResult(
+                status=DiscoveryStatus.FAILED,
+                url=url,
+                warnings=["browser unavailable"],
+            )
+
+        pipeline = self._pipeline(discovery=failed_discovery)
+
+        with self.assertRaises(PipelineStageError) as raised:
+            pipeline.run("Open the example homepage.")
+
+        error = raised.exception
+        self.assertEqual(error.stage, "discovery (step 0: Step 0)")
+        self.assertIsInstance(error.trace, ExecutionTrace)
+        trace = error.trace
+        self.assertEqual(trace.status, TraceStatus.ERROR)
+        self.assertEqual(trace.error_stage, "discovery (step 0: Step 0)")
+        self.assertIn("browser unavailable", trace.error or "")
+        self.assertEqual(len(trace.steps), 1)
+        self.assertEqual(trace.steps[0].discoveries[0].status, DiscoveryStatus.FAILED)
+
+    def test_trace_is_attached_to_decomposition_error(self) -> None:
+        pipeline = QATestPipeline(
+            decomposer=_FakeDecomposer(error=ValueError("invalid task"), events=self.events),
+            discovery=self.discover,
+            plan_generator=self.generator,
+            runner=self.run_plan,
+        )
+
+        with self.assertRaises(PipelineStageError) as raised:
+            pipeline.run("bad task")
+
+        error = raised.exception
+        self.assertEqual(error.stage, "decomposition")
+        self.assertIsInstance(error.trace, ExecutionTrace)
+        self.assertEqual(error.trace.status, TraceStatus.ERROR)
+        self.assertEqual(error.trace.error_stage, "decomposition")
+        self.assertIn("invalid task", error.trace.error or "")
+        self.assertEqual(error.trace.steps, [])
+        self.assertEqual(error.trace.decomposition, None)
+
+    def test_locator_recovery_is_recorded(self) -> None:
+        step = _make_step(0)
+        case = DomainTestCase(
+            name="Flow",
+            description="Check",
+            base_url="https://example.com/",
+            steps=[step],
+        )
+        store = InMemoryPlanStore()
+        plan = DomainTestPlan(test_step_id=step.id, name=step.name)
+        version_one = DomainTestPlanVersion(
+            test_plan_id=plan.id,
+            version=1,
+            qa_test_plan=QATestPlan(
+                url="https://example.com/",
+                steps=[
+                    QATestStep(
+                        action="click",
+                        parameters={"selector": "#old", "text": "Continue"},
+                    )
+                ],
+            ),
+        )
+        store.save(step.id, version_one, test_plan=plan)
+        discovery_result = DiscoveryResult(
+            status=DiscoveryStatus.SUCCESS,
+            url="https://example.com/",
+            interactive_elements=[
+                InteractiveElement(
+                    kind="button",
+                    tag="button",
+                    role="button",
+                    text="Continue",
+                    selector="#new",
+                )
+            ],
+        )
+        calls = 0
+
+        def runner(executable: QATestPlan) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return {
+                    "status": "failed",
+                    "steps": [
+                        {
+                            "action": "click",
+                            "status": "failed",
+                            "error": "Selector '#old' was not found on the page.",
+                        }
+                    ],
+                }
+            self.assertEqual(executable.steps[0].parameters["selector"], "#new")
+            return {"status": "passed", "steps": []}
+
+        result = QATestPipeline(
+            decomposer=_FakeDecomposer(case),
+            discovery=lambda _: discovery_result,
+            plan_generator=_FakeGenerator(),
+            runner=runner,
+            plan_store=store,
+        ).run("Check")
+
+        trace = result.trace
+        assert trace is not None
+        step_trace = trace.steps[0]
+        self.assertEqual(step_trace.plan_cache.hit, True)
+        self.assertEqual(step_trace.plan_cache.version_id, version_one.id)
+        self.assertEqual(step_trace.plan_cache.version_number, 1)
+        # A cache hit skips the initial discovery, so only the rediscovery
+        # after the stale-UI failure is recorded for this step.
+        self.assertEqual(len(step_trace.discoveries), 1)
+        self.assertEqual(step_trace.discoveries[0].status, DiscoveryStatus.SUCCESS)
+        recovery = step_trace.locator_recovery
+        self.assertIsNotNone(recovery)
+        self.assertEqual(recovery.status, RecoveryStatus.MATCHED)
+        self.assertEqual(recovery.original_selector, "#old")
+        self.assertEqual(recovery.candidate_selector, "#new")
+        self.assertIn("exact_text", recovery.signals)
+        self.assertIsNone(step_trace.regeneration)
+        self.assertEqual(
+            [item.status for item in step_trace.execution_attempts],
+            [ExecutionStatus.FAILED, ExecutionStatus.PASSED],
+        )
+        self.assertEqual(step_trace.execution_attempts[0].planned_step_index, 0)
+        self.assertEqual(step_trace.execution_attempts[1].plan_version_number, 2)
+        self.assertEqual(trace.totals.locator_recoveries, 1)
+        self.assertEqual(trace.totals.regenerations, 0)
+        self.assertEqual(trace.totals.execution_attempts, 2)
+        self.assertEqual(result.test_run.status, ExecutionStatus.PASSED)
+
+    def test_regeneration_is_recorded(self) -> None:
+        step = _make_step(0)
+        case = DomainTestCase(
+            name="Flow",
+            description="Check",
+            base_url="https://example.com/",
+            steps=[step],
+        )
+        store = InMemoryPlanStore()
+        plan = DomainTestPlan(test_step_id=step.id, name=step.name)
+        version_one = DomainTestPlanVersion(
+            test_plan_id=plan.id,
+            version=1,
+            qa_test_plan=QATestPlan(
+                url="https://example.com/",
+                steps=[
+                    QATestStep(
+                        action="click",
+                        parameters={"selector": "#old", "text": "Continue"},
+                    )
+                ],
+            ),
+        )
+        store.save(step.id, version_one, test_plan=plan)
+        discovery_result = DiscoveryResult(
+            status=DiscoveryStatus.SUCCESS,
+            url="https://example.com/",
+            interactive_elements=[
+                InteractiveElement(
+                    kind="button",
+                    tag="button",
+                    role="button",
+                    text="Other",
+                    selector="#other",
+                )
+            ],
+        )
+        calls = 0
+
+        def runner(executable: QATestPlan) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return {
+                    "status": "failed",
+                    "steps": [
+                        {
+                            "action": "click",
+                            "status": "failed",
+                            "error": "Selector '#old' was not found on the page.",
+                        }
+                    ],
+                }
+            return {"status": "passed", "steps": []}
+
+        generator = _FakeGenerator()
+        result = QATestPipeline(
+            decomposer=_FakeDecomposer(case),
+            discovery=lambda _: discovery_result,
+            plan_generator=generator,
+            runner=runner,
+            plan_store=store,
+        ).run("Check")
+
+        trace = result.trace
+        assert trace is not None
+        step_trace = trace.steps[0]
+        recovery = step_trace.locator_recovery
+        self.assertIsNotNone(recovery)
+        self.assertEqual(recovery.status, RecoveryStatus.NOT_FOUND)
+        self.assertEqual(recovery.original_selector, "#old")
+        self.assertIsNone(recovery.candidate_selector)
+        regeneration = step_trace.regeneration
+        self.assertIsNotNone(regeneration)
+        self.assertEqual(regeneration.from_version, 1)
+        self.assertEqual(regeneration.to_version, 2)
+        self.assertEqual(regeneration.reason, "stale_ui_failure")
+        self.assertIn("#old", regeneration.trigger_error or "")
+        self.assertEqual(
+            [item.status for item in step_trace.execution_attempts],
+            [ExecutionStatus.FAILED, ExecutionStatus.PASSED],
+        )
+        self.assertEqual([item.version for item in generator.versions], [2])
+        self.assertEqual(
+            [pair.test_plan_version.version for pair in result.test_plans], [1, 2]
+        )
+        self.assertEqual(trace.totals.locator_recoveries, 1)
+        self.assertEqual(trace.totals.regenerations, 1)
+        self.assertEqual(result.test_run.status, ExecutionStatus.PASSED)
+
+    def test_discovery_fallback_is_recorded(self) -> None:
+        fallback_suggestions = AIDiscoveryResult(
+            navigation_paths=[],
+            interactive_elements=[
+                InteractiveElement(
+                    kind="link", selector="#ai-link", text="AI found"
+                )
+            ],
+            warnings=["ai fallback hint"],
+        )
+        fallback = Mock()
+        fallback.discover.return_value = fallback_suggestions
+        partial = DiscoveryResult(
+            status=DiscoveryStatus.FAILED,
+            url="https://example.com/",
+            warnings=["deterministic discovery failed"],
+        )
+
+        result = QATestPipeline(
+            decomposer=_FakeDecomposer(self.test_case, self.events),
+            discovery=lambda _: partial,
+            discovery_fallback=fallback,
+            plan_generator=_FakeGenerator(self.events),
+            runner=self.run_plan,
+        ).run("Open the example homepage.")
+
+        trace = result.trace
+        assert trace is not None
+        for step_trace in trace.steps:
+            fallback_trace = step_trace.discovery_fallback
+            self.assertIsNotNone(fallback_trace)
+            self.assertTrue(fallback_trace.invoked)
+            self.assertEqual(fallback_trace.interactive_elements_added, 1)
+            self.assertEqual(fallback_trace.warnings, ["ai fallback hint"])
+            self.assertIsNotNone(fallback_trace.duration_ms)
+            # The merged discovery result is the one recorded for the step.
+            merged = step_trace.discoveries[0]
+            self.assertEqual(merged.status, DiscoveryStatus.PARTIAL)
+            self.assertIn("deterministic discovery failed", merged.warnings)
+            self.assertIn("ai fallback hint", merged.warnings)
+            self.assertEqual(len(merged.interactive_elements), 1)
+
+    def test_trace_does_not_change_pipeline_result(self) -> None:
+        result = self._pipeline().run("Open the example homepage.")
+
+        self.assertEqual(
+            [event[0] for event in self.events],
+            [
+                "decomposer",
+                "discovery",
+                "generator",
+                "runner",
+                "discovery",
+                "generator",
+                "runner",
+            ],
+        )
+        self.assertEqual(len(result.test_plans), 2)
+        self.assertEqual(len(result.executions), 2)
+        self.assertEqual(self.runner_calls, [plan for plan in self.runner_calls])
+        self.assertEqual(list(result), result.executions)
+        self.assertEqual(len(result), 2)
+        self.assertIs(result[0], result.executions[0])
+        self.assertEqual(result[:], result.executions)
+        self.assertEqual(result.test_run.test_case_id, self.test_case.id)
+        self.assertEqual(result.test_run.status, ExecutionStatus.PASSED)
+
+    def test_trace_failure_does_not_break_execution(self) -> None:
+        class _BrokenRecorder(ExecutionTraceRecorder):
+            def record_discovery(
+                self, result: DiscoveryResult, duration_ms: int | None
+            ) -> None:
+                raise RuntimeError("trace recorder is broken")
+
+            def record_execution_attempt(
+                self,
+                execution: Any,
+                plan_version_number: int | None = None,
+            ) -> None:
+                raise RuntimeError("trace execution recording is broken")
+
+            def finalize(
+                self,
+                status: TraceStatus,
+                error: Exception | None = None,
+                error_stage: str | None = None,
+            ) -> ExecutionTrace:
+                raise RuntimeError("trace finalize is broken")
+
+        class _BrokenTracePipeline(QATestPipeline):
+            def _create_trace_recorder(self, task: str) -> ExecutionTraceRecorder:
+                return _BrokenRecorder(task=task)
+
+        pipeline = _BrokenTracePipeline(
+            decomposer=_FakeDecomposer(self.test_case, self.events),
+            discovery=self.discover,
+            plan_generator=_FakeGenerator(self.events),
+            runner=self.run_plan,
+        )
+
+        result = pipeline.run("Open the example homepage.")
+
+        self.assertEqual(len(result.executions), 2)
+        self.assertEqual(result.test_run.status, ExecutionStatus.PASSED)
+        self.assertEqual(
+            [event[0] for event in self.events],
+            [
+                "decomposer",
+                "discovery",
+                "generator",
+                "runner",
+                "discovery",
+                "generator",
+                "runner",
+            ],
+        )
+        self.assertIsNone(result.trace)
+
+    def test_pipeline_result_backward_compatibility(self) -> None:
+        positional = PipelineResult(self.test_case, [], [])
+        self.assertIsNone(positional.trace)
+        self.assertEqual(list(positional), [])
+        self.assertEqual(len(positional), 0)
+
+        trace = ExecutionTrace(
+            task="Open the example homepage.",
+            status=TraceStatus.PASSED,
+            started_at=datetime.now(timezone.utc),
+        )
+        keyword = PipelineResult(
+            test_case=self.test_case,
+            test_plans=[],
+            executions=[],
+            trace=trace,
+        )
+        self.assertIs(keyword.trace, trace)
+        self.assertIsNone(keyword.trace.error)
+        self.assertEqual(keyword.test_run.test_case_id, self.test_case.id)
+
+    def test_sensitive_values_are_redacted(self) -> None:
+        secret = "super-secret-trace-token-123"
+        with patch.dict(os.environ, {"QA_TRACE_TEST_API_KEY": secret}):
+            def failing_runner(plan: QATestPlan) -> dict[str, Any]:
+                return {
+                    "status": "failed",
+                    "url": plan.url,
+                    "steps": [
+                        {
+                            "action": "assert_visible",
+                            "status": "failed",
+                            "error": f"Selector '{secret}' was not found.",
+                        }
+                    ],
+                }
+
+            result = self._pipeline(runner=failing_runner).run(
+                "Open the example homepage."
+            )
+
+        trace = result.trace
+        assert trace is not None
+        for step_trace in trace.steps:
+            attempt = step_trace.execution_attempts[0]
+            self.assertIn("[REDACTED]", attempt.error or "")
+            self.assertNotIn(secret, attempt.error or "")
+            self.assertIn("[REDACTED]", attempt.runner_steps[0].error or "")
+            self.assertNotIn(secret, attempt.runner_steps[0].error or "")
+        # The domain Execution keeps the raw error: existing behavior is unchanged.
+        self.assertIn(secret, result.executions[0].error)
+
+    def test_task_text_is_redacted(self) -> None:
+        secret = "super-secret-task-token-456"
+        with patch.dict(os.environ, {"QA_TRACE_TEST_API_KEY": secret}):
+            result = self._pipeline().run(f"Open the {secret} homepage.")
+
+        trace = result.trace
+        assert trace is not None
+        self.assertNotIn(secret, trace.task)
+        self.assertIn("[REDACTED]", trace.task)
+
+
+class ExecutionTraceRouterTests(unittest.TestCase):
+    def _recorder_with_step(self) -> ExecutionTraceRecorder:
+        recorder = ExecutionTraceRecorder(task="Check")
+        recorder.begin_step(_test_step())
+        return recorder
+
+    def test_provider_fallback_is_recorded_in_trace(self) -> None:
+        plan = _plan()
+        failing = _StubProvider(
+            "failing",
+            plan=plan,
+            error=RetryableLLMError("request failed with HTTP 429"),
+        )
+        succeeding = _StubProvider("succeeding", plan=plan)
+        router = LLMRouter([failing, succeeding])
+        recorder = self._recorder_with_step()
+
+        with (
+            active_trace_recorder(recorder),
+            redirect_stdout(io.StringIO()),
+        ):
+            result = router.create_test_plan(
+                "Check", "https://example.com/", "{}"
+            )
+
+        self.assertEqual(result, plan)
+        trace = recorder.finalize(TraceStatus.PASSED)
+        attempts = trace.steps[0].provider_attempts
+        self.assertEqual(len(attempts), 2)
+        first, second = attempts
+        self.assertEqual(first.provider_name, "failing")
+        self.assertEqual(first.request_kind, RequestKind.TEST_PLAN)
+        self.assertEqual(first.outcome, ProviderAttemptOutcome.RETRYABLE_ERROR)
+        self.assertEqual(first.model, "failing-model")
+        self.assertEqual(first.error_class, "RetryableLLMError")
+        self.assertIn("HTTP 429", first.error_message or "")
+        self.assertIsNone(first.http_status)
+        self.assertIsNotNone(first.duration_ms)
+        self.assertFalse(first.is_selected)
+        self.assertEqual(second.provider_name, "succeeding")
+        self.assertEqual(second.outcome, ProviderAttemptOutcome.SUCCESS)
+        self.assertEqual(second.model, "succeeding-model")
+        self.assertIsNone(second.error_class)
+        self.assertIsNone(second.error_message)
+        self.assertTrue(second.is_selected)
+        self.assertEqual(trace.totals.provider_attempts, 2)
+
+    def test_unavailable_providers_are_recorded_in_trace(self) -> None:
+        plan = _plan()
+        skipped = _StubProvider("skipped", plan=plan, available=False)
+        succeeding = _StubProvider("succeeding", plan=plan)
+        router = LLMRouter([skipped, succeeding])
+        recorder = self._recorder_with_step()
+
+        with (
+            active_trace_recorder(recorder),
+            redirect_stdout(io.StringIO()),
+        ):
+            router.create_test_plan("Check", "https://example.com/", "{}")
+
+        trace = recorder.finalize(TraceStatus.PASSED)
+        attempts = trace.steps[0].provider_attempts
+        self.assertEqual(
+            [item.outcome for item in attempts],
+            [ProviderAttemptOutcome.UNAVAILABLE, ProviderAttemptOutcome.SUCCESS],
+        )
+        self.assertEqual(
+            [item.provider_name for item in attempts], ["skipped", "succeeding"]
+        )
+        self.assertFalse(attempts[0].is_selected)
+        self.assertTrue(attempts[1].is_selected)
+        self.assertIsNone(attempts[0].duration_ms)
+
+    def test_non_retryable_error_is_recorded_and_halts_fallback(self) -> None:
+        plan = _plan()
+        failing = _StubProvider(
+            "failing", plan=plan, error=NonRetryableLLMError("invalid prompt")
+        )
+        succeeding = _StubProvider("succeeding", plan=plan)
+        router = LLMRouter([failing, succeeding])
+        recorder = self._recorder_with_step()
+
+        with (
+            active_trace_recorder(recorder),
+            redirect_stdout(io.StringIO()),
+        ):
+            with self.assertRaises(NonRetryableLLMError):
+                router.create_test_plan("Check", "https://example.com/", "{}")
+
+        trace = recorder.finalize(TraceStatus.ERROR)
+        attempts = trace.steps[0].provider_attempts
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(
+            attempts[0].outcome, ProviderAttemptOutcome.NON_RETRYABLE_ERROR
+        )
+        self.assertEqual(attempts[0].error_class, "NonRetryableLLMError")
+        self.assertFalse(attempts[0].is_selected)
+
+    def test_discovery_attempts_are_recorded_in_trace(self) -> None:
+        failing = _StubProvider(
+            "failing", error=RetryableLLMError("temporary failure")
+        )
+        succeeding = _StubProvider("succeeding")
+        router = LLMRouter([failing, succeeding])
+        recorder = self._recorder_with_step()
+
+        with (
+            active_trace_recorder(recorder),
+            redirect_stdout(io.StringIO()),
+        ):
+            result = router.create_discovery(
+                "Discover", "https://example.com/", "{}"
+            )
+
+        self.assertIsInstance(result, AIDiscoveryResult)
+        trace = recorder.finalize(TraceStatus.PASSED)
+        attempts = trace.steps[0].provider_attempts
+        self.assertEqual(
+            [item.request_kind for item in attempts],
+            [RequestKind.DISCOVERY, RequestKind.DISCOVERY],
+        )
+        self.assertEqual(
+            [item.outcome for item in attempts],
+            [ProviderAttemptOutcome.RETRYABLE_ERROR, ProviderAttemptOutcome.SUCCESS],
+        )
+
+    def test_router_runs_without_active_recorder(self) -> None:
+        plan = _plan()
+        router = LLMRouter([_StubProvider("succeeding", plan=plan)])
+
+        with redirect_stdout(io.StringIO()):
+            result = router.create_test_plan(
+                "Check", "https://example.com/", "{}"
+            )
+
+        self.assertEqual(result, plan)
+
+    def test_sensitive_values_are_redacted_in_provider_attempts(self) -> None:
+        secret = "super-secret-provider-token-789"
+        plan = _plan()
+        with patch.dict(os.environ, {"QA_TRACE_TEST_API_KEY": secret}):
+            failing = _StubProvider(
+                "failing",
+                plan=plan,
+                error=RetryableLLMError(f"auth failed for {secret}"),
+            )
+            succeeding = _StubProvider("succeeding", plan=plan)
+            router = LLMRouter([failing, succeeding])
+            recorder = self._recorder_with_step()
+
+            with (
+                active_trace_recorder(recorder),
+                redirect_stdout(io.StringIO()),
+            ):
+                router.create_test_plan("Check", "https://example.com/", "{}")
+
+        trace = recorder.finalize(TraceStatus.PASSED)
+        message = trace.steps[0].provider_attempts[0].error_message or ""
+        self.assertIn("[REDACTED]", message)
+        self.assertNotIn(secret, message)
+
+    def test_provider_attempts_flow_through_pipeline(self) -> None:
+        plan = _plan()
+        failing = _StubProvider(
+            "failing", plan=plan, error=RetryableLLMError("temporary failure")
+        )
+        succeeding = _StubProvider("succeeding", plan=plan)
+        router = LLMRouter([failing, succeeding])
+        generator = LLMTestPlanGenerator(router)
+        test_case = DomainTestCase(
+            name="Example flow",
+            description="Open the example homepage.",
+            base_url="https://example.com/",
+            steps=[_make_step(0), _make_step(1)],
+        )
+        discovery_result = DiscoveryResult(
+            status=DiscoveryStatus.PARTIAL, url="https://example.com/"
+        )
+        pipeline = QATestPipeline(
+            decomposer=_FakeDecomposer(test_case),
+            discovery=lambda _: discovery_result,
+            plan_generator=generator,
+            runner=lambda _: {
+                "status": "passed",
+                "steps": [],
+            },
+        )
+
+        with redirect_stdout(io.StringIO()):
+            result = pipeline.run("Open the example homepage.")
+
+        trace = result.trace
+        assert trace is not None
+        self.assertEqual(trace.status, TraceStatus.PASSED)
+        for step_trace in trace.steps:
+            attempts = step_trace.provider_attempts
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(
+                [item.outcome for item in attempts],
+                [
+                    ProviderAttemptOutcome.RETRYABLE_ERROR,
+                    ProviderAttemptOutcome.SUCCESS,
+                ],
+            )
+            self.assertEqual(
+                [item.provider_name for item in attempts], ["failing", "succeeding"]
+            )
+            self.assertEqual(
+                [item.model for item in attempts], ["failing-model", "succeeding-model"]
+            )
+            self.assertFalse(attempts[0].is_selected)
+            self.assertTrue(attempts[1].is_selected)
+        self.assertEqual(trace.totals.provider_attempts, 4)
+        self.assertEqual(trace.totals.steps, 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,3 +1,4 @@
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -7,6 +8,14 @@ from uuid import uuid4
 from qa_agent.browser_discovery import capture_discovery_result, extract_target_url
 from qa_agent.browser_runner import BrowserRunner
 from qa_agent.execution_repository import ExecutionRepository, InMemoryExecutionRepository
+from qa_agent.execution_trace import (
+    ExecutionTrace,
+    ExecutionTraceRecorder,
+    TraceStatus,
+    active_trace_recorder,
+    elapsed_ms,
+    record_safely,
+)
 from qa_agent.models import (
     DiscoveryResult,
     DiscoveryStatus,
@@ -32,6 +41,7 @@ class PipelineStageError(RuntimeError):
 
     def __init__(self, stage: str, message: str) -> None:
         self.stage = stage
+        self.trace: ExecutionTrace | None = None
         super().__init__(f"Pipeline stage '{stage}' failed: {message}")
 
 
@@ -42,6 +52,7 @@ class PipelineResult:
     test_case: TestCase
     test_plans: list[GeneratedTestPlan]
     executions: list[Execution]
+    trace: ExecutionTrace | None = field(default=None, compare=False)
     test_run: TestRun = field(init=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -89,21 +100,61 @@ class QATestPipeline:
         )
 
     def run(self, task: str, base_url: str | None = None) -> PipelineResult:
-        """Run each decomposed step and return plans and executions together."""
+        """Run each decomposed step and return plans and executions together.
+
+        The execution trace is an observability layer only: recording is
+        best-effort and never changes pipeline behavior, fallback semantics,
+        or recovery/regeneration logic.
+        """
+        trace = self._create_trace_recorder(task)
+        with active_trace_recorder(trace):
+            try:
+                return self._run(task, base_url, trace)
+            except PipelineStageError as error:
+                error.trace = record_safely(
+                    trace,
+                    "finalize",
+                    TraceStatus.ERROR,
+                    error=error,
+                    error_stage=error.stage,
+                )
+                raise
+            except Exception as error:
+                record_safely(trace, "finalize", TraceStatus.ERROR, error=error)
+                raise
+
+    def _create_trace_recorder(self, task: str) -> ExecutionTraceRecorder:
+        return ExecutionTraceRecorder(task=task)
+
+    def _run(
+        self,
+        task: str,
+        base_url: str | None,
+        trace: ExecutionTraceRecorder,
+    ) -> PipelineResult:
+        decomposition_started = time.perf_counter()
         try:
             test_case = self._decomposer.decompose(task, base_url)
         except Exception as error:
             raise PipelineStageError("decomposition", str(error)) from error
+        record_safely(
+            trace,
+            "record_decomposition",
+            test_case,
+            elapsed_ms(decomposition_started),
+        )
 
         try:
             target_url = test_case.base_url or extract_target_url(task)
         except Exception as error:
             raise PipelineStageError("target resolution", str(error)) from error
+        record_safely(trace, "record_target_url", target_url)
 
         executions: list[Execution] = []
         generated_plans: list[GeneratedTestPlan] = []
         ordered_steps = sorted(test_case.steps, key=lambda step: step.order)
         for test_step in ordered_steps:
+            record_safely(trace, "begin_step", test_step)
             try:
                 cached_version = self._plan_store.find(test_step.id)
             except Exception as error:
@@ -111,6 +162,13 @@ class QATestPipeline:
                     f"plan lookup (step {test_step.order}: {test_step.name})",
                     str(error),
                 ) from error
+
+            record_safely(
+                trace,
+                "record_cache",
+                cached_version is not None,
+                cached_version,
+            )
 
             if cached_version is not None:
                 try:
@@ -131,12 +189,20 @@ class QATestPipeline:
                         str(error),
                     ) from error
             else:
+                discovery_started = time.perf_counter()
                 try:
                     discovery_result = self._discovery(target_url)
                     if (discovery_result.status != DiscoveryStatus.SUCCESS
                             and self._discovery_fallback is not None):
+                        fallback_started = time.perf_counter()
                         suggestions = self._discovery_fallback.discover(
                             task, target_url, test_step, discovery_result
+                        )
+                        record_safely(
+                            trace,
+                            "record_discovery_fallback",
+                            suggestions,
+                            elapsed_ms(fallback_started),
                         )
                         discovery_result = discovery_result.model_copy(update={
                             "status": (DiscoveryStatus.PARTIAL if discovery_result.status == DiscoveryStatus.FAILED
@@ -148,6 +214,12 @@ class QATestPipeline:
                             "interactive_elements": discovery_result.interactive_elements + suggestions.interactive_elements,
                             "warnings": discovery_result.warnings + suggestions.warnings,
                         })
+                    record_safely(
+                        trace,
+                        "record_discovery",
+                        discovery_result,
+                        elapsed_ms(discovery_started),
+                    )
                     if discovery_result.status == DiscoveryStatus.FAILED:
                         details = "; ".join(discovery_result.warnings) or "No details provided."
                         raise RuntimeError(f"Browser discovery returned FAILED: {details}")
@@ -157,6 +229,7 @@ class QATestPipeline:
                         str(error),
                     ) from error
 
+                generation_started = time.perf_counter()
                 try:
                     generated_plan = self._plan_generator.generate_with_plan(
                         test_step, discovery_result
@@ -168,6 +241,15 @@ class QATestPipeline:
                         f"plan generation (step {test_step.order}: {test_step.name})",
                         str(error),
                     ) from error
+                record_safely(
+                    trace,
+                    "record_plan_generation",
+                    generated_plan.test_plan.id,
+                    generated_plan.test_plan_version.id,
+                    generated_plan.test_plan_version.version,
+                    len(generated_plan.test_plan_version.qa_test_plan.steps),
+                    elapsed_ms(generation_started),
+                )
 
                 try:
                     self._plan_store.save(
@@ -185,12 +267,19 @@ class QATestPipeline:
             generated_plans.append(generated_plan)
             execution = self._execute_plan(test_step, plan_version)
             executions.append(execution)
+            record_safely(
+                trace,
+                "record_execution_attempt",
+                execution,
+                plan_version.version,
+            )
 
             if execution.status != ExecutionStatus.FAILED or not _is_stale_ui_failure(
                 execution.runner_result
             ):
                 continue
 
+            rediscovery_started = time.perf_counter()
             try:
                 rediscovery_result = self._discovery(target_url)
                 if rediscovery_result.status == DiscoveryStatus.FAILED:
@@ -201,11 +290,18 @@ class QATestPipeline:
                     f"rediscovery (step {test_step.order}: {test_step.name})",
                     str(error),
                 ) from error
+            record_safely(
+                trace,
+                "record_discovery",
+                rediscovery_result,
+                elapsed_ms(rediscovery_started),
+            )
 
             failed_interaction = execution.planned_interaction(plan_version)
             recovery = None
             if failed_interaction is not None and failed_interaction.action in {"click", "fill"}:
                 recovery = recover_locator(failed_interaction, rediscovery_result)
+            record_safely(trace, "record_locator_recovery", recovery)
 
             if recovery is not None and recovery.status == RecoveryStatus.MATCHED:
                 candidate = recovery.candidate
@@ -238,9 +334,17 @@ class QATestPipeline:
                         str(error),
                     ) from error
                 generated_plans.append(repaired)
-                executions.append(self._execute_plan(test_step, repaired_version))
+                repaired_execution = self._execute_plan(test_step, repaired_version)
+                executions.append(repaired_execution)
+                record_safely(
+                    trace,
+                    "record_execution_attempt",
+                    repaired_execution,
+                    repaired_version.version,
+                )
                 continue
 
+            regeneration_started = time.perf_counter()
             try:
                 regenerated_plan = self._plan_generator.generate_with_plan(
                     test_step,
@@ -259,6 +363,23 @@ class QATestPipeline:
                     f"regeneration (step {test_step.order}: {test_step.name})",
                     str(error),
                 ) from error
+            record_safely(
+                trace,
+                "record_plan_generation",
+                regenerated_plan.test_plan.id,
+                regenerated_plan.test_plan_version.id,
+                regenerated_plan.test_plan_version.version,
+                len(regenerated_plan.test_plan_version.qa_test_plan.steps),
+                elapsed_ms(regeneration_started),
+            )
+            record_safely(
+                trace,
+                "record_regeneration",
+                plan_version.version,
+                regenerated_plan.test_plan_version.version,
+                "stale_ui_failure",
+                execution.error,
+            )
 
             generated_plans.append(regenerated_plan)
             try:
@@ -272,14 +393,29 @@ class QATestPipeline:
                     f"plan save (step {test_step.order}: {test_step.name})",
                     str(error),
                 ) from error
-            executions.append(
-                self._execute_plan(test_step, regenerated_plan.test_plan_version)
+            regenerated_execution = self._execute_plan(
+                test_step, regenerated_plan.test_plan_version
+            )
+            executions.append(regenerated_execution)
+            record_safely(
+                trace,
+                "record_execution_attempt",
+                regenerated_execution,
+                regenerated_plan.test_plan_version.version,
             )
 
+        run = TestRun.from_test_case(test_case, executions)
+        status = (
+            TraceStatus.FAILED
+            if run.status == ExecutionStatus.FAILED
+            else TraceStatus.PASSED
+        )
+        final_trace = record_safely(trace, "finalize", status)
         return PipelineResult(
             test_case=test_case,
             test_plans=generated_plans,
             executions=executions,
+            trace=final_trace,
         )
 
     def _execute_plan(self, test_step: TestStep, plan_version: TestPlanVersion) -> Execution:
