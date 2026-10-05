@@ -5,8 +5,8 @@ from qa_agent.gemini_client import create_test_plan, get_selected_provider_name
 from qa_agent.browser_runner import run_test_plan
 
 task = (
-    "Open https://www.selenium.dev/selenium/web/web-form.html, click the radio button labeled 'Default radio', "
-    "and verify that it is selected."
+    "Open https://www.selenium.dev/selenium/web/web-form.html, find the native select labeled "
+    "'Dropdown (select)', choose the option 'Two', and verify that 'Two' is selected."
 )
 
 plan = create_test_plan(task)
