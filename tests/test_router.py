@@ -10,8 +10,10 @@ from qa_agent.llm.base import LLMProvider
 from qa_agent.llm.errors import NonRetryableLLMError, RetryableLLMError
 from qa_agent.llm.gemini import GeminiProvider
 from qa_agent.llm.groq import GroqProvider
+from qa_agent.llm.registry import configured_provider_order, create_router
 from qa_agent.llm.router import LLMRouter
 from qa_agent.models import QATestPlan
+
 
 
 class RecordingProvider(LLMProvider):
@@ -344,6 +346,268 @@ class RouterTests(unittest.TestCase):
             self.assertRaisesRegex(ValueError, "deterministic Discovery selector"),
         ):
             gemini_client.create_test_plan(task)
+
+
+
+class MultiProviderFallbackTests(unittest.TestCase):
+    """Verify end-to-end multi-provider fallback across openai, gemini, openrouter, and groq."""
+
+    def setUp(self) -> None:
+        self.plan = QATestPlan(
+            url="https://example.com",
+            steps=[{"action": "assert_page_loaded"}],
+        )
+        self.task = "Verify checkout flow"
+        self.target_url = "https://example.com/checkout"
+        self.snapshot = '{"url":"https://example.com/checkout","title":"Checkout"}'
+        self.keys = {
+            "OPENAI_API_KEY": "fake-openai-key",
+            "GEMINI_API_KEY": "fake-gemini-key",
+            "OPENROUTER_API_KEY": "fake-openrouter-key",
+            "GROQ_API_KEY": "fake-groq-key",
+        }
+
+    def test_default_configured_order_is_openai_gemini_openrouter_groq(self) -> None:
+        with patch.dict(os.environ, self.keys, clear=True):
+            order = configured_provider_order()
+            self.assertEqual(order, ["openai", "gemini", "openrouter", "groq"])
+            router = create_router()
+            names = [router._provider_name(p) for p in router._providers]
+            self.assertEqual(names, ["openai", "GeminiProvider", "openrouter", "GroqProvider"])
+            self.assertTrue(all(p.is_available for p in router._providers))
+
+    def test_scenario_a_openai_fails_gemini_succeeds(self) -> None:
+        with patch.dict(os.environ, self.keys, clear=True):
+            router = create_router()
+            with (
+                patch.object(
+                    router._providers[0], "create_test_plan",
+                    side_effect=RetryableLLMError("OpenAI rate limit 429"),
+                ) as mock_openai,
+                patch.object(
+                    router._providers[1], "create_test_plan",
+                    return_value=self.plan,
+                ) as mock_gemini,
+                patch.object(router._providers[2], "create_test_plan") as mock_openrouter,
+                patch.object(router._providers[3], "create_test_plan") as mock_groq,
+                redirect_stdout(io.StringIO()),
+            ):
+                result = router.create_test_plan(self.task, self.target_url, self.snapshot)
+
+            self.assertEqual(result, self.plan)
+            self.assertEqual(router.selected_provider_name, "GeminiProvider")
+            mock_openai.assert_called_once_with(self.task, self.target_url, self.snapshot)
+            mock_gemini.assert_called_once_with(self.task, self.target_url, self.snapshot)
+            mock_openrouter.assert_not_called()
+            mock_groq.assert_not_called()
+
+    def test_scenario_b_openai_gemini_fail_openrouter_succeeds(self) -> None:
+        with patch.dict(os.environ, self.keys, clear=True):
+            router = create_router()
+            with (
+                patch.object(
+                    router._providers[0], "create_test_plan",
+                    side_effect=RetryableLLMError("OpenAI timeout"),
+                ) as mock_openai,
+                patch.object(
+                    router._providers[1], "create_test_plan",
+                    side_effect=RetryableLLMError("Gemini 503 Service Unavailable"),
+                ) as mock_gemini,
+                patch.object(
+                    router._providers[2], "create_test_plan",
+                    return_value=self.plan,
+                ) as mock_openrouter,
+                patch.object(router._providers[3], "create_test_plan") as mock_groq,
+                redirect_stdout(io.StringIO()),
+            ):
+                result = router.create_test_plan(self.task, self.target_url, self.snapshot)
+
+            self.assertEqual(result, self.plan)
+            self.assertEqual(router.selected_provider_name, "openrouter")
+            mock_openai.assert_called_once_with(self.task, self.target_url, self.snapshot)
+            mock_gemini.assert_called_once_with(self.task, self.target_url, self.snapshot)
+            mock_openrouter.assert_called_once_with(self.task, self.target_url, self.snapshot)
+            mock_groq.assert_not_called()
+
+    def test_scenario_c_openai_gemini_openrouter_fail_groq_succeeds(self) -> None:
+        with patch.dict(os.environ, self.keys, clear=True):
+            router = create_router()
+            with (
+                patch.object(
+                    router._providers[0], "create_test_plan",
+                    side_effect=RetryableLLMError("OpenAI 429 rate limit"),
+                ) as mock_openai,
+                patch.object(
+                    router._providers[1], "create_test_plan",
+                    side_effect=RetryableLLMError("Gemini 500 internal server error"),
+                ) as mock_gemini,
+                patch.object(
+                    router._providers[2], "create_test_plan",
+                    side_effect=RetryableLLMError("OpenRouter 402 payment required"),
+                ) as mock_openrouter,
+                patch.object(
+                    router._providers[3], "create_test_plan",
+                    return_value=self.plan,
+                ) as mock_groq,
+                redirect_stdout(io.StringIO()),
+            ):
+                result = router.create_test_plan(self.task, self.target_url, self.snapshot)
+
+            self.assertEqual(result, self.plan)
+            self.assertEqual(router.selected_provider_name, "GroqProvider")
+            mock_openai.assert_called_once_with(self.task, self.target_url, self.snapshot)
+            mock_gemini.assert_called_once_with(self.task, self.target_url, self.snapshot)
+            mock_openrouter.assert_called_once_with(self.task, self.target_url, self.snapshot)
+            mock_groq.assert_called_once_with(self.task, self.target_url, self.snapshot)
+
+    def test_scenario_d_all_providers_fail_raises_useful_error(self) -> None:
+        with patch.dict(os.environ, self.keys, clear=True):
+            router = create_router()
+            with (
+                patch.object(
+                    router._providers[0], "create_test_plan",
+                    side_effect=RetryableLLMError("OpenAI quota exceeded 429"),
+                ),
+                patch.object(
+                    router._providers[1], "create_test_plan",
+                    side_effect=RetryableLLMError("Gemini unavailable 503"),
+                ),
+                patch.object(
+                    router._providers[2], "create_test_plan",
+                    side_effect=RetryableLLMError("OpenRouter gateway timeout 504"),
+                ),
+                patch.object(
+                    router._providers[3], "create_test_plan",
+                    side_effect=RetryableLLMError("Groq internal error 500"),
+                ),
+                redirect_stdout(io.StringIO()),
+            ):
+                with self.assertRaises(RuntimeError) as context:
+                    router.create_test_plan(self.task, self.target_url, self.snapshot)
+
+            error_message = str(context.exception)
+            self.assertIn("All LLM providers failed", error_message)
+            self.assertIn("OpenAI quota exceeded 429", error_message)
+            self.assertIn("Gemini unavailable 503", error_message)
+            self.assertIn("OpenRouter gateway timeout 504", error_message)
+            self.assertIn("Groq internal error 500", error_message)
+            self.assertIsNone(router.selected_provider_name)
+
+    def test_scenario_e_custom_provider_order_is_followed(self) -> None:
+        custom_order = "groq,openrouter,gemini,openai"
+        with patch.dict(os.environ, {**self.keys, "LLM_PROVIDER_ORDER": custom_order}, clear=True):
+            self.assertEqual(configured_provider_order(), ["groq", "openrouter", "gemini", "openai"])
+            router = create_router()
+            names = [router._provider_name(p) for p in router._providers]
+            self.assertEqual(names, ["GroqProvider", "openrouter", "GeminiProvider", "openai"])
+
+            with (
+                patch.object(
+                    router._providers[0], "create_test_plan",
+                    side_effect=RetryableLLMError("Groq 429 rate limit"),
+                ) as mock_groq,
+                patch.object(
+                    router._providers[1], "create_test_plan",
+                    return_value=self.plan,
+                ) as mock_openrouter,
+                patch.object(router._providers[2], "create_test_plan") as mock_gemini,
+                patch.object(router._providers[3], "create_test_plan") as mock_openai,
+                redirect_stdout(io.StringIO()),
+            ):
+                result = router.create_test_plan(self.task, self.target_url, self.snapshot)
+
+            self.assertEqual(result, self.plan)
+            self.assertEqual(router.selected_provider_name, "openrouter")
+            mock_groq.assert_called_once_with(self.task, self.target_url, self.snapshot)
+            mock_openrouter.assert_called_once_with(self.task, self.target_url, self.snapshot)
+            mock_gemini.assert_not_called()
+            mock_openai.assert_not_called()
+
+    def test_fallback_preserves_request_parameters_without_corruption(self) -> None:
+        complex_task = "Verify 'Kjøp nå' button with special chars: €100 / <test> & \"quotes\""
+        complex_url = "https://example.com/checkout?step=1&lang=no&curr=EUR#summary"
+        complex_snapshot = json.dumps({
+            "url": complex_url,
+            "title": "Kjøp & Betal — €100",
+            "interactive_elements": [{"id": "btn-1", "name": "Kjøp nå", "selector": "#buy"}],
+        }, ensure_ascii=False)
+
+        with patch.dict(os.environ, self.keys, clear=True):
+            router = create_router()
+            with (
+                patch.object(
+                    router._providers[0], "create_test_plan",
+                    side_effect=RetryableLLMError("OpenAI transport error"),
+                ) as mock_openai,
+                patch.object(
+                    router._providers[1], "create_test_plan",
+                    side_effect=RetryableLLMError("Gemini transport error"),
+                ) as mock_gemini,
+                patch.object(
+                    router._providers[2], "create_test_plan",
+                    return_value=self.plan,
+                ) as mock_openrouter,
+                patch.object(router._providers[3], "create_test_plan") as mock_groq,
+                redirect_stdout(io.StringIO()),
+            ):
+                result = router.create_test_plan(complex_task, complex_url, complex_snapshot)
+
+            self.assertEqual(result, self.plan)
+            self.assertEqual(router.selected_provider_name, "openrouter")
+            # Verify exact arguments were forwarded without corruption
+            for mock_call in (mock_openai, mock_gemini, mock_openrouter):
+                call_args = mock_call.call_args.args
+                self.assertEqual(call_args[0], complex_task)
+                self.assertEqual(call_args[1], complex_url)
+                self.assertEqual(call_args[2], complex_snapshot)
+            mock_groq.assert_not_called()
+
+    def test_selected_provider_is_exposed_and_logged(self) -> None:
+        with patch.dict(os.environ, self.keys, clear=True):
+            router = create_router()
+            stdout_capture = io.StringIO()
+            with (
+                patch.object(
+                    router._providers[0], "create_test_plan",
+                    side_effect=RetryableLLMError("OpenAI 429"),
+                ),
+                patch.object(
+                    router._providers[1], "create_test_plan",
+                    return_value=self.plan,
+                ),
+                redirect_stdout(stdout_capture),
+            ):
+                result = router.create_test_plan(self.task, self.target_url, self.snapshot)
+
+            self.assertEqual(result, self.plan)
+            self.assertEqual(router.selected_provider_name, "GeminiProvider")
+
+            output = stdout_capture.getvalue()
+            self.assertIn("LLM provider priority:", output)
+            self.assertIn("1. openai [AVAILABLE]", output)
+            self.assertIn("2. GeminiProvider [AVAILABLE]", output)
+            self.assertIn("3. openrouter [AVAILABLE]", output)
+            self.assertIn("4. GroqProvider [AVAILABLE]", output)
+            self.assertIn("had a retryable failure (OpenAI 429); trying the next provider.", output)
+            self.assertIn("Selected provider: GeminiProvider", output)
+
+    def test_non_retryable_error_halts_fallback_immediately(self) -> None:
+        with patch.dict(os.environ, self.keys, clear=True):
+            router = create_router()
+            with (
+                patch.object(
+                    router._providers[0], "create_test_plan",
+                    side_effect=NonRetryableLLMError("Invalid prompt / bad request"),
+                ) as mock_openai,
+                patch.object(router._providers[1], "create_test_plan") as mock_gemini,
+                redirect_stdout(io.StringIO()),
+            ):
+                with self.assertRaises(NonRetryableLLMError):
+                    router.create_test_plan(self.task, self.target_url, self.snapshot)
+
+            mock_openai.assert_called_once()
+            mock_gemini.assert_not_called()
+            self.assertIsNone(router.selected_provider_name)
 
 
 if __name__ == "__main__":

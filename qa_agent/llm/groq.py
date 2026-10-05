@@ -4,9 +4,10 @@ from typing import Any
 
 import httpx
 
-from ..models import AIDiscoveryResult, QATestPlan, QATestStep
+from ..models import AIDiscoveryResult, QATestPlan
 from .base import LLMProvider
 from .errors import NonRetryableLLMError, RetryableLLMError
+from .json_schema import qa_test_plan_schema
 
 
 class GroqProvider(LLMProvider):
@@ -16,48 +17,7 @@ class GroqProvider(LLMProvider):
     @staticmethod
     def _response_schema() -> dict[str, Any]:
         """Return strict variants with an explicit common parameter shape."""
-        step_variants = []
-        for action in QATestStep.ACTION_PARAMETER_FIELDS:
-            # Groq strict mode needs a non-empty properties map for every
-            # object. These five common nullable fields match the existing
-            # plan wire format; option_label is included only for select_option.
-            parameter_fields = ("url", "expected", "selector", "expected_text", "value")
-            if action == "select_option":
-                parameter_fields += ("option_label",)
-            parameters_schema = {
-                "type": "object",
-                "properties": {
-                    field: (
-                        {"type": "string"}
-                        if field == "option_label"
-                        else {"type": ["string", "null"]}
-                    )
-                    for field in parameter_fields
-                },
-                "required": list(parameter_fields),
-                "additionalProperties": False,
-            }
-            step_variants.append({
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "enum": [action]},
-                    "parameters": parameters_schema,
-                },
-                "required": ["action", "parameters"],
-                "additionalProperties": False,
-            })
-        return {
-            "type": "object",
-            "properties": {
-                "url": {"type": "string"},
-                "steps": {
-                    "type": "array",
-                    "items": {"anyOf": step_variants},
-                },
-            },
-            "required": ["url", "steps"],
-            "additionalProperties": False,
-        }
+        return qa_test_plan_schema()
 
     @property
     def is_available(self) -> bool:
@@ -151,7 +111,7 @@ class GroqProvider(LLMProvider):
         )
 
         request_payload = {
-            "model": self._model,
+            "model": os.getenv("GROQ_MODEL", self._model),
             "max_completion_tokens": 8192,
             "messages": [
                 {"role": "user", "content": prompt},
@@ -183,18 +143,11 @@ class GroqProvider(LLMProvider):
             raise RetryableLLMError(
                 f"Groq request failed with HTTP {response.status_code}."
             )
+        if response.status_code in (401, 403):
+            raise RetryableLLMError(
+                f"Groq request failed with HTTP {response.status_code}."
+            )
         if response.is_error:
-            print("GROQ ERROR RESPONSE:")
-            print(response.text)
-            if debug_request:
-                try:
-                    failed_generation = response.json().get("error", {}).get(
-                        "failed_generation"
-                    )
-                except (ValueError, AttributeError):
-                    failed_generation = None
-                print("GROQ FAILED GENERATION:")
-                print(failed_generation if failed_generation is not None else "<not present>")
             raise NonRetryableLLMError(
                 f"Groq request failed with HTTP {response.status_code}."
             )
@@ -202,26 +155,7 @@ class GroqProvider(LLMProvider):
         try:
             response_data = response.json()
             output_text = response_data["choices"][0]["message"]["content"]
-            print("GROQ OUTPUT TEXT repr:", repr(output_text))
-            try:
-                raw_data = json.loads(output_text)
-                for step in raw_data.get("steps", []):
-                    parameters = step.get("parameters", {})
-                    selector = parameters.get("selector") if isinstance(parameters, dict) else None
-                    if selector and "/lan" in selector:
-                        print("GROQ RAW PARSED SELECTOR repr:", repr(selector))
-                        print("GROQ RAW PARSED SELECTOR:", selector)
-                        break
-            except Exception as diagnostic_error:
-                print("GROQ RAW SELECTOR DIAGNOSTIC FAILED:", diagnostic_error)
-
             plan = QATestPlan.model_validate_json(output_text)
-            for step in plan.steps:
-                selector = step.parameters.get("selector")
-                if selector and "/lan" in selector:
-                    print("PYDANTIC SELECTOR repr:", repr(selector))
-                    print("PYDANTIC SELECTOR:", selector)
-                    break
             return plan
         except Exception as error:
             raise NonRetryableLLMError(
@@ -234,7 +168,7 @@ class GroqProvider(LLMProvider):
         if not api_key:
             raise NonRetryableLLMError("GROQ_API_KEY is not set.")
         schema = AIDiscoveryResult.model_json_schema()
-        payload = {"model": self._model, "max_completion_tokens": 4096,
+        payload = {"model": os.getenv("GROQ_MODEL", self._model), "max_completion_tokens": 4096,
                    "messages": [{"role": "user", "content":
                        "Return grounded structured discovery candidates only. Never return code, "
                        "instructions to execute, or perform browser actions. "
@@ -249,6 +183,8 @@ class GroqProvider(LLMProvider):
         except httpx.RequestError as error:
             raise RetryableLLMError(f"Groq transport failure: {type(error).__name__}.") from error
         if response.status_code in (408, 429) or response.status_code >= 500:
+            raise RetryableLLMError(f"Groq request failed with HTTP {response.status_code}.")
+        if response.status_code in (401, 403):
             raise RetryableLLMError(f"Groq request failed with HTTP {response.status_code}.")
         if response.is_error:
             raise NonRetryableLLMError(f"Groq request failed with HTTP {response.status_code}.")

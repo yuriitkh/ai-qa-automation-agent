@@ -2,13 +2,11 @@ import json
 
 from .browser_discovery import capture_page_snapshot, extract_target_url
 from .models import DiscoveryResult, DiscoveryStatus, QATestPlan
-from .llm.gemini import GeminiProvider
-from .llm.groq import GroqProvider
-from .llm.router import LLMRouter
+from .llm.registry import create_router
 from .test_plan_generator import LLMTestPlanGenerator
 
 
-_router = LLMRouter([GeminiProvider(), GroqProvider()])
+_router = create_router()
 
 
 def create_test_plan(task: str) -> QATestPlan:

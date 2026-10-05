@@ -22,7 +22,7 @@ def _raise_for_gemini_error(error: Exception, operation: str) -> None:
             response = getattr(error, "raw_response", None)
         status_code = getattr(response, "status_code", None)
 
-    if status_code in (408, 429) or (
+    if status_code in (401, 403, 408, 429) or (
         isinstance(status_code, int) and status_code >= 500
     ):
         raise RetryableLLMError(
@@ -37,6 +37,7 @@ def _raise_for_gemini_error(error: Exception, operation: str) -> None:
 class GeminiProvider(LLMProvider):
     def __init__(self) -> None:
         self._api_key = os.environ.get("GEMINI_API_KEY")
+        self._model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
         self._client = (
             genai.Client(
                 api_key=self._api_key,
@@ -73,7 +74,7 @@ class GeminiProvider(LLMProvider):
                 "schema": QATestPlan.model_json_schema(),
             }
             interaction = self._client.interactions.create(
-                model="gemini-3.8-flash",
+                model=self._model,
                 input=(
                     "Create a structured browser QA test plan for this task. "
                     "Use the supplied target URL exactly; do not infer another URL. "
@@ -153,7 +154,7 @@ class GeminiProvider(LLMProvider):
             raise NonRetryableLLMError("Gemini provider is unavailable.")
         try:
             response = self._client.interactions.create(
-                model="gemini-3.8-flash",
+                model=self._model,
                 input=("Return only structured candidate navigation paths and interactive elements "
                        "grounded in the supplied page information. Never return code or actions. "
                        f"URL: {target_url}\nTask: {task}\nPage info: {page_snapshot}"),
