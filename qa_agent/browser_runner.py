@@ -212,7 +212,7 @@ def _run_plan_on_page(
                     )
             elif step.action == "assert_visible":
                 selector = step.parameters["selector"]
-                expected_text = step.parameters["expected_text"]
+                expected_text = step.parameters.get("expected_text")
                 element = page.locator(selector)
                 element_count = element.count()
                 if not element_count:
@@ -225,20 +225,21 @@ def _run_plan_on_page(
                         f"Element matching selector {selector!r} exists "
                         "but is not visible."
                     )
-                try:
-                    actual_text = element.inner_text(timeout=1000)
-                except Exception as error:
-                    raise AssertionError(
-                        f"Could not read visible text for selector "
-                        f"{selector!r} within 1 second: {error}"
-                    ) from error
-                comparable_expected_text = expected_text.replace("\\n", "\n")
-                if actual_text != comparable_expected_text:
-                    raise AssertionError(
-                        f"Expected text {expected_text!r} was not present "
-                        f"as the exact visible text for {selector!r}; "
-                        f"got {actual_text!r}."
-                    )
+                if expected_text is not None:
+                    try:
+                        actual_text = element.inner_text(timeout=1000)
+                    except Exception as error:
+                        raise AssertionError(
+                            f"Could not read visible text for selector "
+                            f"{selector!r} within 1 second: {error}"
+                        ) from error
+                    comparable_expected_text = expected_text.replace("\\n", "\n")
+                    if actual_text != comparable_expected_text:
+                        raise AssertionError(
+                            f"Expected text {expected_text!r} was not present "
+                            f"as the exact visible text for {selector!r}; "
+                            f"got {actual_text!r}."
+                        )
             elif step.action == "assert_text_contains":
                 expected_text = step.parameters["expected_text"].replace("\\n", "\n")
                 selector = step.parameters.get("selector")

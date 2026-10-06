@@ -62,10 +62,26 @@ python -m qa_agent.web
 It binds to `127.0.0.1:8000` by default. The dashboard, saved TestCase
 definitions, run details, JSON report, and standalone HTML report read from
 the same SQLite database. Open a TestCase and choose Validation or Regression
-to run its saved plan versions. Automation is not offered for persisted
-TestCases. Pass `--database PATH` to use a non-default database. Screenshots
+to run its saved plan versions; use Automation first when a TestCase has no
+complete set of executable plans. Pass `--database PATH` to use a non-default database. Screenshots
 are served only when their recorded path is inside the configured evidence
 directory; pass `--evidence-directory PATH` to choose that location.
+
+### AI authoring demo
+
+Configure at least one provider key from the [LLM providers](#llm-providers)
+section, then start the local UI. The built-in deterministic registration page
+is served by the UI itself, so no public site is needed:
+
+```powershell
+python -m qa_agent.web --database .\qa_agent.db
+```
+
+Open <http://127.0.0.1:8000>, choose **Test Cases → New Test Case**, enter a
+name, the base URL `http://127.0.0.1:8000/demo-target/registration`, and a
+natural-language scenario. Review and save the proposed definition, then select
+**Generate & Run Automation**. Once all steps have usable plan versions,
+Validation and Regression become available for the saved versions.
 
 ### Demo UI
 

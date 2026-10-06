@@ -19,10 +19,26 @@ from qa_agent.presentation import (
     short_id,
 )
 from qa_agent.reporting import RunAttemptReport, RunEvidenceReport, RunReportGenerator, RunStepReport
+from qa_agent.browser_runner import BrowserRunner
+from qa_agent.llm.registry import create_router
 from qa_agent.run_history import RunHistoryDetail, RunHistoryRecord, RunHistoryService, WorkflowType
-from qa_agent.test_case_execution import RunUnavailableError, TestCaseExecutionService
+from qa_agent.test_case_execution import (
+    RunUnavailableError,
+    TestCaseExecutionService,
+    WorkflowAvailability,
+)
+from qa_agent.test_case_authoring import (
+    TestCaseAuthoringError,
+    TestCaseAuthoringService,
+    TestCaseDraft,
+    TestCaseDraftStore,
+)
 from qa_agent.test_case_repository import TestCaseRepository
 from qa_agent.storage import create_sqlite_storage
+from qa_agent.pipeline import QATestPipeline
+from qa_agent.test_case_decomposer import TestCaseDecomposer
+from qa_agent.test_plan_generator import LLMTestPlanGenerator
+from qa_agent.workflows import AutomationWorkflow
 
 
 _PAGE_LIMIT = 500
@@ -66,12 +82,16 @@ class LocalWebApplication:
         evidence_root: str | Path | None = None,
         test_cases: TestCaseRepository | None = None,
         run_service: TestCaseExecutionService | None = None,
+        authoring_service: TestCaseAuthoringService | None = None,
+        draft_store: TestCaseDraftStore | None = None,
     ) -> None:
         self._run_history = run_history
         self._reports = reports or RunReportGenerator()
         self._evidence_root = Path(evidence_root).expanduser() if evidence_root else None
         self._test_cases = test_cases
         self._run_service = run_service
+        self._authoring_service = authoring_service
+        self._draft_store = draft_store or TestCaseDraftStore()
 
     def handle(self, method: str, target: str, body: bytes | str | None = None) -> WebResponse:
         parsed = urlsplit(target)
@@ -92,6 +112,10 @@ class LocalWebApplication:
             return WebResponse.html(200, _local_demo_page())
         if path == "/test-cases":
             return WebResponse.html(200, self._test_case_list())
+        if path == "/test-cases/new":
+            return WebResponse.html(200, self._new_test_case_page())
+        if len(parts) == 3 and parts[0] == "test-cases" and parts[1] == "review":
+            return self._draft_review_page(parts[2])
         if path == "/runs":
             return WebResponse.html(200, self._runs_page(query))
 
@@ -146,6 +170,10 @@ class LocalWebApplication:
         return self._not_found("Page not found")
 
     def _handle_post(self, parts: list[str], body: bytes | str | None) -> WebResponse:
+        if parts == ["test-cases", "generate"]:
+            return self._handle_generate_test_case(body)
+        if len(parts) == 4 and parts[:2] == ["test-cases", "review"]:
+            return self._handle_draft_action(parts[2], parts[3], body)
         if len(parts) != 3 or parts[0] != "test-cases" or parts[2] != "run":
             return WebResponse.html(405, self._page(
                 "Method not allowed",
@@ -163,22 +191,16 @@ class LocalWebApplication:
                 '<div class="error-state"><h1>Run unavailable</h1>'
                 "<p>This application has no execution service configured.</p></div>",
             ))
-        if isinstance(body, bytes):
-            try:
-                form_body = body.decode("utf-8")
-            except UnicodeDecodeError:
-                return self._run_error(test_case_id, "The run request was not valid form data.", 400)
-        else:
-            form_body = body or ""
-        if len(form_body) > 8192:
-            return self._run_error(test_case_id, "The run request was too large.", 400)
-        workflow_value = parse_qs(form_body, keep_blank_values=True).get("workflow", [""])[0]
+        form, form_error = _parse_form_body(body)
+        if form_error is not None:
+            return self._run_error(test_case_id, form_error, 400)
+        workflow_value = form.get("workflow", [""])[0]
         try:
             workflow = WorkflowType(workflow_value)
         except ValueError:
-            return self._run_error(test_case_id, "Choose Validation or Regression before starting a run.", 400)
-        if workflow not in {WorkflowType.VALIDATION, WorkflowType.REGRESSION}:
-            return self._run_error(test_case_id, "Choose Validation or Regression before starting a run.", 400)
+            return self._run_error(test_case_id, "Choose Automation, Validation, or Regression before starting a run.", 400)
+        if workflow not in {WorkflowType.AUTOMATION, WorkflowType.VALIDATION, WorkflowType.REGRESSION}:
+            return self._run_error(test_case_id, "Choose Automation, Validation, or Regression before starting a run.", 400)
         try:
             result = self._run_service.run(test_case_id, workflow)
         except RunUnavailableError as error:
@@ -190,6 +212,139 @@ class LocalWebApplication:
                 500,
             )
         return WebResponse.redirect(f"/runs/{result.test_run.id}")
+
+    def _handle_generate_test_case(self, body: bytes | str | None) -> WebResponse:
+        form, form_error = _parse_form_body(body)
+        values = {
+            key: form.get(key, [""])[0]
+            for key in ("name", "base_url", "scenario")
+        }
+        if form_error is not None:
+            return WebResponse.html(400, self._new_test_case_page(form_error, **values))
+        if self._test_cases is None:
+            return WebResponse.html(503, self._new_test_case_page(
+                "TestCase storage is not configured.", **values
+            ))
+        if self._authoring_service is None:
+            return WebResponse.html(503, self._new_test_case_page(
+                "AI generation is unavailable. Configure an LLM provider in the environment and try again.",
+                **values,
+            ))
+        try:
+            draft = self._authoring_service.generate(**values)
+        except TestCaseAuthoringError as error:
+            status = 400 if error.category == "input" else 503
+            return WebResponse.html(status, self._new_test_case_page(str(error), **values))
+        except Exception:
+            return WebResponse.html(503, self._new_test_case_page(
+                "AI generation is temporarily unavailable. Try again later.", **values
+            ))
+        token = self._draft_store.put(draft)
+        return WebResponse.redirect(f"/test-cases/review/{token}")
+
+    def _handle_draft_action(
+        self, token: str, action: str, body: bytes | str | None
+    ) -> WebResponse:
+        form, form_error = _parse_form_body(body)
+        if form_error is not None:
+            return self._not_found("Draft not found or expired")
+        if action == "cancel":
+            self._draft_store.take(token)
+            return WebResponse.redirect("/test-cases")
+        draft = self._draft_store.get(token)
+        if draft is None:
+            return self._not_found("Draft not found or expired")
+        if action == "regenerate":
+            if self._authoring_service is None:
+                return WebResponse.html(503, self._draft_review_html(
+                    draft, token, "AI generation is unavailable. Configure an LLM provider and try again."
+                ))
+            try:
+                new_draft = self._authoring_service.generate(
+                    draft.test_case.name,
+                    draft.test_case.description,
+                    draft.test_case.base_url or "",
+                )
+            except TestCaseAuthoringError as error:
+                return WebResponse.html(503, self._draft_review_html(draft, token, str(error)))
+            except Exception:
+                return WebResponse.html(503, self._draft_review_html(
+                    draft, token, "AI generation is temporarily unavailable. Try again later."
+                ))
+            self._draft_store.take(token)
+            next_token = self._draft_store.put(new_draft)
+            return WebResponse.redirect(f"/test-cases/review/{next_token}")
+        if action != "save":
+            return self._not_found("Draft action not found")
+        # Consume before persistence so the same token cannot create two rows.
+        consumed = self._draft_store.take(token)
+        if consumed is None:
+            return self._not_found("Draft not found or expired")
+        if self._test_cases is None:
+            return WebResponse.html(503, self._not_found("TestCase storage is not configured.").body.decode("utf-8"))
+        try:
+            self._test_cases.save(consumed.test_case)
+        except Exception:
+            return WebResponse.html(500, self._page(
+                "TestCase not saved",
+                '<div class="error-state"><h1>TestCase not saved</h1>'
+                '<p>The reviewed TestCase could not be saved. Generate a new draft and try again.</p>'
+                '<a class="button" href="/test-cases">Return to TestCases</a></div>',
+            ))
+        return WebResponse.redirect(f"/test-cases/{consumed.test_case.id}")
+
+    def _draft_review_page(self, token: str, error: str | None = None) -> WebResponse:
+        draft = self._draft_store.get(token)
+        if draft is None:
+            return self._not_found("Draft not found or expired")
+        return WebResponse.html(200, self._draft_review_html(draft, token, error))
+
+    def _draft_review_html(
+        self, draft: TestCaseDraft, token: str, error: str | None = None
+    ) -> str:
+        test_case = draft.test_case
+        preconditions = "".join(
+            f"<li>{escape_html(item.description)}</li>"
+            for item in sorted(test_case.preconditions, key=lambda item: item.order)
+        )
+        segments = []
+        for number, segment in enumerate(sorted(test_case.segments, key=lambda item: item.order), start=1):
+            steps = "".join(
+                f'<li><strong>{escape_html(step.name)}</strong>'
+                f'<p>{escape_html(step.description)}</p>'
+                f'<p class="muted">Expected: {escape_html(step.expected)}</p></li>'
+                for step in segment.steps
+            )
+            segments.append(
+                f'<section class="subpanel"><h3>Segment {number}</h3><ol>{steps}</ol></section>'
+            )
+        error_html = (
+            f'<div class="error-state"><p>{escape_html(error)}</p></div>' if error else ""
+        )
+        content = (
+            '<header class="page-heading"><h1>Review TestCase</h1>'
+            '<p class="lead">Check the generated definition before saving it.</p></header>'
+            + error_html
+            + '<section class="panel"><h2>Definition</h2>'
+            + f'<p><strong>Name:</strong> {escape_html(test_case.name)}</p>'
+            + f'<p><strong>Base URL:</strong> {escape_html(test_case.base_url or "")}</p>'
+            + f'<p><strong>Scenario:</strong> {escape_html(test_case.description)}</p></section>'
+            + '<section class="panel"><h2>Preconditions</h2>'
+            + (f'<ul>{preconditions}</ul>' if preconditions else '<p class="muted">No preconditions proposed.</p>')
+            + '</section><section class="panel"><h2>Steps</h2>'
+            + "".join(segments)
+            + '</section><div class="actions">'
+            + f'<form method="post" action="/test-cases/review/{escape_html(token)}/save">'
+            + '<button class="button primary" type="submit">Save Test Case</button></form>'
+            + f'<form method="post" action="/test-cases/review/{escape_html(token)}/regenerate">'
+            + '<button class="button" type="submit">Generate Again</button></form>'
+            + f'<form method="post" action="/test-cases/review/{escape_html(token)}/cancel">'
+            + '<button class="button" type="submit">Cancel</button></form></div>'
+        )
+        return self._page(
+            "Review TestCase", content, current="Test Cases",
+            breadcrumbs=[("Dashboard", "/"), ("Test Cases", "/test-cases")],
+        )
 
     def _run_error(self, test_case_id: UUID, message: str, status: int) -> WebResponse:
         content = (
@@ -205,6 +360,7 @@ class LocalWebApplication:
             "Total runs": len(records),
             "Passed": sum(record.status.value == "PASSED" for record in records),
             "Failed": sum(record.status.value == "FAILED" for record in records),
+            "Automation": sum(record.workflow_type == WorkflowType.AUTOMATION for record in records),
             "Validation": sum(record.workflow_type == WorkflowType.VALIDATION for record in records),
             "Regression": sum(record.workflow_type == WorkflowType.REGRESSION for record in records),
             "Product failures": sum(record.outcome == "PRODUCT_FAILURE" for record in records),
@@ -219,7 +375,7 @@ class LocalWebApplication:
         recent = records[:12]
         content = (
             '<header class="page-heading"><h1>AI QA Agent</h1>'
-            '<p class="lead">A clear view of recent validation and regression runs.</p></header>'
+            '<p class="lead">A clear view of recent automation, validation, and regression runs.</p></header>'
             f'<section aria-label="Run summary"><div class="summary-grid">{cards}</div>'
             '<p class="muted">Summary of the latest recorded history.</p></section>'
             '<section class="panel"><div class="section-heading"><h2>Recent runs</h2>'
@@ -234,6 +390,36 @@ class LocalWebApplication:
             '<p class="muted">Browse saved definitions, including TestCases that have not run yet.</p></section>'
         )
         return self._page("Dashboard", content, current="Dashboard")
+
+    def _new_test_case_page(
+        self,
+        error: str | None = None,
+        *,
+        name: str = "",
+        base_url: str = "",
+        scenario: str = "",
+    ) -> str:
+        error_html = (
+            f'<div class="error-state"><p>{escape_html(error)}</p></div>' if error else ""
+        )
+        content = (
+            '<header class="page-heading"><h1>New Test Case</h1>'
+            '<p class="lead">Describe the scenario. AI will propose steps for you to review.</p></header>'
+            + error_html
+            + '<section class="panel"><form method="post" action="/test-cases/generate">'
+            + '<div class="field"><label for="case-name">Name</label>'
+            + f'<input id="case-name" name="name" maxlength="200" required value="{escape_html(name)}"></div>'
+            + '<div class="field"><label for="case-base-url">Base URL</label>'
+            + f'<input id="case-base-url" name="base_url" type="url" required value="{escape_html(base_url)}" placeholder="http://127.0.0.1:8000/demo-target/registration"></div>'
+            + '<div class="field"><label for="case-scenario">Scenario</label>'
+            + f'<textarea id="case-scenario" name="scenario" rows="6" maxlength="6000" required>{escape_html(scenario)}</textarea></div>'
+            + '<button class="button primary" type="submit">Generate Test with AI</button>'
+            + '</form></section>'
+        )
+        return self._page(
+            "New Test Case", content, current="Test Cases",
+            breadcrumbs=[("Dashboard", "/"), ("Test Cases", "/test-cases")],
+        )
 
     def _test_case_list(self) -> str:
         records = self._run_history.list_recent(_PAGE_LIMIT)
@@ -287,11 +473,12 @@ class LocalWebApplication:
             + "</tbody></table></div>"
         )
         content = (
-            '<header class="page-heading"><h1>Test Cases</h1>'
-            '<p class="lead">Saved TestCase definitions and their run history.</p></header>'
+            '<header class="page-heading section-heading"><div><h1>Test Cases</h1>'
+            '<p class="lead">Saved TestCase definitions and their run history.</p></div>'
+            '<a class="button primary" href="/test-cases/new">+ New Test Case</a></header>'
             '<section class="panel"><h2>TestCases</h2>'
             + (table if rows else self._empty_state(
-                "No TestCases found.", "Persist a TestCase definition to see it here."
+                "No TestCases found.", "Create a TestCase from a natural-language scenario to get started."
             ))
             + "</section>"
         )
@@ -445,9 +632,18 @@ class LocalWebApplication:
             '<th>Last run</th><th>Duration</th><th>Run</th></tr></thead><tbody>'
             + history_rows
             + '</tbody></table></div>'
-            if records else self._empty_state("No runs yet.", "Start Validation or Regression to add run history.")
+            if records else self._empty_state(
+                "No runs yet.", "Generate and run automation to create the first plan versions and history."
+            )
         )
-        run_form = self._run_form(test_case_id) if self._run_service is not None and test_case is not None else ""
+        run_form = ""
+        if self._run_service is not None and test_case is not None:
+            availability = self._workflow_availability(test_case_id)
+            if availability is not None:
+                run_form = self._workflow_panel(test_case_id, test_case, availability)
+            else:
+                # Compatibility for lightweight adapters that only implement run().
+                run_form = self._run_form(test_case_id)
         content = (
             '<header class="page-heading"><h1>' + escape_html(case_name) + '</h1>'
             + f'<p class="lead">{escape_html(case_description)}</p>'
@@ -486,6 +682,80 @@ class LocalWebApplication:
             '<option value="REGRESSION">Regression</option>'
             '</select></div><button class="button primary" type="submit">Start run</button></form>'
             '</section>'
+        )
+
+    def _workflow_availability(self, test_case_id: UUID) -> WorkflowAvailability | None:
+        method = getattr(self._run_service, "workflow_availability", None)
+        if not callable(method):
+            return None
+        try:
+            value = method(test_case_id)
+        except RunUnavailableError:
+            return None
+        return value if isinstance(value, WorkflowAvailability) else None
+
+    @staticmethod
+    def _workflow_panel(
+        test_case_id: UUID,
+        test_case,
+        availability: WorkflowAvailability,
+    ) -> str:
+        forms = []
+        if availability.automation_available:
+            forms.append(
+                f'<form method="post" action="/test-cases/{test_case_id}/run">'
+                '<input type="hidden" name="workflow" value="AUTOMATION">'
+                '<button class="button primary" type="submit">Generate &amp; Run Automation</button></form>'
+            )
+        plan_by_step = {
+            step_id: (version, version_id)
+            for step_id, version, version_id in availability.plan_versions
+        }
+        version_rows = []
+        for step in sorted(test_case.steps, key=lambda item: item.order):
+            selected = plan_by_step.get(step.id)
+            if selected is not None:
+                version, version_id = selected
+                version_rows.append(
+                    f'<li>Step {step.order + 1}: {escape_html(step.name)} '
+                    f'<span class="muted">v{version} · {escape_html(short_id(version_id))}</span></li>'
+                )
+        plan_status = (
+            f'{availability.usable_plan_count} / {availability.total_step_count} steps have executable plans.'
+        )
+        validation = availability.validation_available
+        regression = availability.regression_available
+        for workflow, label, available in (
+            (WorkflowType.VALIDATION, "Validation", validation),
+            (WorkflowType.REGRESSION, "Regression", regression),
+        ):
+            if available:
+                forms.append(
+                    f'<form method="post" action="/test-cases/{test_case_id}/run">'
+                    f'<input type="hidden" name="workflow" value="{workflow.value}">'
+                    f'<button class="button" type="submit">Run {label}</button></form>'
+                )
+        status_rows = (
+            '<li>Automation <strong>'
+            + ("Available" if availability.automation_available else "Not configured")
+            + '</strong> — generates and runs executable plans.</li>'
+            + '<li>Validation <strong>' + ("Available" if validation else "Not ready") + '</strong></li>'
+            + '<li>Regression <strong>' + ("Available" if regression else "Not ready") + '</strong></li>'
+        )
+        reason = (
+            f'<p class="muted">{escape_html(availability.reason)}</p>'
+            if not validation and availability.reason else ""
+        )
+        versions = (
+            f'<ol class="compact-list">{"".join(version_rows)}</ol>'
+            if version_rows else '<p class="muted">No executable plan versions have been generated.</p>'
+        )
+        return (
+            '<section class="panel"><h2>Automation</h2>'
+            f'<p>{escape_html(plan_status)}</p>{versions}'
+            f'<ul class="compact-list">{status_rows}</ul>{reason}'
+            + ('<div class="actions">' + ''.join(forms) + '</div>' if forms else '')
+            + '</section>'
         )
 
     def _serve_evidence(self, run_id_text: str, execution_id_text: str, index_text: str) -> WebResponse:
@@ -612,18 +882,29 @@ def create_application(
         if evidence_directory is not None
         else (storage.database_path.parent / ".qa_agent_evidence").resolve()
     )
+    automation_router = create_router()
+    automation_workflow = AutomationWorkflow(QATestPipeline(
+        decomposer=TestCaseDecomposer(),
+        plan_generator=LLMTestPlanGenerator(automation_router),
+        runner=BrowserRunner(evidence_root, headless=True),
+        plan_store=storage.plan_store,
+        execution_repository=storage.execution_repository,
+        run_history=storage.run_history,
+    ))
     run_service = TestCaseExecutionService(
         storage.test_case_repository,
         storage.plan_store,
         storage.execution_repository,
         storage.run_history,
         evidence_directory=evidence_root,
+        automation_workflow=automation_workflow,
     )
     return LocalWebApplication(
         storage.run_history,
         evidence_root=evidence_root,
         test_cases=storage.test_case_repository,
         run_service=run_service,
+        authoring_service=TestCaseAuthoringService(create_router()),
     )
 
 
@@ -704,6 +985,27 @@ def _parse_uuid(value: str) -> UUID | None:
         return UUID(value)
     except (ValueError, AttributeError):
         return None
+
+
+def _parse_form_body(
+    body: bytes | str | None,
+) -> tuple[dict[str, list[str]], str | None]:
+    if isinstance(body, bytes):
+        try:
+            form_body = body.decode("utf-8")
+        except UnicodeDecodeError:
+            return {}, "The request was not valid form data."
+    else:
+        form_body = body or ""
+    if len(form_body) > 8192:
+        return {}, "The request was too large."
+    try:
+        values = parse_qs(form_body, keep_blank_values=True, encoding="utf-8", errors="strict")
+    except (UnicodeDecodeError, ValueError):
+        return {}, "The request was not valid form data."
+    if any(len(items) != 1 for items in values.values()):
+        return {}, "The request contained ambiguous form fields."
+    return values, None
 
 
 def _query_choice(query: dict[str, list[str]], key: str, choices: set[str]) -> str:

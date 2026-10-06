@@ -298,6 +298,17 @@ class BrowserRunnerActionTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "passed")
 
+    def test_assert_visible_without_expected_text_checks_visibility_only(self) -> None:
+        result = self.run_steps(
+            {
+                "action": "assert_visible",
+                "parameters": {"selector": "#email", "expected_text": None},
+            }
+        )
+
+        self.assertEqual(result["status"], "passed")
+        self.locator.first.inner_text.assert_not_called()
+
     def test_assert_visible_keeps_exact_text_comparison(self) -> None:
         self.locator.first.inner_text.return_value = "Godta alle\nlukk popup"
 

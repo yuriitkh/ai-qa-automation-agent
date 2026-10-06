@@ -77,6 +77,11 @@ class OpenAICompatibleProvider(LLMProvider):
                 raise RetryableLLMError(f"{self.name}: request failed ({detail}).") from error
             raise RetryableLLMError(f"{self.name}: invalid response ({type(error).__name__}).") from error
 
+    def create_structured_output(
+        self, prompt: str, schema: dict[str, Any], schema_name: str
+    ) -> str:
+        return self._generate_json(prompt, schema, schema_name)
+
     def create_test_plan(self, task: str, target_url: str, page_snapshot: str) -> QATestPlan:
         prompt = (
             "Create a structured browser QA test plan. Return only JSON matching the schema. "

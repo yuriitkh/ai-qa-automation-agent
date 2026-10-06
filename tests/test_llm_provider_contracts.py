@@ -186,6 +186,43 @@ class LLMProviderContractTests(unittest.TestCase):
         with self.assertRaises(RetryableLLMError):
             provider.create_discovery(self.task, self.target_url, self.snapshot)
 
+    def test_gemini_generic_structured_output_uses_supplied_schema(self) -> None:
+        client = MagicMock()
+        client.interactions.create.return_value.output_text = '{"ok":true}'
+        provider = GeminiProvider()
+        provider._client = client
+        schema = {"type": "object", "properties": {"ok": {"type": "boolean"}},
+                  "required": ["ok"], "additionalProperties": False}
+
+        result = provider.create_structured_output("authoring prompt", schema, "authoring")
+
+        self.assertEqual(result, '{"ok":true}')
+        call = client.interactions.create.call_args.kwargs
+        self.assertEqual(call["input"], "authoring prompt")
+        self.assertEqual(call["response_format"]["schema"], schema)
+        self.assertEqual(call["response_format"]["mime_type"], "application/json")
+
+    def test_groq_generic_structured_output_uses_strict_schema(self) -> None:
+        response = MagicMock()
+        response.is_error = False
+        response.json.return_value = {"choices": [{"message": {"content": '{"ok":true}'}}]}
+        schema = {"type": "object", "properties": {"ok": {"type": "boolean"}},
+                  "required": ["ok"], "additionalProperties": False}
+
+        with (
+            patch.dict(os.environ, {"GROQ_API_KEY": "test-key"}, clear=True),
+            patch("qa_agent.llm.groq.httpx.post", return_value=response) as post,
+        ):
+            result = GroqProvider().create_structured_output(
+                "authoring prompt", schema, "test_case_authoring"
+            )
+
+        self.assertEqual(result, '{"ok":true}')
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["messages"][0]["content"], "authoring prompt")
+        self.assertEqual(payload["response_format"]["json_schema"]["schema"], schema)
+        self.assertTrue(payload["response_format"]["json_schema"]["strict"])
+
     def test_groq_prompt_and_schema_cover_all_actions(self) -> None:
         response = MagicMock()
         response.status_code = 200

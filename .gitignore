@@ -37,3 +37,5 @@ playwright/.cache/
 *.log
 /qa_agent.db
 /.qa_agent_evidence/
+
+/.evidence/

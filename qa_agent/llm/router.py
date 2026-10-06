@@ -228,3 +228,98 @@ class LLMRouter:
         if failures:
             raise RuntimeError("All LLM providers failed: " + "; ".join(failures))
         raise RuntimeError("No configured LLM providers are available. Unavailable providers: " + ", ".join(unavailable))
+
+    def create_structured_output(
+        self, prompt: str, schema: dict, schema_name: str
+    ) -> str:
+        """Route schema-constrained output through the configured provider chain."""
+        if not self._providers:
+            raise RuntimeError("No LLM providers are configured.")
+        self._selected_provider_name = None
+        self._report_priority()
+        failures: list[str] = []
+        unavailable: list[str] = []
+        for index, provider in enumerate(self._providers):
+            name = self._provider_name(provider)
+            if not provider.is_available:
+                unavailable.append(name)
+                self._record_provider_attempt(
+                    provider,
+                    RequestKind.TEST_CASE_AUTHORING,
+                    ProviderAttemptOutcome.UNAVAILABLE,
+                )
+                continue
+            started = time.perf_counter()
+            try:
+                output = provider.create_structured_output(prompt, schema, schema_name)
+            except RetryableLLMError as error:
+                reason = safe_failure_reason(error)
+                failures.append(f"{name}: {reason}")
+                self._record_provider_attempt(
+                    provider,
+                    RequestKind.TEST_CASE_AUTHORING,
+                    ProviderAttemptOutcome.RETRYABLE_ERROR,
+                    error=error,
+                    started=started,
+                )
+                if index + 1 < len(self._providers):
+                    print(
+                        f"LLM ROUTER: {name} structured-output request failed "
+                        f"({reason}); trying the next provider."
+                    )
+            except NonRetryableLLMError as error:
+                self._record_provider_attempt(
+                    provider,
+                    RequestKind.TEST_CASE_AUTHORING,
+                    ProviderAttemptOutcome.NON_RETRYABLE_ERROR,
+                    error=error,
+                    started=started,
+                )
+                raise
+            except NotImplementedError as error:
+                self._record_provider_attempt(
+                    provider,
+                    RequestKind.TEST_CASE_AUTHORING,
+                    ProviderAttemptOutcome.UNCLASSIFIED_ERROR,
+                    error=error,
+                    started=started,
+                )
+                raise RuntimeError(
+                    f"{name} does not support structured output."
+                ) from error
+            except Exception as error:
+                self._record_provider_attempt(
+                    provider,
+                    RequestKind.TEST_CASE_AUTHORING,
+                    ProviderAttemptOutcome.UNCLASSIFIED_ERROR,
+                    error=error,
+                    started=started,
+                )
+                raise
+            else:
+                if not isinstance(output, str):
+                    error = TypeError("provider structured output must be text")
+                    self._record_provider_attempt(
+                        provider,
+                        RequestKind.TEST_CASE_AUTHORING,
+                        ProviderAttemptOutcome.UNCLASSIFIED_ERROR,
+                        error=error,
+                        started=started,
+                    )
+                    raise error
+                self._record_provider_attempt(
+                    provider,
+                    RequestKind.TEST_CASE_AUTHORING,
+                    ProviderAttemptOutcome.SUCCESS,
+                    started=started,
+                    is_selected=True,
+                )
+                self._selected_provider_name = name
+                print(f"Selected provider: {self._selected_provider_name}")
+                return output
+        if failures:
+            raise RuntimeError("All LLM providers failed: " + "; ".join(failures))
+        raise RuntimeError(
+            "No configured LLM providers are available. Unavailable providers: "
+            + ", ".join(unavailable)
+        )

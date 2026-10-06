@@ -1,7 +1,10 @@
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from urllib.parse import urlencode
+from uuid import UUID
 
 from qa_agent.models import (
     ExecutionStatus,
@@ -15,7 +18,12 @@ from qa_agent.models import (
     TestStep as DomainTestStep,
     FailurePolicy,
 )
-from qa_agent.plan_execution import PlanExecutionService
+from qa_agent.browser_runner import BrowserRunner
+from qa_agent.llm.base import LLMProvider
+from qa_agent.llm.router import LLMRouter
+from qa_agent.models import QATestPlan
+from qa_agent.pipeline import QATestPipeline
+from qa_agent.plan_execution import PlanExecutionClassification, PlanExecutionService
 from qa_agent.pinned_execution import PinnedExecutionService, PlanVersionSet, StepPlanSelection
 from qa_agent.reporting import RunReportGenerator
 from qa_agent.run_history import RunHistoryService, WorkflowType
@@ -25,8 +33,13 @@ from qa_agent.sqlite_storage import (
     SQLitePlanStore,
     SQLiteRunHistoryRepository,
 )
-from qa_agent.web import LocalWebApplication
-from qa_agent.workflows import RegressionWorkflow, ValidationWorkflow
+from qa_agent.storage import create_sqlite_storage
+from qa_agent.test_case_authoring import TestCaseAuthoringService
+from qa_agent.test_case_decomposer import TestCaseDecomposer
+from qa_agent.test_case_execution import TestCaseExecutionService
+from qa_agent.test_plan_generator import LLMTestPlanGenerator
+from qa_agent.web import LocalWebApplication, create_http_server
+from qa_agent.workflows import AutomationWorkflow, RegressionWorkflow, ValidationWorkflow
 
 
 class ProductDemoSliceTests(unittest.TestCase):
@@ -198,6 +211,354 @@ class ProductDemoSliceTests(unittest.TestCase):
             self.assertEqual([item.run_id for item in recent], [passing.test_run.id, failed.test_run.id])
             self.assertEqual(recent[0].workflow_type, WorkflowType.REGRESSION)
             self.assertEqual(recent[1].workflow_type, WorkflowType.VALIDATION)
+
+    def test_ai_authoring_review_save_automation_real_browser_and_pinned_regression(self) -> None:
+        class DeterministicProvider(LLMProvider):
+            def create_test_plan(self, task, target_url, page_snapshot):
+                return QATestPlan(url=target_url, steps=[
+                    {"action": "navigate", "parameters": {"url": target_url}},
+                    {"action": "assert_text_contains", "parameters": {
+                        "expected_text": "Account confirmation displayed",
+                    }},
+                ])
+
+            def create_structured_output(self, prompt, schema, schema_name):
+                return (
+                    '{"preconditions":[],"segments":[{"steps":[{'
+                    '"name":"Verify registration confirmation",'
+                    '"description":"Open the registration page and verify the result.",'
+                    '"expected":"The account confirmation is displayed."}]}]}'
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "authoring-flow.sqlite3"
+            evidence_root = root / "evidence"
+            storage = create_sqlite_storage(database)
+            provider = DeterministicProvider()
+            router = LLMRouter([provider])
+            pipeline = QATestPipeline(
+                decomposer=TestCaseDecomposer(),
+                plan_generator=LLMTestPlanGenerator(router),
+                runner=BrowserRunner(evidence_root, headless=True),
+                plan_store=storage.plan_store,
+                execution_repository=storage.execution_repository,
+                run_history=storage.run_history,
+            )
+            run_service = TestCaseExecutionService(
+                storage.test_case_repository,
+                storage.plan_store,
+                storage.execution_repository,
+                storage.run_history,
+                evidence_directory=evidence_root,
+                automation_workflow=AutomationWorkflow(pipeline),
+            )
+            application = LocalWebApplication(
+                storage.run_history,
+                evidence_root=evidence_root,
+                test_cases=storage.test_case_repository,
+                run_service=run_service,
+                authoring_service=TestCaseAuthoringService(LLMRouter([provider])),
+            )
+            server = create_http_server(application, host="127.0.0.1", port=0)
+            port = server.server_address[1]
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            base_url = f"http://127.0.0.1:{port}/demo-target/registration"
+            try:
+                created = application.handle(
+                    "POST",
+                    "/test-cases/generate",
+                    urlencode({
+                        "name": "AI registration flow",
+                        "base_url": base_url,
+                        "scenario": "Register a user and verify the account confirmation.",
+                    }),
+                )
+                self.assertEqual(created.status, 303)
+                token = created.headers["Location"].rsplit("/", 1)[1]
+                review = application.handle("GET", created.headers["Location"])
+                self.assertIn(b"Verify registration confirmation", review.body)
+                self.assertEqual(storage.test_case_repository.list(), [])
+
+                saved = application.handle(
+                    "POST", f"/test-cases/review/{token}/save", b""
+                )
+                self.assertEqual(saved.status, 303)
+                case_id = UUID(saved.headers["Location"].rsplit("/", 1)[1])
+                case = storage.test_case_repository.get(case_id)
+                self.assertIsNotNone(case)
+                self.assertEqual(storage.run_history.list_for_test_case(case_id), [])
+                before_run = application.handle("GET", saved.headers["Location"])
+                self.assertIn(b"NOT RUN", before_run.body)
+                self.assertIn(b"Never", before_run.body)
+                self.assertIn(b"Validation", before_run.body)
+                self.assertIn(b"Regression", before_run.body)
+                self.assertEqual(before_run.body.count(b"Not ready"), 2)
+
+                unavailable = application.handle(
+                    "POST", f"/test-cases/{case_id}/run", b"workflow=VALIDATION"
+                )
+                self.assertEqual(unavailable.status, 409)
+                self.assertEqual(storage.run_history.list_for_test_case(case_id), [])
+
+                automation = application.handle(
+                    "POST", f"/test-cases/{case_id}/run", b"workflow=AUTOMATION"
+                )
+                self.assertEqual(automation.status, 303)
+                automation_id = UUID(automation.headers["Location"].rsplit("/", 1)[1])
+                automation_record = storage.run_history.get(automation_id)
+                self.assertEqual(automation_record.workflow_type, WorkflowType.AUTOMATION)
+                self.assertEqual(automation_record.status, ExecutionStatus.FAILED)
+                self.assertEqual(len(storage.run_history.list_for_test_case(case_id)), 1)
+                self.assertEqual(run_service.workflow_availability(case_id).usable_plan_count, 1)
+                after_automation = application.handle("GET", saved.headers["Location"])
+                self.assertEqual(after_automation.body.count(b"Available"), 3)
+                self.assertIn(b"v1", after_automation.body)
+                plan_version = storage.plan_store.find(case.steps[0].id)
+                self.assertIn(str(plan_version.id)[:8].encode(), after_automation.body)
+
+                automation_detail = storage.run_history.get_detail(automation_id)
+                failed_execution = next(
+                    execution for execution in automation_detail.executions.values()
+                    if execution.evidence
+                )
+                evidence = application.handle(
+                    "GET",
+                    f"/runs/{automation_id}/evidence/{failed_execution.id}/0",
+                )
+                self.assertEqual(evidence.status, 200)
+                self.assertEqual(evidence.content_type, "image/png")
+                report = application.handle("GET", f"/runs/{automation_id}/report.json")
+                self.assertEqual(report.status, 200)
+                parsed_report = json.loads(report.body)
+                self.assertEqual(parsed_report["workflow_type"], WorkflowType.AUTOMATION.value)
+                self.assertEqual(parsed_report["steps"][0]["attempts"][0]["test_plan_version_id"],
+                                 str(automation_record.executions[0].test_plan_version_id))
+
+                regression = application.handle(
+                    "POST", f"/test-cases/{case_id}/run", b"workflow=REGRESSION"
+                )
+                self.assertEqual(regression.status, 303)
+                regression_id = UUID(regression.headers["Location"].rsplit("/", 1)[1])
+                regression_record = storage.run_history.get(regression_id)
+                self.assertEqual(regression_record.workflow_type, WorkflowType.REGRESSION)
+                self.assertEqual(regression_record.outcome, "PRODUCT_FAILURE")
+                self.assertEqual(len(storage.run_history.list_for_test_case(case_id)), 2)
+                self.assertEqual(regression_record.executions[0].test_plan_version_id, plan_version.id)
+                run_page = application.handle("GET", regression.headers["Location"])
+                self.assertEqual(run_page.status, 200)
+                self.assertIn(b"FAILED", run_page.body)
+            finally:
+                server.shutdown()
+                server.server_close()
+                server_thread.join(timeout=5)
+
+    def test_ai_authored_four_step_automation_keeps_product_failure_semantics(self) -> None:
+        class FourStepProvider(LLMProvider):
+            def __init__(self):
+                self.plan_calls = 0
+
+            def create_structured_output(self, prompt, schema, schema_name):
+                return json.dumps({
+                    "preconditions": [],
+                    "segments": [{"steps": [
+                        {
+                            "name": "Open registration page",
+                            "description": "Open the local registration form.",
+                            "expected": "The email input is visible.",
+                        },
+                        {
+                            "name": "Enter user details",
+                            "description": "Populate the email field.",
+                            "expected": "The email field contains the demo address.",
+                        },
+                        {
+                            "name": "Submit registration",
+                            "description": "Submit the registration form.",
+                            "expected": "The registration action is processed.",
+                        },
+                        {
+                            "name": "Verify confirmation state",
+                            "description": "Verify the account-created confirmation.",
+                            "expected": "The account-created confirmation is displayed.",
+                        },
+                    ]}],
+                })
+
+            def create_test_plan(self, task, target_url, page_snapshot):
+                self.plan_calls += 1
+                snapshot = json.loads(page_snapshot)
+                elements = snapshot["interactive_elements"]
+                email_selector = next(
+                    item["selector"] for item in elements
+                    if item["accessible_name"].casefold() == "email"
+                )
+                submit_selector = next(
+                    item["selector"] for item in elements
+                    if item["accessible_name"].casefold() == "create account"
+                )
+                actions = {
+                    1: [
+                        {"action": "navigate", "parameters": {"url": target_url}},
+                        {"action": "assert_visible", "parameters": {
+                            "selector": email_selector,
+                            "expected_text": None,
+                        }},
+                    ],
+                    2: [
+                        {"action": "navigate", "parameters": {"url": target_url}},
+                        {"action": "fill", "parameters": {
+                            "selector": email_selector,
+                            "value": "qa.demo@example.test",
+                        }},
+                    ],
+                    3: [
+                        {"action": "navigate", "parameters": {"url": target_url}},
+                        {"action": "click", "parameters": {"selector": submit_selector}},
+                    ],
+                    4: [
+                        {"action": "navigate", "parameters": {"url": target_url}},
+                        {"action": "assert_text_contains", "parameters": {
+                            "expected_text": "Account created successfully",
+                        }},
+                    ],
+                }[self.plan_calls]
+                return QATestPlan(url=target_url, steps=actions)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "four-step-automation.sqlite3"
+            evidence_root = root / "evidence"
+            storage = create_sqlite_storage(database)
+            provider = FourStepProvider()
+            router = LLMRouter([provider])
+            pipeline = QATestPipeline(
+                decomposer=TestCaseDecomposer(),
+                plan_generator=LLMTestPlanGenerator(router),
+                runner=BrowserRunner(evidence_root, headless=True),
+                plan_store=storage.plan_store,
+                execution_repository=storage.execution_repository,
+                run_history=storage.run_history,
+            )
+            run_service = TestCaseExecutionService(
+                storage.test_case_repository,
+                storage.plan_store,
+                storage.execution_repository,
+                storage.run_history,
+                evidence_directory=evidence_root,
+                automation_workflow=AutomationWorkflow(pipeline),
+            )
+            application = LocalWebApplication(
+                storage.run_history,
+                evidence_root=evidence_root,
+                test_cases=storage.test_case_repository,
+                run_service=run_service,
+                authoring_service=TestCaseAuthoringService(LLMRouter([provider])),
+            )
+            server = create_http_server(application, host="127.0.0.1", port=0)
+            port = server.server_address[1]
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            base_url = f"http://127.0.0.1:{port}/demo-target/registration"
+            try:
+                created = application.handle(
+                    "POST",
+                    "/test-cases/generate",
+                    urlencode({
+                        "name": "Local registration AI test",
+                        "base_url": base_url,
+                        "scenario": "Register a user and verify the account confirmation.",
+                    }),
+                )
+                self.assertEqual(created.status, 303)
+                token = created.headers["Location"].rsplit("/", 1)[1]
+                saved = application.handle(
+                    "POST", f"/test-cases/review/{token}/save", b""
+                )
+                self.assertEqual(saved.status, 303)
+                case_id = UUID(saved.headers["Location"].rsplit("/", 1)[1])
+
+                run_response = application.handle(
+                    "POST", f"/test-cases/{case_id}/run", b"workflow=AUTOMATION"
+                )
+                self.assertEqual(run_response.status, 303)
+                run_id = UUID(run_response.headers["Location"].rsplit("/", 1)[1])
+
+                case = storage.test_case_repository.get(case_id)
+                self.assertEqual(len(case.steps), 4)
+                self.assertEqual(provider.plan_calls, 4)
+                self.assertEqual(run_service.workflow_availability(case_id).usable_plan_count, 4)
+                first_version = storage.plan_store.find(case.steps[0].id)
+                first_plan = storage.plan_store.find_test_plan(case.steps[0].id)
+                self.assertEqual(first_plan.test_step_id, case.steps[0].id)
+                self.assertEqual(first_version.qa_test_plan.url, base_url)
+                self.assertEqual(
+                    first_version.qa_test_plan.steps[0].parameters["url"],
+                    base_url,
+                )
+                history = storage.run_history.list_for_test_case(case_id)
+                self.assertEqual(len(history), 1)
+                record = history[0]
+                self.assertEqual(record.run_id, run_id)
+                self.assertEqual(record.workflow_type, WorkflowType.AUTOMATION)
+                self.assertEqual(record.outcome, "PRODUCT_FAILURE")
+                self.assertEqual(record.status, ExecutionStatus.FAILED)
+                self.assertEqual(
+                    [step.status for step in record.steps],
+                    [
+                        ExecutionStatus.PASSED,
+                        ExecutionStatus.PASSED,
+                        ExecutionStatus.PASSED,
+                        ExecutionStatus.FAILED,
+                    ],
+                )
+
+                detail = storage.run_history.get_detail(run_id)
+                first_execution = detail.executions[
+                    next(item.execution_id for item in record.executions
+                         if item.test_step_id == case.steps[0].id)
+                ]
+                self.assertIsNone(first_execution.error)
+                self.assertEqual(first_execution.status, ExecutionStatus.PASSED)
+                failed_execution = detail.executions[
+                    next(item.execution_id for item in record.executions
+                         if item.test_step_id == case.steps[3].id)
+                ]
+                self.assertEqual(failed_execution.status, ExecutionStatus.FAILED)
+                self.assertEqual(
+                    PlanExecutionService._classify(failed_execution, None),
+                    PlanExecutionClassification.PRODUCT_FAILURE,
+                )
+                self.assertIn(
+                    "Account created successfully",
+                    failed_execution.error,
+                )
+                self.assertNotIn("NoneType", failed_execution.error)
+                self.assertTrue(failed_execution.evidence)
+                screenshot_path = Path(failed_execution.evidence[0].path)
+                self.assertTrue(screenshot_path.is_file())
+                self.assertTrue(screenshot_path.is_relative_to(evidence_root.resolve()))
+
+                report = RunReportGenerator().generate_history(detail)
+                report_json = json.loads(report.to_json())
+                self.assertEqual(report_json["outcome"], "PRODUCT_FAILURE")
+                self.assertEqual(
+                    [step["status"] for step in report_json["steps"]],
+                    ["PASSED", "PASSED", "PASSED", "FAILED"],
+                )
+                self.assertIn("PRODUCT FAILURE", RunReportGenerator().to_html(report))
+
+                evidence = application.handle(
+                    "GET", f"/runs/{run_id}/evidence/{failed_execution.id}/0"
+                )
+                self.assertEqual(evidence.status, 200)
+                self.assertEqual(evidence.content_type, "image/png")
+                self.assertTrue(evidence.body.startswith(b"\x89PNG\r\n\x1a\n"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                server_thread.join(timeout=5)
 
 
 class _Setup:

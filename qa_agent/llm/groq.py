@@ -193,3 +193,46 @@ class GroqProvider(LLMProvider):
             return AIDiscoveryResult.model_validate_json(output)
         except Exception as error:
             raise RetryableLLMError(f"Groq returned invalid Discovery data: {error}") from error
+
+    def create_structured_output(
+        self, prompt: str, schema: dict[str, Any], schema_name: str
+    ) -> str:
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            raise NonRetryableLLMError("GROQ_API_KEY is not set.")
+        payload = {
+            "model": os.getenv("GROQ_MODEL", self._model),
+            "max_completion_tokens": 4096,
+            "messages": [{"role": "user", "content": prompt}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "strict": True,
+                    "schema": schema,
+                },
+            },
+        }
+        try:
+            response = httpx.post(
+                self._endpoint,
+                headers={"Authorization": f"Bearer {api_key}"},
+                json=payload,
+                timeout=30.0,
+            )
+        except httpx.TimeoutException as error:
+            raise RetryableLLMError("Groq request timed out.") from error
+        except httpx.RequestError as error:
+            raise RetryableLLMError(
+                f"Groq transport failure: {type(error).__name__}."
+            ) from error
+        if response.is_error:
+            raise RetryableLLMError(
+                f"Groq structured-output request failed with HTTP {response.status_code}."
+            )
+        try:
+            return response.json()["choices"][0]["message"]["content"]
+        except Exception as error:
+            raise RetryableLLMError(
+                "Groq returned an invalid structured-output response."
+            ) from error

@@ -343,6 +343,19 @@ class QATestPipelineTests(unittest.TestCase):
         self.assertEqual(saved.test_case_id, self.test_case.id)
         self.assertEqual(saved.executions[0].execution_id, result.executions[0].id)
 
+    def test_run_test_case_executes_supplied_canonical_case_without_decomposing(self) -> None:
+        result = self.pipeline.run_test_case(self.test_case)
+
+        self.assertIs(result.test_case, self.test_case)
+        self.assertEqual(
+            [event[0] for event in self.events],
+            ["discovery", "generator", "runner", "discovery", "generator", "runner"],
+        )
+        self.assertEqual([item.test_step_id for item in result.executions], [
+            self.test_case.steps[1].id,
+            self.test_case.steps[0].id,
+        ])
+
     def test_failed_runner_evidence_is_attached_to_execution(self) -> None:
         def runner(plan: QATestPlan) -> dict[str, Any]:
             return {

@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from qa_agent.demo import seed_demo_data
 from qa_agent.models import (
@@ -97,6 +98,75 @@ class TestCaseExecutionServiceTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RunUnavailableError, "Automation is not available"):
             service.run(self.local_case.id, WorkflowType.AUTOMATION)
+        self.assertEqual(self.storage.run_history.list_for_test_case(self.local_case.id), [])
+
+    def test_complete_plan_set_makes_validation_and_regression_available(self) -> None:
+        service = RunCaseService(
+            self.storage.test_case_repository,
+            self.storage.plan_store,
+            self.storage.execution_repository,
+            self.storage.run_history,
+        )
+
+        availability = service.workflow_availability(self.local_case.id)
+
+        self.assertFalse(availability.automation_available)
+        self.assertTrue(availability.validation_available)
+        self.assertTrue(availability.regression_available)
+        self.assertEqual(availability.usable_plan_count, len(self.local_case.steps))
+        self.assertEqual(
+            [item[2] for item in availability.plan_versions],
+            [self.storage.plan_store.find(step.id).id for step in self.local_case.steps],
+        )
+
+    def test_incomplete_plan_set_keeps_pinned_workflows_unavailable(self) -> None:
+        case = DomainTestCase(
+            name="One missing plan",
+            description="Check a page.",
+            segments=[ExecutionSegment(order=0, steps=[DomainTestStep(
+                name="Check title", description="Open the page.",
+                expected="A title is present.", order=0,
+            )])],
+        )
+        self.storage.test_case_repository.save(case)
+        service = RunCaseService(
+            self.storage.test_case_repository,
+            self.storage.plan_store,
+            self.storage.execution_repository,
+            self.storage.run_history,
+        )
+
+        availability = service.workflow_availability(case.id)
+
+        self.assertFalse(availability.validation_available)
+        self.assertFalse(availability.regression_available)
+        self.assertEqual(availability.reason, "No complete automation version has been generated yet.")
+        with self.assertRaisesRegex(RunUnavailableError, "no saved plan"):
+            service.run(case.id, WorkflowType.VALIDATION)
+
+    def test_automation_delegates_to_existing_workflow_for_canonical_case(self) -> None:
+        class FakeAutomation:
+            def __init__(self):
+                self.received = []
+
+            def run_test_case(self, test_case, run_context):
+                self.received.append((test_case, run_context))
+                return SimpleNamespace(test_run=SimpleNamespace(id="run-automation"))
+
+        automation = FakeAutomation()
+        service = RunCaseService(
+            self.storage.test_case_repository,
+            self.storage.plan_store,
+            self.storage.execution_repository,
+            self.storage.run_history,
+            automation_workflow=automation,
+        )
+
+        result = service.run(self.local_case.id, WorkflowType.AUTOMATION)
+
+        self.assertEqual(result.test_run.id, "run-automation")
+        self.assertEqual(len(automation.received), 1)
+        self.assertEqual(automation.received[0][0].id, self.local_case.id)
         self.assertEqual(self.storage.run_history.list_for_test_case(self.local_case.id), [])
 
 

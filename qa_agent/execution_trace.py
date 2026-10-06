@@ -54,6 +54,7 @@ class TraceStatus(str, Enum):
 class RequestKind(str, Enum):
     TEST_PLAN = "TEST_PLAN"
     DISCOVERY = "DISCOVERY"
+    TEST_CASE_AUTHORING = "TEST_CASE_AUTHORING"
 
 
 class ProviderAttemptOutcome(str, Enum):

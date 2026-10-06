@@ -453,7 +453,7 @@ class PersistedTestCaseRunUiTests(unittest.TestCase):
         invalid_response = self.app.handle(
             "POST",
             f"/test-cases/{self.case.id}/run",
-            b"workflow=AUTOMATION",
+            b"workflow=UNKNOWN",
         )
 
         self.assertEqual(get_response.status, 405)

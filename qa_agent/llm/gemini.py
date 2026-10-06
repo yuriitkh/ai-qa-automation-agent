@@ -164,3 +164,22 @@ class GeminiProvider(LLMProvider):
             return AIDiscoveryResult.model_validate_json(response.output_text)
         except Exception as error:
             _raise_for_gemini_error(error, "Discovery request")
+
+    def create_structured_output(
+        self, prompt: str, schema: dict[str, object], schema_name: str
+    ) -> str:
+        if self._client is None:
+            raise NonRetryableLLMError("Gemini provider is unavailable.")
+        try:
+            response = self._client.interactions.create(
+                model=self._model,
+                input=prompt,
+                response_format={
+                    "type": "text",
+                    "mime_type": "application/json",
+                    "schema": schema,
+                },
+            )
+            return response.output_text
+        except Exception as error:
+            _raise_for_gemini_error(error, f"{schema_name} request")

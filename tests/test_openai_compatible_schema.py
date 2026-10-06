@@ -85,6 +85,28 @@ class OpenAICompatibleSchemaTests(unittest.TestCase):
 
         assert_every_object_closed(schema)
 
+    def test_provider_accepts_generic_structured_output_schema(self):
+        response = MagicMock()
+        response.choices[0].message.content = '{"steps":[]}'
+        schema = {
+            "type": "object",
+            "properties": {"steps": {"type": "array", "items": {"type": "string"}}},
+            "required": ["steps"],
+        }
+        with patch.dict(os.environ, {"TEST_LLM_KEY": "unit-test-key"}, clear=True), \
+             patch("qa_agent.llm.openai_compatible.OpenAI") as client_cls:
+            client_cls.return_value.chat.completions.create.return_value = response
+            provider = OpenAICompatibleProvider("test", "TEST_LLM_KEY", "test-model")
+            result = provider.create_structured_output("safe prompt", schema, "test_case_authoring")
+
+        self.assertEqual(result, '{"steps":[]}')
+        request = client_cls.return_value.chat.completions.create.call_args.kwargs
+        self.assertEqual(request["messages"], [{"role": "user", "content": "safe prompt"}])
+        self.assertEqual(
+            request["response_format"]["json_schema"]["schema"],
+            normalize_strict_json_schema(schema),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

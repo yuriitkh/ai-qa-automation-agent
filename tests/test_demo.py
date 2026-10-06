@@ -118,7 +118,7 @@ class DemoSeedTests(unittest.TestCase):
         local_detail = self.application.handle("GET", f"/test-cases/{local_case.id}")
         self.assertEqual(local_detail.status, 200)
         self.assertIn(b"No runs yet.", local_detail.body)
-        self.assertIn(b"Start run", local_detail.body)
+        self.assertIn(b"Run Validation", local_detail.body)
 
         for record in records:
             if record.run_id not in first.run_ids:

@@ -124,6 +124,29 @@ class QATestPipeline:
         base_url: str | None = None,
         run_context: RunContext | None = None,
     ) -> PipelineResult:
+        return self._run_entry(task, base_url, run_context, supplied_test_case=None)
+
+    def run_test_case(
+        self,
+        test_case: TestCase,
+        run_context: RunContext | None = None,
+    ) -> PipelineResult:
+        """Run a persisted canonical TestCase without decomposing its text again."""
+        return self._run_entry(
+            test_case.description,
+            test_case.base_url,
+            run_context,
+            supplied_test_case=test_case,
+        )
+
+    def _run_entry(
+        self,
+        task: str,
+        base_url: str | None,
+        run_context: RunContext | None,
+        *,
+        supplied_test_case: TestCase | None,
+    ) -> PipelineResult:
         """Run each decomposed step and return plans and executions together.
 
         The execution trace is an observability layer only: recording is
@@ -134,7 +157,13 @@ class QATestPipeline:
         trace = self._create_trace_recorder(task)
         with active_trace_recorder(trace):
             try:
-                result = self._run(task, base_url, trace, active_run_context)
+                result = self._run(
+                    task,
+                    base_url,
+                    trace,
+                    active_run_context,
+                    supplied_test_case=supplied_test_case,
+                )
             except PipelineStageError as error:
                 error.trace = record_safely(
                     trace,
@@ -152,11 +181,7 @@ class QATestPipeline:
                 result.test_case,
                 result.test_run,
                 workflow_type=WorkflowType.AUTOMATION,
-                outcome=(
-                    "PASSED"
-                    if result.test_run.status == ExecutionStatus.PASSED
-                    else "FAILED"
-                ),
+                outcome=_automation_run_outcome(result.test_run),
                 trace_id=result.trace.trace_id if result.trace is not None else None,
                 started_at=result.trace.started_at if result.trace is not None else None,
                 finished_at=result.trace.finished_at if result.trace is not None else None,
@@ -172,10 +197,16 @@ class QATestPipeline:
         base_url: str | None,
         trace: ExecutionTraceRecorder,
         run_context: RunContext,
+        *,
+        supplied_test_case: TestCase | None = None,
     ) -> PipelineResult:
         decomposition_started = time.perf_counter()
         try:
-            test_case = self._decomposer.decompose(task, base_url)
+            test_case = (
+                supplied_test_case
+                if supplied_test_case is not None
+                else self._decomposer.decompose(task, base_url)
+            )
         except Exception as error:
             raise PipelineStageError("decomposition", str(error)) from error
         record_safely(
@@ -515,6 +546,7 @@ class QATestPipeline:
             run_context=run_context,
         )
 
+
     def _execute_plan(
         self,
         test_step: TestStep,
@@ -546,6 +578,25 @@ class QATestPipeline:
                 str(outcome.error),
             ) from outcome.error
         return outcome
+
+
+def _automation_run_outcome(test_run: TestRun) -> str:
+    """Preserve product-failure classification in completed Automation runs."""
+    if test_run.status == ExecutionStatus.PASSED:
+        return "PASSED"
+
+    failed_executions = [
+        execution
+        for execution in test_run.final_executions
+        if execution.status == ExecutionStatus.FAILED
+    ]
+    if failed_executions and all(
+        PlanExecutionService._classify(execution, None)
+        == PlanExecutionClassification.PRODUCT_FAILURE
+        for execution in failed_executions
+    ):
+        return PlanExecutionClassification.PRODUCT_FAILURE.value
+    return "FAILED"
 
 
 def _should_block_rest(test_step: TestStep, execution: Execution) -> bool:
