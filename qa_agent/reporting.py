@@ -2,7 +2,6 @@
 
 from pathlib import Path
 from datetime import datetime
-from html import escape
 from typing import Any
 from uuid import UUID
 from collections.abc import Callable, Mapping
@@ -10,6 +9,15 @@ from collections.abc import Callable, Mapping
 from pydantic import BaseModel, ConfigDict, Field
 
 from qa_agent.models import Evidence, EvidenceType, Execution, ExecutionStatus, TestRun
+from qa_agent.presentation import (
+    UI_CSS,
+    badge as presentation_badge,
+    escape_html,
+    format_duration,
+    format_timestamp,
+    outcome_tone,
+    short_id,
+)
 from qa_agent.redaction import redact_secrets
 from qa_agent.run_history import (
     HistoryExecutionReference,
@@ -329,107 +337,213 @@ class RunReportGenerator:
         self,
         report: RunReport,
         *,
-        evidence_url: Callable[[RunStepReport, RunAttemptReport, RunEvidenceReport, int], str] | None = None,
+        evidence_url: Callable[
+            [RunStepReport, RunAttemptReport, RunEvidenceReport, int], str | None
+        ] | None = None,
+        show_html_report_link: bool = True,
     ) -> str:
-        """Render a standalone document; evidence links are supplied by a safe host."""
-        esc = lambda value: escape(str(value), quote=True)
-        badge_status = esc(report.status.value)
-        steps_html = []
-        for step in report.steps:
-            attempts_html = []
+        """Render a standalone, safe HTML report; evidence URLs come from the host."""
+        esc = escape_html
+        special_outcomes = {
+            "PRODUCT_FAILURE": (
+                "The automation executed the check and detected unexpected product behavior."
+            ),
+            "AUTOMATION_DRIFT": "The automation no longer matches the UI.",
+            "INFRASTRUCTURE_ERROR": "The test could not be reliably executed.",
+            "SETUP_FAILURE": "Setup failed, so product execution did not begin.",
+        }
+        steps_html: list[str] = []
+        for number, step in enumerate(report.steps, start=1):
+            attempts_html: list[str] = []
+            evidence_available = False
             for attempt in step.attempts:
-                evidence_html = []
-                for evidence_index, evidence in enumerate(attempt.evidence):
-                    name = esc(evidence.name)
-                    if evidence_url is None:
-                        evidence_html.append(f"<li>{name}</li>")
-                    else:
-                        url = esc(evidence_url(step, attempt, evidence, evidence_index))
-                        evidence_html.append(
-                            f'<li><a href="{url}"><img class="evidence" src="{url}" '
-                            f'alt="{name}"><br>{name}</a></li>'
+                details: list[str] = []
+                if attempt.status == ExecutionStatus.FAILED:
+                    details.append(
+                        '<div class="detail-grid">'
+                        f'<div class="detail-box"><h4>Expected</h4><p>{esc(step.expected)}</p></div>'
+                        f'<div class="detail-box"><h4>Actual</h4><p>{esc(_display_value(attempt.actual_result))}</p></div>'
+                        "</div>"
+                    )
+                    if attempt.error:
+                        details.append(
+                            f'<div class="notice danger"><strong>Error:</strong> {esc(attempt.error)}</div>'
                         )
-                attempt_detail = []
-                if attempt.error:
-                    attempt_detail.append(f"<p><strong>Error:</strong> {esc(attempt.error)}</p>")
-                if attempt.actual_result is not None:
-                    attempt_detail.append(
-                        f"<p><strong>Actual:</strong> {esc(_display_value(attempt.actual_result))}</p>"
+                elif attempt.actual_result is not None:
+                    details.append(
+                        f'<p class="muted"><strong>Observed:</strong> '
+                        f'{esc(_display_value(attempt.actual_result))}</p>'
+                    )
+
+                if attempt.status == ExecutionStatus.FAILED:
+                    version_value = (
+                        f'<code title="{esc(attempt.test_plan_version_id)}">'
+                        f'{esc(short_id(attempt.test_plan_version_id))}</code>'
+                    )
+                else:
+                    version_value = (
+                        f'<code title="{esc(attempt.test_plan_version_id)}">'
+                        f'{esc(short_id(attempt.test_plan_version_id))}</code>'
+                    )
+                details.append(
+                    f'<p class="muted"><strong>Automation · Plan version:</strong> {version_value}</p>'
+                )
+                if attempt.duration_ms is not None:
+                    details.append(
+                        f'<p class="muted">Attempt duration: {esc(format_duration(attempt.duration_ms))}</p>'
                     )
                 if attempt.evidence:
-                    attempt_detail.append(
-                        "<p><strong>Evidence</strong></p><ul>" + "".join(evidence_html) + "</ul>"
+                    evidence_items = []
+                    for evidence_index, evidence in enumerate(attempt.evidence):
+                        name = esc(evidence.name)
+                        url = evidence_url(step, attempt, evidence, evidence_index) if evidence_url else None
+                        if url:
+                            safe_url = esc(url)
+                            evidence_items.append(
+                                f'<a href="{safe_url}" target="_blank" rel="noopener">'
+                                f'<img class="evidence-preview" src="{safe_url}" alt="Screenshot: {name}">'
+                                f"Open {name}</a>"
+                            )
+                            evidence_available = True
+                        elif evidence_url is None:
+                            evidence_items.append(
+                                f'<span>{name} (local image link unavailable in exported file)</span>'
+                            )
+                        else:
+                            evidence_items.append(f'<span class="muted">{name} — unavailable</span>')
+                    details.append(
+                        '<div class="detail-box"><h4>Evidence</h4>'
+                        + "<br>".join(evidence_items)
+                        + "</div>"
                     )
+                elif not evidence_available:
+                    details.append('<p class="muted">No evidence available.</p>')
+
                 attempts_html.append(
-                    f'<div class="attempt"><strong>Attempt {esc(attempt.status.value)}</strong> '
-                    f'<span class="muted">Plan version {esc(attempt.test_plan_version_id)}</span>'
-                    + "".join(attempt_detail)
+                    '<div class="detail-box"><div class="status-line">'
+                    + presentation_badge(attempt.status.value)
+                    + f'<span class="muted">Attempt · {esc(format_timestamp(attempt.started_at))}</span>'
+                    + "</div>"
+                    + "".join(details)
                     + "</div>"
                 )
+
+            status_class = "passed" if step.status == "PASSED" else "failed" if step.status == "FAILED" else "blocked" if step.status == "BLOCKED" else ""
+            if step.status == "BLOCKED":
+                outcome_detail = (
+                    '<div class="notice warning">Not executed because a previous step '
+                    "blocked continuation.</div>"
+                )
+            elif not step.attempts:
+                outcome_detail = '<p class="muted">No execution attempt was recorded.</p>'
+            else:
+                outcome_detail = "".join(attempts_html)
             steps_html.append(
-                f'<article class="step"><h3><span class="badge {esc(step.status.lower())}">'
-                f'{esc(step.status)}</span> Step {step.order} — {esc(step.name)}</h3>'
-                f'<p>{esc(step.description)}</p><p><strong>Expected:</strong> {esc(step.expected)}</p>'
-                + ("".join(attempts_html) if attempts_html else '<p class="muted">No execution attempt.</p>')
+                f'<article class="step-card {status_class}"><div class="step-heading">'
+                + presentation_badge(step.status, title=f"Step status: {step.status}")
+                + f"<h3>Step {number} — {esc(step.name)}</h3></div>"
+                + (f'<p class="muted">{esc(step.description)}</p>' if step.description else "")
+                + (f'<p><strong>Expected:</strong> {esc(step.expected)}</p>' if step.status != "FAILED" else "")
+                + outcome_detail
                 + "</article>"
             )
 
-        preconditions_html = ""
+        setup_html = ""
         if report.preconditions or report.setup_status is not None:
-            preconditions_html = "<section><h2>Initial conditions / Setup</h2><ul>" + "".join(
-                f"<li><strong>{esc(item.status or 'NOT_RUN')}</strong> — "
-                f"{esc(item.description)}"
-                + (f"<p>{esc(item.error)}</p>" if item.error else "")
-                + "</li>"
-                for item in report.preconditions
-            ) + "</ul>"
-            if report.setup_status:
-                preconditions_html += f"<p>Setup: {esc(report.setup_status)}</p>"
-            preconditions_html += "</section>"
+            rows = []
+            for condition in report.preconditions:
+                rows.append(
+                    "<li>"
+                    + (presentation_badge(condition.status) + " " if condition.status else "")
+                    + esc(condition.description)
+                    + (f'<p class="muted">{esc(condition.error)}</p>' if condition.error else "")
+                    + "</li>"
+                )
+            status = report.setup_status
+            summary = presentation_badge(status) if status else '<span class="muted">Not recorded</span>'
+            no_execution = (
+                '<div class="notice danger">Setup did not succeed; product execution did not begin.</div>'
+                if status and status != "SUCCEEDED"
+                else ""
+            )
+            setup_html = (
+                '<section class="panel"><h2>Preconditions and setup</h2>'
+                f'<p>Setup: {summary}</p>{no_execution}'
+                + ("<ul>" + "".join(rows) + "</ul>" if rows else '<p class="muted">No preconditions recorded.</p>')
+                + "</section>"
+            )
 
         cleanup_html = ""
         if report.cleanup_succeeded is not None:
-            cleanup_status = "SUCCEEDED" if report.cleanup_succeeded else "FAILED"
+            cleanup_key = "SUCCEEDED" if report.cleanup_succeeded else "CLEANUP_FAILURE"
+            failures = "".join(
+                f'<div class="notice warning"><strong>{esc(item.get("label", "Cleanup"))}:</strong> '
+                f'{esc(item.get("message", "Cleanup failed."))}</div>'
+                for item in report.cleanup_failures
+            )
             cleanup_html = (
-                f"<section><h2>Cleanup</h2><p>{cleanup_status}</p>"
-                + "".join(
-                    f"<p>{esc(item.get('label', 'cleanup'))}: "
-                    f"{esc(item.get('message', 'Cleanup failed.'))}</p>"
-                    for item in report.cleanup_failures
-                )
+                '<section class="panel"><h2>Cleanup</h2>'
+                + presentation_badge(cleanup_key)
+                + ("<p>Cleanup completed successfully.</p>" if report.cleanup_succeeded else "<p>Cleanup had failures; the primary run result remains shown above.</p>")
+                + failures
                 + "</section>"
             )
-        duration = (
-            f"{report.duration_ms} ms" if report.duration_ms is not None else "Unavailable"
+
+        result_heading = presentation_badge(report.status.value)
+        outcome_badge = presentation_badge(report.outcome, outcome_tone(report.outcome))
+        outcome_text = special_outcomes.get(report.outcome)
+        if not outcome_text and report.cleanup_succeeded is False:
+            outcome_text = "Cleanup failed after the primary test result was recorded."
+        actions = [
+            f'<a class="button" href="/test-cases/{esc(report.test_case_id)}">Back to TestCase</a>',
+            f'<a class="button" href="/runs/{esc(report.run_id)}/report.json">View JSON</a>',
+        ]
+        if show_html_report_link:
+            actions.append(f'<a class="button" href="/runs/{esc(report.run_id)}/report.html">View HTML Report</a>')
+        summary = (
+            '<section class="panel"><div class="status-line">'
+            + result_heading
+            + presentation_badge(report.workflow_type.value, "workflow")
+            + outcome_badge
+            + "</div>"
+            + (f'<div class="notice {"danger" if report.outcome == "PRODUCT_FAILURE" else "warning" if report.outcome in {"SETUP_FAILURE", "CLEANUP_FAILURE"} else ""}">{esc(outcome_text)}</div>' if outcome_text else "")
+            + '<div class="meta-grid">'
+            + _report_meta("Started", format_timestamp(report.started_at))
+            + _report_meta("Finished", format_timestamp(report.finished_at))
+            + _report_meta("Duration", format_duration(report.duration_ms))
+            + _report_meta("Run ID", f'<code title="{esc(report.run_id)}">{esc(short_id(report.run_id))}</code>', raw=True)
+            + _report_meta("Base URL", report.base_url or "Unavailable")
+            + _report_meta("TestCase ID", f'<code title="{esc(report.test_case_id)}">{esc(short_id(report.test_case_id))}</code>', raw=True)
+            + "</div></section>"
         )
+        navigation = (
+            '<header class="topbar"><div class="shell topbar-inner">'
+            '<a class="brand" href="/">AI QA Agent</a><nav class="nav-links" aria-label="Main navigation">'
+            '<a href="/">Dashboard</a><a href="/test-cases">Test Cases</a><a href="/runs">Runs</a>'
+            "</nav></div></header>"
+        )
+        title = f"{esc(report.test_case_name)} — Run report"
         return (
             "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-            f"<title>AI QA Agent Report — {esc(report.test_case_name)}</title>"
-            "<style>body{font:16px system-ui,sans-serif;max-width:1050px;margin:2rem auto;padding:0 1rem;color:#1f2937}"
-            "h1,h2{color:#111827}.summary,.step{border:1px solid #d1d5db;border-radius:8px;padding:1rem;margin:1rem 0}"
-            ".badge{display:inline-block;border-radius:999px;padding:.2rem .65rem;background:#e5e7eb;font-size:.85rem}"
-            ".passed{background:#dcfce7;color:#166534}.failed,.product_failure{background:#fee2e2;color:#991b1b}"
-            ".blocked{background:#fef3c7;color:#92400e}.automation_drift,.infrastructure_error{background:#ffedd5;color:#9a3412}"
-            ".attempt{border-left:3px solid #cbd5e1;margin:1rem 0;padding:.5rem 1rem}.muted{color:#6b7280;font-size:.9rem}"
-            ".evidence{max-width:360px;max-height:240px;object-fit:contain;border:1px solid #d1d5db}"
-            "code{overflow-wrap:anywhere}</style></head><body>"
-            f"<h1>AI QA Agent Test Report</h1><section class=\"summary\"><h2>"
-            f"{esc(report.test_case_name)}</h2><p>{esc(report.test_case_description)}</p>"
-            f"<p>Workflow: <strong>{esc(report.workflow_type.value)}</strong></p>"
-            f"<p>Run: <code>{esc(report.run_id)}</code></p>"
-            f"<p>TestCase ID: <code>{esc(report.test_case_id)}</code></p>"
-            + (f"<p>Base URL: {esc(report.base_url)}</p>" if report.base_url else "")
-            + (f"<p>Setup: {esc(report.setup_status)}</p>" if report.setup_status else "")
-            + f"<p>Overall: <span class=\"badge {badge_status.lower()}\">{badge_status}</span>"
-            f" — {esc(report.outcome)}</p><p>Started: {esc(report.started_at.isoformat())}</p>"
-            f"<p>Finished: {esc(report.finished_at.isoformat() if report.finished_at else 'Unavailable')}</p>"
-            f"<p>Duration: {esc(duration)}</p></section>"
-            + preconditions_html
-            + "<section><h2>Test Steps</h2>" + "".join(steps_html) + "</section>"
+            f"<title>{title}</title><style>{UI_CSS}</style></head><body>"
+            + navigation
+            + '<main class="shell main">'
+            + f'<p class="breadcrumbs"><a href="/">Dashboard</a><span>›</span>'
+            f'<a href="/test-cases/{esc(report.test_case_id)}">{esc(report.test_case_name)}</a>'
+            f'<span>›</span>Run {esc(short_id(report.run_id))}</p>'
+            + '<header class="page-heading"><h1>' + esc(report.test_case_name) + '</h1>'
+            + f'<p class="lead">{esc(report.test_case_description)}</p></header>'
+            + '<div class="actions"><a class="button" href="/">Back to Dashboard</a>'
+            + "".join(actions)
+            + "</div>"
+            + summary
+            + setup_html
+            + '<section class="panel"><h2>Test steps</h2>'
+            + ("".join(steps_html) if steps_html else '<div class="empty-state">No steps recorded.</div>')
+            + "</section>"
             + cleanup_html
-            + f"<section><h2>Final Result</h2><p>{esc(report.outcome)} ({badge_status})</p></section>"
-            + "</body></html>"
+            + '</main><footer class="shell">AI QA Agent · Local run report</footer></body></html>'
         )
 
     def write_json(self, report: RunReport, path: str | Path) -> None:
@@ -445,6 +559,14 @@ def _display_value(value: Any) -> str:
 
         return json.dumps(value, ensure_ascii=False, sort_keys=True)
     return str(value)
+
+
+def _report_meta(label: str, value: object, *, raw: bool = False) -> str:
+    shown = str(value) if raw else escape_html(value)
+    return (
+        f'<div class="meta-item"><span class="meta-label">{escape_html(label)}</span>'
+        f'<span class="meta-value">{shown}</span></div>'
+    )
 
 
 def _safe_report_value(value: Any, test_run: TestRun) -> Any:
