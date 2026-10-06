@@ -1,0 +1,237 @@
+"""Exact plan-version selection and execution for non-learning workflows."""
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Iterable
+from uuid import UUID
+
+from qa_agent.models import (
+    Execution,
+    ExecutionStatus,
+    FailurePolicy,
+    TestCase,
+    TestPlanVersion,
+    TestRun,
+    TestStep,
+)
+from qa_agent.plan_execution import (
+    PlanExecutionClassification,
+    PlanExecutionPersistenceError,
+    PlanExecutionService,
+)
+from qa_agent.plan_store import PlanStore
+from qa_agent.run_context import RunContext
+
+
+@dataclass(frozen=True)
+class StepPlanSelection:
+    """Pin one TestStep to one immutable TestPlanVersion identity."""
+
+    test_step_id: UUID
+    test_plan_version_id: UUID
+
+
+@dataclass(frozen=True)
+class PlanVersionSet:
+    """In-memory exact selections; tuple form preserves duplicate detection."""
+
+    selections: tuple[StepPlanSelection, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "selections", tuple(self.selections))
+
+    @classmethod
+    def from_mapping(cls, selections: dict[UUID, UUID]) -> "PlanVersionSet":
+        return cls(tuple(
+            StepPlanSelection(step_id, version_id)
+            for step_id, version_id in selections.items()
+        ))
+
+
+class PlanSelectionError(ValueError):
+    """A pinned set is incomplete or does not match the TestCase and store."""
+
+
+@dataclass(frozen=True)
+class ResolvedStepPlan:
+    test_step: TestStep
+    plan_version: TestPlanVersion
+
+
+@dataclass(frozen=True)
+class ResolvedPlanVersionSet:
+    """Selections resolved and ordered by their TestCase TestStep order."""
+
+    steps: tuple[ResolvedStepPlan, ...]
+
+
+class WorkflowOutcome(str, Enum):
+    PASSED = "PASSED"
+    PRODUCT_FAILURE = "PRODUCT_FAILURE"
+    AUTOMATION_DRIFT = "AUTOMATION_DRIFT"
+    INFRASTRUCTURE_ERROR = "INFRASTRUCTURE_ERROR"
+    SETUP_FAILURE = "SETUP_FAILURE"
+
+
+@dataclass(frozen=True)
+class PinnedStepExecution:
+    test_step_id: UUID
+    test_plan_version_id: UUID
+    classification: PlanExecutionClassification
+    execution: Execution
+
+
+@dataclass(frozen=True)
+class PinnedExecutionResult:
+    outcome: WorkflowOutcome
+    test_run: TestRun
+    step_executions: tuple[PinnedStepExecution, ...]
+    error: Exception | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def executions(self) -> list[Execution]:
+        return self.test_run.executions
+
+
+class PinnedExecutionService:
+    """Execute a TestCase against only the exact selected plan versions.
+
+    This service has no discovery, generation, repair, regeneration, or
+    current-version lookup dependency.
+    """
+
+    def __init__(
+        self,
+        plan_store: PlanStore,
+        plan_execution: PlanExecutionService,
+    ) -> None:
+        self._plan_store = plan_store
+        self._plan_execution = plan_execution
+
+    def resolve(
+        self,
+        test_case: TestCase,
+        selection: PlanVersionSet,
+    ) -> ResolvedPlanVersionSet:
+        ordered_steps = sorted(test_case.steps, key=lambda step: step.order)
+        required = {step.id: step for step in ordered_steps}
+        selected: dict[UUID, UUID] = {}
+
+        for item in selection.selections:
+            if item.test_step_id not in required:
+                raise PlanSelectionError(
+                    f"Plan selection names unknown TestStep {item.test_step_id}."
+                )
+            if item.test_step_id in selected:
+                raise PlanSelectionError(
+                    f"TestStep {item.test_step_id} has multiple selected versions."
+                )
+            selected[item.test_step_id] = item.test_plan_version_id
+
+        missing = [step.id for step in ordered_steps if step.id not in selected]
+        if missing:
+            raise PlanSelectionError(
+                "Plan selection is missing TestSteps: "
+                + ", ".join(str(step_id) for step_id in missing)
+            )
+
+        resolved: list[ResolvedStepPlan] = []
+        for step in ordered_steps:
+            version_id = selected[step.id]
+            version = self._plan_store.get_version(version_id)
+            if version is None:
+                raise PlanSelectionError(
+                    f"Unknown TestPlanVersion {version_id} for TestStep {step.id}."
+                )
+            test_plan = self._plan_store.find_test_plan(step.id)
+            if test_plan is None or test_plan.test_step_id != step.id:
+                raise PlanSelectionError(
+                    f"No stored TestPlan belongs to TestStep {step.id}."
+                )
+            if version.test_plan_id != test_plan.id:
+                raise PlanSelectionError(
+                    f"TestPlanVersion {version_id} does not belong to TestStep {step.id}."
+                )
+            resolved.append(ResolvedStepPlan(step, version))
+
+        return ResolvedPlanVersionSet(tuple(resolved))
+
+    def execute(
+        self,
+        test_case: TestCase,
+        resolved: ResolvedPlanVersionSet,
+        run_context: RunContext,
+    ) -> PinnedExecutionResult:
+        expected_step_ids = [
+            step.id for step in sorted(test_case.steps, key=lambda step: step.order)
+        ]
+        resolved_step_ids = [item.test_step.id for item in resolved.steps]
+        if resolved_step_ids != expected_step_ids:
+            raise PlanSelectionError(
+                "Resolved plan versions must cover this TestCase exactly in step order."
+            )
+        executions: list[Execution] = []
+        step_executions: list[PinnedStepExecution] = []
+        blocked_step_ids: list[UUID] = []
+        error: Exception | None = None
+
+        for index, selected in enumerate(resolved.steps):
+            try:
+                result = self._plan_execution.execute(
+                    selected.test_step, selected.plan_version
+                )
+            except PlanExecutionPersistenceError as caught:
+                error = caught
+                break
+
+            execution = result.execution
+            executions.append(execution)
+            step_executions.append(PinnedStepExecution(
+                test_step_id=selected.test_step.id,
+                test_plan_version_id=selected.plan_version.id,
+                classification=result.classification,
+                execution=execution,
+            ))
+            if result.error is not None:
+                error = result.error
+                break
+
+            if (
+                execution.status == ExecutionStatus.FAILED
+                and selected.test_step.failure_policy == FailurePolicy.BLOCK_REST
+            ):
+                blocked_step_ids = [
+                    following.test_step.id
+                    for following in resolved.steps[index + 1:]
+                ]
+                break
+
+        test_run = TestRun.from_test_case(
+            test_case,
+            executions,
+            blocked_step_ids=blocked_step_ids,
+            run_context=run_context,
+        )
+        outcome = _workflow_outcome(step_executions, error)
+        return PinnedExecutionResult(
+            outcome=outcome,
+            test_run=test_run,
+            step_executions=tuple(step_executions),
+            error=error,
+        )
+
+
+def _workflow_outcome(
+    step_executions: Iterable[PinnedStepExecution],
+    error: Exception | None,
+) -> WorkflowOutcome:
+    if error is not None:
+        return WorkflowOutcome.INFRASTRUCTURE_ERROR
+    classifications = {item.classification for item in step_executions}
+    if PlanExecutionClassification.INFRASTRUCTURE_ERROR in classifications:
+        return WorkflowOutcome.INFRASTRUCTURE_ERROR
+    if PlanExecutionClassification.AUTOMATION_DRIFT in classifications:
+        return WorkflowOutcome.AUTOMATION_DRIFT
+    if PlanExecutionClassification.PRODUCT_FAILURE in classifications:
+        return WorkflowOutcome.PRODUCT_FAILURE
+    return WorkflowOutcome.PASSED
