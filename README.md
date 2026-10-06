@@ -65,3 +65,16 @@ database. To use a non-default database, pass `--database PATH` to the UI.
 Screenshots are served only when their recorded path is inside the configured
 evidence directory; pass the same `--evidence-directory PATH` used for the CLI.
 The UI is read-only and does not start workflows.
+
+### Demo UI
+
+Seed a small set of safe demonstration runs, then launch the UI against the
+same database:
+
+```powershell
+python -m qa_agent.demo --database .\qa_agent.db
+python -m qa_agent.web --database .\qa_agent.db
+```
+
+Open <http://127.0.0.1:8000>. Re-running the seed command skips demo run IDs
+already present and preserves other run history.

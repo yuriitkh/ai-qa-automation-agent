@@ -1,0 +1,122 @@
+import json
+import tempfile
+import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+from uuid import uuid4
+
+from qa_agent.demo import seed_demo_data
+from qa_agent.models import ExecutionStatus
+from qa_agent.run_history import (
+    RunHistoryRecord,
+    RunHistoryService,
+    WorkflowType,
+)
+from qa_agent.sqlite_storage import SQLiteRunHistoryRepository
+from qa_agent.web import LocalWebApplication
+
+
+class DemoSeedTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.database = Path(self.temporary_directory.name) / "demo.sqlite3"
+        self.repository = SQLiteRunHistoryRepository(self.database)
+        self.application = LocalWebApplication(RunHistoryService(self.repository))
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def test_seed_is_idempotent_preserves_user_rows_and_feeds_ui_and_reports(self) -> None:
+        user_record = RunHistoryRecord(
+            run_id=uuid4(),
+            test_case_id=uuid4(),
+            test_case_name="User-owned run",
+            test_case_description="Existing history must remain intact.",
+            workflow_type=WorkflowType.AUTOMATION,
+            outcome="PASSED",
+            status=ExecutionStatus.PASSED,
+            started_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+        self.repository.save(user_record)
+
+        first = seed_demo_data(self.database)
+        second = seed_demo_data(self.database)
+
+        self.assertEqual((first.created, first.skipped), (3, 0))
+        self.assertEqual((second.created, second.skipped), (0, 3))
+        records = self.repository.list_recent(limit=10)
+        self.assertEqual(len(records), 4)
+        self.assertEqual(self.repository.get(user_record.run_id), user_record)
+
+        self.assertEqual(
+            {record.test_case_name for record in records if record.run_id in first.run_ids},
+            {"User registration", "Checkout flow"},
+        )
+        self.assertEqual(len([record for record in records if record.test_case_name == "User registration"]), 2)
+        registration_records = [
+            record for record in records if record.test_case_name == "User registration"
+        ]
+        self.assertEqual(
+            {record.workflow_type for record in registration_records},
+            {WorkflowType.VALIDATION, WorkflowType.REGRESSION},
+        )
+        failed = next(record for record in registration_records if record.status == ExecutionStatus.FAILED)
+        self.assertEqual(failed.outcome, "PRODUCT_FAILURE")
+        self.assertEqual([step.status for step in failed.steps], [
+            ExecutionStatus.PASSED, ExecutionStatus.FAILED, ExecutionStatus.BLOCKED
+        ])
+        self.assertEqual(failed.setup_status, "SUCCEEDED")
+        self.assertTrue(failed.cleanup_succeeded)
+        self.assertTrue(failed.executions)
+        self.assertTrue(all(item.test_plan_version_id for item in failed.executions))
+        self.assertTrue(all(not item.evidence for item in failed.executions))
+        successful = next(
+            record for record in records
+            if record.run_id in first.run_ids and record.workflow_type == WorkflowType.VALIDATION
+        )
+        self.assertEqual(successful.status, ExecutionStatus.PASSED)
+        self.assertEqual(successful.setup_status, "SUCCEEDED")
+        self.assertTrue(successful.cleanup_succeeded)
+
+        safe_history_json = "\n".join(record.model_dump_json() for record in records)
+        self.assertNotIn("demo-only-sensitive-value-not-a-credential", safe_history_json)
+        self.assertIn("[REDACTED]", safe_history_json)
+
+        dashboard = self.application.handle("GET", "/")
+        self.assertEqual(dashboard.status, 200)
+        self.assertIn(b"User registration", dashboard.body)
+        self.assertIn(b"Checkout flow", dashboard.body)
+
+        registration_id = registration_records[0].test_case_id
+        testcase_page = self.application.handle("GET", f"/test-cases/{registration_id}")
+        self.assertEqual(testcase_page.status, 200)
+        self.assertIn(b"Run History", testcase_page.body)
+        self.assertIn(b"User registration", testcase_page.body)
+
+        for record in records:
+            if record.run_id not in first.run_ids:
+                continue
+            detail = self.application.handle("GET", f"/runs/{record.run_id}")
+            json_report = self.application.handle("GET", f"/runs/{record.run_id}/report.json")
+            html_report = self.application.handle("GET", f"/runs/{record.run_id}/report.html")
+            self.assertEqual(detail.status, 200)
+            self.assertEqual(json_report.status, 200)
+            self.assertEqual(html_report.status, 200)
+            parsed = json.loads(json_report.body)
+            self.assertEqual(parsed["workflow_type"], record.workflow_type.value)
+            self.assertIn("test_plan_version_id", json_report.body.decode("utf-8"))
+            self.assertNotIn("demo-only-sensitive-value-not-a-credential", json_report.body.decode("utf-8"))
+            self.assertNotIn("demo-only-sensitive-value-not-a-credential", html_report.body.decode("utf-8"))
+            self.assertNotIn(b"/evidence/", html_report.body)
+
+        failed_report = json.loads(
+            self.application.handle("GET", f"/runs/{failed.run_id}/report.json").body
+        )
+        self.assertEqual(
+            [step["status"] for step in failed_report["steps"]],
+            ["PASSED", "FAILED", "BLOCKED"],
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
