@@ -61,6 +61,9 @@ class ProviderAttemptOutcome(str, Enum):
     RETRYABLE_ERROR = "RETRYABLE_ERROR"
     NON_RETRYABLE_ERROR = "NON_RETRYABLE_ERROR"
     UNAVAILABLE = "UNAVAILABLE"
+    # An unexpected (unclassified) provider failure: deliberately NOT mapped
+    # to RETRYABLE/NON_RETRYABLE because no classification was made.
+    UNCLASSIFIED_ERROR = "UNCLASSIFIED_ERROR"
 
 
 class TraceTotals(BaseModel):
@@ -108,6 +111,10 @@ class DiscoveryFallbackTrace(BaseModel):
     interactive_elements_added: int = 0
     warnings: list[str] = Field(default_factory=list)
     duration_ms: int | None = None
+    # Set only when the invoked fallback itself failed; a successful
+    # fallback leaves this None so callers can distinguish
+    # "invoked + failed" from "invoked + succeeded".
+    error: str | None = None
 
 
 class ProviderAttemptTrace(BaseModel):
@@ -331,6 +338,23 @@ class ExecutionTraceRecorder:
             direct_navigation_paths_added=len(suggestions.direct_navigation_paths),
             interactive_elements_added=len(suggestions.interactive_elements),
             warnings=[redact_secrets(warning) for warning in suggestions.warnings],
+            duration_ms=duration_ms,
+        )
+
+    def record_discovery_fallback_failure(
+        self, error: Exception, duration_ms: int | None
+    ) -> None:
+        """Record an invoked AI fallback that failed before producing a result.
+
+        The fallback was genuinely attempted, so the trace must not look as
+        if it never ran; the error marks it as failed rather than successful.
+        """
+        step = self._current_step
+        if step is None:
+            return
+        step.discovery_fallback = DiscoveryFallbackTrace(
+            invoked=True,
+            error=safe_failure_reason(error),
             duration_ms=duration_ms,
         )
 

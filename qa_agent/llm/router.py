@@ -121,6 +121,18 @@ class LLMRouter:
                     started=started,
                 )
                 raise
+            except Exception as error:
+                # P2-2 (Choice D): an unclassified failure stays unclassified
+                # — no fallback, no wrapping, the SAME exception propagates —
+                # but the attempted provider must be observable in the trace.
+                self._record_provider_attempt(
+                    provider,
+                    RequestKind.TEST_PLAN,
+                    ProviderAttemptOutcome.UNCLASSIFIED_ERROR,
+                    error=error,
+                    started=started,
+                )
+                raise
             else:
                 self._record_provider_attempt(
                     provider,
@@ -190,6 +202,18 @@ class LLMRouter:
                 raise
             except NotImplementedError as error:
                 raise RuntimeError(f"{name} does not support Discovery output.") from error
+            except Exception as error:
+                # P2-2 (Choice D): same contract as create_test_plan — record
+                # the attempted provider, then re-raise the original
+                # exception unchanged with no fallback to the next provider.
+                self._record_provider_attempt(
+                    provider,
+                    RequestKind.DISCOVERY,
+                    ProviderAttemptOutcome.UNCLASSIFIED_ERROR,
+                    error=error,
+                    started=started,
+                )
+                raise
             else:
                 self._record_provider_attempt(
                     provider,

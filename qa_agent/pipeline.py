@@ -195,9 +195,30 @@ class QATestPipeline:
                     if (discovery_result.status != DiscoveryStatus.SUCCESS
                             and self._discovery_fallback is not None):
                         fallback_started = time.perf_counter()
-                        suggestions = self._discovery_fallback.discover(
-                            task, target_url, test_step, discovery_result
-                        )
+                        try:
+                            suggestions = self._discovery_fallback.discover(
+                                task, target_url, test_step, discovery_result
+                            )
+                        except Exception as fallback_error:
+                            # Evidence-first ordering (same principle as the
+                            # P0-2 fix): the deterministic discovery already
+                            # returned a result and the fallback attempt
+                            # happened, so record both before the failure
+                            # propagates. record_safely is best-effort and
+                            # cannot mask the original error.
+                            record_safely(
+                                trace,
+                                "record_discovery",
+                                discovery_result,
+                                elapsed_ms(discovery_started),
+                            )
+                            record_safely(
+                                trace,
+                                "record_discovery_fallback_failure",
+                                fallback_error,
+                                elapsed_ms(fallback_started),
+                            )
+                            raise
                         record_safely(
                             trace,
                             "record_discovery_fallback",
@@ -265,7 +286,7 @@ class QATestPipeline:
 
             plan_version = generated_plan.test_plan_version
             generated_plans.append(generated_plan)
-            execution = self._execute_plan(test_step, plan_version)
+            execution = self._execute_plan(test_step, plan_version, trace)
             executions.append(execution)
             record_safely(
                 trace,
@@ -282,20 +303,43 @@ class QATestPipeline:
             rediscovery_started = time.perf_counter()
             try:
                 rediscovery_result = self._discovery(target_url)
-                if rediscovery_result.status == DiscoveryStatus.FAILED:
-                    details = "; ".join(rediscovery_result.warnings) or "No details provided."
-                    raise RuntimeError(f"Browser rediscovery returned FAILED: {details}")
             except Exception as error:
+                # The rediscovery callable itself failed, so no result object
+                # exists; record a FAILED attempt anyway so an attempted
+                # rediscovery is never invisible in the trace. The pipeline
+                # still aborts before recovery/regeneration, and the AI
+                # fallback remains unused on this path.
+                record_safely(
+                    trace,
+                    "record_discovery",
+                    DiscoveryResult(
+                        status=DiscoveryStatus.FAILED,
+                        url=target_url,
+                        warnings=[str(error)],
+                    ),
+                    elapsed_ms(rediscovery_started),
+                )
                 raise PipelineStageError(
                     f"rediscovery (step {test_step.order}: {test_step.name})",
                     str(error),
                 ) from error
+
+            # Record the attempt BEFORE the FAILED check so a rediscovery
+            # that halts the run is still represented in the trace; a
+            # successful rediscovery is recorded exactly once here, as before.
             record_safely(
                 trace,
                 "record_discovery",
                 rediscovery_result,
                 elapsed_ms(rediscovery_started),
             )
+            if rediscovery_result.status == DiscoveryStatus.FAILED:
+                details = "; ".join(rediscovery_result.warnings) or "No details provided."
+                reason = f"Browser rediscovery returned FAILED: {details}"
+                raise PipelineStageError(
+                    f"rediscovery (step {test_step.order}: {test_step.name})",
+                    reason,
+                ) from RuntimeError(reason)
 
             failed_interaction = execution.planned_interaction(plan_version)
             recovery = None
@@ -334,7 +378,9 @@ class QATestPipeline:
                         str(error),
                     ) from error
                 generated_plans.append(repaired)
-                repaired_execution = self._execute_plan(test_step, repaired_version)
+                repaired_execution = self._execute_plan(
+                    test_step, repaired_version, trace
+                )
                 executions.append(repaired_execution)
                 record_safely(
                     trace,
@@ -394,7 +440,7 @@ class QATestPipeline:
                     str(error),
                 ) from error
             regenerated_execution = self._execute_plan(
-                test_step, regenerated_plan.test_plan_version
+                test_step, regenerated_plan.test_plan_version, trace
             )
             executions.append(regenerated_execution)
             record_safely(
@@ -418,7 +464,12 @@ class QATestPipeline:
             trace=final_trace,
         )
 
-    def _execute_plan(self, test_step: TestStep, plan_version: TestPlanVersion) -> Execution:
+    def _execute_plan(
+        self,
+        test_step: TestStep,
+        plan_version: TestPlanVersion,
+        trace: ExecutionTraceRecorder,
+    ) -> Execution:
         started_at = datetime.now(timezone.utc)
         runner_result: dict[str, Any] | None = None
         try:
@@ -446,6 +497,16 @@ class QATestPipeline:
                 runner_result=runner_result,
             )
             self._save_execution(failed_execution, test_step, plan_version)
+            # Record the trace attempt immediately after persistence and
+            # before raising: the caller in _run() can never observe this
+            # Execution, so recording it here keeps every persisted
+            # Execution mirrored by exactly one trace execution attempt.
+            record_safely(
+                trace,
+                "record_execution_attempt",
+                failed_execution,
+                plan_version.version,
+            )
             raise PipelineStageError(
                 f"execution (step {test_step.order}: {test_step.name}, "
                 f"plan version {plan_version.version})",

@@ -288,6 +288,72 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual(trace["totals"]["steps"], 1)
         self.assertEqual(trace["totals"]["execution_attempts"], 1)
 
+    def test_json_failed_run_prints_pure_machine_readable_trace(self) -> None:
+        # P2-5a: a failed QA result with --json must be exit 1 and stdout
+        # must be exactly one JSON document — no human section headers,
+        # no traceback, and the failure detail lives inside the trace.
+        pipeline = _pipeline(runner=_failing_runner)
+        with (
+            patch("qa_agent.cli.build_pipeline", return_value=pipeline),
+            redirect_stdout(io.StringIO()) as output,
+            redirect_stderr(io.StringIO()) as error_output,
+        ):
+            code = main(["Open https://example.com/ and check the page.", "--json"])
+
+        self.assertEqual(code, EXIT_FAILED)
+        text = output.getvalue()
+        # Whole stdout parses as JSON: nothing else was printed.
+        trace = json.loads(text)
+        self.assertEqual(trace["status"], "FAILED")
+        self.assertEqual(trace["schema_version"], "1")
+        self.assertIn("trace_id", trace)
+        # Failure/error information is present inside the serialized trace.
+        attempt = trace["steps"][0]["execution_attempts"][0]
+        self.assertEqual(attempt["status"], "FAILED")
+        self.assertEqual(attempt["error"], "wrong title")
+        # No human-readable headers and no traceback leaked into stdout.
+        self.assertNotIn("status:", text)
+        self.assertNotIn("Traceback", text)
+        self.assertEqual(error_output.getvalue(), "")
+
+    def test_json_pipeline_stage_error_prints_redacted_trace_json(
+        self,
+    ) -> None:
+        # P2-5b: a PipelineStageError with --json must be exit 1 with a
+        # valid, redacted JSON trace on stdout — status ERROR, the failed
+        # stage, the failure reason (secrets replaced), exactly one
+        # "Pipeline stage" prefix, and no traceback or human headers.
+        secret = "unit-test-secret-value"
+
+        def secret_leaking_discovery(url: str) -> DiscoveryResult:
+            raise RuntimeError(f"browser unavailable token={secret}")
+
+        pipeline = _pipeline(discovery=secret_leaking_discovery)
+        with (
+            patch("qa_agent.cli.build_pipeline", return_value=pipeline),
+            patch.dict("os.environ", {"GEMINI_API_KEY": secret}),
+            redirect_stdout(io.StringIO()) as output,
+            redirect_stderr(io.StringIO()) as error_output,
+        ):
+            code = main(["Open https://example.com/ and check the page.", "--json"])
+
+        self.assertEqual(code, EXIT_FAILED)
+        text = output.getvalue()
+        trace = json.loads(text)
+        self.assertEqual(trace["status"], "ERROR")
+        self.assertIn("discovery", trace["error_stage"] or "")
+        self.assertIn("browser unavailable", trace["error"] or "")
+        # The composed stage message appears exactly once (no duplicated
+        # "Pipeline stage ... failed" prefix in the JSON output).
+        self.assertEqual((trace["error"] or "").count("Pipeline stage"), 1)
+        # Secret is redacted and absent from the whole output.
+        self.assertIn("[REDACTED]", trace["error"] or "")
+        self.assertNotIn(secret, text)
+        # No traceback and no human-readable summary in stdout/stderr.
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn("status:", text)
+        self.assertEqual(error_output.getvalue(), "")
+
     def test_evidence_directory_is_passed_through(self) -> None:
         pipeline = _pipeline()
         with (

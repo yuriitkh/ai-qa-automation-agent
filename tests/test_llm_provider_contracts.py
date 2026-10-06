@@ -372,6 +372,123 @@ class LLMProviderContractTests(unittest.TestCase):
             )
             self.assertNotIn("expected", url_parameters)
 
+    def test_openai_compatible_wraps_sdk_failures_into_llm_errors(self) -> None:
+        # P2-3 characterization: OpenAICompatibleProvider converts underlying
+        # SDK/client failures into the project's typed LLM exceptions. Typed
+        # errors survive create_test_plan's re-raise untouched, the original
+        # exception is preserved only via __cause__, the exposed message
+        # carries just the HTTP status or type name (raw reason redacted), and
+        # a missing API key is classified non-retryable without leaking it.
+        import openai
+
+        from qa_agent.llm.errors import NonRetryableLLMError
+        from qa_agent.llm.openai_compatible import OpenAICompatibleProvider
+
+        secret = "sk-unit-test-secret-value"
+        request = httpx.Request(
+            "POST", "https://api.example.com/v1/chat/completions"
+        )
+        response_429 = httpx.Response(429, request=request, json={})
+        provider = OpenAICompatibleProvider(
+            "openai-compat", "TEST_COMPAT_API_KEY", "test-model"
+        )
+
+        sdk_connection_error = openai.APIConnectionError(
+            message=f"connection reset by key={secret}", request=request
+        )
+        sdk_rate_limit_error = openai.RateLimitError(
+            f"rate limited key={secret}", response=response_429, body=None
+        )
+        timeout_error = httpx.TimeoutException(f"slow network {secret}")
+        transport_error = httpx.ConnectError(f"connection refused {secret}")
+        unexpected_error = RuntimeError(f"unexpected client bug {secret}")
+
+        cases = [
+            (
+                "sdk_connection_error",
+                sdk_connection_error,
+                "openai-compat: request failed (APIConnectionError).",
+            ),
+            (
+                "sdk_rate_limit_error",
+                sdk_rate_limit_error,
+                "openai-compat: request failed (HTTP 429).",
+            ),
+            (
+                "timeout",
+                timeout_error,
+                "openai-compat: request timed out.",
+            ),
+            (
+                "transport",
+                transport_error,
+                "openai-compat: transport failed (ConnectError).",
+            ),
+            (
+                "non_sdk_exception",
+                unexpected_error,
+                "openai-compat: invalid response (RuntimeError).",
+            ),
+        ]
+
+        for label, underlying, expected_message in cases:
+            with self.subTest(label):
+                with (
+                    patch.dict(
+                        os.environ, {"TEST_COMPAT_API_KEY": secret}, clear=True
+                    ),
+                    patch(
+                        "qa_agent.llm.openai_compatible.OpenAI"
+                    ) as openai_client,
+                ):
+                    openai_client.return_value.chat.completions.create.side_effect = (
+                        underlying
+                    )
+                    with self.assertRaises(RetryableLLMError) as raised:
+                        provider.create_test_plan(
+                            self.task, self.target_url, self.snapshot
+                        )
+
+                error = raised.exception
+                self.assertEqual(str(error), expected_message)
+                # Underlying exception preserved only through the cause chain.
+                self.assertIs(error.__cause__, underlying)
+                # Raw failure reason (and secret) never reaches the message.
+                self.assertNotIn(secret, str(error))
+                self.assertNotIn(str(underlying), str(error))
+
+        # Invalid payload from a healthy client is also a typed retryable error.
+        with (
+            patch.dict(os.environ, {"TEST_COMPAT_API_KEY": secret}, clear=True),
+            patch("qa_agent.llm.openai_compatible.OpenAI") as openai_client,
+        ):
+            bad_response = MagicMock()
+            bad_response.choices[0].message.content = "not valid json"
+            openai_client.return_value.chat.completions.create.return_value = (
+                bad_response
+            )
+            with self.assertRaises(RetryableLLMError) as raised:
+                provider.create_test_plan(
+                    self.task, self.target_url, self.snapshot
+                )
+        self.assertEqual(
+            str(raised.exception),
+            "openai-compat: returned an invalid QA test plan.",
+        )
+        self.assertIsNotNone(raised.exception.__cause__)
+
+        # Missing API key: non-retryable, env var named but never echoed.
+        with patch.dict(os.environ, {"TEST_COMPAT_API_KEY": "  "}, clear=True):
+            with self.assertRaises(NonRetryableLLMError) as raised:
+                provider.create_test_plan(
+                    self.task, self.target_url, self.snapshot
+                )
+        self.assertEqual(
+            str(raised.exception),
+            "openai-compat: TEST_COMPAT_API_KEY is not configured.",
+        )
+        self.assertNotIn(secret, str(raised.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

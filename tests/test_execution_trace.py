@@ -546,10 +546,14 @@ class ExecutionTracePipelineTests(unittest.TestCase):
             fallback_trace = step_trace.discovery_fallback
             self.assertIsNotNone(fallback_trace)
             self.assertTrue(fallback_trace.invoked)
+            # Successful fallback: never marked as failed.
+            self.assertIsNone(fallback_trace.error)
             self.assertEqual(fallback_trace.interactive_elements_added, 1)
             self.assertEqual(fallback_trace.warnings, ["ai fallback hint"])
             self.assertIsNotNone(fallback_trace.duration_ms)
-            # The merged discovery result is the one recorded for the step.
+            # The merged discovery result is the one recorded for the step,
+            # exactly once — no duplicate discovery entries.
+            self.assertEqual(len(step_trace.discoveries), 1)
             merged = step_trace.discoveries[0]
             self.assertEqual(merged.status, DiscoveryStatus.PARTIAL)
             self.assertIn("deterministic discovery failed", merged.warnings)
@@ -793,6 +797,76 @@ class ExecutionTraceRouterTests(unittest.TestCase):
         self.assertEqual(attempts[0].error_class, "NonRetryableLLMError")
         self.assertFalse(attempts[0].is_selected)
 
+    def test_unclassified_error_is_recorded_and_halts_fallback(self) -> None:
+        # P2-2 regression: a raw exception at the provider boundary stays
+        # unclassified — no fallback, original identity preserved — but the
+        # attempted provider is recorded exactly once in the trace.
+        boom = RuntimeError("boom")
+        failing_calls: list[str] = []
+        succeeding_calls: list[str] = []
+
+        class _Failing(LLMProvider):
+            name = "failing_raw"
+            model = "failing-raw-model"
+
+            @property
+            def is_available(self) -> bool:
+                return True
+
+            def create_test_plan(
+                self, task: str, target_url: str, page_snapshot: str
+            ) -> QATestPlan:
+                failing_calls.append(task)
+                raise boom
+
+        class _Succeeding(LLMProvider):
+            name = "succeeding_raw"
+            model = "succeeding-raw-model"
+
+            @property
+            def is_available(self) -> bool:
+                return True
+
+            def create_test_plan(
+                self, task: str, target_url: str, page_snapshot: str
+            ) -> QATestPlan:
+                succeeding_calls.append(task)
+                return _plan()
+
+        router = LLMRouter([_Failing(), _Succeeding()])
+        recorder = self._recorder_with_step()
+
+        with (
+            active_trace_recorder(recorder),
+            redirect_stdout(io.StringIO()),
+        ):
+            with self.assertRaises(RuntimeError) as context:
+                router.create_test_plan("Check", "https://example.com/", "{}")
+
+        # The original exception is re-raised unchanged — not wrapped.
+        self.assertIs(context.exception, boom)
+
+        # No fallback: the second provider was never invoked.
+        self.assertEqual(len(failing_calls), 1)
+        self.assertEqual(succeeding_calls, [])
+
+        # Exactly one attempt row, deliberately unclassified.
+        trace = recorder.finalize(TraceStatus.ERROR)
+        attempts = trace.steps[0].provider_attempts
+        self.assertEqual(len(attempts), 1)
+        attempt = attempts[0]
+        self.assertEqual(
+            attempt.outcome, ProviderAttemptOutcome.UNCLASSIFIED_ERROR
+        )
+        self.assertEqual(attempt.request_kind, RequestKind.TEST_PLAN)
+        self.assertEqual(attempt.provider_name, "failing_raw")
+        self.assertEqual(attempt.model, "failing-raw-model")
+        self.assertEqual(attempt.error_class, "RuntimeError")
+        self.assertEqual(attempt.error_message, "boom")
+        self.assertIsNotNone(attempt.duration_ms)
+        self.assertFalse(attempt.is_selected)
+        self.assertEqual(trace.totals.provider_attempts, 1)
+
     def test_discovery_attempts_are_recorded_in_trace(self) -> None:
         failing = _StubProvider(
             "failing", error=RetryableLLMError("temporary failure")
@@ -820,6 +894,86 @@ class ExecutionTraceRouterTests(unittest.TestCase):
             [item.outcome for item in attempts],
             [ProviderAttemptOutcome.RETRYABLE_ERROR, ProviderAttemptOutcome.SUCCESS],
         )
+
+    def test_unclassified_discovery_error_is_recorded_and_halts_fallback(
+        self,
+    ) -> None:
+        # P2-2 regression: same contract on the discovery route — the raw
+        # exception propagates unchanged, no fallback, one trace row.
+        boom = RuntimeError("discovery boom")
+        failing_calls: list[str] = []
+        succeeding_calls: list[str] = []
+
+        class _Failing(LLMProvider):
+            name = "failing_raw"
+            model = "failing-raw-model"
+
+            @property
+            def is_available(self) -> bool:
+                return True
+
+            def create_test_plan(
+                self, task: str, target_url: str, page_snapshot: str
+            ) -> QATestPlan:
+                raise AssertionError("create_test_plan must not run here")
+
+            def create_discovery(
+                self, task: str, target_url: str, page_snapshot: str
+            ) -> AIDiscoveryResult:
+                failing_calls.append(task)
+                raise boom
+
+        class _Succeeding(LLMProvider):
+            name = "succeeding_raw"
+            model = "succeeding-raw-model"
+
+            @property
+            def is_available(self) -> bool:
+                return True
+
+            def create_test_plan(
+                self, task: str, target_url: str, page_snapshot: str
+            ) -> QATestPlan:
+                raise AssertionError("create_test_plan must not run here")
+
+            def create_discovery(
+                self, task: str, target_url: str, page_snapshot: str
+            ) -> AIDiscoveryResult:
+                succeeding_calls.append(task)
+                return AIDiscoveryResult()
+
+        router = LLMRouter([_Failing(), _Succeeding()])
+        recorder = self._recorder_with_step()
+
+        with (
+            active_trace_recorder(recorder),
+            redirect_stdout(io.StringIO()),
+        ):
+            with self.assertRaises(RuntimeError) as context:
+                router.create_discovery("Discover", "https://example.com/", "{}")
+
+        # The original exception is re-raised unchanged — not wrapped.
+        self.assertIs(context.exception, boom)
+
+        # No fallback: the second provider was never invoked.
+        self.assertEqual(len(failing_calls), 1)
+        self.assertEqual(succeeding_calls, [])
+
+        # Exactly one attempt row on the DISCOVERY route.
+        trace = recorder.finalize(TraceStatus.ERROR)
+        attempts = trace.steps[0].provider_attempts
+        self.assertEqual(len(attempts), 1)
+        attempt = attempts[0]
+        self.assertEqual(
+            attempt.outcome, ProviderAttemptOutcome.UNCLASSIFIED_ERROR
+        )
+        self.assertEqual(attempt.request_kind, RequestKind.DISCOVERY)
+        self.assertEqual(attempt.provider_name, "failing_raw")
+        self.assertEqual(attempt.error_class, "RuntimeError")
+        self.assertEqual(attempt.error_message, "discovery boom")
+        self.assertIsNotNone(attempt.duration_ms)
+        self.assertFalse(attempt.is_selected)
+        self.assertEqual(trace.totals.provider_attempts, 1)
 
     def test_router_runs_without_active_recorder(self) -> None:
         plan = _plan()
