@@ -14,6 +14,7 @@ from qa_agent.models import (
     InteractiveElement,
     NavigationAction,
     NavigationSequence,
+    Precondition as DomainPrecondition,
     QATestPlan,
     QATestStep,
     TestCase as DomainTestCase,
@@ -130,6 +131,53 @@ class DomainModelTests(unittest.TestCase):
         )
 
         self.assertEqual([step.order for step in case.steps], [0, 1])
+        self.assertEqual(case.preconditions, [])
+
+    def test_test_case_preconditions_are_ordered_and_round_trip(self) -> None:
+        conditions = [
+            DomainPrecondition(
+                description="Registration email is unused",
+                order=0,
+                provided_data_keys=["registration_email"],
+            ),
+            DomainPrecondition(
+                description="Account has sufficient balance",
+                order=1,
+            ),
+        ]
+        case = DomainTestCase(
+            name="Register user",
+            description="Create an account.",
+            steps=[self.make_test_step()],
+            preconditions=conditions,
+        )
+
+        restored = DomainTestCase.model_validate(case.model_dump())
+
+        self.assertEqual(restored.id, case.id)
+        self.assertEqual(
+            [item.id for item in restored.preconditions],
+            [item.id for item in conditions],
+        )
+        self.assertEqual(
+            [item.order for item in restored.preconditions], [0, 1]
+        )
+        self.assertEqual(
+            restored.preconditions[0].provided_data_keys,
+            ["registration_email"],
+        )
+
+    def test_test_case_rejects_unordered_preconditions(self) -> None:
+        with self.assertRaises(ValidationError):
+            DomainTestCase(
+                name="Invalid preconditions",
+                description="Conditions are out of order.",
+                steps=[self.make_test_step()],
+                preconditions=[
+                    DomainPrecondition(description="Second", order=1),
+                    DomainPrecondition(description="First", order=0),
+                ],
+            )
 
     def test_legacy_test_case_exposes_one_implicit_segment(self) -> None:
         steps = [self.make_test_step(0), self.make_test_step(1)]

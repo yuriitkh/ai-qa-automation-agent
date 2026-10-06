@@ -5,6 +5,8 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
+from qa_agent.run_context import RunContext
+
 
 class QATestStep(BaseModel):
     ACTION_PARAMETER_FIELDS: ClassVar[dict[str, tuple[str, ...]]] = {
@@ -191,11 +193,33 @@ class ExecutionSegment(BaseModel):
     steps: list[TestStep] = Field(min_length=1)
 
 
+class Precondition(BaseModel):
+    """A declarative condition that must hold before a TestCase is run.
+
+    ``provided_data_keys`` names RunContext values that must be available once
+    this condition has been established. It describes a contract, not setup.
+    """
+
+    id: UUID = Field(default_factory=uuid4)
+    description: str = Field(min_length=1)
+    order: int = Field(ge=0)
+    provided_data_keys: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_provided_data_keys(self) -> "Precondition":
+        if any(not key or key != key.strip() for key in self.provided_data_keys):
+            raise ValueError("Precondition data keys must be non-empty trimmed strings.")
+        if len(set(self.provided_data_keys)) != len(self.provided_data_keys):
+            raise ValueError("Precondition data keys must be unique.")
+        return self
+
+
 class TestCase(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     name: str = Field(min_length=1)
     description: str = Field(min_length=1)
     base_url: str | None = None
+    preconditions: list[Precondition] = Field(default_factory=list)
     segments: list[ExecutionSegment] = Field(min_length=1)
 
     @model_validator(mode="before")
@@ -271,6 +295,9 @@ class TestCase(BaseModel):
                 if step.id in seen_step_ids:
                     raise ValueError("A TestStep cannot belong to multiple segments.")
                 seen_step_ids.add(step.id)
+        precondition_orders = [item.order for item in self.preconditions]
+        if precondition_orders != sorted(precondition_orders) or len(set(precondition_orders)) != len(precondition_orders):
+            raise ValueError("TestCase Preconditions must have unique, ordered order values.")
         return self
 
     @computed_field
@@ -373,6 +400,7 @@ class TestRun(BaseModel):
     test_step_names: list[str] = Field(default_factory=list)
     started_at: datetime
     finished_at: datetime | None = None
+    run_context: RunContext = Field(default_factory=RunContext)
     executions: list[Execution] = Field(default_factory=list)
     # Steps that never executed because an earlier step's BLOCK_REST failure
     # policy prevented continuation. Blocked steps never carry an Execution.

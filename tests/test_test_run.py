@@ -5,6 +5,7 @@ from uuid import uuid4
 from qa_agent.models import (
     Execution,
     ExecutionStatus,
+    RunContext,
     TestCase as DomainTestCase,
     TestRun as _DomainTestRun,
     TestStep as DomainTestStep,
@@ -65,6 +66,99 @@ class TestRunTests(unittest.TestCase):
         self.assertEqual(run.finished_at, execution.finished_at)
         self.assertEqual(run.passed_steps, [self.step_one.id])
         self.assertEqual(run.failed_steps, [])
+
+    def test_runs_have_independent_contexts_and_can_use_fresh_values(self) -> None:
+        first_run = _DomainTestRun.from_test_case(self.test_case, [])
+        second_run = _DomainTestRun.from_test_case(self.test_case, [])
+
+        first_run.run_context.set_value(
+            "registration_email", "unique-1@example.test", source="test-data"
+        )
+        second_run.run_context.set_value(
+            "registration_email", "unique-2@example.test", source="test-data"
+        )
+
+        self.assertIsNot(first_run.run_context, second_run.run_context)
+        self.assertEqual(
+            first_run.run_context.get_value("registration_email"),
+            "unique-1@example.test",
+        )
+        self.assertEqual(
+            second_run.run_context.get_value("registration_email"),
+            "unique-2@example.test",
+        )
+        first_run.run_context.replace_value(
+            "registration_email", "updated-1@example.test"
+        )
+        self.assertEqual(
+            first_run.run_context.get_value("registration_email"),
+            "updated-1@example.test",
+        )
+        self.assertEqual(
+            second_run.run_context.get_value("registration_email"),
+            "unique-2@example.test",
+        )
+
+    def test_run_context_api_has_deterministic_key_and_update_behavior(self) -> None:
+        context = RunContext()
+        self.assertFalse(context.has_value("created_user_id"))
+        with self.assertRaises(KeyError):
+            context.get_value("created_user_id")
+        with self.assertRaises(ValueError):
+            context.set_value("  ", "value")
+
+        context.set_value("created_user_id", "user-123", source="registration-step")
+        with self.assertRaises(ValueError):
+            context.set_value("created_user_id", "user-456")
+        context.replace_value("created_user_id", "user-456")
+
+        self.assertEqual(context.get_value("created_user_id"), "user-456")
+        self.assertTrue(context.has_value("created_user_id"))
+        self.assertEqual(
+            context.values["created_user_id"].source, "registration-step"
+        )
+
+    def test_sensitive_context_values_are_accessible_but_safe_outputs_redact(self) -> None:
+        secret = "FAKE_TOKEN_do_not_leak_9f4a"
+        run = _DomainTestRun.from_test_case(self.test_case, [])
+        run.run_context.set_value(
+            "api_token", secret, sensitive=True, source="fixture-provider"
+        )
+        run.run_context.replace_value("api_token", secret, sensitive=False)
+        run.run_context.set_value("product_id", "sku-42", source="catalog-fixture")
+
+        self.assertEqual(run.run_context.get_value("api_token"), secret)
+        safe_text = str(run.run_context)
+        self.assertNotIn(secret, safe_text)
+        self.assertNotIn(secret, repr(run.run_context))
+        self.assertNotIn(secret, repr(run))
+        self.assertNotIn(secret, str(run))
+        safe_data = run.run_context.safe_dump()
+        self.assertNotIn(secret, str(safe_data))
+        self.assertEqual(safe_data["api_token"]["value"], "[REDACTED]")
+        self.assertEqual(safe_data["product_id"]["value"], "sku-42")
+
+    def test_run_context_persistence_round_trip_preserves_values_and_ids(self) -> None:
+        secret = "FAKE_PASSWORD_keep_for_runtime"
+        run = _DomainTestRun.from_test_case(self.test_case, [])
+        run.run_context.set_value("password", secret, sensitive=True)
+
+        dumped = run.model_dump()
+        self.assertEqual(dumped["run_context"]["values"]["password"]["value"], secret)
+        restored = _DomainTestRun.model_validate(dumped)
+
+        self.assertEqual(restored.id, run.id)
+        self.assertEqual(restored.test_case_id, run.test_case_id)
+        self.assertEqual(restored.run_context.get_value("password"), secret)
+        self.assertNotIn(secret, repr(restored.run_context))
+
+    def test_legacy_test_run_without_context_gets_a_new_empty_context(self) -> None:
+        first = _DomainTestRun.from_test_case(self.test_case, [])
+        second = _DomainTestRun.from_test_case(self.test_case, [])
+
+        self.assertEqual(first.run_context.values, {})
+        self.assertEqual(second.run_context.values, {})
+        self.assertIsNot(first.run_context, second.run_context)
 
     def test_multiple_steps_all_pass(self) -> None:
         executions = [
