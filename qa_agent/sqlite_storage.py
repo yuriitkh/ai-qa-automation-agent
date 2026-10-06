@@ -20,6 +20,7 @@ from qa_agent.models import (
     TestPlanVersion,
 )
 from qa_agent.plan_store import PlanStore, _validate_plan_store_write
+from qa_agent.run_history import RunHistoryRecord
 
 
 class _SQLiteStorage:
@@ -360,3 +361,82 @@ class SQLiteExecutionRepository(_SQLiteStorage):
             runner_result=runner_result,
             evidence=tuple(evidence),
         )
+
+
+class SQLiteRunHistoryRepository(_SQLiteStorage):
+    """Persist safe run snapshots and references to canonical Executions."""
+
+    def __init__(self, db_path: str | Path) -> None:
+        super().__init__(db_path)
+        with self._connection() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS run_history (
+                    insertion_order INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL UNIQUE,
+                    test_case_id TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    record_json TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_run_history_test_case_order "
+                "ON run_history(test_case_id, insertion_order DESC)"
+            )
+
+    def save(self, record: RunHistoryRecord) -> None:
+        try:
+            with self._connection() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO run_history (
+                        run_id, test_case_id, started_at, record_json
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        str(record.run_id),
+                        str(record.test_case_id),
+                        record.started_at.isoformat(),
+                        record.model_dump_json(),
+                    ),
+                )
+        except sqlite3.IntegrityError as error:
+            if "UNIQUE constraint failed: run_history.run_id" not in str(error):
+                raise
+            raise ValueError(f"Run {record.run_id} already exists in history.") from error
+
+    def get(self, run_id: UUID) -> RunHistoryRecord | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT record_json FROM run_history WHERE run_id = ?",
+                (str(run_id),),
+            ).fetchone()
+        return RunHistoryRecord.model_validate_json(row["record_json"]) if row else None
+
+    def list_recent(self, limit: int = 50) -> list[RunHistoryRecord]:
+        _validate_run_history_limit(limit)
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT record_json FROM run_history "
+                "ORDER BY insertion_order DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [RunHistoryRecord.model_validate_json(row["record_json"]) for row in rows]
+
+    def list_for_test_case(
+        self, test_case_id: UUID, limit: int = 50
+    ) -> list[RunHistoryRecord]:
+        _validate_run_history_limit(limit)
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT record_json FROM run_history WHERE test_case_id = ? "
+                "ORDER BY insertion_order DESC LIMIT ?",
+                (str(test_case_id), limit),
+            ).fetchall()
+        return [RunHistoryRecord.model_validate_json(row["record_json"]) for row in rows]
+
+
+def _validate_run_history_limit(limit: int) -> None:
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+        raise ValueError("Run history limit must be a non-negative integer.")

@@ -1,6 +1,7 @@
 """Thin automation, validation, and regression workflow entry points."""
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from qa_agent.models import TestCase, TestRun
 from qa_agent.pipeline import PipelineResult, QATestPipeline
@@ -12,6 +13,7 @@ from qa_agent.pinned_execution import (
     WorkflowOutcome,
 )
 from qa_agent.run_context import RunContext
+from qa_agent.run_history import RunHistoryService, WorkflowType
 from qa_agent.setup_orchestration import (
     CleanupOutcome,
     SetupCleanupCoordinator,
@@ -25,6 +27,7 @@ class PinnedWorkflowResult:
     """Primary workflow outcome with setup and cleanup reported separately."""
 
     outcome: WorkflowOutcome
+    test_run: TestRun
     lifecycle: TestCaseRunOutcome = field(repr=False)
     execution: PinnedExecutionResult | None = field(default=None, repr=False)
 
@@ -41,10 +44,6 @@ class PinnedWorkflowResult:
         return self.lifecycle.cleanup
 
     @property
-    def test_run(self) -> TestRun | None:
-        return self.execution.test_run if self.execution is not None else None
-
-    @property
     def product_started(self) -> bool:
         return self.lifecycle.product_started
 
@@ -58,13 +57,17 @@ class PinnedWorkflowResult:
 
 
 class _PinnedTestCaseWorkflow:
+    workflow_type: WorkflowType
+
     def __init__(
         self,
         executor: PinnedExecutionService,
         setup_cleanup: SetupCleanupCoordinator | None = None,
+        run_history: RunHistoryService | None = None,
     ) -> None:
         self._executor = executor
         self._setup_cleanup = setup_cleanup or SetupCleanupCoordinator({})
+        self._run_history = run_history
 
     def run(
         self,
@@ -76,6 +79,7 @@ class _PinnedTestCaseWorkflow:
         # Reject bad pins before provisioning resources. Resolution is exact and
         # never consults the store's current/latest version for execution.
         resolved = self._executor.resolve(test_case, selected_versions)
+        started_at = datetime.now(timezone.utc)
         execution_result: PinnedExecutionResult | None = None
 
         def execute_pinned(received_context: RunContext) -> PinnedExecutionResult:
@@ -86,6 +90,7 @@ class _PinnedTestCaseWorkflow:
             return execution_result
 
         lifecycle = self._setup_cleanup.run(test_case, context, execute_pinned)
+        finished_at = datetime.now(timezone.utc)
         if not lifecycle.setup.succeeded:
             outcome = WorkflowOutcome.SETUP_FAILURE
         elif lifecycle.product_error_type is not None:
@@ -95,19 +100,41 @@ class _PinnedTestCaseWorkflow:
         else:
             outcome = execution_result.outcome
 
-        return PinnedWorkflowResult(
+        test_run = (
+            execution_result.test_run
+            if execution_result is not None
+            else TestRun.from_test_case(test_case, [], run_context=context)
+        )
+        result = PinnedWorkflowResult(
             outcome=outcome,
+            test_run=test_run,
             lifecycle=lifecycle,
             execution=execution_result,
         )
+        if self._run_history is not None:
+            self._run_history.record_completed_run(
+                test_case,
+                result.test_run,
+                workflow_type=self.workflow_type,
+                outcome=result.outcome,
+                setup=result.setup,
+                cleanup=result.cleanup,
+                started_at=started_at,
+                finished_at=finished_at,
+            )
+        return result
 
 
 class ValidationWorkflow(_PinnedTestCaseWorkflow):
     """Verify one exact plan-version set from a configured initial state."""
 
+    workflow_type = WorkflowType.VALIDATION
+
 
 class RegressionWorkflow(_PinnedTestCaseWorkflow):
     """Repeat execution of selected versions without any learning behavior."""
+
+    workflow_type = WorkflowType.REGRESSION
 
 
 class AutomationWorkflow:

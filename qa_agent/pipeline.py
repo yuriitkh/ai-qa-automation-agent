@@ -39,6 +39,7 @@ from qa_agent.plan_execution import (
     PlanExecutionService,
 )
 from qa_agent.run_context import RunContext
+from qa_agent.run_history import RunHistoryService, WorkflowType
 
 
 class PipelineStageError(RuntimeError):
@@ -99,11 +100,13 @@ class QATestPipeline:
         plan_store: PlanStore | None = None,
         execution_repository: ExecutionRepository | None = None,
         discovery_fallback: DiscoveryFallback | None = None,
+        run_history: RunHistoryService | None = None,
     ) -> None:
         self._decomposer = decomposer
         self._plan_generator = plan_generator
         self._discovery = discovery
         self._discovery_fallback = discovery_fallback
+        self._run_history = run_history
         self._runner = runner if runner is not None else BrowserRunner(evidence_directory)
         self._plan_store = plan_store if plan_store is not None else InMemoryPlanStore()
         self._execution_repository = (
@@ -131,7 +134,7 @@ class QATestPipeline:
         trace = self._create_trace_recorder(task)
         with active_trace_recorder(trace):
             try:
-                return self._run(task, base_url, trace, active_run_context)
+                result = self._run(task, base_url, trace, active_run_context)
             except PipelineStageError as error:
                 error.trace = record_safely(
                     trace,
@@ -144,6 +147,21 @@ class QATestPipeline:
             except Exception as error:
                 record_safely(trace, "finalize", TraceStatus.ERROR, error=error)
                 raise
+        if self._run_history is not None:
+            self._run_history.record_completed_run(
+                result.test_case,
+                result.test_run,
+                workflow_type=WorkflowType.AUTOMATION,
+                outcome=(
+                    "PASSED"
+                    if result.test_run.status == ExecutionStatus.PASSED
+                    else "FAILED"
+                ),
+                trace_id=result.trace.trace_id if result.trace is not None else None,
+                started_at=result.trace.started_at if result.trace is not None else None,
+                finished_at=result.trace.finished_at if result.trace is not None else None,
+            )
+        return result
 
     def _create_trace_recorder(self, task: str) -> ExecutionTraceRecorder:
         return ExecutionTraceRecorder(task=task)

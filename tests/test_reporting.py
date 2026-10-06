@@ -15,6 +15,7 @@ from qa_agent.models import (
     TestStep as DomainTestStep,
 )
 from qa_agent.reporting import TestReport as DomainTestReport, TestReportGenerator
+from qa_agent.run_context import RunContext
 
 
 class TestReportGeneratorTests(unittest.TestCase):
@@ -171,6 +172,32 @@ class TestReportGeneratorTests(unittest.TestCase):
         self.assertEqual(failed_step.status, ExecutionStatus.FAILED)
         self.assertEqual(failed_step.attempts[0].error, "raw runner error: heading missing")
         self.assertEqual(failed_step.attempts[0].actual_result, {"assertion": "heading missing"})
+
+    def test_run_context_secrets_are_redacted_from_legacy_report(self) -> None:
+        secret = "demo-password-42"
+        step = min(self.steps, key=lambda item: item.order)
+        execution = self.execution(
+            step,
+            ExecutionStatus.FAILED,
+            0,
+            actual_result={"submitted": secret},
+            error=f"runner saw {secret}",
+        )
+        execution.evidence = (
+            self.evidence(
+                execution.id,
+                f"artifacts/{secret}.png",
+                description=f"Capture for {secret}",
+            ),
+        )
+        context = RunContext()
+        context.set_value("password", secret, sensitive=True)
+        run = DomainTestRun.from_test_case(self.case, [execution], run_context=context)
+
+        serialized = self.generator.generate(run).to_json()
+
+        self.assertNotIn(secret, serialized)
+        self.assertIn("[REDACTED]", serialized)
 
     def test_stale_retry_retains_both_attempts_in_execution_order(self) -> None:
         first, second = sorted(self.steps, key=lambda step: step.order)[:2]

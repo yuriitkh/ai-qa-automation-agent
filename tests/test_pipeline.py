@@ -29,6 +29,7 @@ from qa_agent.llm.errors import RetryableLLMError
 from qa_agent.llm.router import LLMRouter
 from qa_agent.pipeline import PipelineResult, PipelineStageError, QATestPipeline
 from qa_agent.plan_store import InMemoryPlanStore
+from qa_agent.run_history import InMemoryRunHistoryRepository, RunHistoryService, WorkflowType
 from qa_agent.test_case_decomposer import TestCaseDecomposer
 from qa_agent.test_plan_generator import GeneratedTestPlan, LLMTestPlanGenerator
 
@@ -321,6 +322,26 @@ class QATestPipelineTests(unittest.TestCase):
         self.assertIs(first.run_context, first.test_run.run_context)
         self.assertIs(second.run_context, second.test_run.run_context)
         self.assertIsNot(first.run_context, second.run_context)
+
+    def test_pipeline_persists_automation_history_when_configured(self) -> None:
+        repository = InMemoryRunHistoryRepository()
+        history = RunHistoryService(repository)
+        pipeline = QATestPipeline(
+            decomposer=self.decomposer,
+            discovery=self.discover,
+            plan_generator=self.generator,
+            runner=self.run_plan,
+            run_history=history,
+        )
+
+        result = pipeline.run("Open the example homepage.")
+        saved = history.get(result.test_run.id)
+
+        self.assertIsNotNone(saved)
+        self.assertEqual(saved.workflow_type, WorkflowType.AUTOMATION)
+        self.assertEqual(saved.trace_id, result.trace.trace_id)
+        self.assertEqual(saved.test_case_id, self.test_case.id)
+        self.assertEqual(saved.executions[0].execution_id, result.executions[0].id)
 
     def test_failed_runner_evidence_is_attached_to_execution(self) -> None:
         def runner(plan: QATestPlan) -> dict[str, Any]:

@@ -19,6 +19,7 @@ from qa_agent.llm.registry import create_router
 from qa_agent.models import ExecutionStatus
 from qa_agent.pipeline import PipelineResult, PipelineStageError, QATestPipeline
 from qa_agent.redaction import safe_failure_reason
+from qa_agent.storage import create_sqlite_storage
 from qa_agent.test_case_decomposer import TestCaseDecomposer
 from qa_agent.test_plan_generator import LLMTestPlanGenerator
 
@@ -29,19 +30,24 @@ EXIT_USAGE = 2
 
 def build_pipeline(
     evidence_directory: str | Path | None = None,
+    database_path: str | Path | None = None,
 ) -> QATestPipeline:
     """Build the real pipeline from existing components and defaults.
 
     Deterministic browser discovery, the Playwright ``BrowserRunner``,
     the in-memory plan store, and the in-memory execution repository
-    come from the existing ``QATestPipeline`` defaults and are
-    intentionally not repeated here.
+    are backed by the shared SQLite database so completed runs remain
+    available to reports and the local Web UI.
     """
     router = create_router()
+    storage = create_sqlite_storage(database_path)
     return QATestPipeline(
         decomposer=TestCaseDecomposer(),
         plan_generator=LLMTestPlanGenerator(router),
         evidence_directory=evidence_directory,
+        plan_store=storage.plan_store,
+        execution_repository=storage.execution_repository,
+        run_history=storage.run_history,
     )
 
 
@@ -58,7 +64,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return EXIT_PASSED
         return code if isinstance(code, int) else EXIT_USAGE
 
-    pipeline = build_pipeline(evidence_directory=args.evidence_directory)
+    pipeline = build_pipeline(
+        evidence_directory=args.evidence_directory,
+        database_path=args.database,
+    )
     try:
         result = pipeline.run(args.task)
     except PipelineStageError as error:
@@ -113,6 +122,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         help="print the structured ExecutionTrace as JSON instead of the summary",
+    )
+    parser.add_argument(
+        "--database",
+        metavar="PATH",
+        default=None,
+        help="SQLite database path (defaults to ~/.qa_agent/qa_agent.sqlite3)",
     )
     return parser
 

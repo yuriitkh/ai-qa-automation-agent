@@ -22,6 +22,11 @@ from qa_agent.pinned_execution import (
 )
 from qa_agent.plan_execution import PlanExecutionService
 from qa_agent.plan_store import InMemoryPlanStore
+from qa_agent.run_history import (
+    InMemoryRunHistoryRepository,
+    RunHistoryService,
+    WorkflowType,
+)
 from qa_agent.setup_orchestration import (
     SetupCleanupCoordinator,
     SetupOperationResult,
@@ -313,7 +318,8 @@ class PinnedWorkflowTests(unittest.TestCase):
 
         self.assertEqual(result.outcome, WorkflowOutcome.SETUP_FAILURE)
         self.assertFalse(result.product_started)
-        self.assertIsNone(result.test_run)
+        self.assertEqual(result.test_run.executions, [])
+        self.assertEqual(result.test_run.status, ExecutionStatus.FAILED)
         self.assertEqual(events, ["setup-failed", "cleanup"])
         self.assertEqual(self.received_plans, [])
         self.assertTrue(result.cleanup.succeeded)
@@ -462,6 +468,31 @@ class PinnedWorkflowTests(unittest.TestCase):
         self.assertIsNot(first.run_context, second.run_context)
         self.assertIs(first.test_run.run_context, first.run_context)
         self.assertIs(second.test_run.run_context, second.run_context)
+
+    def test_workflow_persists_completed_run_and_safe_context(self) -> None:
+        history_repository = InMemoryRunHistoryRepository()
+        history = RunHistoryService(history_repository, self.repository)
+        context = RunContext()
+        secret = "FAKE_WORKFLOW_HISTORY_SECRET"
+        context.set_value("token", secret, sensitive=True)
+        workflow = RegressionWorkflow(self.executor, run_history=history)
+
+        result = workflow.run(
+            self.test_case, self.full_selection(), run_context=context
+        )
+        saved = history.get(result.test_run.id)
+
+        self.assertIsNotNone(saved)
+        self.assertEqual(saved.workflow_type, WorkflowType.REGRESSION)
+        self.assertEqual(
+            [reference.execution_id for reference in saved.executions],
+            [execution.id for execution in result.test_run.executions],
+        )
+        self.assertEqual(
+            [reference.test_plan_version_id for reference in saved.executions],
+            [execution.test_plan_version_id for execution in result.test_run.executions],
+        )
+        self.assertNotIn(secret, saved.model_dump_json())
 
     def test_validation_rejects_incomplete_foreign_duplicate_and_unknown_pins(self) -> None:
         workflow = ValidationWorkflow(self.executor)

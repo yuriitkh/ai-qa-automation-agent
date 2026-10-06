@@ -8,8 +8,10 @@ constructs the real components.
 
 import io
 import json
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
 from typing import Any
 from unittest.mock import Mock, patch
 
@@ -18,6 +20,7 @@ from qa_agent.cli import (
     EXIT_PASSED,
     EXIT_USAGE,
     _build_parser,
+    build_pipeline,
     main,
 )
 from qa_agent.llm.base import LLMProvider
@@ -36,6 +39,11 @@ from qa_agent.models import (
 )
 from qa_agent.pipeline import QATestPipeline
 from qa_agent.plan_store import InMemoryPlanStore
+from qa_agent.sqlite_storage import (
+    SQLiteExecutionRepository,
+    SQLitePlanStore,
+    SQLiteRunHistoryRepository,
+)
 from qa_agent.test_plan_generator import (
     GeneratedTestPlan,
     LLMTestPlanGenerator,
@@ -177,16 +185,34 @@ class CliArgumentParsingTests(unittest.TestCase):
         )
         self.assertEqual(args.task, "Open https://example.com/ and check it.")
         self.assertEqual(args.evidence_directory, "ev")
+        self.assertIsNone(args.database)
         self.assertTrue(args.json)
 
     def test_options_default_to_off(self) -> None:
         parser = _build_parser()
         args = parser.parse_args(["Open https://example.com/."])
         self.assertIsNone(args.evidence_directory)
+        self.assertIsNone(args.database)
         self.assertFalse(args.json)
+
+    def test_database_option_is_parsed(self) -> None:
+        args = _build_parser().parse_args([
+            "Open https://example.com/.", "--database", "history.sqlite3"
+        ])
+        self.assertEqual(args.database, "history.sqlite3")
 
 
 class CliRunTests(unittest.TestCase):
+    def test_build_pipeline_wires_all_sqlite_repositories_to_one_database(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "cli.sqlite3"
+            with patch("qa_agent.cli.create_router", return_value=Mock()):
+                pipeline = build_pipeline(database_path=database)
+
+            self.assertIsInstance(pipeline._plan_store, SQLitePlanStore)
+            self.assertIsInstance(pipeline._execution_repository, SQLiteExecutionRepository)
+            self.assertIsInstance(pipeline._run_history._repository, SQLiteRunHistoryRepository)
+
     def test_successful_run_returns_zero(self) -> None:
         with (
             patch("qa_agent.cli.build_pipeline", return_value=_pipeline()),

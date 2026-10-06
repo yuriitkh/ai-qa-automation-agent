@@ -1,0 +1,168 @@
+import json
+import unittest
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
+
+from qa_agent.models import (
+    Evidence,
+    EvidenceType,
+    Execution,
+    ExecutionStatus,
+    RunContext,
+    TestCase as DomainTestCase,
+    TestRun as DomainTestRun,
+    TestStep as DomainTestStep,
+)
+from qa_agent.reporting import RunReportGenerator
+from qa_agent.run_history import RunHistoryRecord, WorkflowType
+
+
+class RunReportTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.started = datetime(2026, 4, 1, tzinfo=timezone.utc)
+        self.steps = [
+            self.make_step("Open page", 0),
+            self.make_step("Verify result", 1),
+            self.make_step("Next step", 2),
+        ]
+        self.case = DomainTestCase(
+            name="Registration <script>alert(1)</script>",
+            description="Report a registration outcome.",
+            steps=self.steps,
+        )
+        self.secret = "FAKE_REPORT_SECRET_6e32"
+        context = RunContext()
+        context.set_value("password", self.secret, sensitive=True)
+        passed = self.make_execution(self.steps[0], ExecutionStatus.PASSED, 0)
+        failed = self.make_execution(
+            self.steps[1],
+            ExecutionStatus.FAILED,
+            2,
+            error=f"Expected welcome; token={self.secret}",
+            actual=f"Actual value {self.secret}",
+        )
+        failed.evidence = (Evidence(
+            execution_id=failed.id,
+            type=EvidenceType.SCREENSHOT,
+            path="artifacts/failure-view.png",
+            description="Page after failed assertion.",
+        ),)
+        self.run = DomainTestRun.from_test_case(
+            self.case,
+            [passed, failed],
+            blocked_step_ids=[self.steps[2].id],
+            run_context=context,
+        )
+        self.generator = RunReportGenerator()
+
+    @staticmethod
+    def make_step(name, order):
+        return DomainTestStep(
+            name=name,
+            description=f"Perform {name}.",
+            expected=f"{name} is correct.",
+            order=order,
+        )
+
+    def make_execution(self, step, status, offset, *, error=None, actual=None):
+        start = self.started + timedelta(seconds=offset)
+        return Execution(
+            test_step_id=step.id,
+            test_plan_version_id=uuid4(),
+            status=status,
+            started_at=start,
+            finished_at=start + timedelta(seconds=1),
+            actual_result=actual if actual is not None else status.value,
+            error=error,
+        )
+
+    def test_json_report_has_workflow_steps_versions_and_redacted_values(self) -> None:
+        report = self.generator.generate_current(
+            self.case,
+            self.run,
+            workflow_type=WorkflowType.REGRESSION,
+            outcome="PRODUCT_FAILURE",
+            started_at=self.started,
+            finished_at=self.started + timedelta(seconds=4),
+        )
+        payload = json.loads(report.to_json())
+
+        self.assertEqual(payload["workflow_type"], "REGRESSION")
+        self.assertEqual(payload["outcome"], "PRODUCT_FAILURE")
+        self.assertEqual(payload["status"], "FAILED")
+        self.assertEqual(
+            [step["status"] for step in payload["steps"]],
+            ["PASSED", "FAILED", "BLOCKED"],
+        )
+        failed_attempt = payload["steps"][1]["attempts"][0]
+        self.assertEqual(
+            failed_attempt["test_plan_version_id"],
+            str(self.run.executions[1].test_plan_version_id),
+        )
+        self.assertEqual(failed_attempt["evidence"][0]["name"], "failure-view.png")
+        self.assertEqual(failed_attempt["error"], "Expected welcome; token=[REDACTED]")
+        self.assertEqual(failed_attempt["actual_result"], "Actual value [REDACTED]")
+        self.assertNotIn(self.secret, report.to_json())
+        self.assertEqual(report.duration_ms, 4000)
+
+    def test_html_is_standalone_escaped_and_distinguishes_blocked(self) -> None:
+        report = self.generator.generate_current(
+            self.case,
+            self.run,
+            workflow_type=WorkflowType.VALIDATION,
+            outcome="PRODUCT_FAILURE",
+        )
+        html = self.generator.to_html(report)
+
+        self.assertIn("<!doctype html>", html.lower())
+        self.assertIn("<style>", html)
+        self.assertIn("BLOCKED", html)
+        self.assertIn("Plan version", html)
+        self.assertIn("failure-view.png", html)
+        self.assertIn("Registration &lt;script&gt;alert(1)&lt;/script&gt;", html)
+        self.assertNotIn("<script>alert(1)</script>", html)
+        self.assertNotIn("<script src=", html)
+        self.assertNotIn("<link rel=", html)
+        self.assertNotIn("cdnjs", html)
+        self.assertNotIn(self.secret, html)
+
+    def test_historical_record_generates_same_safe_report_without_live_test_run(self) -> None:
+        record = RunHistoryRecord.from_completed_run(
+            self.case,
+            self.run,
+            workflow_type=WorkflowType.AUTOMATION,
+            outcome="FAILED",
+        )
+
+        report = self.generator.generate_history(record)
+
+        self.assertEqual(report.run_id, self.run.id)
+        self.assertEqual(report.workflow_type, WorkflowType.AUTOMATION)
+        self.assertEqual(
+            [step.status for step in report.steps], ["PASSED", "FAILED", "BLOCKED"]
+        )
+        self.assertEqual(
+            report.steps[1].attempts[0].test_plan_version_id,
+            self.run.executions[1].test_plan_version_id,
+        )
+        self.assertNotIn(self.secret, report.to_json())
+
+    def test_html_uses_only_explicitly_supplied_local_evidence_url(self) -> None:
+        report = self.generator.generate_current(
+            self.case, self.run, workflow_type=WorkflowType.REGRESSION
+        )
+        html = self.generator.to_html(
+            report,
+            evidence_url=lambda _step, attempt, _evidence, index: (
+                f"/runs/{report.run_id}/evidence/{attempt.execution_id}/{index}"
+            ),
+        )
+
+        self.assertIn(
+            f"/runs/{report.run_id}/evidence/{self.run.executions[1].id}/0",
+            html,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

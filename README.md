@@ -42,3 +42,26 @@ $env:OPENAI_API_KEY = "..."
 ```
 
 It will be tried first under the default priority; no source change is needed. No OpenAI key is needed for unit tests.
+
+## Persistent run history and local UI
+
+The CLI stores plan versions, executions, and completed run history in SQLite.
+The default database is `~/.qa_agent/qa_agent.sqlite3`; set `QA_AGENT_DB_PATH`
+or pass `--database PATH` to use another file:
+
+```powershell
+python -m qa_agent "Open https://example.com/ and verify the page title"
+```
+
+Start the read-only local run browser with:
+
+```powershell
+python -m qa_agent.web
+```
+
+It binds to `127.0.0.1:8000` by default. The dashboard, TestCase history, run
+details, JSON report, and standalone HTML report read from the same SQLite
+database. To use a non-default database, pass `--database PATH` to the UI.
+Screenshots are served only when their recorded path is inside the configured
+evidence directory; pass the same `--evidence-directory PATH` used for the CLI.
+The UI is read-only and does not start workflows.
