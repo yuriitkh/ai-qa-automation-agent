@@ -12,6 +12,7 @@ from qa_agent.execution_trace import (
     ProviderAttemptOutcome,
     RequestKind,
     RecoveryStatus,
+    SegmentTrace,
     TraceStatus,
     active_trace_recorder,
 )
@@ -22,7 +23,9 @@ from qa_agent.models import (
     AIDiscoveryResult,
     DiscoveryResult,
     DiscoveryStatus,
+    ExecutionSegment,
     ExecutionStatus,
+    FailurePolicy,
     InteractiveElement,
     QATestPlan,
     QATestStep,
@@ -36,12 +39,16 @@ from qa_agent.plan_store import InMemoryPlanStore
 from qa_agent.test_plan_generator import GeneratedTestPlan, LLMTestPlanGenerator
 
 
-def _make_step(order: int) -> DomainTestStep:
+def _make_step(
+    order: int,
+    failure_policy: FailurePolicy = FailurePolicy.CONTINUE,
+) -> DomainTestStep:
     return DomainTestStep(
         name=f"Step {order}",
         description=f"Perform check {order}",
         expected=f"Check {order} passes",
         order=order,
+        failure_policy=failure_policy,
     )
 
 
@@ -209,7 +216,7 @@ class ExecutionTracePipelineTests(unittest.TestCase):
         self.assertIsNotNone(trace.duration_ms)
         self.assertIsNone(trace.error)
         self.assertIsNone(trace.error_stage)
-        self.assertEqual(trace.schema_version, "1")
+        self.assertEqual(trace.schema_version, "2")
 
         decomposition = trace.decomposition
         assert decomposition is not None
@@ -222,6 +229,18 @@ class ExecutionTracePipelineTests(unittest.TestCase):
         self.assertIsNotNone(decomposition.duration_ms)
 
         self.assertEqual(len(trace.steps), 2)
+        self.assertEqual(len(trace.segments), 1)
+        segment_trace = trace.segments[0]
+        self.assertEqual(segment_trace.segment_id, self.test_case.segments[0].id)
+        self.assertEqual(segment_trace.order, 0)
+        self.assertEqual(segment_trace.base_url, self.test_case.base_url)
+        self.assertEqual(
+            segment_trace.test_step_ids,
+            [step.test_step_id for step in trace.steps],
+        )
+        self.assertEqual(segment_trace.blocked_test_step_ids, [])
+        self.assertEqual(len(self.runner_calls), 2)
+        self.assertEqual(sum(event[0] == "discovery" for event in self.events), 2)
         for step_trace in trace.steps:
             self.assertEqual(len(step_trace.discoveries), 1)
             discovery = step_trace.discoveries[0]
@@ -252,6 +271,17 @@ class ExecutionTracePipelineTests(unittest.TestCase):
         self.assertEqual(trace.totals.provider_attempts, 0)
         self.assertEqual(trace.totals.locator_recoveries, 0)
         self.assertEqual(trace.totals.regenerations, 0)
+
+        serialized = trace.model_dump_json()
+        serialized_data = ExecutionTrace.model_validate_json(serialized)
+        self.assertEqual(
+            [segment.segment_id for segment in serialized_data.segments],
+            [segment.segment_id for segment in trace.segments],
+        )
+        self.assertEqual(
+            [step.test_step_id for step in serialized_data.steps],
+            [step.test_step_id for step in trace.steps],
+        )
 
     def test_trace_is_created_for_failed_run(self) -> None:
         def failing_runner(plan: QATestPlan) -> dict[str, Any]:
@@ -289,6 +319,116 @@ class ExecutionTracePipelineTests(unittest.TestCase):
         self.assertEqual(trace.totals.execution_attempts, 2)
         self.assertEqual(result.test_run.status, ExecutionStatus.FAILED)
 
+    def test_explicit_segments_reference_the_canonical_step_traces(self) -> None:
+        steps = [_make_step(index) for index in range(4)]
+        case = DomainTestCase(
+            name="Segmented flow",
+            description="Two segments with ordered steps.",
+            base_url="https://example.com/",
+            segments=[
+                ExecutionSegment(order=0, base_url="https://example.com/", steps=steps[:2]),
+                ExecutionSegment(order=1, base_url="https://example.org/", steps=steps[2:]),
+            ],
+        )
+        result = self._pipeline(
+            decomposer=_FakeDecomposer(case, self.events)
+        ).run("Run segmented flow")
+
+        trace = result.trace
+        assert trace is not None
+        self.assertEqual(len(trace.segments), 2)
+        self.assertEqual([segment.order for segment in trace.segments], [0, 1])
+        self.assertEqual([segment.segment_id for segment in trace.segments], [segment.id for segment in case.segments])
+        self.assertEqual(trace.segments[0].base_url, case.base_url)
+        self.assertEqual(trace.segments[1].base_url, "https://example.org/")
+        self.assertEqual(
+            [segment.test_step_ids for segment in trace.segments],
+            [[steps[0].id, steps[1].id], [steps[2].id, steps[3].id]],
+        )
+        self.assertEqual(
+            [step.test_step_id for step in trace.steps],
+            [step.id for step in steps],
+        )
+        self.assertNotIn("steps", SegmentTrace.model_fields)
+        self.assertEqual(len(self.runner_calls), 4)
+        self.assertEqual(len(self.generator.calls), 4)
+        self.assertEqual(sum(event[0] == "discovery" for event in self.events), 4)
+
+    def test_continue_failure_remains_traceable_across_segment_boundary(self) -> None:
+        steps = [_make_step(index) for index in range(3)]
+        case = DomainTestCase(
+            name="Continuing flow",
+            description="Continue into the next segment after failure.",
+            base_url="https://example.com/",
+            segments=[
+                ExecutionSegment(order=0, steps=[steps[0]]),
+                ExecutionSegment(order=1, steps=steps[1:]),
+            ],
+        )
+        calls = 0
+
+        def fail_then_pass(plan: QATestPlan) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return {"status": "failed", "steps": [
+                    {"action": "assert_visible", "status": "failed", "error": "mismatch"}
+                ]}
+            return {"status": "passed", "steps": []}
+
+        result = self._pipeline(
+            decomposer=_FakeDecomposer(case, self.events),
+            runner=fail_then_pass,
+        ).run("Continue flow")
+
+        trace = result.trace
+        assert trace is not None
+        self.assertEqual(calls, 3)
+        self.assertEqual(
+            [step.test_step_id for step in trace.steps], [step.id for step in steps]
+        )
+        self.assertEqual(trace.steps[0].execution_attempts[0].status, ExecutionStatus.FAILED)
+        self.assertEqual(trace.steps[1].execution_attempts[0].status, ExecutionStatus.PASSED)
+        self.assertEqual(trace.segments[1].test_step_ids, [steps[1].id, steps[2].id])
+
+    def test_block_rest_records_blocked_membership_without_fake_step_traces(self) -> None:
+        steps = [
+            _make_step(0, FailurePolicy.BLOCK_REST),
+            _make_step(1),
+            _make_step(2),
+        ]
+        case = DomainTestCase(
+            name="Blocked flow",
+            description="Block the later segment.",
+            base_url="https://example.com/",
+            segments=[
+                ExecutionSegment(order=0, steps=[steps[0]]),
+                ExecutionSegment(order=1, steps=steps[1:]),
+            ],
+        )
+
+        calls = 0
+
+        def fail(plan: QATestPlan) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            return {"status": "failed", "steps": [
+                {"action": "assert_visible", "status": "failed", "error": "mismatch"}
+            ]}
+
+        result = self._pipeline(
+            decomposer=_FakeDecomposer(case, self.events), runner=fail
+        ).run("Block flow")
+
+        trace = result.trace
+        assert trace is not None
+        self.assertEqual([step.test_step_id for step in trace.steps], [steps[0].id])
+        self.assertEqual(trace.segments[1].test_step_ids, [steps[1].id, steps[2].id])
+        self.assertEqual(trace.segments[1].blocked_test_step_ids, [steps[1].id, steps[2].id])
+        self.assertEqual(trace.steps[0].execution_attempts[0].status, ExecutionStatus.FAILED)
+        self.assertEqual(calls, 1)
+        self.assertEqual(result.blocked_step_ids, [steps[1].id, steps[2].id])
+
     def test_trace_is_attached_to_pipeline_stage_error(self) -> None:
         def failed_discovery(url: str) -> DiscoveryResult:
             return DiscoveryResult(
@@ -309,6 +449,11 @@ class ExecutionTracePipelineTests(unittest.TestCase):
         self.assertEqual(trace.status, TraceStatus.ERROR)
         self.assertEqual(trace.error_stage, "discovery (step 0: Step 0)")
         self.assertIn("browser unavailable", trace.error or "")
+        self.assertEqual(len(trace.segments), 1)
+        self.assertEqual(
+            trace.segments[0].test_step_ids,
+            [step.id for step in sorted(self.steps, key=lambda item: item.order)],
+        )
         self.assertEqual(len(trace.steps), 1)
         self.assertEqual(trace.steps[0].discoveries[0].status, DiscoveryStatus.FAILED)
 

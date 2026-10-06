@@ -38,7 +38,7 @@ from qa_agent.redaction import redact_secrets, safe_failure_reason
 
 logger = logging.getLogger(__name__)
 
-TRACE_SCHEMA_VERSION = "1"
+TRACE_SCHEMA_VERSION = "2"
 
 _current_recorder: ContextVar["ExecutionTraceRecorder | None"] = ContextVar(
     "execution_trace_recorder", default=None
@@ -89,6 +89,16 @@ class DecompositionTrace(BaseModel):
     base_url: str | None = None
     steps: list[DecompositionStepTrace] = Field(default_factory=list)
     duration_ms: int | None = None
+
+
+class SegmentTrace(BaseModel):
+    """Segment metadata referencing the canonical step traces by identity."""
+
+    segment_id: UUID
+    order: int
+    base_url: str | None = None
+    test_step_ids: list[UUID] = Field(default_factory=list)
+    blocked_test_step_ids: list[UUID] = Field(default_factory=list)
 
 
 class DiscoveryTrace(BaseModel):
@@ -213,6 +223,7 @@ class ExecutionTrace(BaseModel):
     error: str | None = None
     error_stage: str | None = None
     decomposition: DecompositionTrace | None = None
+    segments: list[SegmentTrace] = Field(default_factory=list)
     steps: list[StepTrace] = Field(default_factory=list)
     totals: TraceTotals = Field(default_factory=TraceTotals)
 
@@ -260,6 +271,7 @@ class ExecutionTraceRecorder:
         self._error: str | None = None
         self._error_stage: str | None = None
         self._decomposition: DecompositionTrace | None = None
+        self._segments: list[SegmentTrace] = []
         self._steps: list[StepTrace] = []
         self._current_step: StepTrace | None = None
 
@@ -269,6 +281,18 @@ class ExecutionTraceRecorder:
     def record_decomposition(
         self, test_case: TestCase, duration_ms: int | None
     ) -> None:
+        self._segments = [
+            SegmentTrace(
+                segment_id=segment.id,
+                order=segment.order,
+                base_url=segment.base_url,
+                test_step_ids=[
+                    step.id
+                    for step in sorted(segment.steps, key=lambda item: item.order)
+                ],
+            )
+            for segment in sorted(test_case.segments, key=lambda item: item.order)
+        ]
         self._decomposition = DecompositionTrace(
             test_case_id=test_case.id,
             name=redact_secrets(test_case.name),
@@ -296,6 +320,20 @@ class ExecutionTraceRecorder:
             expected=redact_secrets(test_step.expected),
         )
         self._steps.append(self._current_step)
+
+    def record_blocked_steps(self, test_step_ids: list[UUID]) -> None:
+        """Attach blocked domain membership without creating fake StepTrace entries."""
+        blocked_ids = set(test_step_ids)
+        self._segments = [
+            segment.model_copy(update={
+                "blocked_test_step_ids": [
+                    test_step_id
+                    for test_step_id in segment.test_step_ids
+                    if test_step_id in blocked_ids
+                ]
+            })
+            for segment in self._segments
+        ]
 
     def record_cache(self, hit: bool, version: TestPlanVersion | None) -> None:
         step = self._current_step
@@ -509,6 +547,7 @@ class ExecutionTraceRecorder:
             error=self._error,
             error_stage=self._error_stage,
             decomposition=self._decomposition,
+            segments=self._segments,
             steps=self._steps,
             totals=TraceTotals(
                 steps=len(self._steps),

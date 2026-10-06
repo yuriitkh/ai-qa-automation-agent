@@ -476,6 +476,7 @@ class QATestPipeline:
                 ]
                 break
 
+        record_safely(trace, "record_blocked_steps", blocked_step_ids)
         run = TestRun.from_test_case(
             test_case, executions, blocked_step_ids=blocked_step_ids
         )

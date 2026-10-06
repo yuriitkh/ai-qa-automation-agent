@@ -216,7 +216,7 @@ class CliRunTests(unittest.TestCase):
         self.assertIn("plan v1", text)
         self.assertIn("no failure evidence", text)
         self.assertIn("trace_id:", text)
-        self.assertIn("schema_version: 1", text)
+        self.assertIn("schema_version: 2", text)
 
     def test_failed_run_returns_one(self) -> None:
         pipeline = _pipeline(runner=_failing_runner)
@@ -283,7 +283,7 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual(code, EXIT_PASSED)
         trace = json.loads(output.getvalue())
         self.assertEqual(trace["status"], "PASSED")
-        self.assertEqual(trace["schema_version"], "1")
+        self.assertEqual(trace["schema_version"], "2")
         self.assertIn("trace_id", trace)
         self.assertEqual(trace["totals"]["steps"], 1)
         self.assertEqual(trace["totals"]["execution_attempts"], 1)
@@ -305,7 +305,7 @@ class CliRunTests(unittest.TestCase):
         # Whole stdout parses as JSON: nothing else was printed.
         trace = json.loads(text)
         self.assertEqual(trace["status"], "FAILED")
-        self.assertEqual(trace["schema_version"], "1")
+        self.assertEqual(trace["schema_version"], "2")
         self.assertIn("trace_id", trace)
         # Failure/error information is present inside the serialized trace.
         attempt = trace["steps"][0]["execution_attempts"][0]
