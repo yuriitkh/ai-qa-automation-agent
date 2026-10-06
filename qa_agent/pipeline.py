@@ -3,7 +3,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from qa_agent.browser_discovery import capture_discovery_result, extract_target_url
 from qa_agent.browser_runner import BrowserRunner
@@ -23,6 +23,7 @@ from qa_agent.models import (
     ExecutionStatus,
     Evidence,
     EvidenceType,
+    FailurePolicy,
     QATestPlan,
     TestCase,
     TestPlanVersion,
@@ -53,13 +54,19 @@ class PipelineResult:
     test_plans: list[GeneratedTestPlan]
     executions: list[Execution]
     trace: ExecutionTrace | None = field(default=None, compare=False)
+    # Step ids a BLOCK_REST failure policy prevented from executing.
+    blocked_step_ids: list[UUID] = field(default_factory=list)
     test_run: TestRun = field(init=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(
             self,
             "test_run",
-            TestRun.from_test_case(self.test_case, self.executions),
+            TestRun.from_test_case(
+                self.test_case,
+                self.executions,
+                blocked_step_ids=self.blocked_step_ids,
+            ),
         )
 
     def __iter__(self):
@@ -152,8 +159,9 @@ class QATestPipeline:
 
         executions: list[Execution] = []
         generated_plans: list[GeneratedTestPlan] = []
+        blocked_step_ids: list[UUID] = []
         ordered_steps = sorted(test_case.steps, key=lambda step: step.order)
-        for test_step in ordered_steps:
+        for step_index, test_step in enumerate(ordered_steps):
             record_safely(trace, "begin_step", test_step)
             try:
                 cached_version = self._plan_store.find(test_step.id)
@@ -298,6 +306,14 @@ class QATestPipeline:
             if execution.status != ExecutionStatus.FAILED or not _is_stale_ui_failure(
                 execution.runner_result
             ):
+                # Explicit failure policy: a step whose final outcome is
+                # FAILED may still continue the TestCase (CONTINUE) or stop
+                # it entirely (BLOCK_REST); the decision is never implicit.
+                if _should_block_rest(test_step, execution):
+                    blocked_step_ids = [
+                        step.id for step in ordered_steps[step_index + 1:]
+                    ]
+                    break
                 continue
 
             rediscovery_started = time.perf_counter()
@@ -388,6 +404,11 @@ class QATestPipeline:
                     repaired_execution,
                     repaired_version.version,
                 )
+                if _should_block_rest(test_step, repaired_execution):
+                    blocked_step_ids = [
+                        step.id for step in ordered_steps[step_index + 1:]
+                    ]
+                    break
                 continue
 
             regeneration_started = time.perf_counter()
@@ -449,8 +470,15 @@ class QATestPipeline:
                 regenerated_execution,
                 regenerated_plan.test_plan_version.version,
             )
+            if _should_block_rest(test_step, regenerated_execution):
+                blocked_step_ids = [
+                    step.id for step in ordered_steps[step_index + 1:]
+                ]
+                break
 
-        run = TestRun.from_test_case(test_case, executions)
+        run = TestRun.from_test_case(
+            test_case, executions, blocked_step_ids=blocked_step_ids
+        )
         status = (
             TraceStatus.FAILED
             if run.status == ExecutionStatus.FAILED
@@ -461,6 +489,7 @@ class QATestPipeline:
             test_case=test_case,
             test_plans=generated_plans,
             executions=executions,
+            blocked_step_ids=blocked_step_ids,
             trace=final_trace,
         )
 
@@ -599,6 +628,14 @@ class QATestPipeline:
                 description=item.get("description"),
             ))
         return tuple(evidence)
+
+
+def _should_block_rest(test_step: TestStep, execution: Execution) -> bool:
+    """Honor an explicit BLOCK_REST failure policy after a step ends FAILED."""
+    return (
+        test_step.failure_policy == FailurePolicy.BLOCK_REST
+        and execution.status == ExecutionStatus.FAILED
+    )
 
 
 def _is_stale_ui_failure(runner_result: dict[str, Any] | None) -> bool:

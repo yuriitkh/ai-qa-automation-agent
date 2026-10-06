@@ -119,6 +119,49 @@ class TestRunTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _DomainTestRun.from_test_case(self.test_case, [unrelated])
 
+    def test_failed_and_blocked_steps_stay_distinguishable(self) -> None:
+        failed = self.make_execution(self.step_one, ExecutionStatus.FAILED, 0)
+
+        run = _DomainTestRun.from_test_case(
+            self.test_case,
+            [failed],
+            blocked_step_ids=[self.step_two.id],
+        )
+
+        self.assertEqual(run.failed_steps, [self.step_one.id])
+        self.assertEqual(run.blocked_steps, [self.step_two.id])
+        self.assertTrue(set(run.failed_steps).isdisjoint(run.blocked_steps))
+        self.assertIsNone(run.final_execution_for_step(self.step_two.id))
+        self.assertEqual(run.status, ExecutionStatus.FAILED)
+
+    def test_blocked_steps_fail_the_run_without_becoming_failed_steps(self) -> None:
+        run = _DomainTestRun.from_test_case(
+            self.test_case,
+            [],
+            blocked_step_ids=[self.step_one.id, self.step_two.id],
+        )
+
+        self.assertEqual(run.blocked_steps, [self.step_one.id, self.step_two.id])
+        self.assertEqual(run.failed_steps, [])
+        self.assertEqual(run.status, ExecutionStatus.FAILED)
+
+    def test_rejects_blocked_step_with_execution_or_unknown_step(self) -> None:
+        executed = self.make_execution(self.step_one, ExecutionStatus.PASSED, 0)
+
+        with self.assertRaises(ValueError):
+            _DomainTestRun.from_test_case(
+                self.test_case,
+                [executed],
+                blocked_step_ids=[self.step_one.id],
+            )
+
+        with self.assertRaises(ValueError):
+            _DomainTestRun.from_test_case(
+                self.test_case,
+                [],
+                blocked_step_ids=[uuid4()],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

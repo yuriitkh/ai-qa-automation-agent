@@ -154,12 +154,27 @@ class AIDiscoveryResult(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class FailurePolicy(str, Enum):
+    """Explicit policy for what happens after a TestStep's final outcome is FAILED.
+
+    CONTINUE keeps the historical behavior: later steps still execute.
+    BLOCK_REST stops the TestCase: later steps become BLOCKED and never run.
+    """
+
+    CONTINUE = "CONTINUE"
+    BLOCK_REST = "BLOCK_REST"
+
+
 class TestStep(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     name: str = Field(min_length=1)
     description: str = Field(min_length=1)
     expected: str = Field(min_length=1)
     order: int = Field(ge=0)
+    # What the pipeline does when this step's final outcome is FAILED.
+    # The default preserves the historical continue-after-failure behavior
+    # and is intentionally excluded from the decomposer's uuid5 step identity.
+    failure_policy: FailurePolicy = FailurePolicy.CONTINUE
 
 
 class TestCase(BaseModel):
@@ -191,6 +206,10 @@ class ExecutionStatus(str, Enum):
     RUNNING = "RUNNING"
     PASSED = "PASSED"
     FAILED = "FAILED"
+    # Step-level outcome only: the step never executed because an earlier
+    # step's BLOCK_REST failure policy prevented continuation. A blocked
+    # step carries no Execution; FAILED always means "executed and failed".
+    BLOCKED = "BLOCKED"
 
 
 class EvidenceType(str, Enum):
@@ -256,6 +275,9 @@ class TestRun(BaseModel):
     started_at: datetime
     finished_at: datetime | None = None
     executions: list[Execution] = Field(default_factory=list)
+    # Steps that never executed because an earlier step's BLOCK_REST failure
+    # policy prevented continuation. Blocked steps never carry an Execution.
+    blocked_step_ids: list[UUID] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_execution_steps(self) -> "TestRun":
@@ -266,6 +288,13 @@ class TestRun(BaseModel):
         known_step_ids = set(self.test_step_ids)
         if any(execution.test_step_id not in known_step_ids for execution in self.executions):
             raise ValueError("TestRun contains an execution for an unrelated TestStep.")
+        if len(set(self.blocked_step_ids)) != len(self.blocked_step_ids):
+            raise ValueError("TestRun blocked_step_ids must be unique.")
+        if any(blocked not in known_step_ids for blocked in self.blocked_step_ids):
+            raise ValueError("TestRun blocked_step_ids must name known TestSteps.")
+        if any(execution.test_step_id in set(self.blocked_step_ids)
+               for execution in self.executions):
+            raise ValueError("A blocked TestStep must not have an Execution.")
         return self
 
     @classmethod
@@ -273,6 +302,7 @@ class TestRun(BaseModel):
         cls,
         test_case: TestCase,
         executions: list[Execution],
+        blocked_step_ids: list[UUID] | None = None,
     ) -> "TestRun":
         ordered_steps = sorted(test_case.steps, key=lambda step: step.order)
         if executions:
@@ -297,6 +327,7 @@ class TestRun(BaseModel):
             started_at=started_at,
             finished_at=finished_at,
             executions=executions,
+            blocked_step_ids=list(blocked_step_ids or []),
         )
 
     @property
@@ -331,17 +362,31 @@ class TestRun(BaseModel):
         ]
 
     @property
+    def blocked_steps(self) -> list[UUID]:
+        """Blocked step ids in execution order; these steps never ran."""
+        blocked = set(self.blocked_step_ids)
+        return [step_id for step_id in self.test_step_ids if step_id in blocked]
+
+    @property
     def failed_steps(self) -> list[UUID]:
+        # Blocked steps are excluded: FAILED means "executed and failed",
+        # BLOCKED means "never executed because of an earlier failure".
+        blocked = set(self.blocked_step_ids)
         return [
             step_id
             for step_id in self.test_step_ids
-            if (execution := self.final_execution_for_step(step_id)) is None
-            or execution.status != ExecutionStatus.PASSED
+            if step_id not in blocked
+            and (
+                (execution := self.final_execution_for_step(step_id)) is None
+                or execution.status != ExecutionStatus.PASSED
+            )
         ]
 
     @property
     def status(self) -> ExecutionStatus:
-        if self.failed_steps:
+        # Blocked steps also fail the run: a TestCase that did not execute
+        # to completion has not passed.
+        if self.failed_steps or self.blocked_step_ids:
             return ExecutionStatus.FAILED
         return ExecutionStatus.PASSED
 

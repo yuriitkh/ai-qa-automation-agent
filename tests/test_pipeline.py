@@ -11,6 +11,7 @@ from qa_agent.models import (
     DiscoveryResult,
     DiscoveryStatus,
     ExecutionStatus,
+    FailurePolicy,
     InteractiveElement,
     QATestPlan,
     QATestStep,
@@ -1686,6 +1687,177 @@ class QATestPipelineTests(unittest.TestCase):
 
         self.assertEqual([item.status for item in executions], [ExecutionStatus.FAILED] * 2)
         self.assertEqual([item.error for item in executions], ["not found"] * 2)
+
+    def test_failed_step_with_continue_policy_executes_subsequent_steps(self) -> None:
+        steps = [
+            DomainTestStep(
+                name="Step 0",
+                description="Perform check 0",
+                expected="Check 0 passes",
+                order=0,
+                failure_policy=FailurePolicy.CONTINUE,
+            ),
+            self.make_step(1),
+            self.make_step(2),
+        ]
+        case = DomainTestCase(
+            name="Example flow",
+            description="Check the example page.",
+            base_url="https://example.com/",
+            steps=steps,
+        )
+        runner_calls: list[QATestPlan] = []
+
+        def runner(plan: QATestPlan) -> dict[str, Any]:
+            runner_calls.append(plan)
+            if len(runner_calls) == 1:
+                return {
+                    "status": "failed",
+                    "url": plan.url,
+                    "steps": [{
+                        "action": "assert_title",
+                        "status": "failed",
+                        "error": "wrong title",
+                    }],
+                }
+            return {"status": "passed", "url": plan.url, "steps": []}
+
+        pipeline = QATestPipeline(
+            decomposer=_FakeDecomposer(case, self.events),
+            discovery=self.discover,
+            plan_generator=self.generator,
+            runner=runner,
+        )
+
+        result = pipeline.run("Check the example page.")
+
+        # FAIL + CONTINUE: the later steps are executed normally.
+        self.assertEqual(len(runner_calls), 3)
+        self.assertEqual(
+            [execution.status for execution in result.executions],
+            [ExecutionStatus.FAILED, ExecutionStatus.PASSED, ExecutionStatus.PASSED],
+        )
+        self.assertEqual(
+            [execution.test_step_id for execution in result.executions],
+            [steps[0].id, steps[1].id, steps[2].id],
+        )
+        # An ordinary assertion failure never enters the recovery path.
+        self.assertEqual(
+            sum(event[0] == "discovery" for event in self.events), 3
+        )
+        # The original failed step remains FAILED; nothing is blocked.
+        self.assertEqual(
+            result.test_run.final_execution_for_step(steps[0].id).status,
+            ExecutionStatus.FAILED,
+        )
+        self.assertEqual(result.test_run.failed_steps, [steps[0].id])
+        self.assertEqual(result.blocked_step_ids, [])
+        self.assertEqual(result.test_run.blocked_steps, [])
+        self.assertEqual(result.test_run.status, ExecutionStatus.FAILED)
+
+    def test_failed_step_with_block_rest_policy_blocks_subsequent_steps(self) -> None:
+        steps = [
+            DomainTestStep(
+                name="Step 0",
+                description="Perform check 0",
+                expected="Check 0 passes",
+                order=0,
+                failure_policy=FailurePolicy.BLOCK_REST,
+            ),
+            self.make_step(1),
+            self.make_step(2),
+        ]
+        case = DomainTestCase(
+            name="Example flow",
+            description="Check the example page.",
+            base_url="https://example.com/",
+            steps=steps,
+        )
+        runner_calls: list[QATestPlan] = []
+
+        def runner(plan: QATestPlan) -> dict[str, Any]:
+            runner_calls.append(plan)
+            return {
+                "status": "failed",
+                "url": plan.url,
+                "steps": [{
+                    "action": "assert_title",
+                    "status": "failed",
+                    "error": "wrong title",
+                }],
+            }
+
+        pipeline = QATestPipeline(
+            decomposer=_FakeDecomposer(case, self.events),
+            discovery=self.discover,
+            plan_generator=self.generator,
+            runner=runner,
+        )
+
+        result = pipeline.run("Check the example page.")
+
+        # FAIL + BLOCK_REST: subsequent steps are never executed.
+        self.assertEqual(len(runner_calls), 1)
+        self.assertEqual(len(result.executions), 1)
+        # The original failed step remains FAILED (it really executed).
+        self.assertEqual(result.executions[0].status, ExecutionStatus.FAILED)
+        self.assertEqual(result.executions[0].test_step_id, steps[0].id)
+        # Subsequent steps are marked BLOCKED, in step order, with no Execution.
+        self.assertEqual(result.blocked_step_ids, [steps[1].id, steps[2].id])
+        self.assertEqual(
+            result.test_run.blocked_steps, [steps[1].id, steps[2].id]
+        )
+        self.assertIsNone(
+            result.test_run.final_execution_for_step(steps[1].id)
+        )
+        self.assertIsNone(
+            result.test_run.final_execution_for_step(steps[2].id)
+        )
+        # FAILED and BLOCKED remain distinguishable step outcomes.
+        self.assertEqual(result.test_run.failed_steps, [steps[0].id])
+        self.assertTrue(
+            set(result.test_run.failed_steps).isdisjoint(
+                result.test_run.blocked_steps
+            )
+        )
+        # The final TestCase status is FAILED in both policies.
+        self.assertEqual(result.test_run.status, ExecutionStatus.FAILED)
+
+    def test_block_rest_policy_does_not_replace_infrastructure_abort(self) -> None:
+        steps = [
+            DomainTestStep(
+                name="Step 0",
+                description="Perform check 0",
+                expected="Check 0 passes",
+                order=0,
+                failure_policy=FailurePolicy.BLOCK_REST,
+            ),
+            self.make_step(1),
+        ]
+        case = DomainTestCase(
+            name="Example flow",
+            description="Check the example page.",
+            base_url="https://example.com/",
+            steps=steps,
+        )
+        runner = unittest.mock.Mock(side_effect=RuntimeError("browser crashed"))
+        pipeline = QATestPipeline(
+            decomposer=_FakeDecomposer(case, self.events),
+            discovery=self.discover,
+            plan_generator=self.generator,
+            runner=runner,
+        )
+
+        # Infrastructure failures still abort the run: no PipelineResult
+        # (and therefore no TestRun with BLOCKED steps) is produced, and the
+        # failure policy never converts an abort into blocked steps.
+        with self.assertRaises(PipelineStageError) as raised:
+            pipeline.run("Check the example page.")
+
+        self.assertTrue(
+            raised.exception.stage.startswith("execution (step 0")
+        )
+        self.assertEqual(runner.call_count, 1)
 
     def test_stale_ui_failure_rediscovers_and_generates_version_two_once(self) -> None:
         one_step_case = DomainTestCase(

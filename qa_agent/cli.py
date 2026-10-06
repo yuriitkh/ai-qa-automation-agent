@@ -199,9 +199,15 @@ def _print_test_case_section(
         plan_versions[generated.test_plan.test_step_id] = (
             generated.test_plan_version.version
         )
+    blocked_ids = set(result.test_run.blocked_step_ids)
     for step in sorted(result.test_case.steps, key=lambda item: item.order):
         final = result.test_run.final_execution_for_step(step.id)
-        status = final.status.value if final is not None else "NOT_RUN"
+        if final is not None:
+            status = final.status.value
+        elif step.id in blocked_ids:
+            status = ExecutionStatus.BLOCKED.value
+        else:
+            status = "NOT_RUN"
         step_trace = trace_steps.get(step.id)
         attempts = (
             len(step_trace.execution_attempts)

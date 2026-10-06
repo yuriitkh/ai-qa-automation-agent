@@ -86,6 +86,7 @@ class TestReportGenerator:
         for execution in test_run.executions:
             executions_by_step[execution.test_step_id].append(execution)
 
+        blocked_ids = set(test_run.blocked_step_ids)
         names = test_run.test_step_names or ["" for _ in test_run.test_step_ids]
         steps = []
         for step_id, name in zip(test_run.test_step_ids, names):
@@ -94,7 +95,11 @@ class TestReportGenerator:
                 TestStepReport(
                     step_id=step_id,
                     name=name,
-                    status=attempts[-1].status if attempts else None,
+                    status=(
+                        ExecutionStatus.BLOCKED
+                        if step_id in blocked_ids
+                        else (attempts[-1].status if attempts else None)
+                    ),
                     attempts=[TestAttemptReport.from_execution(item) for item in attempts],
                 )
             )

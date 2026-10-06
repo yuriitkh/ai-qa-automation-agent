@@ -206,6 +206,32 @@ class TestReportGeneratorTests(unittest.TestCase):
         self.assertEqual(first_report.attempts[0].evidence[0].path, "artifacts/stale.png")
         self.assertEqual(first_report.attempts[1].evidence, [])
 
+    def test_blocked_steps_are_reported_distinctly_from_failed_steps(self) -> None:
+        first, second, third = sorted(self.steps, key=lambda step: step.order)
+        run = DomainTestRun.from_test_case(
+            self.case,
+            [self.execution(first, ExecutionStatus.FAILED, 0, error="wrong title")],
+            blocked_step_ids=[second.id, third.id],
+        )
+
+        report = self.generator.generate(run)
+        serialized = report.to_json()
+        parsed = json.loads(serialized)
+
+        # The failed step shows FAILED with its attempt; the blocked steps
+        # show BLOCKED with no attempts and are never reported as FAILED.
+        self.assertEqual(report.status, ExecutionStatus.FAILED)
+        self.assertEqual(
+            [step.status for step in report.steps],
+            [ExecutionStatus.FAILED, ExecutionStatus.BLOCKED, ExecutionStatus.BLOCKED],
+        )
+        self.assertEqual([len(step.attempts) for step in report.steps], [1, 0, 0])
+        self.assertEqual(
+            [step["status"] for step in parsed["steps"]],
+            ["FAILED", "BLOCKED", "BLOCKED"],
+        )
+        self.assertEqual(DomainTestReport.model_validate_json(serialized), report)
+
     def test_file_output_writes_json_to_explicit_path(self) -> None:
         step = min(self.steps, key=lambda item: item.order)
         run = DomainTestRun.from_test_case(
