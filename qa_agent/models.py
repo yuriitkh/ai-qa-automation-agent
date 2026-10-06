@@ -3,7 +3,7 @@ from enum import Enum
 from typing import Any, ClassVar, Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 
 class QATestStep(BaseModel):
@@ -177,12 +177,111 @@ class TestStep(BaseModel):
     failure_policy: FailurePolicy = FailurePolicy.CONTINUE
 
 
+class ExecutionSegment(BaseModel):
+    """Domain grouping for ordered TestSteps within a TestCase.
+
+    Segment boundaries are descriptive only at this stage; they do not define
+    browser, discovery, or execution lifecycles.
+    """
+
+    id: UUID = Field(default_factory=uuid4)
+    order: int = Field(ge=0)
+    base_url: str | None = None
+    is_implicit: bool = False
+    steps: list[TestStep] = Field(min_length=1)
+
+
 class TestCase(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     name: str = Field(min_length=1)
     description: str = Field(min_length=1)
     base_url: str | None = None
-    steps: list[TestStep] = Field(min_length=1)
+    segments: list[ExecutionSegment] = Field(min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_steps(cls, value: Any) -> Any:
+        """Accept legacy flat ``steps=`` input as one implicit segment."""
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        flat_steps = data.pop("steps", None)
+        segments = data.get("segments")
+        if segments is None:
+            if flat_steps is None:
+                raise ValueError("TestCase requires steps or segments.")
+            data["segments"] = [{
+                "order": 0,
+                "base_url": data.get("base_url"),
+                "is_implicit": True,
+                "steps": flat_steps,
+            }]
+        elif flat_steps is not None:
+            # model_dump() includes the compatibility property. Accept it only
+            # when it exactly matches the canonical segmented representation.
+            flattened = [
+                step
+                for segment in segments
+                for step in (segment.get("steps", []) if isinstance(segment, dict) else segment.steps)
+            ]
+            flat_models = [step if isinstance(step, TestStep) else TestStep.model_validate(step) for step in flat_steps]
+            segment_models = [step if isinstance(step, TestStep) else TestStep.model_validate(step) for step in flattened]
+            if flat_models != segment_models:
+                raise ValueError("TestCase steps must match the flattened segment steps.")
+            segment_orders = [segment.order if isinstance(segment, ExecutionSegment) else segment.get("order") for segment in segments]
+            step_orders = [step.order if isinstance(step, TestStep) else step.get("order") for step in flattened]
+            step_ids = [step.id if isinstance(step, TestStep) else step.get("id") for step in flattened]
+            is_implicit = [segment.is_implicit if isinstance(segment, ExecutionSegment) else segment.get("is_implicit", False) for segment in segments]
+            if segment_orders != sorted(segment_orders) or len(set(segment_orders)) != len(segment_orders):
+                raise ValueError("ExecutionSegments must have unique, ordered order values.")
+            if any(is_implicit) and (len(segments) != 1 or is_implicit != [True]):
+                raise ValueError("Only one implicit ExecutionSegment is allowed.")
+            if not any(is_implicit) and step_orders != sorted(step_orders):
+                raise ValueError("ExecutionSegment steps must be ordered by order.")
+            if len(set(step_ids)) != len(step_ids):
+                raise ValueError("A TestStep cannot belong to multiple segments.")
+        else:
+            # Explicit segment input must already have deterministic ordering
+            # and must not repeat a TestStep across groups.
+            segment_orders = [segment.order if isinstance(segment, ExecutionSegment) else segment.get("order") for segment in segments]
+            if segment_orders != sorted(segment_orders) or len(set(segment_orders)) != len(segment_orders):
+                raise ValueError("ExecutionSegments must have unique, ordered order values.")
+            explicit_steps = [
+                step
+                for segment in segments
+                for step in (segment.steps if isinstance(segment, ExecutionSegment) else segment.get("steps", []))
+            ]
+            step_orders = [step.order if isinstance(step, TestStep) else step.get("order") for step in explicit_steps]
+            step_ids = [step.id if isinstance(step, TestStep) else step.get("id") for step in explicit_steps]
+            if step_orders != sorted(step_orders):
+                raise ValueError("ExecutionSegment steps must be ordered by order.")
+            if len(set(step_ids)) != len(step_ids):
+                raise ValueError("A TestStep cannot belong to multiple segments.")
+        return data
+
+    @model_validator(mode="after")
+    def validate_segments(self) -> "TestCase":
+        segments = self.segments
+        segment_orders = [segment.order for segment in segments]
+        if segment_orders != sorted(segment_orders) or len(set(segment_orders)) != len(segment_orders):
+            raise ValueError("ExecutionSegments must be ordered by order.")
+        seen_step_ids: set[UUID] = set()
+        for segment in segments:
+            for step in segment.steps:
+                if step.id in seen_step_ids:
+                    raise ValueError("A TestStep cannot belong to multiple segments.")
+                seen_step_ids.add(step.id)
+        return self
+
+    @computed_field
+    @property
+    def steps(self) -> list[TestStep]:
+        """Backward-compatible flat view, ordered by segment then step."""
+        return [
+            step
+            for segment in self.segments
+            for step in segment.steps
+        ]
 
 
 class TestPlan(BaseModel):

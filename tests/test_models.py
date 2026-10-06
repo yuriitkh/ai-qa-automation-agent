@@ -10,6 +10,7 @@ from qa_agent.models import (
     ExecutionStatus,
     DiscoveryResult,
     DiscoveryStatus,
+    ExecutionSegment,
     InteractiveElement,
     NavigationAction,
     NavigationSequence,
@@ -129,6 +130,136 @@ class DomainModelTests(unittest.TestCase):
         )
 
         self.assertEqual([step.order for step in case.steps], [0, 1])
+
+    def test_legacy_test_case_exposes_one_implicit_segment(self) -> None:
+        steps = [self.make_test_step(0), self.make_test_step(1)]
+        case = DomainTestCase(
+            name="Example flow",
+            description="Check the example page.",
+            base_url="https://example.com",
+            steps=steps,
+        )
+
+        self.assertEqual(len(case.segments), 1)
+        self.assertEqual(case.segments[0].order, 0)
+        self.assertEqual(case.segments[0].base_url, case.base_url)
+        self.assertEqual(case.steps, steps)
+        self.assertIs(case.segments[0].steps[0], steps[0])
+        self.assertIs(case.segments[0].steps[1], steps[1])
+
+    def test_unsorted_legacy_steps_round_trip_without_reordering(self) -> None:
+        steps = [self.make_test_step(1), self.make_test_step(0)]
+        case = DomainTestCase(
+            name="Legacy flow",
+            description="Keep supplied step order.",
+            base_url="https://example.com",
+            steps=steps,
+        )
+
+        restored = DomainTestCase(**case.model_dump())
+
+        self.assertEqual(restored.id, case.id)
+        self.assertEqual(restored.segments[0].id, case.segments[0].id)
+        self.assertEqual([step.id for step in restored.steps], [step.id for step in steps])
+        self.assertEqual([step.order for step in restored.steps], [1, 0])
+        self.assertEqual(restored.segments[0].base_url, case.base_url)
+        self.assertTrue(restored.segments[0].is_implicit)
+
+    def test_ordered_legacy_steps_round_trip(self) -> None:
+        steps = [self.make_test_step(0), self.make_test_step(1)]
+        case = DomainTestCase(
+            name="Legacy flow",
+            description="Round-trip an ordered legacy case.",
+            steps=steps,
+        )
+
+        restored = DomainTestCase(**case.model_dump())
+
+        self.assertEqual(restored.id, case.id)
+        self.assertEqual(restored.segments[0].id, case.segments[0].id)
+        self.assertEqual([step.id for step in restored.steps], [step.id for step in steps])
+
+    def test_explicit_segments_round_trip(self) -> None:
+        steps = [self.make_test_step(index) for index in range(3)]
+        case = DomainTestCase(
+            name="Segmented flow",
+            description="Round-trip explicit groups.",
+            segments=[
+                ExecutionSegment(order=0, steps=steps[:2]),
+                ExecutionSegment(order=1, steps=steps[2:]),
+            ],
+        )
+
+        restored = DomainTestCase(**case.model_dump())
+
+        self.assertEqual([segment.id for segment in restored.segments], [segment.id for segment in case.segments])
+        self.assertEqual(
+            [[step.id for step in segment.steps] for segment in restored.segments],
+            [[step.id for step in segment.steps] for segment in case.segments],
+        )
+
+    def test_dual_steps_and_segments_reject_conflicting_step_content(self) -> None:
+        step = self.make_test_step(0)
+        case = DomainTestCase(
+            name="Segmented flow",
+            description="Canonical content comes from segments.",
+            segments=[ExecutionSegment(order=0, steps=[step])],
+        )
+        dumped = case.model_dump()
+        dumped["steps"][0]["expected"] = "Conflicting expectation"
+
+        with self.assertRaises(ValidationError):
+            DomainTestCase(**dumped)
+
+    def test_explicit_segments_preserve_order_and_step_identity(self) -> None:
+        steps = [self.make_test_step(index) for index in range(3)]
+        case = DomainTestCase(
+            name="Segmented flow",
+            description="Two explicit groups.",
+            segments=[
+                ExecutionSegment(order=0, base_url="https://one.example", steps=steps[:2]),
+                ExecutionSegment(order=1, base_url="https://two.example", steps=steps[2:]),
+            ],
+        )
+
+        self.assertEqual([[step.id for step in segment.steps] for segment in case.segments], [
+            [steps[0].id, steps[1].id], [steps[2].id],
+        ])
+        self.assertEqual([step.id for step in case.steps], [step.id for step in steps])
+        self.assertIs(case.steps[2], steps[2])
+
+    def test_explicit_segments_reject_duplicate_step_membership(self) -> None:
+        step = self.make_test_step(0)
+        with self.assertRaises(ValidationError):
+            DomainTestCase(
+                name="Invalid flow",
+                description="A step appears in two groups.",
+                segments=[
+                    ExecutionSegment(order=0, steps=[step]),
+                    ExecutionSegment(order=1, steps=[step]),
+                ],
+            )
+
+    def test_explicit_segments_reject_unordered_groups_and_steps(self) -> None:
+        first, second = self.make_test_step(0), self.make_test_step(1)
+        with self.assertRaises(ValidationError):
+            DomainTestCase(
+                name="Invalid flow",
+                description="Groups are out of order.",
+                segments=[
+                    ExecutionSegment(order=1, steps=[first]),
+                    ExecutionSegment(order=0, steps=[second]),
+                ],
+            )
+
+        with self.assertRaises(ValidationError):
+            DomainTestCase(
+                name="Invalid flow",
+                description="Steps are out of order.",
+                segments=[
+                    ExecutionSegment(order=0, steps=[second, first]),
+                ],
+            )
 
     def test_test_step_has_description_and_expected(self) -> None:
         step = self.make_test_step()
