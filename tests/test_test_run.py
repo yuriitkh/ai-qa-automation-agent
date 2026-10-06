@@ -99,6 +99,17 @@ class TestRunTests(unittest.TestCase):
             "unique-2@example.test",
         )
 
+    def test_from_test_case_preserves_supplied_run_context_identity(self) -> None:
+        context = RunContext()
+        context.set_value("account_id", "account-123")
+
+        run = _DomainTestRun.from_test_case(
+            self.test_case, [], run_context=context
+        )
+
+        self.assertIs(run.run_context, context)
+        self.assertEqual(run.run_context.get_value("account_id"), "account-123")
+
     def test_run_context_api_has_deterministic_key_and_update_behavior(self) -> None:
         context = RunContext()
         self.assertFalse(context.has_value("created_user_id"))

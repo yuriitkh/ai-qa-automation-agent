@@ -430,6 +430,7 @@ class TestRun(BaseModel):
         test_case: TestCase,
         executions: list[Execution],
         blocked_step_ids: list[UUID] | None = None,
+        run_context: RunContext | None = None,
     ) -> "TestRun":
         ordered_steps = sorted(test_case.steps, key=lambda step: step.order)
         if executions:
@@ -453,6 +454,7 @@ class TestRun(BaseModel):
             test_step_names=[step.name for step in ordered_steps],
             started_at=started_at,
             finished_at=finished_at,
+            run_context=run_context if run_context is not None else RunContext(),
             executions=executions,
             blocked_step_ids=list(blocked_step_ids or []),
         )

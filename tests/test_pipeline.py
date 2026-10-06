@@ -15,6 +15,7 @@ from qa_agent.models import (
     InteractiveElement,
     QATestPlan,
     QATestStep,
+    RunContext,
     TestCase as DomainTestCase,
     TestPlan as DomainTestPlan,
     TestPlanVersion as DomainTestPlanVersion,
@@ -298,6 +299,28 @@ class QATestPipelineTests(unittest.TestCase):
         self.assertEqual(result.test_run.test_case_id, self.test_case.id)
         self.assertEqual(result.test_run.executions, executions)
         self.assertEqual(result.test_run.status, ExecutionStatus.PASSED)
+
+    def test_pipeline_preserves_supplied_run_context(self) -> None:
+        context = RunContext()
+        secret = "FAKE_PIPELINE_CONTEXT_SECRET_731"
+        context.set_value("session_token", secret, sensitive=True)
+
+        result = self.pipeline.run("Open the example homepage.", run_context=context)
+
+        self.assertIs(result.run_context, context)
+        self.assertIs(result.test_run.run_context, context)
+        self.assertEqual(result.run_context.get_value("session_token"), secret)
+        self.assertEqual(result.test_run.status, ExecutionStatus.PASSED)
+        self.assertEqual(result.test_run.failed_steps, [])
+        self.assertEqual(result.test_run.blocked_steps, [])
+
+    def test_pipeline_creates_a_distinct_run_context_for_each_run(self) -> None:
+        first = self.pipeline.run("Open the example homepage.")
+        second = self.pipeline.run("Open the example homepage.")
+
+        self.assertIs(first.run_context, first.test_run.run_context)
+        self.assertIs(second.run_context, second.test_run.run_context)
+        self.assertIsNot(first.run_context, second.run_context)
 
     def test_failed_runner_evidence_is_attached_to_execution(self) -> None:
         def runner(plan: QATestPlan) -> dict[str, Any]:

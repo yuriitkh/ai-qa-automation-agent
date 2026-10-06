@@ -38,6 +38,7 @@ from qa_agent.plan_execution import (
     PlanExecutionPersistenceError,
     PlanExecutionService,
 )
+from qa_agent.run_context import RunContext
 
 
 class PipelineStageError(RuntimeError):
@@ -59,6 +60,7 @@ class PipelineResult:
     trace: ExecutionTrace | None = field(default=None, compare=False)
     # Step ids a BLOCK_REST failure policy prevented from executing.
     blocked_step_ids: list[UUID] = field(default_factory=list)
+    run_context: RunContext = field(default_factory=RunContext, compare=False)
     test_run: TestRun = field(init=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -69,6 +71,7 @@ class PipelineResult:
                 self.test_case,
                 self.executions,
                 blocked_step_ids=self.blocked_step_ids,
+                run_context=self.run_context,
             ),
         )
 
@@ -112,17 +115,23 @@ class QATestPipeline:
             self._runner, self._execution_repository
         )
 
-    def run(self, task: str, base_url: str | None = None) -> PipelineResult:
+    def run(
+        self,
+        task: str,
+        base_url: str | None = None,
+        run_context: RunContext | None = None,
+    ) -> PipelineResult:
         """Run each decomposed step and return plans and executions together.
 
         The execution trace is an observability layer only: recording is
         best-effort and never changes pipeline behavior, fallback semantics,
         or recovery/regeneration logic.
         """
+        active_run_context = run_context if run_context is not None else RunContext()
         trace = self._create_trace_recorder(task)
         with active_trace_recorder(trace):
             try:
-                return self._run(task, base_url, trace)
+                return self._run(task, base_url, trace, active_run_context)
             except PipelineStageError as error:
                 error.trace = record_safely(
                     trace,
@@ -144,6 +153,7 @@ class QATestPipeline:
         task: str,
         base_url: str | None,
         trace: ExecutionTraceRecorder,
+        run_context: RunContext,
     ) -> PipelineResult:
         decomposition_started = time.perf_counter()
         try:
@@ -467,7 +477,10 @@ class QATestPipeline:
 
         record_safely(trace, "record_blocked_steps", blocked_step_ids)
         run = TestRun.from_test_case(
-            test_case, executions, blocked_step_ids=blocked_step_ids
+            test_case,
+            executions,
+            blocked_step_ids=blocked_step_ids,
+            run_context=run_context,
         )
         status = (
             TraceStatus.FAILED
@@ -481,6 +494,7 @@ class QATestPipeline:
             executions=executions,
             blocked_step_ids=blocked_step_ids,
             trace=final_trace,
+            run_context=run_context,
         )
 
     def _execute_plan(
