@@ -40,6 +40,7 @@ from qa_agent.plan_execution import (
 )
 from qa_agent.run_context import RunContext
 from qa_agent.run_history import RunHistoryService, WorkflowType
+from qa_agent.execution_progress import ExecutionEventType, emit_progress_event
 
 
 class PipelineStageError(RuntimeError):
@@ -215,6 +216,10 @@ class QATestPipeline:
             test_case,
             elapsed_ms(decomposition_started),
         )
+        emit_progress_event(
+            ExecutionEventType.AUTOMATION_PREPARATION_STARTED,
+            message="Preparing automation for the TestCase.",
+        )
 
         try:
             target_url = test_case.base_url or extract_target_url(task)
@@ -257,11 +262,27 @@ class QATestPipeline:
                     if cached_plan.test_step_id != test_step.id:
                         raise ValueError("Cached TestPlan belongs to a different TestStep.")
                 except Exception as error:
+                    emit_progress_event(
+                        ExecutionEventType.PLAN_GENERATION_FAILED,
+                        step=test_step,
+                        classification="MISSING_AUTOMATION",
+                        message="Saved automation could not be loaded.",
+                    )
                     raise PipelineStageError(
                         f"plan lookup (step {test_step.order}: {test_step.name})",
                         str(error),
                     ) from error
+                emit_progress_event(
+                    ExecutionEventType.PLAN_REUSED,
+                    step=test_step,
+                    message="Saved automation loaded.",
+                )
             else:
+                emit_progress_event(
+                    ExecutionEventType.PLAN_GENERATION_STARTED,
+                    step=test_step,
+                    message="Preparing automation for this step.",
+                )
                 discovery_started = time.perf_counter()
                 try:
                     discovery_result = self._discovery(target_url)
@@ -318,6 +339,12 @@ class QATestPipeline:
                         details = "; ".join(discovery_result.warnings) or "No details provided."
                         raise RuntimeError(f"Browser discovery returned FAILED: {details}")
                 except Exception as error:
+                    emit_progress_event(
+                        ExecutionEventType.PLAN_GENERATION_FAILED,
+                        step=test_step,
+                        classification="INFRASTRUCTURE_ERROR",
+                        message="The browser could not inspect the target page.",
+                    )
                     raise PipelineStageError(
                         f"discovery (step {test_step.order}: {test_step.name})",
                         str(error),
@@ -331,6 +358,12 @@ class QATestPipeline:
                     if generated_plan.test_plan.test_step_id != test_step.id:
                         raise ValueError("Generated TestPlan belongs to a different TestStep.")
                 except Exception as error:
+                    emit_progress_event(
+                        ExecutionEventType.PLAN_GENERATION_FAILED,
+                        step=test_step,
+                        classification="AUTOMATION_GENERATION_ERROR",
+                        message="Executable automation could not be generated for this step.",
+                    )
                     raise PipelineStageError(
                         f"plan generation (step {test_step.order}: {test_step.name})",
                         str(error),
@@ -352,10 +385,21 @@ class QATestPipeline:
                         test_plan=generated_plan.test_plan,
                     )
                 except Exception as error:
+                    emit_progress_event(
+                        ExecutionEventType.PLAN_GENERATION_FAILED,
+                        step=test_step,
+                        classification="INFRASTRUCTURE_ERROR",
+                        message="Generated automation could not be saved.",
+                    )
                     raise PipelineStageError(
                         f"plan save (step {test_step.order}: {test_step.name})",
                         str(error),
                     ) from error
+                emit_progress_event(
+                    ExecutionEventType.PLAN_GENERATED,
+                    step=test_step,
+                    message="Automation generated for this step.",
+                )
 
             plan_version = generated_plan.test_plan_version
             generated_plans.append(generated_plan)
@@ -371,6 +415,7 @@ class QATestPipeline:
                     blocked_step_ids = [
                         step.id for step in ordered_steps[step_index + 1:]
                     ]
+                    _emit_blocked_steps(ordered_steps[step_index + 1:])
                     break
                 continue
 
@@ -461,6 +506,7 @@ class QATestPipeline:
                     blocked_step_ids = [
                         step.id for step in ordered_steps[step_index + 1:]
                     ]
+                    _emit_blocked_steps(ordered_steps[step_index + 1:])
                     break
                 continue
 
@@ -522,6 +568,7 @@ class QATestPipeline:
                 blocked_step_ids = [
                     step.id for step in ordered_steps[step_index + 1:]
                 ]
+                _emit_blocked_steps(ordered_steps[step_index + 1:])
                 break
 
         record_safely(trace, "record_blocked_steps", blocked_step_ids)
@@ -590,13 +637,27 @@ def _automation_run_outcome(test_run: TestRun) -> str:
         for execution in test_run.final_executions
         if execution.status == ExecutionStatus.FAILED
     ]
-    if failed_executions and all(
+    classifications = {
         PlanExecutionService._classify(execution, None)
-        == PlanExecutionClassification.PRODUCT_FAILURE
         for execution in failed_executions
-    ):
+    }
+    if PlanExecutionClassification.INFRASTRUCTURE_ERROR in classifications:
+        return PlanExecutionClassification.INFRASTRUCTURE_ERROR.value
+    if PlanExecutionClassification.AUTOMATION_DRIFT in classifications:
+        return PlanExecutionClassification.AUTOMATION_DRIFT.value
+    if PlanExecutionClassification.PRODUCT_FAILURE in classifications:
         return PlanExecutionClassification.PRODUCT_FAILURE.value
     return "FAILED"
+
+
+def _emit_blocked_steps(steps: list[TestStep]) -> None:
+    for step in steps:
+        emit_progress_event(
+            ExecutionEventType.STEP_BLOCKED,
+            step=step,
+            status=ExecutionStatus.BLOCKED.value,
+            message="Blocked by the preceding step's failure policy.",
+        )
 
 
 def _should_block_rest(test_step: TestStep, execution: Execution) -> bool:

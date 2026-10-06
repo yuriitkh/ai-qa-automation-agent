@@ -8,6 +8,7 @@ from uuid import UUID
 
 from qa_agent.browser_runner import BrowserRunner
 from qa_agent.execution_repository import ExecutionRepository
+from qa_agent.execution_progress import get_active_execution_progress
 from qa_agent.models import QATestPlan
 from qa_agent.pipeline import PipelineResult
 from qa_agent.plan_execution import PlanExecutionService
@@ -32,6 +33,10 @@ from qa_agent.workflows import (
 
 class RunUnavailableError(ValueError):
     """A safe, user-facing reason a persisted TestCase cannot be run."""
+
+    def __init__(self, message: str, *, category: str = "MISSING_AUTOMATION") -> None:
+        self.category = category
+        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -117,23 +122,36 @@ class TestCaseExecutionService:
         test_case_id: UUID,
         workflow_type: WorkflowType,
     ) -> PinnedWorkflowResult | PipelineResult:
+        progress = get_active_execution_progress()
         if workflow_type == WorkflowType.AUTOMATION:
             if self._automation_workflow is None:
                 raise RunUnavailableError(
-                    "Automation is not available for persisted TestCases yet."
+                    "Automation is not available for persisted TestCases yet.",
+                    category="MISSING_AUTOMATION",
                 )
             test_case = self._test_cases.get(test_case_id)
             if test_case is None:
-                raise RunUnavailableError("TestCase not found.")
-            return self._automation_workflow.run_test_case(test_case, RunContext())
+                raise RunUnavailableError(
+                    "TestCase not found.", category="INVALID_TESTCASE"
+                )
+            run_context = progress.run_context if progress is not None else RunContext()
+            if progress is not None:
+                progress.bind_run_context(run_context)
+                progress.test_case_loaded(test_case)
+            return self._automation_workflow.run_test_case(test_case, run_context)
         if workflow_type not in {WorkflowType.VALIDATION, WorkflowType.REGRESSION}:
             raise RunUnavailableError(
-                "Choose Automation, Validation, or Regression before starting a run."
+                "Choose Automation, Validation, or Regression before starting a run.",
+                category="EXECUTION_ERROR",
             )
 
         test_case = self._test_cases.get(test_case_id)
         if test_case is None:
-            raise RunUnavailableError("TestCase not found.")
+            raise RunUnavailableError("TestCase not found.", category="INVALID_TESTCASE")
+        run_context = progress.run_context if progress is not None else RunContext()
+        if progress is not None:
+            progress.bind_run_context(run_context)
+            progress.test_case_loaded(test_case)
 
         selections: list[StepPlanSelection] = []
         missing_steps = []
@@ -145,12 +163,14 @@ class TestCaseExecutionService:
                 selections.append(StepPlanSelection(step.id, version.id))
         if missing_steps:
             raise RunUnavailableError(
-                "This TestCase is not ready to run because one or more steps have no saved plan."
+                "This TestCase is not ready to run because one or more steps have no saved plan.",
+                category="MISSING_AUTOMATION",
             )
         availability = self.workflow_availability(test_case_id)
         if not availability.validation_available:
             raise RunUnavailableError(
-                "This TestCase is not ready to run because one or more saved plans are not usable."
+                "This TestCase is not ready to run because one or more saved plans are not usable.",
+                category="MISSING_AUTOMATION",
             )
 
         runner = self._runner_factory(self._evidence_directory)
@@ -170,9 +190,10 @@ class TestCaseExecutionService:
             return workflow.run(
                 test_case,
                 PlanVersionSet(tuple(selections)),
-                RunContext(),
+                run_context,
             )
         except PlanSelectionError as error:
             raise RunUnavailableError(
-                "Saved plans changed before this run started. Reload the TestCase and try again."
+                "Saved plans changed before this run started. Reload the TestCase and try again.",
+                category="MISSING_AUTOMATION",
             ) from error

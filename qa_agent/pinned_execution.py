@@ -14,6 +14,10 @@ from qa_agent.models import (
     TestRun,
     TestStep,
 )
+from qa_agent.execution_progress import (
+    ExecutionEventType,
+    emit_progress_event,
+)
 from qa_agent.plan_execution import (
     PlanExecutionClassification,
     PlanExecutionPersistenceError,
@@ -176,6 +180,11 @@ class PinnedExecutionService:
         error: Exception | None = None
 
         for index, selected in enumerate(resolved.steps):
+            emit_progress_event(
+                ExecutionEventType.PLAN_REUSED,
+                step=selected.test_step,
+                message="Saved automation loaded.",
+            )
             try:
                 result = self._plan_execution.execute(
                     selected.test_step, selected.plan_version
@@ -204,6 +213,13 @@ class PinnedExecutionService:
                     following.test_step.id
                     for following in resolved.steps[index + 1:]
                 ]
+                for following in resolved.steps[index + 1:]:
+                    emit_progress_event(
+                        ExecutionEventType.STEP_BLOCKED,
+                        step=following.test_step,
+                        status=ExecutionStatus.BLOCKED.value,
+                        message="Blocked by the preceding step's failure policy.",
+                    )
                 break
 
         test_run = TestRun.from_test_case(

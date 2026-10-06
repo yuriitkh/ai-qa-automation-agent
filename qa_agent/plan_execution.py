@@ -7,6 +7,10 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from qa_agent.execution_repository import ExecutionRepository
+from qa_agent.execution_progress import (
+    ExecutionEventType,
+    emit_progress_event,
+)
 from qa_agent.models import (
     Evidence,
     EvidenceType,
@@ -16,6 +20,7 @@ from qa_agent.models import (
     TestPlanVersion,
     TestStep,
 )
+from qa_agent.presentation import failure_message
 
 
 class PlanExecutionClassification(str, Enum):
@@ -57,6 +62,12 @@ class PlanExecutionService:
         plan_version: TestPlanVersion,
     ) -> PlanExecutionOutcome:
         started_at = datetime.now(timezone.utc)
+        emit_progress_event(
+            ExecutionEventType.STEP_STARTED,
+            step=test_step,
+            status=ExecutionStatus.RUNNING.value,
+            message="Running step.",
+        )
         runner_result: dict[str, Any] | None = None
         execution_error: Exception | None = None
         try:
@@ -105,9 +116,40 @@ class PlanExecutionService:
         try:
             self._execution_repository.save(execution)
         except Exception as error:
+            emit_progress_event(
+                ExecutionEventType.STEP_FAILED,
+                step=test_step,
+                status=ExecutionStatus.FAILED.value,
+                classification=PlanExecutionClassification.INFRASTRUCTURE_ERROR.value,
+                message="The execution result could not be saved.",
+            )
             raise PlanExecutionPersistenceError(str(error)) from error
 
         classification = self._classify(execution, execution_error)
+        for evidence_index, _item in enumerate(execution.evidence):
+            emit_progress_event(
+                ExecutionEventType.EVIDENCE_CAPTURED,
+                step=test_step,
+                evidence_execution_id=execution.id,
+                evidence_index=evidence_index,
+                message="Screenshot evidence captured.",
+            )
+        if status == ExecutionStatus.PASSED:
+            emit_progress_event(
+                ExecutionEventType.STEP_PASSED,
+                step=test_step,
+                status=status.value,
+                classification=classification.value,
+                message="Step passed.",
+            )
+        else:
+            emit_progress_event(
+                ExecutionEventType.STEP_FAILED,
+                step=test_step,
+                status=status.value,
+                classification=classification.value,
+                message=failure_message(classification.value),
+            )
         return PlanExecutionOutcome(
             execution=execution,
             classification=classification,

@@ -1,6 +1,7 @@
 import json
 import tempfile
 import threading
+import time
 import unittest
 from http.client import HTTPConnection
 from pathlib import Path
@@ -52,11 +53,39 @@ class PersistedTestCaseBrowserFlowTests(unittest.TestCase):
                 )
                 response = connection.getresponse()
                 self.assertEqual(response.status, 303)
-                run_location = response.getheader("Location")
+                progress_location = response.getheader("Location")
                 response.read()
-                self.assertIsNotNone(run_location)
+                self.assertIsNotNone(progress_location)
+                progress_id = progress_location.rsplit("/", 1)[1]
+                deadline = time.monotonic() + 80
+                progress = None
+                while time.monotonic() < deadline:
+                    connection.request("GET", f"/api/progress/{progress_id}")
+                    progress_response = connection.getresponse()
+                    progress_body = progress_response.read().decode("utf-8")
+                    self.assertEqual(progress_response.status, 200)
+                    progress = json.loads(progress_body)
+                    if progress["finished"]:
+                        break
+                    time.sleep(0.05)
+                self.assertIsNotNone(progress)
+                self.assertTrue(progress["finished"], "background run did not finish in time")
+                event_types = [event["type"] for event in progress["events"]]
+                self.assertIn("TESTCASE_LOADED", event_types)
+                self.assertIn("SETUP_SUCCEEDED", event_types)
+                self.assertIn("PLAN_REUSED", event_types)
+                self.assertIn("STEP_STARTED", event_types)
+                self.assertIn("STEP_FAILED", event_types)
+                self.assertIn("STEP_BLOCKED", event_types)
+                self.assertIn("EVIDENCE_CAPTURED", event_types)
+                self.assertIn("CLEANUP_SUCCEEDED", event_types)
+                self.assertEqual(event_types[-1], "RUN_FINISHED")
+                self.assertEqual(progress["outcome"], "PRODUCT_FAILURE")
+                self.assertNotIn(str(evidence_root), progress_body)
+                run_location = progress["final_run_url"]
 
                 record = storage.run_history.list_for_test_case(test_case.id)[0]
+                self.assertEqual(progress["elapsed_ms"], record.duration_ms)
                 self.assertEqual(record.workflow_type, WorkflowType.VALIDATION)
                 self.assertEqual(record.status.value, "FAILED")
                 self.assertEqual(record.outcome, "PRODUCT_FAILURE")

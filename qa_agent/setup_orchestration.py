@@ -5,6 +5,7 @@ from enum import Enum
 from typing import Any, Callable, Mapping, Protocol
 from uuid import UUID
 
+from qa_agent.execution_progress import ExecutionEventType, emit_progress_event
 from qa_agent.models import Precondition, TestCase
 from qa_agent.redaction import redact_secrets, safe_failure_reason
 from qa_agent.run_context import RunContext
@@ -264,7 +265,30 @@ class SetupCleanupCoordinator:
         product_error: str | None = None
 
         try:
-            setup_outcome = self._setup.run(test_case, run_context, cleanup)
+            emit_progress_event(
+                ExecutionEventType.SETUP_STARTED,
+                message="Establishing required test conditions.",
+            )
+            try:
+                setup_outcome = self._setup.run(test_case, run_context, cleanup)
+            except Exception:
+                emit_progress_event(
+                    ExecutionEventType.SETUP_FAILED,
+                    classification="SETUP_FAILURE",
+                    message="Required test conditions could not be established.",
+                )
+                raise
+            emit_progress_event(
+                ExecutionEventType.SETUP_SUCCEEDED
+                if setup_outcome.succeeded
+                else ExecutionEventType.SETUP_FAILED,
+                classification=None if setup_outcome.succeeded else "SETUP_FAILURE",
+                message=(
+                    "Preconditions established."
+                    if setup_outcome.succeeded
+                    else "Required test conditions could not be established."
+                ),
+            )
             if setup_outcome.succeeded:
                 product_started = True
                 try:
@@ -273,7 +297,30 @@ class SetupCleanupCoordinator:
                     product_error_type = type(error).__name__
                     product_error = _safe_error(error, run_context)
         finally:
-            cleanup_outcome = cleanup.run()
+            emit_progress_event(
+                ExecutionEventType.CLEANUP_STARTED,
+                message="Running registered cleanup actions.",
+            )
+            try:
+                cleanup_outcome = cleanup.run()
+            except Exception:
+                emit_progress_event(
+                    ExecutionEventType.CLEANUP_FAILED,
+                    classification="CLEANUP_FAILURE",
+                    message="One or more cleanup actions did not complete.",
+                )
+                raise
+            emit_progress_event(
+                ExecutionEventType.CLEANUP_SUCCEEDED
+                if cleanup_outcome.succeeded
+                else ExecutionEventType.CLEANUP_FAILED,
+                classification=None if cleanup_outcome.succeeded else "CLEANUP_FAILURE",
+                message=(
+                    "Cleanup completed."
+                    if cleanup_outcome.succeeded
+                    else "One or more cleanup actions did not complete."
+                ),
+            )
 
         return TestCaseRunOutcome(
             setup=setup_outcome,

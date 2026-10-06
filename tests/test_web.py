@@ -1,5 +1,7 @@
 import json
+import threading
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -415,15 +417,27 @@ class PersistedTestCaseRunUiTests(unittest.TestCase):
         cases = InMemoryTestCaseRepository()
         cases.save(self.case)
         self.run_service = Mock()
-        self.run_id = uuid4()
-        self.run_service.run.return_value = SimpleNamespace(
-            test_run=SimpleNamespace(id=self.run_id)
-        )
+        self.run_started = threading.Event()
+        self.release_run = threading.Event()
+
+        def run_blocked(test_case_id, workflow_type):
+            self.run_started.set()
+            self.release_run.wait(timeout=5)
+            return SimpleNamespace(
+                test_run=SimpleNamespace(status=ExecutionStatus.PASSED),
+                outcome="PASSED",
+            )
+
+        self.run_service.run.side_effect = run_blocked
         self.app = LocalWebApplication(
             RunHistoryService(InMemoryRunHistoryRepository()),
             test_cases=cases,
             run_service=self.run_service,
         )
+
+    def tearDown(self) -> None:
+        self.release_run.set()
+        self.app.close()
 
     def test_saved_case_is_listed_and_detail_loads_without_history(self) -> None:
         listing = self.app.handle("GET", "/test-cases")
@@ -437,7 +451,8 @@ class PersistedTestCaseRunUiTests(unittest.TestCase):
         self.assertIn(b'method="post"', detail.body)
         self.run_service.run.assert_not_called()
 
-    def test_post_runs_selected_workflow_and_redirects_to_run_detail(self) -> None:
+    def test_post_returns_progress_url_and_runs_selected_workflow_in_background(self) -> None:
+        started_at = time.monotonic()
         response = self.app.handle(
             "POST",
             f"/test-cases/{self.case.id}/run",
@@ -445,8 +460,30 @@ class PersistedTestCaseRunUiTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status, 303)
-        self.assertEqual(response.headers["Location"], f"/runs/{self.run_id}")
+        self.assertLess(time.monotonic() - started_at, 1.5)
+        self.assertTrue(response.headers["Location"].startswith("/runs/progress/"))
+        progress_id = response.headers["Location"].rsplit("/", 1)[1]
+        self.assertTrue(self.run_started.wait(timeout=2))
+        page = self.app.handle("GET", response.headers["Location"])
+        self.assertEqual(page.status, 200)
+        self.assertIn(b"Live execution", page.body)
+        self.assertIn(b"/api/progress/", self.app.handle("GET", "/assets/ui.js").body)
+        self.assertEqual(self.app.handle("GET", response.headers["Location"]).status, 200)
         self.run_service.run.assert_called_once_with(self.case.id, WorkflowType.REGRESSION)
+
+        self.release_run.set()
+        deadline = time.monotonic() + 2
+        snapshot = None
+        while time.monotonic() < deadline:
+            progress_response = self.app.handle("GET", f"/api/progress/{progress_id}")
+            snapshot = json.loads(progress_response.body)
+            if snapshot["finished"]:
+                break
+            time.sleep(0.01)
+        self.assertIsNotNone(snapshot)
+        self.assertTrue(snapshot["finished"])
+        self.assertEqual(snapshot["workflow"], "REGRESSION")
+        self.assertEqual(snapshot["outcome"], "PASSED")
 
     def test_get_cannot_start_run_and_invalid_workflow_is_rejected(self) -> None:
         get_response = self.app.handle("GET", f"/test-cases/{self.case.id}/run")

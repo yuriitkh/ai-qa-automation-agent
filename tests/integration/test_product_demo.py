@@ -1,6 +1,7 @@
 import json
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from urllib.parse import urlencode
@@ -40,6 +41,20 @@ from qa_agent.test_case_execution import TestCaseExecutionService
 from qa_agent.test_plan_generator import LLMTestPlanGenerator
 from qa_agent.web import LocalWebApplication, create_http_server
 from qa_agent.workflows import AutomationWorkflow, RegressionWorkflow, ValidationWorkflow
+
+
+def _wait_for_progress(application, location: str, timeout: float = 60.0) -> dict:
+    progress_id = location.rsplit("/", 1)[1]
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        response = application.handle("GET", f"/api/progress/{progress_id}")
+        if response.status != 200:
+            raise AssertionError(response.body.decode("utf-8", errors="replace"))
+        snapshot = json.loads(response.body)
+        if snapshot["finished"]:
+            return snapshot
+        time.sleep(0.05)
+    raise AssertionError(f"Execution progress {progress_id} did not finish in time.")
 
 
 class ProductDemoSliceTests(unittest.TestCase):
@@ -299,17 +314,28 @@ class ProductDemoSliceTests(unittest.TestCase):
                 unavailable = application.handle(
                     "POST", f"/test-cases/{case_id}/run", b"workflow=VALIDATION"
                 )
-                self.assertEqual(unavailable.status, 409)
+                self.assertEqual(unavailable.status, 303)
+                unavailable_progress = _wait_for_progress(
+                    application, unavailable.headers["Location"]
+                )
+                self.assertEqual(unavailable_progress["error_category"], "MISSING_AUTOMATION")
                 self.assertEqual(storage.run_history.list_for_test_case(case_id), [])
 
                 automation = application.handle(
                     "POST", f"/test-cases/{case_id}/run", b"workflow=AUTOMATION"
                 )
                 self.assertEqual(automation.status, 303)
-                automation_id = UUID(automation.headers["Location"].rsplit("/", 1)[1])
+                automation_progress = _wait_for_progress(
+                    application, automation.headers["Location"]
+                )
+                automation_id = UUID(automation_progress["final_run_id"])
                 automation_record = storage.run_history.get(automation_id)
                 self.assertEqual(automation_record.workflow_type, WorkflowType.AUTOMATION)
                 self.assertEqual(automation_record.status, ExecutionStatus.FAILED)
+                automation_event_types = [event["type"] for event in automation_progress["events"]]
+                self.assertIn("TESTCASE_LOADED", automation_event_types)
+                self.assertIn("STEP_STARTED", automation_event_types)
+                self.assertEqual(automation_event_types[-1], "RUN_FINISHED")
                 self.assertEqual(len(storage.run_history.list_for_test_case(case_id)), 1)
                 self.assertEqual(run_service.workflow_availability(case_id).usable_plan_count, 1)
                 after_automation = application.handle("GET", saved.headers["Location"])
@@ -340,13 +366,16 @@ class ProductDemoSliceTests(unittest.TestCase):
                     "POST", f"/test-cases/{case_id}/run", b"workflow=REGRESSION"
                 )
                 self.assertEqual(regression.status, 303)
-                regression_id = UUID(regression.headers["Location"].rsplit("/", 1)[1])
+                regression_progress = _wait_for_progress(
+                    application, regression.headers["Location"]
+                )
+                regression_id = UUID(regression_progress["final_run_id"])
                 regression_record = storage.run_history.get(regression_id)
                 self.assertEqual(regression_record.workflow_type, WorkflowType.REGRESSION)
                 self.assertEqual(regression_record.outcome, "PRODUCT_FAILURE")
                 self.assertEqual(len(storage.run_history.list_for_test_case(case_id)), 2)
                 self.assertEqual(regression_record.executions[0].test_plan_version_id, plan_version.id)
-                run_page = application.handle("GET", regression.headers["Location"])
+                run_page = application.handle("GET", f"/runs/{regression_id}")
                 self.assertEqual(run_page.status, 200)
                 self.assertIn(b"FAILED", run_page.body)
             finally:
@@ -483,7 +512,8 @@ class ProductDemoSliceTests(unittest.TestCase):
                     "POST", f"/test-cases/{case_id}/run", b"workflow=AUTOMATION"
                 )
                 self.assertEqual(run_response.status, 303)
-                run_id = UUID(run_response.headers["Location"].rsplit("/", 1)[1])
+                progress = _wait_for_progress(application, run_response.headers["Location"])
+                run_id = UUID(progress["final_run_id"])
 
                 case = storage.test_case_repository.get(case_id)
                 self.assertEqual(len(case.steps), 4)
@@ -504,6 +534,17 @@ class ProductDemoSliceTests(unittest.TestCase):
                 self.assertEqual(record.workflow_type, WorkflowType.AUTOMATION)
                 self.assertEqual(record.outcome, "PRODUCT_FAILURE")
                 self.assertEqual(record.status, ExecutionStatus.FAILED)
+                event_types = [event["type"] for event in progress["events"]]
+                self.assertLess(event_types.index("RUN_STARTED"), event_types.index("TESTCASE_LOADED"))
+                self.assertIn("PLAN_GENERATION_STARTED", event_types)
+                self.assertIn("PLAN_GENERATED", event_types)
+                self.assertEqual(event_types.count("STEP_STARTED"), 4)
+                self.assertIn("EVIDENCE_CAPTURED", event_types)
+                self.assertEqual(event_types[-1], "RUN_FINISHED")
+                self.assertEqual(
+                    [step["state"] for step in progress["steps"]],
+                    ["PASSED", "PASSED", "PASSED", "FAILED"],
+                )
                 self.assertEqual(
                     [step.status for step in record.steps],
                     [

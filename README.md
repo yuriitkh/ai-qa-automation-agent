@@ -97,3 +97,14 @@ Open <http://127.0.0.1:8000>. The seed includes an executable local
 registration TestCase at `/demo-target/registration`; its deliberate missing
 confirmation assertion demonstrates a real browser failure and screenshot.
 Re-running the seed skips existing demo run IDs and preserves other run history.
+
+### Live execution progress
+
+Starting a saved TestCase run redirects to an opaque progress URL. The UI polls
+real workflow events from a thread-safe in-memory store and links to Run Details
+when the workflow writes its normal Run History record. Refreshing reconnects
+to the same progress request; progress does not create placeholder TestRuns.
+Finished progress is retained for up to 24 hours, with at most 500 finished
+requests. A server restart clears in-memory progress; job recovery is not
+persisted yet. AI TestCase authoring remains synchronous; it can use a separate
+authoring progress lifecycle in a later extension.

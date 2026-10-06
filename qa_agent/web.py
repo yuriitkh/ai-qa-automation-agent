@@ -1,6 +1,7 @@
 """Local UI for persisted TestCases and TestRun history."""
 
 import argparse
+import json
 import mimetypes
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,6 +15,7 @@ from qa_agent.presentation import (
     escape_html,
     format_duration,
     format_timestamp,
+    failure_message,
     outcome_label,
     outcome_tone,
     short_id,
@@ -36,6 +38,10 @@ from qa_agent.test_case_authoring import (
 from qa_agent.test_case_repository import TestCaseRepository
 from qa_agent.storage import create_sqlite_storage
 from qa_agent.pipeline import QATestPipeline
+from qa_agent.background_execution import BackgroundRunService
+from qa_agent.execution_progress import (
+    ExecutionProgressStore,
+)
 from qa_agent.test_case_decomposer import TestCaseDecomposer
 from qa_agent.test_plan_generator import LLMTestPlanGenerator
 from qa_agent.workflows import AutomationWorkflow
@@ -84,6 +90,7 @@ class LocalWebApplication:
         run_service: TestCaseExecutionService | None = None,
         authoring_service: TestCaseAuthoringService | None = None,
         draft_store: TestCaseDraftStore | None = None,
+        progress_store: ExecutionProgressStore | None = None,
     ) -> None:
         self._run_history = run_history
         self._reports = reports or RunReportGenerator()
@@ -92,6 +99,19 @@ class LocalWebApplication:
         self._run_service = run_service
         self._authoring_service = authoring_service
         self._draft_store = draft_store or TestCaseDraftStore()
+        self._progress_store = progress_store or ExecutionProgressStore()
+        self._background_runs = (
+            BackgroundRunService(run_service, run_history, self._progress_store)
+            if run_service is not None else None
+        )
+
+    @property
+    def progress_store(self) -> ExecutionProgressStore:
+        return self._progress_store
+
+    def close(self) -> None:
+        if self._background_runs is not None:
+            self._background_runs.close()
 
     def handle(self, method: str, target: str, body: bytes | str | None = None) -> WebResponse:
         parsed = urlsplit(target)
@@ -106,6 +126,16 @@ class LocalWebApplication:
                 '<div class="error-state"><h1>Method not allowed</h1>'
                 "<p>Use the TestCase run form to start a workflow.</p></div>",
             ))
+        if path == "/assets/ui.js":
+            return WebResponse(
+                200,
+                "application/javascript; charset=utf-8",
+                _UI_JAVASCRIPT.encode("utf-8"),
+            )
+        if len(parts) == 3 and parts[:2] == ["api", "progress"]:
+            return self._progress_json(parts[2])
+        if len(parts) == 3 and parts[:2] == ["runs", "progress"]:
+            return self._progress_page(parts[2])
         if path == "/":
             return WebResponse.html(200, self._dashboard())
         if path == "/demo-target/registration":
@@ -201,17 +231,172 @@ class LocalWebApplication:
             return self._run_error(test_case_id, "Choose Automation, Validation, or Regression before starting a run.", 400)
         if workflow not in {WorkflowType.AUTOMATION, WorkflowType.VALIDATION, WorkflowType.REGRESSION}:
             return self._run_error(test_case_id, "Choose Automation, Validation, or Regression before starting a run.", 400)
-        try:
-            result = self._run_service.run(test_case_id, workflow)
-        except RunUnavailableError as error:
-            return self._run_error(test_case_id, str(error), 409)
-        except Exception:
+        if self._background_runs is None:
             return self._run_error(
                 test_case_id,
-                "The run could not be started. Review saved plans and setup configuration.",
-                500,
+                "Execution is not available for this application.",
+                503,
             )
-        return WebResponse.redirect(f"/runs/{result.test_run.id}")
+        progress_id = self._background_runs.start(test_case_id, workflow)
+        return WebResponse.redirect(f"/runs/progress/{progress_id}")
+
+    def _progress_json(self, progress_id: str) -> WebResponse:
+        snapshot = self._progress_store.get(progress_id)
+        if snapshot is None:
+            return WebResponse.json(404, json.dumps({
+                "error": "Execution progress is no longer available."
+            }))
+        payload = snapshot.to_public_dict()
+        payload["redirect_after_ms"] = 1200 if snapshot.final_run_url else None
+        return WebResponse.json(
+            200,
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        )
+
+    def _progress_page(self, progress_id: str) -> WebResponse:
+        snapshot = self._progress_store.get(progress_id)
+        if snapshot is None:
+            return self._not_found("Execution progress is no longer available.")
+
+        case_name = snapshot.test_case_name or "TestCase run"
+        result = ""
+        retry = ""
+        if snapshot.state.value == "FINISHED":
+            category = snapshot.outcome or snapshot.error_category or "FAILED"
+            result = (
+                f'<p data-result-summary>{badge(outcome_label(category), outcome_tone(category))} '
+                f'{escape_html(snapshot.error_message or failure_message(category))}</p>'
+                + (
+                    f'<a class="button primary" data-final-run-link href="{escape_html(snapshot.final_run_url)}">'
+                    "View Run Details</a>"
+                    if snapshot.final_run_url else ""
+                )
+            )
+            if snapshot.error_category in {
+                "INFRASTRUCTURE_ERROR",
+                "EXECUTION_ERROR",
+                "AUTOMATION_GENERATION_ERROR",
+                "SETUP_FAILURE",
+            }:
+                retry = (
+                    f'<form method="post" action="/test-cases/{snapshot.test_case_id}/run" '
+                    'data-run-form data-progress-retry><input type="hidden" name="workflow" '
+                    f'value="{escape_html(snapshot.workflow_type)}">'
+                    '<button class="button" type="submit">Retry Run</button></form>'
+                )
+
+        state_symbols = {
+            "PENDING": ("○", "Pending"),
+            "PREPARING_AUTOMATION": ("◌", "Preparing automation"),
+            "READY": ("✓", "Automation ready"),
+            "RUNNING": ("◉", "Running"),
+            "PASSED": ("✓", "Passed"),
+            "FAILED": ("✕", "Failed"),
+            "BLOCKED": ("⊘", "Blocked"),
+        }
+        step_rows = []
+        for step in snapshot.steps:
+            symbol, label = state_symbols.get(step.state.value, ("○", step.state.value))
+            automation_state = (
+                f'<span class="muted">Automation {escape_html(step.automation_state.casefold())}</span>'
+                if step.automation_state else ""
+            )
+            evidence_count = sum(
+                event.event_type.value == "EVIDENCE_CAPTURED"
+                and event.step_id == step.id
+                for event in snapshot.events
+            )
+            evidence = (
+                f'<span class="progress-evidence">Screenshot evidence captured ({evidence_count})</span>'
+                if evidence_count else ""
+            )
+            step_rows.append(
+                f'<li class="progress-step state-{escape_html(step.state.value.casefold())}">'
+                f'<span class="progress-symbol" aria-hidden="true">{symbol}</span>'
+                f'<span><strong>Step {step.order + 1}: {escape_html(step.name)}</strong>'
+                f'<span class="progress-step-state">{escape_html(label)}</span>{automation_state}{evidence}</span></li>'
+            )
+
+        events = snapshot.events
+        preparation = self._progress_event_list(events, {
+            "TESTCASE_LOADED", "SETUP_STARTED", "SETUP_SUCCEEDED", "SETUP_FAILED",
+        }, "preparation")
+        automation = self._progress_event_list(events, {
+            "AUTOMATION_PREPARATION_STARTED", "PLAN_REUSED", "PLAN_GENERATION_STARTED",
+            "PLAN_GENERATED", "PLAN_GENERATION_FAILED",
+        }, "automation")
+        cleanup = self._progress_event_list(events, {
+            "CLEANUP_STARTED", "CLEANUP_SUCCEEDED", "CLEANUP_FAILED",
+        }, "cleanup")
+        finished = snapshot.state.value == "FINISHED"
+        phase = escape_html(snapshot.phase)
+        body = (
+            '<header class="page-heading"><p class="eyebrow">Live execution</p>'
+            f'<h1>{escape_html(case_name)}</h1>'
+            f'<p class="lead">{badge(snapshot.workflow_type, "workflow")} '
+            f'<span data-progress-phase>{phase}</span></p></header>'
+            '<div class="summary-grid">'
+            + _summary_card(
+                "Current phase",
+                f'<span data-progress-phase>{phase}</span>',
+                raw=True,
+            )
+            + _summary_card(
+                "Elapsed",
+                f'<span data-progress-elapsed>{escape_html(format_duration(snapshot.elapsed_ms))}</span>',
+                raw=True,
+            )
+            + _summary_card("Execution", escape_html(snapshot.state.value.title()))
+            + '</div>'
+            + f'<div class="progress-live" data-progress-id="{escape_html(progress_id)}">'
+            + '<section class="panel"><h2>Preparation</h2>'
+            + (preparation if preparation else '<ul class="compact-list" data-progress-events="preparation"></ul>')
+            + '</section><section class="panel"><h2>Automation</h2>'
+            + (automation if automation else '<ul class="compact-list" data-progress-events="automation"></ul>')
+            + '</section><section class="panel"><h2>Execution</h2>'
+            + (
+                f'<ol class="progress-steps" id="progress-steps">{"".join(step_rows)}</ol>'
+                if step_rows else '<ol class="progress-steps" id="progress-steps"></ol>'
+            )
+            + '</section><section class="panel"><h2>Cleanup</h2>'
+            + (cleanup if cleanup else '<ul class="compact-list" data-progress-events="cleanup"></ul>')
+            + '</section></div>'
+            + '<section class="panel progress-result" data-progress-result'
+            + ('' if finished else ' hidden')
+            + '><h2>Result</h2><div data-progress-result-content>' + result + '</div></section>'
+            + (f'<div class="actions">{retry}</div>' if retry else "")
+            + '<p class="muted" data-progress-notice aria-live="polite"></p>'
+        )
+        return WebResponse.html(
+            200,
+            self._page(
+                f"{case_name} progress",
+                body,
+                breadcrumbs=[("Dashboard", "/"), ("Test Cases", "/test-cases")],
+            ),
+        )
+
+    @staticmethod
+    def _progress_event_list(events, event_types: set[str], group: str) -> str:
+        rows = []
+        for event in events:
+            if event.event_type.value not in event_types:
+                continue
+            label = event.message or event.event_type.value.replace("_", " ").title()
+            event_type = event.event_type.value
+            symbol = (
+                "✕" if event_type.endswith("FAILED")
+                else "◉" if event_type.endswith("STARTED")
+                else "✓"
+            )
+            rows.append(
+                f'<li class="progress-event"><span aria-hidden="true">{symbol}</span>'
+                f'<span>{escape_html(label)}</span></li>'
+            )
+        return (
+            f'<ul class="compact-list" data-progress-events="{group}">{"".join(rows)}</ul>'
+            if rows else ""
+        )
 
     def _handle_generate_test_case(self, body: bytes | str | None) -> WebResponse:
         form, form_error = _parse_form_body(body)
@@ -674,7 +859,7 @@ class LocalWebApplication:
         return (
             '<section class="panel"><h2>Run this TestCase</h2>'
             '<p class="muted">Validation and Regression execute the saved plan versions for each step.</p>'
-            f'<form method="post" action="/test-cases/{test_case_id}/run" class="filters">'
+            f'<form method="post" action="/test-cases/{test_case_id}/run" class="filters" data-run-form>'
             '<div class="field"><label for="run-workflow">Workflow</label>'
             '<select id="run-workflow" name="workflow" required>'
             '<option value="" disabled selected>Choose a workflow</option>'
@@ -703,7 +888,7 @@ class LocalWebApplication:
         forms = []
         if availability.automation_available:
             forms.append(
-                f'<form method="post" action="/test-cases/{test_case_id}/run">'
+                f'<form method="post" action="/test-cases/{test_case_id}/run" data-run-form>'
                 '<input type="hidden" name="workflow" value="AUTOMATION">'
                 '<button class="button primary" type="submit">Generate &amp; Run Automation</button></form>'
             )
@@ -731,7 +916,7 @@ class LocalWebApplication:
         ):
             if available:
                 forms.append(
-                    f'<form method="post" action="/test-cases/{test_case_id}/run">'
+                    f'<form method="post" action="/test-cases/{test_case_id}/run" data-run-form>'
                     f'<input type="hidden" name="workflow" value="{workflow.value}">'
                     f'<button class="button" type="submit">Run {label}</button></form>'
                 )
@@ -851,6 +1036,7 @@ class LocalWebApplication:
         return (
             '<!doctype html><html lang="en"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            '<script src="/assets/ui.js" defer></script>'
             f'<title>{escape_html(title)} · AI QA Agent</title><style>{UI_CSS}</style></head><body>'
             '<header class="topbar"><div class="shell topbar-inner">'
             '<a class="brand" href="/">AI QA Agent</a>'
@@ -944,7 +1130,14 @@ def create_http_server(
             self.end_headers()
             self.wfile.write(response.body)
 
-    return ThreadingHTTPServer((host, port), Handler)
+    class ApplicationHTTPServer(ThreadingHTTPServer):
+        def server_close(self) -> None:
+            try:
+                super().server_close()
+            finally:
+                application.close()
+
+    return ApplicationHTTPServer((host, port), Handler)
 
 
 def serve(application: LocalWebApplication, host: str = "127.0.0.1", port: int = 8000) -> None:
@@ -1042,6 +1235,176 @@ def _outcome_badge(record: RunHistoryRecord, *, stacked: bool = False) -> str:
         return '<span class="muted">—</span>'
     shown = badge(record.outcome, outcome_tone(record.outcome))
     return f'<div class="row-sub-badge">{shown}</div>' if stacked else shown
+
+
+_UI_JAVASCRIPT = r"""
+(() => {
+  document.querySelectorAll('[data-run-form]').forEach((form) => {
+    form.addEventListener('submit', () => {
+      form.querySelectorAll('button[type="submit"]').forEach((button) => {
+        button.disabled = true;
+        button.classList.add('is-disabled');
+        button.setAttribute('aria-busy', 'true');
+        if (button.textContent.trim() === 'Start run') button.textContent = 'Starting…';
+      });
+    }, { once: true });
+  });
+
+  const root = document.querySelector('.progress-live[data-progress-id]');
+  if (!root) return;
+  const progressId = root.dataset.progressId;
+  const notice = document.querySelector('[data-progress-notice]');
+  const stepsList = document.querySelector('#progress-steps');
+  const result = document.querySelector('[data-progress-result]');
+  const resultContent = document.querySelector('[data-progress-result-content]');
+  let stopped = false;
+  let redirectScheduled = false;
+
+  const eventGroups = {
+    preparation: new Set(['TESTCASE_LOADED', 'SETUP_STARTED', 'SETUP_SUCCEEDED', 'SETUP_FAILED']),
+    automation: new Set(['AUTOMATION_PREPARATION_STARTED', 'PLAN_REUSED', 'PLAN_GENERATION_STARTED', 'PLAN_GENERATED', 'PLAN_GENERATION_FAILED']),
+    cleanup: new Set(['CLEANUP_STARTED', 'CLEANUP_SUCCEEDED', 'CLEANUP_FAILED'])
+  };
+  const stepStates = {
+    PENDING: ['○', 'Pending'], PREPARING_AUTOMATION: ['◌', 'Preparing automation'],
+    READY: ['✓', 'Automation ready'], RUNNING: ['◉', 'Running'], PASSED: ['✓', 'Passed'],
+    FAILED: ['✕', 'Failed'], BLOCKED: ['⊘', 'Blocked']
+  };
+
+  function appendEvent(list, event) {
+    const row = document.createElement('li');
+    row.className = 'progress-event';
+    const symbol = document.createElement('span');
+    symbol.setAttribute('aria-hidden', 'true');
+    symbol.textContent = event.type.endsWith('FAILED') ? '✕' :
+      (event.type.endsWith('STARTED') ? '◉' : '✓');
+    const text = document.createElement('span');
+    text.textContent = event.message || event.type.replaceAll('_', ' ').toLowerCase();
+    row.append(symbol, text);
+    list.append(row);
+  }
+
+  function render(snapshot) {
+    document.querySelectorAll('[data-progress-phase]').forEach((node) => {
+      node.textContent = snapshot.phase;
+    });
+    const elapsed = document.querySelector('[data-progress-elapsed]');
+    if (elapsed) elapsed.textContent = `${(snapshot.elapsed_ms / 1000).toFixed(1)} s`;
+
+    Object.entries(eventGroups).forEach(([name, types]) => {
+      const list = document.querySelector(`[data-progress-events="${name}"]`);
+      if (!list) return;
+      list.replaceChildren();
+      snapshot.events.filter((event) => types.has(event.type)).forEach((event) => appendEvent(list, event));
+    });
+
+    stepsList.replaceChildren();
+    snapshot.steps.forEach((step) => {
+      const item = document.createElement('li');
+      item.className = `progress-step state-${step.state.toLowerCase()}`;
+      const icon = document.createElement('span');
+      icon.className = 'progress-symbol';
+      icon.setAttribute('aria-hidden', 'true');
+      const state = stepStates[step.state] || ['○', step.state];
+      icon.textContent = state[0];
+      const content = document.createElement('span');
+      const name = document.createElement('strong');
+      name.textContent = `Step ${step.order + 1}: ${step.name}`;
+      const label = document.createElement('span');
+      label.className = 'progress-step-state';
+      label.textContent = state[1];
+      content.append(name, label);
+      if (step.automation_state) {
+        const automation = document.createElement('span');
+        automation.className = 'muted';
+        automation.textContent = `Automation ${step.automation_state.toLowerCase()}`;
+        content.append(automation);
+      }
+      const evidenceCount = snapshot.events.filter((event) =>
+        event.type === 'EVIDENCE_CAPTURED' && event.step_id === step.id).length;
+      if (evidenceCount) {
+        const evidence = document.createElement('span');
+        evidence.className = 'progress-evidence';
+        evidence.textContent = `Screenshot evidence captured (${evidenceCount})`;
+        content.append(evidence);
+      }
+      item.append(icon, content);
+      stepsList.append(item);
+    });
+
+    if (snapshot.finished) {
+      result.hidden = false;
+      const summary = document.createElement('p');
+      summary.dataset.resultSummary = '';
+      const strong = document.createElement('strong');
+      strong.textContent = (snapshot.outcome || snapshot.error_category || 'FAILED').replaceAll('_', ' ');
+      const explanation = document.createTextNode(` ${snapshot.error_message || 'The run has finished.'}`);
+      summary.append(strong, explanation);
+      resultContent.replaceChildren(summary);
+      if (snapshot.final_run_url) {
+        const link = document.createElement('a');
+        link.className = 'button primary';
+        link.href = snapshot.final_run_url;
+        link.textContent = 'View Run Details';
+        resultContent.append(link);
+        if (!redirectScheduled) {
+          redirectScheduled = true;
+          window.setTimeout(() => window.location.assign(snapshot.final_run_url), snapshot.redirect_after_ms || 1200);
+        }
+      } else if (notice) {
+        notice.textContent = 'No completed Run History record is available for this request.';
+      }
+      const retryable = ['INFRASTRUCTURE_ERROR', 'EXECUTION_ERROR', 'AUTOMATION_GENERATION_ERROR', 'SETUP_FAILURE'];
+      if (retryable.includes(snapshot.error_category) && !document.querySelector('[data-progress-retry]')) {
+        const form = document.createElement('form');
+        form.method = 'post';
+        form.action = `/test-cases/${snapshot.test_case_id}/run`;
+        form.dataset.runForm = '';
+        form.dataset.progressRetry = '';
+        const workflow = document.createElement('input');
+        workflow.type = 'hidden';
+        workflow.name = 'workflow';
+        workflow.value = snapshot.workflow;
+        const button = document.createElement('button');
+        button.className = 'button';
+        button.type = 'submit';
+        button.textContent = 'Retry Run';
+        form.append(workflow, button);
+        const actions = document.createElement('div');
+        actions.className = 'actions';
+        actions.append(form);
+        result.after(actions);
+        form.addEventListener('submit', () => {
+          button.disabled = true;
+          button.classList.add('is-disabled');
+        }, { once: true });
+      }
+      stopped = true;
+    }
+  }
+
+  async function poll() {
+    if (stopped) return;
+    try {
+      const response = await fetch(`/api/progress/${encodeURIComponent(progressId)}`, {
+        headers: { 'Accept': 'application/json' },
+        cache: 'no-store'
+      });
+      if (response.status === 404) {
+        stopped = true;
+        if (notice) notice.textContent = 'Execution progress is no longer available.';
+        return;
+      }
+      if (!response.ok) throw new Error('Progress unavailable');
+      render(await response.json());
+    } catch (_error) {
+      if (notice) notice.textContent = 'Live updates are temporarily unavailable. Retrying…';
+    }
+    if (!stopped) window.setTimeout(poll, 750);
+  }
+  poll();
+})();
+"""
 
 
 if __name__ == "__main__":

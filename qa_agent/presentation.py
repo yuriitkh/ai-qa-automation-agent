@@ -38,6 +38,16 @@ th{font-size:.84rem;color:#4e5b6c;background:#f8fafc;font-weight:700}tr:last-chi
 .evidence-preview{display:block;max-width:min(100%,540px);max-height:380px;object-fit:contain;border:1px solid var(--line);border-radius:7px;margin:.45rem 0}
 footer{color:var(--muted);font-size:.85rem;padding:1rem 0;border-top:1px solid var(--line)}
 @media(max-width:640px){.shell{padding:0 .8rem}.topbar-inner{padding:.55rem 0}.main{padding-top:1rem}.panel{padding:.85rem}.card-value{font-size:1.25rem}}
+.progress-event{display:flex;gap:.65rem;align-items:baseline;padding:.42rem 0;border-bottom:1px solid #eef1f5}
+.is-disabled{opacity:.65;cursor:wait}
+.progress-steps{list-style:none;padding:0;margin:0}
+.progress-step{display:grid;grid-template-columns:1.5rem 1fr;gap:.65rem;padding:.8rem 0;border-bottom:1px solid #eef1f5}
+.progress-symbol{font-size:1.1rem;font-weight:700}
+.progress-step-state,.progress-step .muted{display:block;margin-top:.2rem;font-size:.9rem}
+.progress-result[hidden]{display:none}
+[data-progress-result-content]{display:flex;align-items:center;gap:1rem;flex-wrap:wrap}
+[data-progress-result-content] p{margin:0}
+.progress-evidence{display:block;margin-top:.2rem;font-size:.9rem;color:var(--muted)}
 """
 
 
@@ -94,6 +104,24 @@ def outcome_tone(value: str) -> str:
         "CLEANUP_FAILURE": "cleanup-failure",
         "FAILED": "danger",
     }.get(value, "neutral")
+
+
+def failure_message(value: str) -> str:
+    """Short, stable explanations safe for progress pages and JSON."""
+    return {
+        "PASSED": "The run completed successfully.",
+        "PRODUCT_FAILURE": "The automation completed the check and detected unexpected product behavior.",
+        "AUTOMATION_DRIFT": "The saved automation no longer matches the current UI.",
+        "INFRASTRUCTURE_ERROR": "The test could not be reliably executed because of a browser, network, or runtime problem.",
+        "SETUP_FAILURE": "Required test conditions could not be established.",
+        "AI_GENERATION_ERROR": "The AI could not generate a valid test definition.",
+        "AUTOMATION_GENERATION_ERROR": "Executable automation could not be generated for this test.",
+        "INVALID_TESTCASE": "The selected TestCase is invalid or no longer available.",
+        "MISSING_AUTOMATION": "Validation or Regression requires saved automation for every step.",
+        "EXECUTION_ERROR": "An unexpected execution error occurred.",
+        "CLEANUP_FAILURE": "The run completed, but cleanup did not succeed.",
+        "FAILED": "The run did not pass.",
+    }.get(value, "The run could not be completed.")
 
 
 def status_tone(value: str) -> str:
