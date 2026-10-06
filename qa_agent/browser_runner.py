@@ -12,8 +12,14 @@ from .models import QATestPlan
 class BrowserSession:
     """Own one Playwright runtime, browser, context, and its pages."""
 
-    def __init__(self, evidence_directory: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        evidence_directory: str | Path | None = None,
+        *,
+        headless: bool = False,
+    ) -> None:
         self.evidence_directory = Path(evidence_directory) if evidence_directory is not None else None
+        self.headless = headless
         self._playwright_manager: Any | None = None
         self._playwright: Any | None = None
         self._playwright_entered = False
@@ -28,7 +34,7 @@ class BrowserSession:
         self._playwright_manager = sync_playwright()
         self._playwright = self._playwright_manager.__enter__()
         self._playwright_entered = True
-        self._browser = self._playwright.chromium.launch(headless=False)
+        self._browser = self._playwright.chromium.launch(headless=self.headless)
         self._context = self._browser.new_context()
 
     def new_page(self) -> Any:
@@ -79,12 +85,18 @@ class BrowserSession:
 class BrowserRunner:
     """Execute plans in Playwright, optionally saving screenshots on failure."""
 
-    def __init__(self, evidence_directory: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        evidence_directory: str | Path | None = None,
+        *,
+        headless: bool = False,
+    ) -> None:
         self.evidence_directory = Path(evidence_directory) if evidence_directory is not None else None
+        self.headless = headless
 
     @contextmanager
     def open_session(self) -> Iterator[BrowserSession]:
-        session = BrowserSession(self.evidence_directory)
+        session = BrowserSession(self.evidence_directory, headless=self.headless)
         try:
             session.start()
             yield session

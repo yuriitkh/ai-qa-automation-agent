@@ -3,6 +3,8 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 from uuid import uuid4
 
 from qa_agent.execution_repository import InMemoryExecutionRepository
@@ -10,6 +12,7 @@ from qa_agent.models import (
     Evidence,
     EvidenceType,
     Execution,
+    ExecutionSegment,
     ExecutionStatus,
     Precondition,
     RunContext,
@@ -28,6 +31,7 @@ from qa_agent.run_history import (
     RunHistoryService,
     WorkflowType,
 )
+from qa_agent.test_case_repository import InMemoryTestCaseRepository
 from qa_agent.setup_orchestration import (
     CleanupOutcome,
     PreconditionSetupOutcome,
@@ -394,6 +398,67 @@ class LocalWebApplicationTests(unittest.TestCase):
         self.assertEqual(image_response.status, 404)
         self.assertIn("unavailable", report_body)
         self.assertNotIn(f"/runs/{self.record.run_id}/evidence/", report_body)
+
+
+class PersistedTestCaseRunUiTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.case = DomainTestCase(
+            name="Saved local case",
+            description="This definition exists before it has run.",
+            segments=[ExecutionSegment(order=0, steps=[DomainTestStep(
+                name="Open saved page",
+                description="Open a page.",
+                expected="It loads.",
+                order=0,
+            )])],
+        )
+        cases = InMemoryTestCaseRepository()
+        cases.save(self.case)
+        self.run_service = Mock()
+        self.run_id = uuid4()
+        self.run_service.run.return_value = SimpleNamespace(
+            test_run=SimpleNamespace(id=self.run_id)
+        )
+        self.app = LocalWebApplication(
+            RunHistoryService(InMemoryRunHistoryRepository()),
+            test_cases=cases,
+            run_service=self.run_service,
+        )
+
+    def test_saved_case_is_listed_and_detail_loads_without_history(self) -> None:
+        listing = self.app.handle("GET", "/test-cases")
+        detail = self.app.handle("GET", f"/test-cases/{self.case.id}")
+
+        self.assertEqual(listing.status, 200)
+        self.assertIn(b"Saved local case", listing.body)
+        self.assertEqual(detail.status, 200)
+        self.assertIn(b"No runs yet.", detail.body)
+        self.assertIn(b"Start run", detail.body)
+        self.assertIn(b'method="post"', detail.body)
+        self.run_service.run.assert_not_called()
+
+    def test_post_runs_selected_workflow_and_redirects_to_run_detail(self) -> None:
+        response = self.app.handle(
+            "POST",
+            f"/test-cases/{self.case.id}/run",
+            b"workflow=REGRESSION",
+        )
+
+        self.assertEqual(response.status, 303)
+        self.assertEqual(response.headers["Location"], f"/runs/{self.run_id}")
+        self.run_service.run.assert_called_once_with(self.case.id, WorkflowType.REGRESSION)
+
+    def test_get_cannot_start_run_and_invalid_workflow_is_rejected(self) -> None:
+        get_response = self.app.handle("GET", f"/test-cases/{self.case.id}/run")
+        invalid_response = self.app.handle(
+            "POST",
+            f"/test-cases/{self.case.id}/run",
+            b"workflow=AUTOMATION",
+        )
+
+        self.assertEqual(get_response.status, 405)
+        self.assertEqual(invalid_response.status, 400)
+        self.run_service.run.assert_not_called()
 
 
 if __name__ == "__main__":

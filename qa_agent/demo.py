@@ -12,8 +12,12 @@ from qa_agent.models import (
     ExecutionStatus,
     FailurePolicy,
     Precondition,
+    QATestPlan,
+    QATestStep,
     TestCase,
     TestRun,
+    TestPlan,
+    TestPlanVersion,
     TestStep,
 )
 from qa_agent.run_context import RunContext
@@ -25,7 +29,11 @@ from qa_agent.setup_orchestration import (
     SetupRunOutcome,
     SetupStatus,
 )
-from qa_agent.sqlite_storage import SQLiteRunHistoryRepository
+from qa_agent.sqlite_storage import (
+    SQLitePlanStore,
+    SQLiteRunHistoryRepository,
+    SQLiteTestCaseRepository,
+)
 
 
 _NAMESPACE = UUID("43aaea91-7c8e-5f4b-b704-c9869eae4eed")
@@ -39,11 +47,28 @@ class DemoSeedResult:
     run_ids: tuple[UUID, ...]
 
 
-def seed_demo_data(database_path: str | Path) -> DemoSeedResult:
-    """Add any missing demo runs, preserving every existing history record."""
+def seed_demo_data(
+    database_path: str | Path,
+    *,
+    demo_base_url: str = "http://127.0.0.1:8000/demo-target/registration",
+) -> DemoSeedResult:
+    """Add deterministic definitions, plans, and missing demo runs."""
     repository = SQLiteRunHistoryRepository(database_path)
     history = RunHistoryService(repository)
-    _, run_specs = _demo_data()
+    test_cases, run_specs = _demo_data(demo_base_url)
+    test_case_repository = SQLiteTestCaseRepository(database_path)
+    plan_store = SQLitePlanStore(database_path)
+    for test_case in test_cases:
+        existing = test_case_repository.get(test_case.id)
+        if existing is not None and existing != test_case:
+            raise ValueError(
+                f"Demo TestCase {test_case.name!r} already exists with different content; preserving it."
+            )
+    executable_case = test_cases[-1]
+    _save_local_demo_plans(plan_store, executable_case, demo_base_url)
+    for test_case in test_cases:
+        if test_case_repository.get(test_case.id) is None:
+            test_case_repository.save(test_case)
     created = 0
     skipped = 0
     run_ids: list[UUID] = []
@@ -66,7 +91,7 @@ def seed_demo_data(database_path: str | Path) -> DemoSeedResult:
     return DemoSeedResult(created=created, skipped=skipped, run_ids=tuple(run_ids))
 
 
-def _demo_data():
+def _demo_data(demo_base_url: str = "http://127.0.0.1:8000/demo-target/registration"):
     now = datetime.now(timezone.utc).replace(microsecond=0)
     registration = _case(
         "User registration",
@@ -88,6 +113,17 @@ def _demo_data():
             ("Place order", "Order confirmation is displayed.", FailurePolicy.CONTINUE),
         ],
     )
+    local_demo = _case(
+        "Local registration demo",
+        "Run browser checks against the built-in local registration page. "
+        "The confirmation assertion is intentionally unmet so the UI can show failure evidence.",
+        demo_base_url,
+        [
+            ("Open local registration page", "The registration form is visible.", FailurePolicy.CONTINUE),
+            ("Verify account confirmation", "The account confirmation is displayed.", FailurePolicy.BLOCK_REST),
+            ("Verify the completed registration", "The completion state is displayed.", FailurePolicy.CONTINUE),
+        ],
+    )
     runs = [
         _run_spec(
             registration, "registration-validation", WorkflowType.VALIDATION, WorkflowOutcome.PASSED,
@@ -107,7 +143,72 @@ def _demo_data():
             setup=False, cleanup=True,
         ),
     ]
-    return (registration, checkout), runs
+    return (registration, checkout, local_demo), runs
+
+
+def _save_local_demo_plans(
+    plan_store: SQLitePlanStore,
+    test_case: TestCase,
+    base_url: str,
+) -> None:
+    plans = (
+        QATestPlan(
+            url=base_url,
+            steps=[
+                QATestStep(action="navigate", parameters={"url": base_url}),
+                QATestStep(action="assert_text_contains", parameters={
+                    "expected_text": "Registration demo",
+                }),
+            ],
+        ),
+        QATestPlan(
+            url=base_url,
+            steps=[
+                QATestStep(action="navigate", parameters={"url": base_url}),
+                QATestStep(action="assert_text_contains", parameters={
+                    "expected_text": "Account confirmation displayed",
+                }),
+            ],
+        ),
+        QATestPlan(
+            url=base_url,
+            steps=[
+                QATestStep(action="navigate", parameters={"url": base_url}),
+                QATestStep(action="assert_text_contains", parameters={
+                    "expected_text": "Registration demo",
+                }),
+            ],
+        ),
+    )
+    created_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    plan_specs = []
+    for step, qa_test_plan in zip(test_case.steps, plans, strict=True):
+        test_plan = TestPlan(
+            id=_id(f"local-test-plan:{step.id}"),
+            test_step_id=step.id,
+            name=f"Local demo: {step.name}",
+        )
+        version = TestPlanVersion(
+            id=_id(f"local-plan-version:{step.id}"),
+            test_plan_id=test_plan.id,
+            version=1,
+            created_at=created_at,
+            qa_test_plan=qa_test_plan,
+        )
+        plan_specs.append((step, test_plan, version))
+
+    for step, test_plan, version in plan_specs:
+        current_version = plan_store.find(step.id)
+        current_plan = plan_store.find_test_plan(step.id)
+        if current_version is not None and (
+            current_version != version or current_plan != test_plan
+        ):
+            raise ValueError(
+                f"Demo plan for {step.name!r} already exists with different content; preserving it."
+            )
+    for step, test_plan, version in plan_specs:
+        if plan_store.find(step.id) is None:
+            plan_store.save(step.id, version, test_plan=test_plan)
 
 
 def _case(name, description, base_url, step_specs, *, precondition=False) -> TestCase:
@@ -224,8 +325,13 @@ def _id(name: str) -> UUID:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Seed safe demo runs for the local AI QA Agent UI.")
     parser.add_argument("--database", required=True, help="SQLite database path to seed")
+    parser.add_argument(
+        "--demo-base-url",
+        default="http://127.0.0.1:8000/demo-target/registration",
+        help="local URL used by the executable registration demo plans",
+    )
     args = parser.parse_args(argv)
-    result = seed_demo_data(args.database)
+    result = seed_demo_data(args.database, demo_base_url=args.demo_base_url)
     print(
         f"Demo history: created {result.created}, skipped {result.skipped}; "
         f"database: {Path(args.database).expanduser()}"

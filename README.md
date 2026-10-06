@@ -53,18 +53,19 @@ or pass `--database PATH` to use another file:
 python -m qa_agent "Open https://example.com/ and verify the page title"
 ```
 
-Start the read-only local run browser with:
+Start the local run browser with:
 
 ```powershell
 python -m qa_agent.web
 ```
 
-It binds to `127.0.0.1:8000` by default. The dashboard, TestCase history, run
-details, JSON report, and standalone HTML report read from the same SQLite
-database. To use a non-default database, pass `--database PATH` to the UI.
-Screenshots are served only when their recorded path is inside the configured
-evidence directory; pass the same `--evidence-directory PATH` used for the CLI.
-The UI is read-only and does not start workflows.
+It binds to `127.0.0.1:8000` by default. The dashboard, saved TestCase
+definitions, run details, JSON report, and standalone HTML report read from
+the same SQLite database. Open a TestCase and choose Validation or Regression
+to run its saved plan versions. Automation is not offered for persisted
+TestCases. Pass `--database PATH` to use a non-default database. Screenshots
+are served only when their recorded path is inside the configured evidence
+directory; pass `--evidence-directory PATH` to choose that location.
 
 ### Demo UI
 
@@ -76,5 +77,7 @@ python -m qa_agent.demo --database .\qa_agent.db
 python -m qa_agent.web --database .\qa_agent.db
 ```
 
-Open <http://127.0.0.1:8000>. Re-running the seed command skips demo run IDs
-already present and preserves other run history.
+Open <http://127.0.0.1:8000>. The seed includes an executable local
+registration TestCase at `/demo-target/registration`; its deliberate missing
+confirmation assertion demonstrates a real browser failure and screenshot.
+Re-running the seed skips existing demo run IDs and preserves other run history.

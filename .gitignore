@@ -36,3 +36,4 @@ playwright/.cache/
 # Local diagnostics / temporary files
 *.log
 /qa_agent.db
+/.qa_agent_evidence/

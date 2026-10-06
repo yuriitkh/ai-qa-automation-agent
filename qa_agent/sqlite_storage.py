@@ -3,7 +3,7 @@
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 from uuid import UUID, uuid4
@@ -199,6 +199,21 @@ class SQLitePlanStore(_SQLiteStorage):
             ).fetchone()
         return self._to_version(row) if row is not None else None
 
+    def find_test_plan(self, test_step_id: UUID) -> TestPlan | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT test_plan_id, test_step_id, test_plan_name "
+                "FROM cached_test_plans WHERE test_step_id = ?",
+                (str(test_step_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        return TestPlan(
+            id=UUID(row["test_plan_id"]),
+            test_step_id=UUID(row["test_step_id"]),
+            name=row["test_plan_name"],
+        )
+
     @staticmethod
     def _to_version(row: sqlite3.Row) -> TestPlanVersion:
         return TestPlanVersion(
@@ -208,6 +223,63 @@ class SQLitePlanStore(_SQLiteStorage):
             created_at=datetime.fromisoformat(row["created_at"]),
             qa_test_plan=QATestPlan.model_validate_json(row["qa_test_plan_json"]),
         )
+
+
+class SQLiteTestCaseRepository(_SQLiteStorage):
+    """Persist canonical TestCase definitions independently of run history."""
+
+    def __init__(self, db_path: str | Path) -> None:
+        super().__init__(db_path)
+        with self._connection() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS test_cases (
+                    test_case_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    definition_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+
+    def save(self, test_case: TestCase) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO test_cases (
+                    test_case_id, name, definition_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(test_case_id) DO UPDATE SET
+                    name = excluded.name,
+                    definition_json = excluded.definition_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(test_case.id),
+                    test_case.name,
+                    test_case.model_dump_json(exclude={"steps"}),
+                    now,
+                    now,
+                ),
+            )
+
+    def get(self, test_case_id: UUID) -> TestCase | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT definition_json FROM test_cases WHERE test_case_id = ?",
+                (str(test_case_id),),
+            ).fetchone()
+        return TestCase.model_validate_json(row["definition_json"]) if row else None
+
+    def list(self) -> list[TestCase]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT definition_json FROM test_cases "
+                "ORDER BY name COLLATE NOCASE, test_case_id"
+            ).fetchall()
+        return [TestCase.model_validate_json(row["definition_json"]) for row in rows]
 
     def find_test_plan(self, test_step_id: UUID) -> TestPlan | None:
         with self._connection() as connection:

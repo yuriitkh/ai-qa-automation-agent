@@ -9,10 +9,10 @@ from qa_agent.demo import seed_demo_data
 from qa_agent.models import ExecutionStatus
 from qa_agent.run_history import (
     RunHistoryRecord,
-    RunHistoryService,
     WorkflowType,
 )
-from qa_agent.sqlite_storage import SQLiteRunHistoryRepository
+from qa_agent.storage import create_sqlite_storage
+from qa_agent.test_case_execution import TestCaseExecutionService
 from qa_agent.web import LocalWebApplication
 
 
@@ -20,8 +20,19 @@ class DemoSeedTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.database = Path(self.temporary_directory.name) / "demo.sqlite3"
-        self.repository = SQLiteRunHistoryRepository(self.database)
-        self.application = LocalWebApplication(RunHistoryService(self.repository))
+        self.storage = create_sqlite_storage(self.database)
+        self.repository = self.storage.run_history_repository
+        self.application = LocalWebApplication(
+            self.storage.run_history,
+            test_cases=self.storage.test_case_repository,
+            run_service=TestCaseExecutionService(
+                self.storage.test_case_repository,
+                self.storage.plan_store,
+                self.storage.execution_repository,
+                self.storage.run_history,
+                evidence_directory=Path(self.temporary_directory.name) / "evidence",
+            ),
+        )
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
@@ -47,6 +58,12 @@ class DemoSeedTests(unittest.TestCase):
         records = self.repository.list_recent(limit=10)
         self.assertEqual(len(records), 4)
         self.assertEqual(self.repository.get(user_record.run_id), user_record)
+
+        definitions = self.storage.test_case_repository.list()
+        self.assertEqual(
+            {case.name for case in definitions},
+            {"User registration", "Checkout flow", "Local registration demo"},
+        )
 
         self.assertEqual(
             {record.test_case_name for record in records if record.run_id in first.run_ids},
@@ -95,6 +112,14 @@ class DemoSeedTests(unittest.TestCase):
         self.assertIn(b"User registration", testcase_page.body)
         self.assertIn(b"PRODUCT FAILURE", testcase_page.body)
 
+        cases_page = self.application.handle("GET", "/test-cases")
+        self.assertIn(b"Local registration demo", cases_page.body)
+        local_case = next(case for case in definitions if case.name == "Local registration demo")
+        local_detail = self.application.handle("GET", f"/test-cases/{local_case.id}")
+        self.assertEqual(local_detail.status, 200)
+        self.assertIn(b"No runs yet.", local_detail.body)
+        self.assertIn(b"Start run", local_detail.body)
+
         for record in records:
             if record.run_id not in first.run_ids:
                 continue
@@ -117,6 +142,23 @@ class DemoSeedTests(unittest.TestCase):
         self.assertEqual(
             [step["status"] for step in failed_report["steps"]],
             ["PASSED", "FAILED", "BLOCKED"],
+        )
+
+    def test_seed_refuses_to_overwrite_an_edited_demo_definition(self) -> None:
+        seed_demo_data(self.database)
+        local_case = next(
+            case for case in self.storage.test_case_repository.list()
+            if case.name == "Local registration demo"
+        )
+        edited = local_case.model_copy(update={"description": "User-edited definition."})
+        self.storage.test_case_repository.save(edited)
+
+        with self.assertRaisesRegex(ValueError, "different content; preserving it"):
+            seed_demo_data(self.database)
+
+        self.assertEqual(
+            self.storage.test_case_repository.get(local_case.id).description,
+            "User-edited definition.",
         )
 
 
