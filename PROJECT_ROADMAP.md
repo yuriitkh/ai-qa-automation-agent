@@ -260,6 +260,78 @@ Test Case v2
       → Test Plan v5
 ```
 
+### Operating Modes: AI Autonomy vs Human Approval
+
+**Status: FUTURE — planned concept only; not implemented.**
+
+This section is architectural guidance. It intentionally specifies no database schema, UI implementation, API design, or code changes. None of this functionality exists today.
+
+The project should support two primary operating modes.
+
+#### Autonomous Mode
+
+The AI may:
+
+- decompose the user's task into TestSteps;
+- define Expected Results;
+- generate Test Plans;
+- execute the TestCase.
+
+Human approval is not required before execution.
+
+#### Controlled / Approved Mode
+
+The AI proposes the TestCase and TestPlan, but a human can review and approve them before execution.
+
+The human should eventually be able to:
+
+- edit TestStep text;
+- edit the Expected Result;
+- edit the executable Test Plan;
+- approve a Step / Expected Result / Plan;
+- see which content was AI-generated;
+- see which content was manually edited;
+- see the current approved version;
+- view change history;
+- see what changed (before → after);
+- see who changed it;
+- see when it was changed;
+- optionally add a comment explaining the change.
+
+#### Approval versioning
+
+Execution should reference a specific approved/versioned definition:
+
+```
+AI generated
+    ↓
+Draft
+    ↓
+Human edited
+    ↓
+Approved Version
+    ↓
+Execution
+```
+
+Example progression of one plan:
+
+```
+TestPlan v1 — AI generated
+TestPlan v2 — AI regenerated
+TestPlan v3 — Human edited
+TestPlan v4 — Human approved
+```
+
+This builds on the existing `TestPlanVersion` chain rather than introducing a parallel versioning concept: AI generations and regenerations already produce new immutable versions of a Test Plan today, and in the future the same versions would additionally carry draft/approval state and edit provenance.
+
+Content distinctions to preserve in this future model:
+
+- AI-generated content;
+- human-edited content;
+- approved content;
+- execution based on a specific version.
+
 ### Test Run
 Represents one complete run of a Test Case or a collection of Test Cases.
 
