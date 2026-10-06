@@ -1,9 +1,8 @@
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from qa_agent.browser_discovery import capture_discovery_result, extract_target_url
 from qa_agent.browser_runner import BrowserRunner
@@ -21,8 +20,6 @@ from qa_agent.models import (
     DiscoveryStatus,
     Execution,
     ExecutionStatus,
-    Evidence,
-    EvidenceType,
     FailurePolicy,
     QATestPlan,
     TestCase,
@@ -35,6 +32,12 @@ from qa_agent.locator_recovery import RecoveryStatus, recover_locator
 from qa_agent.test_case_decomposer import TestCaseDecomposer
 from qa_agent.test_plan_generator import GeneratedTestPlan, TestPlanGenerator
 from qa_agent.discovery_fallback import DiscoveryFallback
+from qa_agent.plan_execution import (
+    PlanExecutionClassification,
+    PlanExecutionOutcome,
+    PlanExecutionPersistenceError,
+    PlanExecutionService,
+)
 
 
 class PipelineStageError(RuntimeError):
@@ -104,6 +107,9 @@ class QATestPipeline:
             execution_repository
             if execution_repository is not None
             else InMemoryExecutionRepository()
+        )
+        self._plan_execution = PlanExecutionService(
+            self._runner, self._execution_repository
         )
 
     def run(self, task: str, base_url: str | None = None) -> PipelineResult:
@@ -294,18 +300,11 @@ class QATestPipeline:
 
             plan_version = generated_plan.test_plan_version
             generated_plans.append(generated_plan)
-            execution = self._execute_plan(test_step, plan_version, trace)
+            execution_outcome = self._execute_plan(test_step, plan_version, trace)
+            execution = execution_outcome.execution
             executions.append(execution)
-            record_safely(
-                trace,
-                "record_execution_attempt",
-                execution,
-                plan_version.version,
-            )
 
-            if execution.status != ExecutionStatus.FAILED or not _is_stale_ui_failure(
-                execution.runner_result
-            ):
+            if execution_outcome.classification != PlanExecutionClassification.AUTOMATION_DRIFT:
                 # Explicit failure policy: a step whose final outcome is
                 # FAILED may still continue the TestCase (CONTINUE) or stop
                 # it entirely (BLOCK_REST); the decision is never implicit.
@@ -394,16 +393,11 @@ class QATestPipeline:
                         str(error),
                     ) from error
                 generated_plans.append(repaired)
-                repaired_execution = self._execute_plan(
+                repaired_outcome = self._execute_plan(
                     test_step, repaired_version, trace
                 )
+                repaired_execution = repaired_outcome.execution
                 executions.append(repaired_execution)
-                record_safely(
-                    trace,
-                    "record_execution_attempt",
-                    repaired_execution,
-                    repaired_version.version,
-                )
                 if _should_block_rest(test_step, repaired_execution):
                     blocked_step_ids = [
                         step.id for step in ordered_steps[step_index + 1:]
@@ -460,16 +454,11 @@ class QATestPipeline:
                     f"plan save (step {test_step.order}: {test_step.name})",
                     str(error),
                 ) from error
-            regenerated_execution = self._execute_plan(
+            regenerated_outcome = self._execute_plan(
                 test_step, regenerated_plan.test_plan_version, trace
             )
+            regenerated_execution = regenerated_outcome.execution
             executions.append(regenerated_execution)
-            record_safely(
-                trace,
-                "record_execution_attempt",
-                regenerated_execution,
-                regenerated_plan.test_plan_version.version,
-            )
             if _should_block_rest(test_step, regenerated_execution):
                 blocked_step_ids = [
                     step.id for step in ordered_steps[step_index + 1:]
@@ -499,136 +488,32 @@ class QATestPipeline:
         test_step: TestStep,
         plan_version: TestPlanVersion,
         trace: ExecutionTraceRecorder,
-    ) -> Execution:
-        started_at = datetime.now(timezone.utc)
-        runner_result: dict[str, Any] | None = None
+    ) -> PlanExecutionOutcome:
         try:
-            runner_output = self._runner(plan_version.qa_test_plan)
-            if not isinstance(runner_output, dict):
-                raise TypeError("Browser runner must return a result dictionary.")
-            runner_result = runner_output
-            runner_status = runner_result.get("status")
-            if runner_status not in {"passed", "failed"}:
-                raise ValueError(
-                    f"Browser runner returned unsupported status {runner_status!r}."
-                )
-        except Exception as error:
-            failed_execution = Execution(
-                test_step_id=test_step.id,
-                test_plan_version_id=plan_version.id,
-                planned_step_index=self._failed_plan_step_index(
-                    plan_version, runner_result
-                ),
-                status=ExecutionStatus.FAILED,
-                started_at=started_at,
-                finished_at=datetime.now(timezone.utc),
-                actual_result="failed",
-                error=str(error),
-                runner_result=runner_result,
-            )
-            self._save_execution(failed_execution, test_step, plan_version)
-            # Record the trace attempt immediately after persistence and
-            # before raising: the caller in _run() can never observe this
-            # Execution, so recording it here keeps every persisted
-            # Execution mirrored by exactly one trace execution attempt.
-            record_safely(
-                trace,
-                "record_execution_attempt",
-                failed_execution,
-                plan_version.version,
-            )
-            raise PipelineStageError(
-                f"execution (step {test_step.order}: {test_step.name}, "
-                f"plan version {plan_version.version})",
-                str(error),
-            ) from error
-
-        status = (
-            ExecutionStatus.PASSED
-            if runner_status == "passed"
-            else ExecutionStatus.FAILED
-        )
-        execution_id = uuid4()
-        execution = Execution(
-            id=execution_id,
-            test_step_id=test_step.id,
-            test_plan_version_id=plan_version.id,
-            planned_step_index=(
-                self._failed_plan_step_index(plan_version, runner_result)
-                if status == ExecutionStatus.FAILED
-                else None
-            ),
-            status=status,
-            started_at=started_at,
-            finished_at=datetime.now(timezone.utc),
-            actual_result=runner_status,
-            error=self._runner_error(runner_result) if status == ExecutionStatus.FAILED else None,
-            runner_result=runner_result,
-            evidence=self._runner_evidence(runner_result, status, execution_id),
-        )
-        self._save_execution(execution, test_step, plan_version)
-        return execution
-
-    def _save_execution(
-        self,
-        execution: Execution,
-        test_step: TestStep,
-        plan_version: TestPlanVersion,
-    ) -> None:
-        try:
-            self._execution_repository.save(execution)
-        except Exception as error:
+            outcome = self._plan_execution.execute(test_step, plan_version)
+        except PlanExecutionPersistenceError as error:
             raise PipelineStageError(
                 f"execution repository (step {test_step.order}: {test_step.name}, "
                 f"plan version {plan_version.version})",
                 str(error),
-            ) from error
+            ) from error.__cause__
 
-    @staticmethod
-    def _runner_error(runner_result: dict[str, Any]) -> str:
-        for step_result in runner_result.get("steps", []):
-            if isinstance(step_result, dict) and step_result.get("status") == "failed":
-                return str(step_result.get("error") or "Browser plan failed.")
-        return "Browser plan failed."
-
-    @staticmethod
-    def _failed_plan_step_index(
-        plan_version: TestPlanVersion,
-        runner_result: dict[str, Any] | None,
-    ) -> int | None:
-        if not isinstance(runner_result, dict):
-            return None
-        for index, step_result in enumerate(runner_result.get("steps", [])):
-            if isinstance(step_result, dict) and step_result.get("status") == "failed":
-                return index if index < len(plan_version.qa_test_plan.steps) else None
-        return None
-
-    @staticmethod
-    def _runner_evidence(
-        runner_result: dict[str, Any], status: ExecutionStatus, execution_id
-    ) -> tuple[Evidence, ...]:
-        if status != ExecutionStatus.FAILED:
-            return ()
-        items = runner_result.get("evidence", [])
-        if not isinstance(items, list):
-            return ()
-        evidence = []
-        for item in items:
-            if not isinstance(item, dict) or item.get("type") != EvidenceType.SCREENSHOT.value:
-                continue
-            path = item.get("path")
-            if not isinstance(path, str) or not path:
-                continue
-            evidence_id = uuid4()
-            item["evidence_id"] = str(evidence_id)
-            evidence.append(Evidence(
-                id=evidence_id,
-                execution_id=execution_id,
-                type=EvidenceType.SCREENSHOT,
-                path=path,
-                description=item.get("description"),
-            ))
-        return tuple(evidence)
+        # Trace remains a pipeline concern. Record immediately after the
+        # service persists the execution, including before re-raising runner
+        # errors, so every persisted attempt has exactly one trace record.
+        record_safely(
+            trace,
+            "record_execution_attempt",
+            outcome.execution,
+            plan_version.version,
+        )
+        if outcome.error is not None:
+            raise PipelineStageError(
+                f"execution (step {test_step.order}: {test_step.name}, "
+                f"plan version {plan_version.version})",
+                str(outcome.error),
+            ) from outcome.error
+        return outcome
 
 
 def _should_block_rest(test_step: TestStep, execution: Execution) -> bool:
@@ -637,45 +522,6 @@ def _should_block_rest(test_step: TestStep, execution: Execution) -> bool:
         test_step.failure_policy == FailurePolicy.BLOCK_REST
         and execution.status == ExecutionStatus.FAILED
     )
-
-
-def _is_stale_ui_failure(runner_result: dict[str, Any] | None) -> bool:
-    """Recognize locator/UI mismatches only; assertions and infra do not qualify."""
-    if not isinstance(runner_result, dict):
-        return False
-
-    for step_result in runner_result.get("steps", []):
-        if not isinstance(step_result, dict) or step_result.get("status") != "failed":
-            continue
-        if step_result.get("action") not in {"click", "fill"}:
-            continue
-
-        error = str(step_result.get("error") or "").casefold()
-        selector_missing = "selector" in error and (
-            "not found" in error or "was not found" in error
-        )
-        element_unavailable = any(
-            marker in error
-            for marker in (
-                "resolved to hidden",
-                "resolved to 0 elements",
-                "element is not visible",
-                "waiting for element to be visible",
-                "not attached to the dom",
-                "detached from the dom",
-            )
-        )
-        locator_actionability_timeout = (
-            "timeout" in error
-            and "waiting for locator" in error
-            and (
-                "could not click element matching selector" in error
-                or "could not fill element matching selector" in error
-            )
-        )
-        if selector_missing or element_unavailable or locator_actionability_timeout:
-            return True
-    return False
 
 
 def _replace_interaction_selector(
