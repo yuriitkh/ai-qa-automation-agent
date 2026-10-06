@@ -48,7 +48,7 @@ class DemoSeedTests(unittest.TestCase):
             status=ExecutionStatus.PASSED,
             started_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
         )
-        self.repository.save(user_record)
+        saved_user_record = self.repository.save(user_record)
 
         first = seed_demo_data(self.database)
         second = seed_demo_data(self.database)
@@ -57,7 +57,7 @@ class DemoSeedTests(unittest.TestCase):
         self.assertEqual((second.created, second.skipped), (0, 3))
         records = self.repository.list_recent(limit=10)
         self.assertEqual(len(records), 4)
-        self.assertEqual(self.repository.get(user_record.run_id), user_record)
+        self.assertEqual(self.repository.get(user_record.run_id), saved_user_record)
 
         definitions = self.storage.test_case_repository.list()
         self.assertEqual(

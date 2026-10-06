@@ -53,17 +53,19 @@ def seed_demo_data(
     demo_base_url: str = "http://127.0.0.1:8000/demo-target/registration",
 ) -> DemoSeedResult:
     """Add deterministic definitions, plans, and missing demo runs."""
-    repository = SQLiteRunHistoryRepository(database_path)
-    history = RunHistoryService(repository)
     test_cases, run_specs = _demo_data(demo_base_url)
     test_case_repository = SQLiteTestCaseRepository(database_path)
     plan_store = SQLitePlanStore(database_path)
+    repository = SQLiteRunHistoryRepository(database_path)
+    history = RunHistoryService(repository, plan_store=plan_store)
     for test_case in test_cases:
         existing = test_case_repository.get(test_case.id)
-        if existing is not None and existing != test_case:
-            raise ValueError(
-                f"Demo TestCase {test_case.name!r} already exists with different content; preserving it."
-            )
+        if existing is not None:
+            if existing.model_copy(update={"public_id": None}) != test_case:
+                raise ValueError(
+                    f"Demo TestCase {test_case.name!r} already exists with different content; preserving it."
+                )
+            test_case.public_id = existing.public_id
     executable_case = test_cases[-1]
     _save_local_demo_plans(plan_store, executable_case, demo_base_url)
     for test_case in test_cases:

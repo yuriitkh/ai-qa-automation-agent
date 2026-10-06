@@ -8,6 +8,7 @@ from qa_agent.execution_repository import InMemoryExecutionRepository
 from qa_agent.models import (
     Execution,
     ExecutionStatus,
+    PlanVersionOrigin,
     Precondition,
     QATestPlan,
     QATestStep,
@@ -201,6 +202,7 @@ class RunHistoryTests(unittest.TestCase):
             plan_version = DomainTestPlanVersion(
                 test_plan_id=test_plan.id,
                 version=1,
+                origin=PlanVersionOrigin.AI_GENERATED,
                 qa_test_plan=QATestPlan(
                     url="https://example.test/",
                     steps=[QATestStep(action="assert_page_loaded")],
@@ -210,7 +212,9 @@ class RunHistoryTests(unittest.TestCase):
             executions[0].test_plan_version_id = plan_version.id
             for execution in executions:
                 execution_repository.save(execution)
-            service = RunHistoryService(history_repository, execution_repository)
+            service = RunHistoryService(
+                history_repository, execution_repository, plan_store=plan_store
+            )
             record = service.record_completed_run(
                 self.test_case,
                 run,
@@ -234,6 +238,11 @@ class RunHistoryTests(unittest.TestCase):
                 [item.test_plan_version_id for item in executions],
             )
             self.assertEqual(SQLitePlanStore(db_path).find(test_plan.test_step_id).id, plan_version.id)
+            self.assertEqual(record.executions[0].plan_version_number, 1)
+            self.assertEqual(
+                record.executions[0].plan_version_origin,
+                PlanVersionOrigin.AI_GENERATED,
+            )
             self.assertEqual(len(reopened_executions.list_for_test_case(self.test_case)), 2)
             # Repeated schema initialization is safe and preserves the record.
             self.assertEqual(SQLiteRunHistoryRepository(db_path).get(run.id), record)

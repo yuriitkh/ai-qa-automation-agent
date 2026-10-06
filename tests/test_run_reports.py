@@ -8,6 +8,7 @@ from qa_agent.models import (
     EvidenceType,
     Execution,
     ExecutionStatus,
+    PlanVersionOrigin,
     RunContext,
     TestCase as DomainTestCase,
     TestRun as DomainTestRun,
@@ -26,6 +27,7 @@ class RunReportTests(unittest.TestCase):
             self.make_step("Next step", 2),
         ]
         self.case = DomainTestCase(
+            public_id="TC-0007",
             name="Registration <script>alert(1)</script>",
             description="Report a registration outcome.",
             steps=self.steps,
@@ -146,6 +148,48 @@ class RunReportTests(unittest.TestCase):
             self.run.executions[1].test_plan_version_id,
         )
         self.assertNotIn(self.secret, report.to_json())
+
+    def test_public_ids_and_version_provenance_are_additive_and_readable(self) -> None:
+        record = RunHistoryRecord.from_completed_run(
+            self.case,
+            self.run,
+            workflow_type=WorkflowType.REGRESSION,
+            outcome="PRODUCT_FAILURE",
+        )
+        references = [
+            item.model_copy(update={
+                "plan_version_number": 4,
+                "plan_version_origin": PlanVersionOrigin.AI_GENERATED,
+            })
+            for item in record.executions
+        ]
+        record = record.model_copy(update={
+            "public_id": "RUN-000253",
+            "executions": references,
+        })
+        report = self.generator.generate_history(record)
+        payload = json.loads(report.to_json())
+
+        self.assertEqual(payload["run_id"], str(self.run.id))
+        self.assertEqual(payload["test_case_id"], str(self.case.id))
+        self.assertEqual(payload["run_public_id"], "RUN-000253")
+        self.assertEqual(payload["test_case_public_id"], "TC-0007")
+        self.assertEqual(
+            payload["steps"][0]["attempts"][0]["test_plan_version_id"],
+            str(self.run.executions[0].test_plan_version_id),
+        )
+        self.assertEqual(payload["steps"][0]["attempts"][0]["plan_version_number"], 4)
+        self.assertEqual(
+            payload["steps"][0]["attempts"][0]["plan_version_origin"],
+            "AI_GENERATED",
+        )
+
+        html = self.generator.to_html(report)
+        self.assertIn("RUN-000253", html)
+        self.assertIn("TC-0007", html)
+        self.assertIn("v4 · AI generated", html)
+        self.assertIn("Technical IDs", html)
+        self.assertIn(str(self.run.executions[0].test_plan_version_id), html)
 
     def test_html_uses_only_explicitly_supplied_local_evidence_url(self) -> None:
         report = self.generator.generate_current(

@@ -39,9 +39,11 @@ def create_sqlite_storage(
     path = Path(database_path).expanduser() if database_path is not None else default_database_path()
     plan_store = SQLitePlanStore(path)
     execution_repository = SQLiteExecutionRepository(path)
-    run_history_repository = SQLiteRunHistoryRepository(path)
     test_case_repository = SQLiteTestCaseRepository(path)
-    run_history = RunHistoryService(run_history_repository, execution_repository)
+    run_history_repository = SQLiteRunHistoryRepository(path)
+    run_history = RunHistoryService(
+        run_history_repository, execution_repository, plan_store=plan_store
+    )
     return SQLiteApplicationStorage(
         database_path=path,
         plan_store=plan_store,

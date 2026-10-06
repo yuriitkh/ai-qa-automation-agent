@@ -16,14 +16,19 @@ from qa_agent.models import (
     Execution,
     ExecutionSegment,
     ExecutionStatus,
+    PlanVersionOrigin,
     Precondition,
+    QATestPlan,
+    QATestStep,
     RunContext,
     TestCase as DomainTestCase,
+    TestPlan as DomainTestPlan,
+    TestPlanVersion as DomainTestPlanVersion,
     TestRun as DomainTestRun,
     TestStep as DomainTestStep,
 )
 from qa_agent.reporting import RunReportGenerator
-from qa_agent.presentation import format_duration, format_timestamp, short_id
+from qa_agent.presentation import format_duration, format_timestamp
 from qa_agent.run_history import (
     HistoryCleanupFailure,
     HistoryPrecondition,
@@ -34,6 +39,8 @@ from qa_agent.run_history import (
     WorkflowType,
 )
 from qa_agent.test_case_repository import InMemoryTestCaseRepository
+from qa_agent.plan_store import InMemoryPlanStore
+from qa_agent.test_case_execution import WorkflowAvailability
 from qa_agent.setup_orchestration import (
     CleanupOutcome,
     PreconditionSetupOutcome,
@@ -60,6 +67,7 @@ class LocalWebApplicationTests(unittest.TestCase):
             provided_data_keys=["user_id"],
         )
         self.case = DomainTestCase(
+            public_id="TC-0042",
             name="Sign up <flow>",
             description="Check registration safely.",
             steps=steps,
@@ -137,7 +145,7 @@ class LocalWebApplicationTests(unittest.TestCase):
         self.assertIn(f"/runs/{self.record.run_id}", body)
         self.assertNotIn("<flow>", body)
 
-    def test_dashboard_summary_uses_friendly_time_duration_and_short_run_link(self) -> None:
+    def test_dashboard_summary_uses_public_run_id_and_friendly_time_duration(self) -> None:
         body = self.app.handle("GET", "/").body.decode("utf-8")
 
         self.assertIn("Total runs", body)
@@ -150,7 +158,7 @@ class LocalWebApplicationTests(unittest.TestCase):
         self.assertIn("1 May 2026, 00:00 UTC", body)
         self.assertIn("5.0 s", body)
         self.assertIn(f'href="/runs/{self.record.run_id}" title="{self.record.run_id}"', body)
-        self.assertIn(f">{short_id(self.record.run_id)}<", body)
+        self.assertIn(">RUN-000001</a>", body)
         self.assertEqual(format_timestamp(self.started), "1 May 2026, 00:00 UTC")
         self.assertEqual(format_duration(34000), "34.0 s")
         self.assertEqual(format_duration(72000), "1m 12s")
@@ -163,8 +171,10 @@ class LocalWebApplicationTests(unittest.TestCase):
 
         self.assertEqual(listing.status, 200)
         self.assertIn("Sign up &lt;flow&gt;", list_body)
+        self.assertIn("TC-0042", list_body)
         self.assertIn("Latest status", list_body)
         self.assertEqual(detail.status, 200)
+        self.assertIn("TC-0042", detail_body)
         self.assertIn("<li><strong>Open page</strong>", detail_body)
         self.assertNotIn("<strong>0.", detail_body)
         self.assertNotIn("<strong>1.", detail_body)
@@ -228,17 +238,71 @@ class LocalWebApplicationTests(unittest.TestCase):
         self.assertIn("Preconditions", body)
         self.assertIn("Cleanup completed successfully", body)
         self.assertIn(f'href="/runs/{self.record.run_id}/report.json"', body)
-        self.assertIn(f'href="/runs/{self.record.run_id}/report.html"', body)
+        self.assertIn(f'href="/runs/{self.record.run_id}/report.html" target="_blank" rel="noopener"', body)
         self.assertEqual(json_response.status, 200)
         self.assertEqual(html_response.status, 200)
         self.assertEqual(json_body["status"], "FAILED")
         self.assertEqual(json_body["outcome"], "PRODUCT_FAILURE")
+        self.assertEqual(json_body["run_public_id"], "RUN-000001")
+        self.assertEqual(json_body["test_case_public_id"], "TC-0042")
+        self.assertEqual(json_body["run_id"], str(self.record.run_id))
+        self.assertEqual(json_body["test_case_id"], str(self.case.id))
         self.assertEqual([step["status"] for step in json_body["steps"]], [
             "PASSED", "FAILED", "BLOCKED"
         ])
         self.assertIn("FAILED", html_body)
         self.assertIn("BLOCKED", html_body)
+        self.assertIn("RUN-000001", html_body)
+        self.assertIn("TC-0042", html_body)
+        self.assertIn(f'href="/runs/{self.record.run_id}"', html_body)
+        self.assertIn("Back to Run", html_body)
         self.assertNotIn(self.secret, body + html_body + json_response.body.decode("utf-8"))
+
+    def test_automation_versions_show_provenance_and_keep_uuid_in_details(self) -> None:
+        step = self.case.steps[0]
+        plan = DomainTestPlan(test_step_id=step.id, name=step.name)
+        version = DomainTestPlanVersion(
+            test_plan_id=plan.id,
+            version=4,
+            created_at=self.started,
+            origin=PlanVersionOrigin.REPAIRED,
+            qa_test_plan=QATestPlan(
+                url="http://127.0.0.1:8000/register",
+                steps=[QATestStep(action="assert_page_loaded")],
+            ),
+        )
+        plans = InMemoryPlanStore()
+        plans.save(step.id, version, test_plan=plan)
+        cases = InMemoryTestCaseRepository()
+        cases.save(self.case)
+        run_service = Mock()
+        run_service.workflow_availability.return_value = WorkflowAvailability(
+            automation_available=True,
+            validation_available=False,
+            regression_available=False,
+            usable_plan_count=1,
+            total_step_count=len(self.case.steps),
+            plan_versions=((step.id, version.version, version.id),),
+            reason="A complete version is not available yet.",
+        )
+        app = LocalWebApplication(
+            self.history,
+            test_cases=cases,
+            run_service=run_service,
+            plan_store=plans,
+        )
+        try:
+            body = app.handle("GET", f"/test-cases/{self.case.id}").body.decode("utf-8")
+        finally:
+            app.close()
+
+        summary_start = body.index("<summary>v4")
+        summary_end = body.index("</summary>", summary_start)
+        self.assertIn("Repaired", body[summary_start:summary_end])
+        self.assertNotIn(str(version.id), body[summary_start:summary_end])
+        self.assertIn("Created: 1 May 2026, 00:00 UTC", body)
+        self.assertIn("Previous version: v3", body)
+        self.assertIn(f"Internal ID: <code>{version.id}</code>", body)
 
     def test_setup_failure_and_cleanup_failure_are_presented_separately(self) -> None:
         setup_run = RunHistoryRecord(
@@ -445,7 +509,9 @@ class PersistedTestCaseRunUiTests(unittest.TestCase):
 
         self.assertEqual(listing.status, 200)
         self.assertIn(b"Saved local case", listing.body)
+        self.assertIn(b"TC-0001", listing.body)
         self.assertEqual(detail.status, 200)
+        self.assertIn(b"TC-0001", detail.body)
         self.assertIn(b"No runs yet.", detail.body)
         self.assertIn(b"Start run", detail.body)
         self.assertIn(b'method="post"', detail.body)

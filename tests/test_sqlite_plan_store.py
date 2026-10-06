@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -7,6 +8,7 @@ from uuid import uuid4
 from qa_agent.models import (
     QATestPlan,
     QATestStep,
+    PlanVersionOrigin,
     TestPlan as DomainTestPlan,
     TestPlanVersion as DomainTestPlanVersion,
     TestStep as DomainTestStep,
@@ -42,6 +44,10 @@ class SQLitePlanStoreTests(unittest.TestCase):
             test_plan_id=self.plan.id,
             version=number,
             created_at=datetime(2025, 1, number, tzinfo=timezone.utc),
+            origin=(
+                PlanVersionOrigin.AI_GENERATED
+                if number == 1 else PlanVersionOrigin.REGENERATED
+            ),
             qa_test_plan=self.qa_plan,
         )
 
@@ -123,6 +129,29 @@ class SQLitePlanStoreTests(unittest.TestCase):
         store = SQLitePlanStore(self.db_path)
         self.assertIsNone(store.find(uuid4()))
         self.assertIsNone(store.find_test_plan(uuid4()))
+
+    def test_legacy_cached_plan_migrates_with_unknown_origin(self) -> None:
+        connection = sqlite3.connect(self.db_path)
+        try:
+            connection.execute(
+                "CREATE TABLE cached_test_plans (test_step_id TEXT PRIMARY KEY, "
+                "test_plan_id TEXT NOT NULL, test_plan_name TEXT NOT NULL, version_id TEXT NOT NULL, "
+                "version_number INTEGER NOT NULL, created_at TEXT NOT NULL, qa_test_plan_json TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO cached_test_plans VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (str(self.step.id), str(self.plan.id), self.plan.name, str(uuid4()), 4,
+                 "2025-01-04T00:00:00+00:00", self.qa_plan.model_dump_json()),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        migrated = SQLitePlanStore(self.db_path)
+        current = migrated.find(self.step.id)
+        self.assertEqual(current.version, 4)
+        self.assertIsNone(current.origin)
+        self.assertEqual(migrated.get_version(current.id), current)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,15 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 from qa_agent.execution_repository import ExecutionRepository
-from qa_agent.models import Execution, ExecutionStatus, TestCase, TestRun
+from qa_agent.models import (
+    Execution,
+    ExecutionStatus,
+    PlanVersionOrigin,
+    TestCase,
+    TestRun,
+)
+from qa_agent.plan_store import PlanStore
+from qa_agent.public_ids import format_run_public_id, parse_run_public_id
 from qa_agent.redaction import redact_secrets
 from qa_agent.run_context import RunContext
 from qa_agent.setup_orchestration import CleanupOutcome, SetupRunOutcome
@@ -68,6 +76,8 @@ class HistoryExecutionReference(BaseModel):
     execution_id: UUID
     test_step_id: UUID
     test_plan_version_id: UUID
+    plan_version_number: int | None = None
+    plan_version_origin: PlanVersionOrigin | None = None
     status: ExecutionStatus
     started_at: datetime
     finished_at: datetime | None = None
@@ -90,7 +100,9 @@ class RunHistoryRecord(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     run_id: UUID
+    public_id: str | None = Field(default=None, pattern=r"^RUN-\d{6,}$")
     test_case_id: UUID
+    test_case_public_id: str | None = Field(default=None, pattern=r"^TC-\d{4,}$")
     test_case_name: str
     test_case_description: str
     base_url: str | None = None
@@ -191,6 +203,7 @@ class RunHistoryRecord(BaseModel):
         safe_context = _safe_context(run_context)
         return cls(
             run_id=test_run.id,
+            test_case_public_id=test_case.public_id,
             test_case_id=test_case.id,
             test_case_name=_safe_text(test_case.name, run_context),
             test_case_description=_safe_text(test_case.description, run_context),
@@ -262,7 +275,7 @@ class RunHistoryRecord(BaseModel):
 
 
 class RunHistoryRepository(Protocol):
-    def save(self, record: RunHistoryRecord) -> None: ...
+    def save(self, record: RunHistoryRecord) -> RunHistoryRecord: ...
 
     def get(self, run_id: UUID) -> RunHistoryRecord | None: ...
 
@@ -278,14 +291,34 @@ class InMemoryRunHistoryRepository:
 
     def __init__(self) -> None:
         self._records: dict[UUID, RunHistoryRecord] = {}
+        self._next_public_id = 1
 
-    def save(self, record: RunHistoryRecord) -> None:
+    def save(self, record: RunHistoryRecord) -> RunHistoryRecord:
         if record.run_id in self._records:
             raise ValueError(f"Run {record.run_id} already exists in history.")
-        self._records[record.run_id] = record.model_copy(deep=True)
+        public_id = record.public_id
+        sequence = parse_run_public_id(public_id)
+        if public_id is None:
+            public_id = format_run_public_id(self._next_public_id)
+            sequence = self._next_public_id
+        elif sequence is None:
+            raise ValueError("Run public ID must use the RUN-000001 format.")
+        if any(item.public_id == public_id for item in self._records.values()):
+            raise ValueError(f"Run public ID {public_id} already exists in history.")
+        self._next_public_id = max(self._next_public_id, (sequence or 0) + 1)
+        saved = record.model_copy(update={"public_id": public_id}, deep=True)
+        self._records[record.run_id] = saved
+        return saved.model_copy(deep=True)
 
     def get(self, run_id: UUID) -> RunHistoryRecord | None:
         record = self._records.get(run_id)
+        return record.model_copy(deep=True) if record is not None else None
+
+    def get_by_public_id(self, public_id: str) -> RunHistoryRecord | None:
+        record = next(
+            (item for item in self._records.values() if item.public_id == public_id),
+            None,
+        )
         return record.model_copy(deep=True) if record is not None else None
 
     def list_recent(self, limit: int = 50) -> list[RunHistoryRecord]:
@@ -320,9 +353,11 @@ class RunHistoryService:
         self,
         repository: RunHistoryRepository,
         execution_repository: ExecutionRepository | None = None,
+        plan_store: PlanStore | None = None,
     ) -> None:
         self._repository = repository
         self._execution_repository = execution_repository
+        self._plan_store = plan_store
 
     def record_completed_run(
         self,
@@ -348,8 +383,22 @@ class RunHistoryService:
             started_at=started_at,
             finished_at=finished_at,
         )
-        self._repository.save(record)
-        return record
+        if self._plan_store is not None:
+            references = []
+            for reference in record.executions:
+                try:
+                    version = self._plan_store.get_version(reference.test_plan_version_id)
+                except Exception:
+                    version = None
+                if version is None:
+                    references.append(reference)
+                    continue
+                references.append(reference.model_copy(update={
+                    "plan_version_number": version.version,
+                    "plan_version_origin": version.origin,
+                }))
+            record = record.model_copy(update={"executions": references})
+        return self._repository.save(record)
 
     def get(self, run_id: UUID) -> RunHistoryRecord | None:
         return self._repository.get(run_id)

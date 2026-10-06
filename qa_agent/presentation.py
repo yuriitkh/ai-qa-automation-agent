@@ -35,6 +35,7 @@ th{font-size:.84rem;color:#4e5b6c;background:#f8fafc;font-weight:700}tr:last-chi
 .filters{display:flex;align-items:end;gap:.75rem;flex-wrap:wrap}.field{display:grid;gap:.25rem}.field label{font-size:.85rem;font-weight:650}.field select{min-width:155px;padding:.48rem;border:1px solid #aebaca;border-radius:6px;background:#fff;color:var(--ink);font:inherit}
 .field input,.field textarea{width:min(100%,720px);padding:.55rem .62rem;border:1px solid #aebaca;border-radius:6px;background:#fff;color:var(--ink);font:inherit}.field textarea{resize:vertical}
 .actions{display:flex;gap:.55rem;flex-wrap:wrap;margin:.8rem 0}.id-code,code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.id-code{font-size:.9rem}
+.eyebrow{color:var(--muted);font-size:.85rem;font-weight:700;letter-spacing:.04em;margin:0}.technical-details{margin:.7rem 0;color:var(--muted)}.technical-details summary,.plan-version-details summary{cursor:pointer}.plan-version-details{display:inline-block;margin-left:.45rem}.plan-version-details>p,.technical-details>p{margin:.35rem 0}
 .evidence-preview{display:block;max-width:min(100%,540px);max-height:380px;object-fit:contain;border:1px solid var(--line);border-radius:7px;margin:.45rem 0}
 footer{color:var(--muted);font-size:.85rem;padding:1rem 0;border-top:1px solid var(--line)}
 @media(max-width:640px){.shell{padding:0 .8rem}.topbar-inner{padding:.55rem 0}.main{padding-top:1rem}.panel{padding:.85rem}.card-value{font-size:1.25rem}}

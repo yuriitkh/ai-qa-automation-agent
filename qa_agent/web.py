@@ -18,7 +18,6 @@ from qa_agent.presentation import (
     failure_message,
     outcome_label,
     outcome_tone,
-    short_id,
 )
 from qa_agent.reporting import RunAttemptReport, RunEvidenceReport, RunReportGenerator, RunStepReport
 from qa_agent.browser_runner import BrowserRunner
@@ -42,6 +41,8 @@ from qa_agent.background_execution import BackgroundRunService
 from qa_agent.execution_progress import (
     ExecutionProgressStore,
 )
+from qa_agent.models import PlanVersionOrigin
+from qa_agent.plan_store import PlanStore
 from qa_agent.test_case_decomposer import TestCaseDecomposer
 from qa_agent.test_plan_generator import LLMTestPlanGenerator
 from qa_agent.workflows import AutomationWorkflow
@@ -91,6 +92,7 @@ class LocalWebApplication:
         authoring_service: TestCaseAuthoringService | None = None,
         draft_store: TestCaseDraftStore | None = None,
         progress_store: ExecutionProgressStore | None = None,
+        plan_store: PlanStore | None = None,
     ) -> None:
         self._run_history = run_history
         self._reports = reports or RunReportGenerator()
@@ -100,6 +102,7 @@ class LocalWebApplication:
         self._authoring_service = authoring_service
         self._draft_store = draft_store or TestCaseDraftStore()
         self._progress_store = progress_store or ExecutionProgressStore()
+        self._plan_store = plan_store
         self._background_runs = (
             BackgroundRunService(run_service, run_history, self._progress_store)
             if run_service is not None else None
@@ -169,6 +172,7 @@ class LocalWebApplication:
                         detail, run_id, step, attempt, evidence, index
                     ),
                     show_html_report_link=False,
+                    run_details_url=f"/runs/{run_id}",
                 ),
             )
         if len(parts) == 2 and parts[0] == "runs":
@@ -632,8 +636,9 @@ class LocalWebApplication:
                 )
                 rows.append(
                     "<tr>"
-                    f'<td><a href="/test-cases/{test_case_id}">{escape_html(test_case.name)}</a>'
-                    f'<div class="muted">{escape_html(short_id(test_case_id))}</div></td>'
+                    f'<td><div class="status-line"><span class="id-code">{escape_html(test_case.public_id or "")}</span>'
+                    f'<a href="/test-cases/{test_case_id}">{escape_html(test_case.name)}</a></div>'
+                    f'<details><summary>Technical ID</summary><code>{escape_html(test_case_id)}</code></details></td>'
                     f"<td>{status}</td><td>{outcome}</td><td>{last_run}</td>"
                     f"<td>{len(history)}</td><td>{latest_workflow}</td></tr>"
                 )
@@ -642,8 +647,9 @@ class LocalWebApplication:
                 history = grouped[test_case_id]
                 rows.append(
                     "<tr>"
-                    f'<td><a href="/test-cases/{test_case_id}">{escape_html(latest.test_case_name)}</a>'
-                    f'<div class="muted">{escape_html(short_id(test_case_id))}</div></td>'
+                    f'<td><div class="status-line"><span class="id-code">{escape_html(latest.test_case_public_id or "")}</span>'
+                    f'<a href="/test-cases/{test_case_id}">{escape_html(latest.test_case_name)}</a></div>'
+                    f'<details><summary>Technical ID</summary><code>{escape_html(test_case_id)}</code></details></td>'
                     f'<td>{badge(latest.status.value)}</td>'
                     f'<td>{_outcome_badge(latest)}</td>'
                     f'<td>{escape_html(format_timestamp(latest.started_at))}</td>'
@@ -708,13 +714,14 @@ class LocalWebApplication:
             rows.append(
                 "<tr>"
                 f"<td>{status_html}{outcome_html}</td>"
-                f'<td><a href="/test-cases/{record.test_case_id}">{escape_html(record.test_case_name)}</a></td>'
+                f'<td><span class="muted">{escape_html(record.test_case_public_id or "")}</span> '
+                f'<a href="/test-cases/{record.test_case_id}">{escape_html(record.test_case_name)}</a></td>'
                 f'<td>{badge(record.workflow_type.value, "workflow")}</td>'
                 f'<td><time datetime="{escape_html(record.started_at.isoformat())}">'
                 f'{escape_html(format_timestamp(record.started_at))}</time></td>'
                 f'<td>{escape_html(format_duration(record.duration_ms))}</td>'
                 f'<td><a href="/runs/{record.run_id}" title="{escape_html(record.run_id)}">'
-                f'{escape_html(short_id(record.run_id))}</a></td>'
+                f'{escape_html(record.public_id or "Run")}</a></td>'
                 "</tr>"
             )
         return (
@@ -751,6 +758,7 @@ class LocalWebApplication:
             )
         )
         if test_case is not None:
+            case_public_id = test_case.public_id or (latest.test_case_public_id if latest else None)
             case_name = test_case.name
             case_description = test_case.description
             source_note = "Definition loaded from the saved TestCase."
@@ -779,6 +787,7 @@ class LocalWebApplication:
                 for number, segment in enumerate(sorted(test_case.segments, key=lambda item: item.order), start=1)
             )
         else:
+            case_public_id = latest.test_case_public_id
             case_name = latest.test_case_name
             case_description = latest.test_case_description
             source_note = "Definition shown from the most recent recorded run."
@@ -809,7 +818,7 @@ class LocalWebApplication:
             f'{escape_html(format_timestamp(record.started_at))}</time></td>'
             f'<td>{escape_html(format_duration(record.duration_ms))}</td>'
             f'<td><a href="/runs/{record.run_id}" title="{escape_html(record.run_id)}">'
-            f'{escape_html(short_id(record.run_id))}</a></td></tr>'
+            f'{escape_html(record.public_id or "Run")}</a></td></tr>'
             for record in records
         )
         history_table = (
@@ -830,9 +839,13 @@ class LocalWebApplication:
                 # Compatibility for lightweight adapters that only implement run().
                 run_form = self._run_form(test_case_id)
         content = (
-            '<header class="page-heading"><h1>' + escape_html(case_name) + '</h1>'
+            '<header class="page-heading">'
+            + (f'<p class="eyebrow">{escape_html(case_public_id)}</p>' if case_public_id else '')
+            + '<h1>' + escape_html(case_name) + '</h1>'
             + f'<p class="lead">{escape_html(case_description)}</p>'
             + f'<p class="muted">{escape_html(source_note)}</p></header>'
+            + f'<details class="technical-details"><summary>Technical IDs</summary>'
+            + f'<p>TestCase UUID: <code>{escape_html(test_case_id)}</code></p></details>'
             + f'<div class="summary-grid">{cards}</div>'
             + run_form
             + '<section class="panel"><h2>Preconditions</h2>'
@@ -847,7 +860,7 @@ class LocalWebApplication:
         return WebResponse.html(
             200,
             self._page(
-                case_name,
+                f"{case_public_id} — {case_name}" if case_public_id else case_name,
                 content,
                 current="Test Cases",
                 breadcrumbs=[("Dashboard", "/"), ("Test Cases", "/test-cases")],
@@ -879,8 +892,8 @@ class LocalWebApplication:
             return None
         return value if isinstance(value, WorkflowAvailability) else None
 
-    @staticmethod
     def _workflow_panel(
+        self,
         test_case_id: UUID,
         test_case,
         availability: WorkflowAvailability,
@@ -901,9 +914,24 @@ class LocalWebApplication:
             selected = plan_by_step.get(step.id)
             if selected is not None:
                 version, version_id = selected
+                saved_version = (
+                    self._plan_store.get_version(version_id)
+                    if self._plan_store is not None else None
+                )
+                origin_label = _plan_origin_label(
+                    saved_version.origin if saved_version is not None else None
+                )
+                created = (
+                    f'<p>Created: {escape_html(format_timestamp(saved_version.created_at))}</p>'
+                    if saved_version is not None else ""
+                )
+                previous = f'<p>Previous version: v{version - 1}</p>' if version > 1 else ""
                 version_rows.append(
-                    f'<li>Step {step.order + 1}: {escape_html(step.name)} '
-                    f'<span class="muted">v{version} · {escape_html(short_id(version_id))}</span></li>'
+                    f'<li><span>Step {step.order + 1}: {escape_html(step.name)}</span> '
+                    f'<details class="plan-version-details"><summary>v{version} '
+                    f'{badge(origin_label, "workflow")}</summary>'
+                    f'<p>Automation version v{version}</p>{created}{previous}'
+                    f'<p>Internal ID: <code>{escape_html(version_id)}</code></p></details></li>'
                 )
         plan_status = (
             f'{availability.usable_plan_count} / {availability.total_step_count} steps have executable plans.'
@@ -1091,6 +1119,7 @@ def create_application(
         test_cases=storage.test_case_repository,
         run_service=run_service,
         authoring_service=TestCaseAuthoringService(create_router()),
+        plan_store=storage.plan_store,
     )
 
 
@@ -1228,6 +1257,15 @@ def _summary_card(label: str, value: str, *, raw: bool = False) -> str:
         f'<article class="card"><div class="card-label">{escape_html(label)}</div>'
         f'<div class="card-value">{shown}</div></article>'
     )
+
+
+def _plan_origin_label(origin: PlanVersionOrigin | None) -> str:
+    return {
+        PlanVersionOrigin.AI_GENERATED: "AI generated",
+        PlanVersionOrigin.HUMAN_EDITED: "Human edited",
+        PlanVersionOrigin.REGENERATED: "Regenerated",
+        PlanVersionOrigin.REPAIRED: "Repaired",
+    }.get(origin, "Unknown origin")
 
 
 def _outcome_badge(record: RunHistoryRecord, *, stacked: bool = False) -> str:

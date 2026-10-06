@@ -8,7 +8,14 @@ from collections.abc import Callable, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from qa_agent.models import Evidence, EvidenceType, Execution, ExecutionStatus, TestRun
+from qa_agent.models import (
+    Evidence,
+    EvidenceType,
+    Execution,
+    ExecutionStatus,
+    PlanVersionOrigin,
+    TestRun,
+)
 from qa_agent.presentation import (
     UI_CSS,
     badge as presentation_badge,
@@ -16,7 +23,6 @@ from qa_agent.presentation import (
     format_duration,
     format_timestamp,
     outcome_tone,
-    short_id,
 )
 from qa_agent.redaction import redact_secrets
 from qa_agent.run_history import (
@@ -165,6 +171,8 @@ class RunEvidenceReport(BaseModel):
 class RunAttemptReport(BaseModel):
     execution_id: UUID
     test_plan_version_id: UUID
+    plan_version_number: int | None = None
+    plan_version_origin: PlanVersionOrigin | None = None
     status: ExecutionStatus
     started_at: datetime
     finished_at: datetime | None = None
@@ -189,7 +197,9 @@ class RunReport(BaseModel):
 
     schema_version: str = "1"
     run_id: UUID
+    run_public_id: str | None = None
     test_case_id: UUID
+    test_case_public_id: str | None = None
     test_case_name: str
     test_case_description: str
     workflow_type: WorkflowType
@@ -278,7 +288,9 @@ class RunReportGenerator:
 
         return RunReport(
             run_id=record.run_id,
+            run_public_id=record.public_id,
             test_case_id=record.test_case_id,
+            test_case_public_id=record.test_case_public_id,
             test_case_name=record.test_case_name,
             test_case_description=record.test_case_description,
             workflow_type=record.workflow_type,
@@ -324,6 +336,8 @@ class RunReportGenerator:
         return RunAttemptReport(
             execution_id=reference.execution_id,
             test_plan_version_id=reference.test_plan_version_id,
+            plan_version_number=reference.plan_version_number,
+            plan_version_origin=reference.plan_version_origin,
             status=reference.status,
             started_at=started_at,
             finished_at=finished_at,
@@ -341,6 +355,7 @@ class RunReportGenerator:
             [RunStepReport, RunAttemptReport, RunEvidenceReport, int], str | None
         ] | None = None,
         show_html_report_link: bool = True,
+        run_details_url: str | None = None,
     ) -> str:
         """Render a standalone, safe HTML report; evidence URLs come from the host."""
         esc = escape_html
@@ -378,15 +393,20 @@ class RunReportGenerator:
                 if attempt.status == ExecutionStatus.FAILED:
                     version_value = (
                         f'<code title="{esc(attempt.test_plan_version_id)}">'
-                        f'{esc(short_id(attempt.test_plan_version_id))}</code>'
+                        f'{esc(_plan_version_label(attempt))}</code>'
                     )
                 else:
                     version_value = (
                         f'<code title="{esc(attempt.test_plan_version_id)}">'
-                        f'{esc(short_id(attempt.test_plan_version_id))}</code>'
+                        f'{esc(_plan_version_label(attempt))}</code>'
                     )
                 details.append(
                     f'<p class="muted"><strong>Automation · Plan version:</strong> {version_value}</p>'
+                )
+                details.append(
+                    '<details class="plan-version-details"><summary>Version details</summary>'
+                    f'<p>Plan version ID: <code>{esc(attempt.test_plan_version_id)}</code></p>'
+                    '</details>'
                 )
                 if attempt.duration_ms is not None:
                     details.append(
@@ -499,7 +519,15 @@ class RunReportGenerator:
             f'<a class="button" href="/runs/{esc(report.run_id)}/report.json">View JSON</a>',
         ]
         if show_html_report_link:
-            actions.append(f'<a class="button" href="/runs/{esc(report.run_id)}/report.html">View HTML Report</a>')
+            actions.append(
+                f'<a class="button" href="/runs/{esc(report.run_id)}/report.html" '
+                'target="_blank" rel="noopener">View HTML Report</a>'
+            )
+        if run_details_url is not None:
+            actions.insert(
+                0,
+                f'<a class="button" href="{esc(run_details_url)}">Back to Run</a>',
+            )
         summary = (
             '<section class="panel"><div class="status-line">'
             + result_heading
@@ -511,10 +539,16 @@ class RunReportGenerator:
             + _report_meta("Started", format_timestamp(report.started_at))
             + _report_meta("Finished", format_timestamp(report.finished_at))
             + _report_meta("Duration", format_duration(report.duration_ms))
-            + _report_meta("Run ID", f'<code title="{esc(report.run_id)}">{esc(short_id(report.run_id))}</code>', raw=True)
+            + _report_meta("Run", report.run_public_id or "Unknown")
             + _report_meta("Base URL", report.base_url or "Unavailable")
-            + _report_meta("TestCase ID", f'<code title="{esc(report.test_case_id)}">{esc(short_id(report.test_case_id))}</code>', raw=True)
+            + _report_meta("TestCase", report.test_case_public_id or "Unknown")
             + "</div></section>"
+        )
+        technical_ids = (
+            '<details class="technical-details"><summary>Technical IDs</summary>'
+            f'<p>Run UUID: <code>{esc(report.run_id)}</code></p>'
+            f'<p>TestCase UUID: <code>{esc(report.test_case_id)}</code></p>'
+            '</details>'
         )
         navigation = (
             '<header class="topbar"><div class="shell topbar-inner">'
@@ -530,14 +564,16 @@ class RunReportGenerator:
             + navigation
             + '<main class="shell main">'
             + f'<p class="breadcrumbs"><a href="/">Dashboard</a><span>›</span>'
-            f'<a href="/test-cases/{esc(report.test_case_id)}">{esc(report.test_case_name)}</a>'
-            f'<span>›</span>Run {esc(short_id(report.run_id))}</p>'
+            f'<a href="/test-cases/{esc(report.test_case_id)}">'
+            f'{esc(report.test_case_public_id or report.test_case_name)} — {esc(report.test_case_name)}</a>'
+            f'<span>›</span>{esc(report.run_public_id or "Run")}</p>'
             + '<header class="page-heading"><h1>' + esc(report.test_case_name) + '</h1>'
             + f'<p class="lead">{esc(report.test_case_description)}</p></header>'
             + '<div class="actions"><a class="button" href="/">Back to Dashboard</a>'
             + "".join(actions)
             + "</div>"
             + summary
+            + technical_ids
             + setup_html
             + '<section class="panel"><h2>Test steps</h2>'
             + ("".join(steps_html) if steps_html else '<div class="empty-state">No steps recorded.</div>')
@@ -559,6 +595,24 @@ def _display_value(value: Any) -> str:
 
         return json.dumps(value, ensure_ascii=False, sort_keys=True)
     return str(value)
+
+
+def _plan_origin_label(origin: PlanVersionOrigin | None) -> str:
+    return {
+        PlanVersionOrigin.AI_GENERATED: "AI generated",
+        PlanVersionOrigin.HUMAN_EDITED: "Human edited",
+        PlanVersionOrigin.REGENERATED: "Regenerated",
+        PlanVersionOrigin.REPAIRED: "Repaired",
+    }.get(origin, "Unknown origin")
+
+
+def _plan_version_label(attempt: RunAttemptReport) -> str:
+    version = (
+        f"v{attempt.plan_version_number}"
+        if attempt.plan_version_number is not None
+        else "Version unknown"
+    )
+    return f"{version} · {_plan_origin_label(attempt.plan_version_origin)}"
 
 
 def _report_meta(label: str, value: object, *, raw: bool = False) -> str:

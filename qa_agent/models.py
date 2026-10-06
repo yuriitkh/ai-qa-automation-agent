@@ -216,6 +216,7 @@ class Precondition(BaseModel):
 
 class TestCase(BaseModel):
     id: UUID = Field(default_factory=uuid4)
+    public_id: str | None = Field(default=None, pattern=r"^TC-\d{4,}$")
     name: str = Field(min_length=1)
     description: str = Field(min_length=1)
     base_url: str | None = None
@@ -317,6 +318,13 @@ class TestPlan(BaseModel):
     name: str = Field(min_length=1)
 
 
+class PlanVersionOrigin(str, Enum):
+    AI_GENERATED = "AI_GENERATED"
+    HUMAN_EDITED = "HUMAN_EDITED"
+    REGENERATED = "REGENERATED"
+    REPAIRED = "REPAIRED"
+
+
 class TestPlanVersion(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -324,6 +332,7 @@ class TestPlanVersion(BaseModel):
     test_plan_id: UUID
     version: int = Field(ge=1)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    origin: PlanVersionOrigin | None = None
     qa_test_plan: QATestPlan
 
 

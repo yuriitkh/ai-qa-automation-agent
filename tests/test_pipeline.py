@@ -13,6 +13,7 @@ from qa_agent.models import (
     ExecutionStatus,
     FailurePolicy,
     InteractiveElement,
+    PlanVersionOrigin,
     QATestPlan,
     QATestStep,
     RunContext,
@@ -53,6 +54,10 @@ class QATestPipelineTests(unittest.TestCase):
                     discovery_fallback=fallback, plan_generator=generator,
                     runner=lambda plan: {"status": "passed", "steps": []},
                 ).run("Check account")
+                self.assertEqual(
+                    result.test_plans[0].test_plan_version.origin,
+                    PlanVersionOrigin.AI_GENERATED,
+                )
                 self.assertEqual(fallback.discover.call_count,
                                  0 if status == DiscoveryStatus.SUCCESS else 1)
                 if status != DiscoveryStatus.SUCCESS:
@@ -94,6 +99,10 @@ class QATestPipelineTests(unittest.TestCase):
         ).run("Check")
 
         self.assertEqual([p.test_plan_version.version for p in result.test_plans], [1, 2])
+        self.assertEqual(
+            [pair.test_plan_version.origin for pair in result.test_plans],
+            [None, PlanVersionOrigin.REPAIRED],
+        )
         self.assertEqual(result.test_plans[0].test_plan_version.qa_test_plan.steps[0].parameters["selector"], "#old")
         self.assertEqual(result.test_plans[1].test_plan_version.qa_test_plan.steps[0].parameters["selector"], "#new")
         self.assertEqual([e.status for e in result.executions], [ExecutionStatus.FAILED, ExecutionStatus.PASSED])
@@ -128,6 +137,10 @@ class QATestPipelineTests(unittest.TestCase):
                     plan_generator=generator, runner=runner, plan_store=store).run("Check")
                 self.assertEqual(len(generator.calls), 1)
                 self.assertEqual([p.test_plan_version.version for p in result.test_plans], [1, 2])
+                self.assertEqual(
+                    result.test_plans[-1].test_plan_version.origin,
+                    PlanVersionOrigin.REGENERATED,
+                )
 
     def test_regeneration_failure_raises_stage_error_and_keeps_version_one(
         self,
@@ -440,7 +453,15 @@ class QATestPipelineTests(unittest.TestCase):
 
         generated_versions = self.generator.versions
         generated_plans = self.generator.plans
-        self.assertEqual(result.test_plans, self.generator.generated)
+        self.assertEqual([pair.test_plan for pair in result.test_plans], generated_plans)
+        self.assertEqual(
+            [pair.test_plan_version.id for pair in result.test_plans],
+            [pair.test_plan_version.id for pair in self.generator.generated],
+        )
+        self.assertTrue(all(
+            pair.test_plan_version.origin == PlanVersionOrigin.AI_GENERATED
+            for pair in result.test_plans
+        ))
         self.assertEqual(self.runner_calls, [version.qa_test_plan for version in generated_versions])
         self.assertEqual(
             [run.test_plan_version_id for run in executions],

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from qa_agent.llm.router import LLMRouter
 from qa_agent.models import (
     DiscoveryResult,
+    PlanVersionOrigin,
     QATestPlan,
     TestPlan,
     TestPlanVersion,
@@ -97,6 +98,11 @@ class LLMTestPlanGenerator(TestPlanGenerator):
         version = TestPlanVersion(
             test_plan_id=test_plan.id,
             version=version_number,
+            origin=(
+                PlanVersionOrigin.REGENERATED
+                if existing_test_plan is not None
+                else PlanVersionOrigin.AI_GENERATED
+            ),
             qa_test_plan=executable_plan,
         )
         return GeneratedTestPlan(test_plan=test_plan, test_plan_version=version)

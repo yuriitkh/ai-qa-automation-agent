@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from qa_agent.models import (
     DiscoveryResult,
+    PlanVersionOrigin,
     DiscoveryStatus,
     InteractiveElement,
     QATestPlan,
@@ -159,6 +160,7 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
         self.assertEqual(plan_factory.call_args.kwargs["test_step_id"], step.id)
         self.assertEqual(version.qa_test_plan, executable)
         self.assertEqual(len(version.qa_test_plan.steps), 4)
+        self.assertEqual(version.origin, PlanVersionOrigin.AI_GENERATED)
 
     def test_generate_with_plan_returns_the_created_plan_and_its_version(self) -> None:
         step = self.make_test_step()
@@ -193,6 +195,7 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
         self.assertIs(second.test_plan, first.test_plan)
         self.assertEqual(second.test_plan_version.test_plan_id, first.test_plan.id)
         self.assertEqual(second.test_plan_version.version, 2)
+        self.assertEqual(second.test_plan_version.origin, PlanVersionOrigin.REGENERATED)
 
     def test_router_failure_propagates_without_masking(self) -> None:
         error = RuntimeError("router failed")

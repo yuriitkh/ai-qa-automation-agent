@@ -21,6 +21,7 @@ from qa_agent.models import (
     Execution,
     ExecutionStatus,
     FailurePolicy,
+    PlanVersionOrigin,
     QATestPlan,
     TestCase,
     TestPlanVersion,
@@ -357,6 +358,9 @@ class QATestPipeline:
                     )
                     if generated_plan.test_plan.test_step_id != test_step.id:
                         raise ValueError("Generated TestPlan belongs to a different TestStep.")
+                    generated_plan = _with_plan_origin(
+                        generated_plan, PlanVersionOrigin.AI_GENERATED
+                    )
                 except Exception as error:
                     emit_progress_event(
                         ExecutionEventType.PLAN_GENERATION_FAILED,
@@ -482,6 +486,7 @@ class QATestPipeline:
                     repaired_version = TestPlanVersion(
                         test_plan_id=generated_plan.test_plan.id,
                         version=plan_version.version + 1,
+                        origin=PlanVersionOrigin.REPAIRED,
                         qa_test_plan=repaired_plan,
                     )
                     repaired = GeneratedTestPlan(
@@ -517,6 +522,9 @@ class QATestPipeline:
                     rediscovery_result,
                     existing_test_plan=generated_plan.test_plan,
                     version_number=plan_version.version + 1,
+                )
+                regenerated_plan = _with_plan_origin(
+                    regenerated_plan, PlanVersionOrigin.REGENERATED
                 )
                 if regenerated_plan.test_plan.id != generated_plan.test_plan.id:
                     raise ValueError("Regeneration must reuse the existing TestPlan.")
@@ -625,6 +633,19 @@ class QATestPipeline:
                 str(outcome.error),
             ) from outcome.error
         return outcome
+
+
+def _with_plan_origin(
+    generated_plan: GeneratedTestPlan,
+    origin: PlanVersionOrigin,
+) -> GeneratedTestPlan:
+    version = generated_plan.test_plan_version
+    if version.origin == origin:
+        return generated_plan
+    return GeneratedTestPlan(
+        test_plan=generated_plan.test_plan,
+        test_plan_version=version.model_copy(update={"origin": origin}),
+    )
 
 
 def _automation_run_outcome(test_run: TestRun) -> str:
