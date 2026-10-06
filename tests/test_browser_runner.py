@@ -3,7 +3,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from qa_agent.browser_runner import run_test_plan
+from qa_agent.browser_runner import BrowserRunner, run_test_plan
 from qa_agent.models import QATestPlan
 
 
@@ -16,7 +16,9 @@ class BrowserRunnerActionTests(unittest.TestCase):
         self.page.locator.return_value = self.locator
 
         self.browser = MagicMock()
-        self.browser.new_page.return_value = self.page
+        self.context = MagicMock()
+        self.context.new_page.return_value = self.page
+        self.browser.new_context.return_value = self.context
         self.playwright = MagicMock()
         self.playwright.chromium.launch.return_value = self.browser
         self.manager = MagicMock()
@@ -44,6 +46,140 @@ class BrowserRunnerActionTests(unittest.TestCase):
         self.page.wait_for_load_state.assert_called_once_with(
             "load", timeout=10000
         )
+
+    def test_navigate_action_uses_its_url_without_automatic_plan_navigation(self) -> None:
+        result = self.run_steps(
+            {"action": "navigate", "parameters": {"url": "https://target.example/path"}}
+        )
+
+        self.assertEqual(result["status"], "passed")
+        self.page.goto.assert_called_once_with("https://target.example/path")
+
+    def test_browser_runner_calls_remain_isolated_per_invocation(self) -> None:
+        second_page = MagicMock()
+        first_context = MagicMock()
+        first_context.new_page.return_value = self.page
+        second_context = MagicMock()
+        second_context.new_page.return_value = second_page
+        first_browser = MagicMock()
+        first_browser.new_context.return_value = first_context
+        second_browser = MagicMock()
+        second_browser.new_context.return_value = second_context
+        first_playwright = MagicMock()
+        first_playwright.chromium.launch.return_value = first_browser
+        second_playwright = MagicMock()
+        second_playwright.chromium.launch.return_value = second_browser
+        managers = []
+        for playwright in (first_playwright, second_playwright):
+            manager = MagicMock()
+            manager.__enter__.return_value = playwright
+            managers.append(manager)
+
+        runner = BrowserRunner()
+        plan = QATestPlan(url="https://example.com", steps=[
+            {"action": "assert_page_loaded", "parameters": {}}
+        ])
+        with patch(
+            "qa_agent.browser_runner.sync_playwright", side_effect=managers
+        ):
+            runner(plan)
+            runner(plan)
+
+        self.assertIsNot(self.page, second_page)
+        for manager, browser, context in zip(
+            managers, (first_browser, second_browser), (first_context, second_context)
+        ):
+            browser.new_context.assert_called_once_with()
+            context.new_page.assert_called_once_with()
+            context.close.assert_called_once_with()
+            browser.close.assert_called_once_with()
+            manager.__exit__.assert_called_once()
+
+    def test_open_session_reuses_resources_for_plans_and_pages(self) -> None:
+        second_page = MagicMock()
+        self.context.new_page.side_effect = [self.page, second_page]
+        runner = BrowserRunner()
+        plan = QATestPlan(url="https://example.com", steps=[
+            {"action": "assert_page_loaded", "parameters": {}}
+        ])
+
+        with patch("qa_agent.browser_runner.sync_playwright", return_value=self.manager):
+            with runner.open_session() as session:
+                first_page = session.new_page()
+                second_page_result = session.new_page()
+                self.assertIs(first_page, self.page)
+                self.assertIs(second_page_result, second_page)
+                self.assertEqual(session.run_plan(first_page, plan)["status"], "passed")
+                self.assertEqual(session.run_plan(first_page, plan)["status"], "passed")
+                self.assertEqual(session.run_plan(second_page_result, plan)["status"], "passed")
+
+        self.manager.__enter__.assert_called_once_with()
+        self.playwright.chromium.launch.assert_called_once_with(headless=False)
+        self.browser.new_context.assert_called_once_with()
+        self.context.new_page.assert_has_calls([unittest.mock.call(), unittest.mock.call()])
+        self.page.wait_for_load_state.assert_has_calls(
+            [unittest.mock.call("load"), unittest.mock.call("load")]
+        )
+        self.context.close.assert_called_once_with()
+        self.browser.close.assert_called_once_with()
+        self.manager.__exit__.assert_called_once_with(None, None, None)
+        self.page.close.assert_called_once_with()
+        second_page.close.assert_called_once_with()
+
+    def test_session_without_plan_cleans_resources(self) -> None:
+        with patch("qa_agent.browser_runner.sync_playwright", return_value=self.manager):
+            with BrowserRunner().open_session():
+                pass
+
+        self.playwright.chromium.launch.assert_called_once_with(headless=False)
+        self.browser.new_context.assert_called_once_with()
+        self.context.new_page.assert_not_called()
+        self.context.close.assert_called_once_with()
+        self.browser.close.assert_called_once_with()
+        self.manager.__exit__.assert_called_once_with(None, None, None)
+
+    def test_session_page_creation_exception_cleans_created_resources(self) -> None:
+        self.context.new_page.side_effect = RuntimeError("page setup failed")
+        with patch("qa_agent.browser_runner.sync_playwright", return_value=self.manager):
+            with self.assertRaisesRegex(RuntimeError, "page setup failed"):
+                with BrowserRunner().open_session() as session:
+                    session.new_page()
+
+        self.context.new_page.assert_called_once_with()
+        self.context.close.assert_called_once_with()
+        self.browser.close.assert_called_once_with()
+        self.manager.__exit__.assert_called_once()
+
+    def test_context_setup_exception_closes_browser_and_runtime(self) -> None:
+        self.browser.new_context.side_effect = RuntimeError("context setup failed")
+        with patch("qa_agent.browser_runner.sync_playwright", return_value=self.manager):
+            with self.assertRaisesRegex(RuntimeError, "context setup failed"):
+                with BrowserRunner().open_session():
+                    self.fail("session should not be yielded")
+
+        self.browser.close.assert_called_once_with()
+        self.manager.__exit__.assert_called_once()
+
+    def test_screenshot_precedes_page_context_browser_and_runtime_cleanup(self) -> None:
+        events: list[str] = []
+        self.page.title.return_value = "Wrong"
+        self.page.screenshot.side_effect = lambda **_: events.append("screenshot")
+        self.page.close.side_effect = lambda: events.append("page.close")
+        self.context.close.side_effect = lambda: events.append("context.close")
+        self.browser.close.side_effect = lambda: events.append("browser.close")
+        self.manager.__exit__.side_effect = lambda *args: events.append("playwright.exit")
+        plan = QATestPlan(url="https://example.com", steps=[{
+            "action": "assert_title", "parameters": {"expected": "Expected"}
+        }])
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("qa_agent.browser_runner.sync_playwright", return_value=self.manager):
+                result = BrowserRunner(directory)(plan)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(events, [
+            "screenshot", "page.close", "context.close", "browser.close", "playwright.exit"
+        ])
 
     def test_fill_invokes_locator_fill_with_value(self) -> None:
         result = self.run_steps(
