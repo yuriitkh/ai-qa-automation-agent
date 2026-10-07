@@ -86,6 +86,50 @@ class PlanExecutionServiceTests(unittest.TestCase):
         )
         self.assertEqual(outcome.execution.test_plan_version_id, self.plan_version.id)
 
+    def test_generated_plan_with_missing_assertion_target_is_execution_error(self) -> None:
+        outcome = self.execute(lambda _: {
+            "status": "failed",
+            "steps": [{
+                "action": "assert_visible",
+                "status": "failed",
+                "error": "Selector '#submit' was not found on the page.",
+            }],
+        })
+
+        self.assertEqual(
+            outcome.classification,
+            PlanExecutionClassification.AUTOMATION_EXECUTION_ERROR,
+        )
+
+    def test_generated_plan_interaction_failure_is_automation_execution_error(self) -> None:
+        outcome = self.execute(lambda _: {
+            "status": "failed",
+            "steps": [{
+                "action": "click",
+                "status": "failed",
+                "error": "Click failed because an overlay intercepted the action.",
+            }],
+        })
+
+        self.assertEqual(
+            outcome.classification,
+            PlanExecutionClassification.AUTOMATION_EXECUTION_ERROR,
+        )
+
+    def test_browser_failure_returned_by_runner_is_infrastructure_error(self) -> None:
+        outcome = self.execute(lambda _: {
+            "status": "failed",
+            "steps": [{
+                "action": "click",
+                "status": "failed",
+                "error": "Browser has been closed unexpectedly.",
+            }],
+        })
+
+        self.assertEqual(
+            outcome.classification, PlanExecutionClassification.INFRASTRUCTURE_ERROR
+        )
+
     def test_runner_exception_is_infrastructure_error_and_persists_failed_execution(self) -> None:
         runner_error = RuntimeError("browser launch failed")
 

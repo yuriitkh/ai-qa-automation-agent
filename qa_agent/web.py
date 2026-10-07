@@ -271,17 +271,48 @@ class LocalWebApplication:
         retry = ""
         if snapshot.state.value == "FINISHED":
             category = snapshot.outcome or snapshot.error_category or "FAILED"
-            result = (
-                f'<p data-result-summary>{badge(outcome_label(category), outcome_tone(category))} '
-                f'{escape_html(snapshot.error_message or failure_message(category))}</p>'
-                + (
-                    f'<a class="button primary" data-final-run-link href="{escape_html(snapshot.final_run_url)}">'
-                    "View Run Details</a>"
-                    if snapshot.final_run_url else ""
+            failure = snapshot.automation_generation_failure
+            if category == "AUTOMATION_GENERATION_ERROR" and failure is not None:
+                generated_count = sum(
+                    step.order < failure.step_order
+                    and step.automation_state in {"Generated", "Reused", "Repaired"}
+                    for step in snapshot.steps
                 )
+                remaining_count = sum(
+                    step.state.value == "NOT_ATTEMPTED"
+                    for step in snapshot.steps
+                )
+                saved_automation = (
+                    "Available from a previous attempt."
+                    if failure.prior_plan_exists
+                    else "Not available for this step."
+                )
+                new_plan = "Yes" if failure.new_plan_saved else "No"
+                result = (
+                    f'<p data-result-summary>{badge(outcome_label(category), outcome_tone(category))} '
+                    f'Automation stopped at Step {failure.step_order + 1} of {len(snapshot.steps)}.</p>'
+                    f'<p>Generated successfully: {generated_count} steps.</p>'
+                    f'<p>Remaining: {remaining_count} steps not attempted.</p>'
+                    f'<p>Not attempted because automation generation stopped at Step {failure.step_order + 1}.</p>'
+                    f'<p>Reason: {escape_html(failure.safe_reason)}</p>'
+                    f'<p>Saved automation: {escape_html(saved_automation)}</p>'
+                    f'<p>New plan saved: {new_plan}.</p>'
+                    '<details class="technical-details"><summary>Developer details</summary>'
+                    f'<p>Classification: <code>{escape_html(failure.technical_classification)}</code></p></details>'
+                )
+            else:
+                result = (
+                    f'<p data-result-summary>{badge(outcome_label(category), outcome_tone(category))} '
+                    f'{escape_html(snapshot.error_message or failure_message(category))}</p>'
+                )
+            result += (
+                f'<a class="button primary" data-final-run-link href="{escape_html(snapshot.final_run_url)}">'
+                "View Run Details</a>"
+                if snapshot.final_run_url else ""
             )
             if snapshot.error_category in {
                 "INFRASTRUCTURE_ERROR",
+                "AUTOMATION_EXECUTION_ERROR",
                 "EXECUTION_ERROR",
                 "AUTOMATION_GENERATION_ERROR",
                 "SETUP_FAILURE",
@@ -290,7 +321,7 @@ class LocalWebApplication:
                     f'<form method="post" action="/test-cases/{snapshot.test_case_id}/run" '
                     'data-run-form data-progress-retry><input type="hidden" name="workflow" '
                     f'value="{escape_html(snapshot.workflow_type)}">'
-                    '<button class="button" type="submit">Retry Run</button></form>'
+                    f'<button class="button" type="submit">{"Retry Automation" if snapshot.error_category == "AUTOMATION_GENERATION_ERROR" else "Retry Run"}</button></form>'
                 )
 
         state_symbols = {
@@ -301,6 +332,7 @@ class LocalWebApplication:
             "PASSED": ("✓", "Passed"),
             "FAILED": ("✕", "Failed"),
             "BLOCKED": ("⊘", "Blocked"),
+            "NOT_ATTEMPTED": ("○", "Not attempted"),
         }
         step_rows = []
         for step in snapshot.steps:
@@ -354,7 +386,11 @@ class LocalWebApplication:
                 f'<span data-progress-elapsed>{escape_html(format_duration(snapshot.elapsed_ms))}</span>',
                 raw=True,
             )
-            + _summary_card("Execution", escape_html(snapshot.state.value.title()))
+            + _summary_card(
+                "Execution",
+                f'<span data-progress-state>{escape_html(snapshot.state.value.title())}</span>',
+                raw=True,
+            )
             + '</div>'
             + f'<div class="progress-live" data-progress-id="{escape_html(progress_id)}">'
             + '<section class="panel"><h2>Preparation</h2>'
@@ -1419,7 +1455,7 @@ _UI_JAVASCRIPT = r"""
   const stepStates = {
     PENDING: ['○', 'Pending'], PREPARING_AUTOMATION: ['◌', 'Preparing automation'],
     READY: ['✓', 'Automation ready'], RUNNING: ['◉', 'Running'], PASSED: ['✓', 'Passed'],
-    FAILED: ['✕', 'Failed'], BLOCKED: ['⊘', 'Blocked']
+    FAILED: ['✕', 'Failed'], BLOCKED: ['⊘', 'Blocked'], NOT_ATTEMPTED: ['○', 'Not attempted']
   };
 
   function appendEvent(list, event) {
@@ -1438,6 +1474,10 @@ _UI_JAVASCRIPT = r"""
   function render(snapshot) {
     document.querySelectorAll('[data-progress-phase]').forEach((node) => {
       node.textContent = snapshot.phase;
+    });
+    document.querySelectorAll('[data-progress-state]').forEach((node) => {
+      node.textContent = snapshot.state.toLowerCase().replaceAll('_', ' ')
+        .replace(/(^|\s)\S/g, (letter) => letter.toUpperCase());
     });
     const elapsed = document.querySelector('[data-progress-elapsed]');
     if (elapsed) elapsed.textContent = `${(snapshot.elapsed_ms / 1000).toFixed(1)} s`;
@@ -1485,13 +1525,47 @@ _UI_JAVASCRIPT = r"""
 
     if (snapshot.finished) {
       result.hidden = false;
-      const summary = document.createElement('p');
-      summary.dataset.resultSummary = '';
-      const strong = document.createElement('strong');
-      strong.textContent = (snapshot.outcome || snapshot.error_category || 'FAILED').replaceAll('_', ' ');
-      const explanation = document.createTextNode(` ${snapshot.error_message || 'The run has finished.'}`);
-      summary.append(strong, explanation);
-      resultContent.replaceChildren(summary);
+      const category = snapshot.outcome || snapshot.error_category || 'FAILED';
+      const failure = snapshot.automation_generation_failure;
+      if (category === 'AUTOMATION_GENERATION_ERROR' && failure) {
+        const summary = document.createElement('p');
+        summary.dataset.resultSummary = '';
+        const strong = document.createElement('strong');
+        strong.textContent = 'AUTOMATION GENERATION ERROR';
+        summary.append(strong, document.createTextNode(
+          ` Automation stopped at Step ${failure.step_order + 1} of ${snapshot.steps.length}.`));
+        const generatedCount = snapshot.steps.filter((step) =>
+          step.order < failure.step_order && ['Generated', 'Reused', 'Repaired'].includes(step.automation_state)).length;
+        const remainingCount = snapshot.steps.filter((step) => step.state === 'NOT_ATTEMPTED').length;
+        const generated = document.createElement('p');
+        generated.textContent = `Generated successfully: ${generatedCount} steps.`;
+        const remaining = document.createElement('p');
+        remaining.textContent = `Remaining: ${remainingCount} steps not attempted.`;
+        const stopped = document.createElement('p');
+        stopped.textContent = `Not attempted because automation generation stopped at Step ${failure.step_order + 1}.`;
+        const reason = document.createElement('p');
+        reason.textContent = `Reason: ${failure.safe_reason}`;
+        const saved = document.createElement('p');
+        saved.textContent = `Saved automation: ${failure.prior_plan_exists ? 'Available from a previous attempt.' : 'Not available for this step.'}`;
+        const newPlan = document.createElement('p');
+        newPlan.textContent = `New plan saved: ${failure.new_plan_saved ? 'Yes.' : 'No.'}`;
+        const technical = document.createElement('details');
+        technical.className = 'technical-details';
+        const technicalSummary = document.createElement('summary');
+        technicalSummary.textContent = 'Developer details';
+        const classification = document.createElement('p');
+        classification.textContent = `Classification: ${failure.technical_classification}`;
+        technical.append(technicalSummary, classification);
+        resultContent.replaceChildren(summary, generated, remaining, stopped, reason, saved, newPlan, technical);
+      } else {
+        const summary = document.createElement('p');
+        summary.dataset.resultSummary = '';
+        const strong = document.createElement('strong');
+        strong.textContent = category.replaceAll('_', ' ');
+        const explanation = document.createTextNode(` ${snapshot.error_message || 'The run has finished.'}`);
+        summary.append(strong, explanation);
+        resultContent.replaceChildren(summary);
+      }
       if (snapshot.final_run_url) {
         const link = document.createElement('a');
         link.className = 'button primary';
@@ -1505,7 +1579,7 @@ _UI_JAVASCRIPT = r"""
       } else if (notice) {
         notice.textContent = 'No completed Run History record is available for this request.';
       }
-      const retryable = ['INFRASTRUCTURE_ERROR', 'EXECUTION_ERROR', 'AUTOMATION_GENERATION_ERROR', 'SETUP_FAILURE'];
+      const retryable = ['INFRASTRUCTURE_ERROR', 'AUTOMATION_EXECUTION_ERROR', 'EXECUTION_ERROR', 'AUTOMATION_GENERATION_ERROR', 'SETUP_FAILURE'];
       if (retryable.includes(snapshot.error_category) && !document.querySelector('[data-progress-retry]')) {
         const form = document.createElement('form');
         form.method = 'post';
@@ -1519,7 +1593,8 @@ _UI_JAVASCRIPT = r"""
         const button = document.createElement('button');
         button.className = 'button';
         button.type = 'submit';
-        button.textContent = 'Retry Run';
+        button.textContent = snapshot.error_category === 'AUTOMATION_GENERATION_ERROR'
+          ? 'Retry Automation' : 'Retry Run';
         form.append(workflow, button);
         const actions = document.createElement('div');
         actions.className = 'actions';

@@ -123,6 +123,96 @@ class ExecutionProgressStoreTests(unittest.TestCase):
         self.assertEqual(timestamps, sorted(timestamps))
         self.assertEqual(len({event.id for event in finished.events}), len(finished.events))
 
+    def test_terminal_generation_failure_preserves_step_details_and_marks_remaining_steps(self) -> None:
+        test_case = DomainTestCase(
+            id=self.test_case_id,
+            name="Partial automation",
+            description="Prepare a multi-step flow.",
+            steps=[
+                DomainTestStep(name=f"Step {index + 1}", description="Do one action.", expected="It works.", order=index)
+                for index in range(5)
+            ],
+        )
+        self.reporter.emit(ExecutionEventType.RUN_STARTED, message="Run started.")
+        self.reporter.test_case_loaded(test_case)
+        for step in test_case.steps[:2]:
+            self.reporter.emit(ExecutionEventType.PLAN_GENERATION_STARTED, step=step)
+            self.reporter.emit(ExecutionEventType.PLAN_GENERATED, step=step)
+            self.reporter.emit(ExecutionEventType.STEP_STARTED, step=step)
+            self.reporter.emit(ExecutionEventType.STEP_PASSED, step=step)
+        failed_step = test_case.steps[2]
+        self.reporter.emit(ExecutionEventType.PLAN_GENERATION_STARTED, step=failed_step)
+        self.reporter.emit(
+            ExecutionEventType.PLAN_GENERATION_FAILED,
+            step=failed_step,
+            classification="AUTOMATION_GENERATION_ERROR",
+            failure_code="LLM_PROVIDER_FAILURE",
+            prior_plan_exists=False,
+            new_plan_saved=False,
+            message="The automation provider could not return a usable plan.",
+        )
+        self.reporter.finish(
+            outcome="AUTOMATION_GENERATION_ERROR",
+            error_category="AUTOMATION_GENERATION_ERROR",
+        )
+        self.reporter.finish(outcome="PASSED", run_status="PASSED")
+
+        snapshot = self.store.get(self.progress_id)
+        self.assertEqual(snapshot.state, ProgressState.FINISHED)
+        self.assertEqual(snapshot.phase, "Finished")
+        self.assertIsNone(snapshot.run_status)
+        self.assertEqual(
+            [step.state for step in snapshot.steps],
+            [
+                ProgressStepState.PASSED,
+                ProgressStepState.PASSED,
+                ProgressStepState.FAILED,
+                ProgressStepState.NOT_ATTEMPTED,
+                ProgressStepState.NOT_ATTEMPTED,
+            ],
+        )
+        failure = snapshot.automation_generation_failure
+        self.assertIsNotNone(failure)
+        self.assertEqual(failure.test_case_id, self.test_case_id)
+        self.assertEqual(failure.workflow_type, WorkflowType.AUTOMATION.value)
+        self.assertEqual(failure.step_id, failed_step.id)
+        self.assertEqual(failure.step_order, 2)
+        self.assertEqual(failure.step_name, "Step 3")
+        self.assertFalse(failure.prior_plan_exists)
+        self.assertFalse(failure.new_plan_saved)
+        self.assertEqual(failure.failure_category, "AUTOMATION_GENERATION_ERROR")
+        self.assertEqual(failure.technical_classification, "LLM_PROVIDER_FAILURE")
+        self.assertEqual(
+            [event.event_type for event in snapshot.events].count(ExecutionEventType.RUN_FINISHED),
+            1,
+        )
+        with self.assertRaises(RuntimeError):
+            self.reporter.emit(ExecutionEventType.STEP_STARTED, step=test_case.steps[3])
+
+    def test_step_cannot_pass_before_it_starts(self) -> None:
+        test_case = DomainTestCase(
+            id=self.test_case_id,
+            name="Flow",
+            description="Check one step.",
+            steps=[DomainTestStep(name="Open", description="Open it.", expected="It opens.", order=0)],
+        )
+        self.reporter.test_case_loaded(test_case)
+        with self.assertRaisesRegex(ValueError, "before it has started"):
+            self.reporter.emit(ExecutionEventType.STEP_PASSED, step=test_case.steps[0])
+        self.assertEqual(
+            [event.event_type for event in self.store.get(self.progress_id).events],
+            [ExecutionEventType.TESTCASE_LOADED],
+        )
+
+    def test_terminal_finalizer_clears_nonterminal_run_status(self) -> None:
+        self.reporter.finish(outcome="PASSED", run_status="RUNNING")
+        snapshot = self.store.get(self.progress_id)
+        self.assertEqual(snapshot.state, ProgressState.FINISHED)
+        self.assertEqual(snapshot.phase, "Finished")
+        self.assertEqual(snapshot.outcome, "EXECUTION_ERROR")
+        self.assertEqual(snapshot.error_category, "EXECUTION_ERROR")
+        self.assertIsNone(snapshot.run_status)
+
     def test_finished_progress_expires_and_oldest_finished_records_are_pruned(self) -> None:
         store = ExecutionProgressStore(
             finished_ttl=timedelta(seconds=10),
@@ -237,6 +327,68 @@ class ExecutionProgressWebTests(unittest.TestCase):
             infra_page = app.handle("GET", f"/runs/progress/{infra_id}").body.decode()
             self.assertIn("Retry Run", infra_page)
             self.assertIn('name="workflow" value="VALIDATION"', infra_page)
+        finally:
+            app.close()
+
+    def test_finished_progress_page_renders_failure_details_and_refreshes_execution_state(self) -> None:
+        store = ExecutionProgressStore()
+        test_case_id = uuid4()
+        progress_id = store.create(test_case_id, WorkflowType.AUTOMATION)
+        reporter = ExecutionProgressReporter(store, progress_id)
+        case = DomainTestCase(
+            id=test_case_id,
+            name="Account setup",
+            description="Create an account.",
+            steps=[
+                DomainTestStep(name="Open form", description="Open the form.", expected="It opens.", order=0),
+                DomainTestStep(name="Submit registration", description="Submit the form.", expected="It succeeds.", order=1),
+                DomainTestStep(name="Verify result", description="Check the result.", expected="It is shown.", order=2),
+            ],
+        )
+        reporter.emit(ExecutionEventType.RUN_STARTED)
+        reporter.test_case_loaded(case)
+        first = case.steps[0]
+        reporter.emit(ExecutionEventType.PLAN_GENERATION_STARTED, step=first)
+        reporter.emit(ExecutionEventType.PLAN_GENERATED, step=first)
+        reporter.emit(ExecutionEventType.STEP_STARTED, step=first)
+        reporter.emit(ExecutionEventType.STEP_PASSED, step=first)
+        failed = case.steps[1]
+        reporter.emit(ExecutionEventType.PLAN_GENERATION_STARTED, step=failed)
+        reporter.emit(
+            ExecutionEventType.PLAN_GENERATION_FAILED,
+            step=failed,
+            classification="AUTOMATION_GENERATION_ERROR",
+            failure_code="PLAN_VALIDATION_FAILED",
+            prior_plan_exists=False,
+            new_plan_saved=False,
+            message="Generated automation failed validation.",
+        )
+        reporter.finish(outcome="AUTOMATION_GENERATION_ERROR", error_category="AUTOMATION_GENERATION_ERROR")
+        app = LocalWebApplication(
+            RunHistoryService(InMemoryRunHistoryRepository()),
+            progress_store=store,
+        )
+        try:
+            page = app.handle("GET", f"/runs/progress/{progress_id}").body.decode("utf-8")
+            script = app.handle("GET", "/assets/ui.js").body.decode("utf-8")
+            payload = json.loads(app.handle("GET", f"/api/progress/{progress_id}").body)
+            self.assertIn('class="card-label">Execution</div>', page)
+            self.assertIn('data-progress-state>Finished</span>', page)
+            self.assertIn("AUTOMATION GENERATION ERROR", page)
+            self.assertIn("Automation stopped at Step 2 of 3", page)
+            self.assertIn("Submit registration", page)
+            self.assertIn("Generated successfully: 1 steps", page)
+            self.assertIn("Remaining: 1 steps not attempted", page)
+            self.assertIn("Retry Automation", page)
+            self.assertIn("PLAN_VALIDATION_FAILED", page)
+            self.assertIn("data-progress-state", script)
+            self.assertIn("snapshot.state.toLowerCase()", script)
+            self.assertEqual(payload["state"], "FINISHED")
+            self.assertEqual(payload["phase"], "Finished")
+            self.assertEqual(payload["run_status"], None)
+            self.assertEqual(payload["steps"][2]["state"], "NOT_ATTEMPTED")
+            self.assertEqual(payload["automation_generation_failure"]["step_name"], "Submit registration")
+            self.assertNotIn("Traceback", json.dumps(payload))
         finally:
             app.close()
 

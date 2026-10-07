@@ -1,17 +1,22 @@
 import json
+import sqlite3
 import tempfile
 import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlencode
 from uuid import UUID
 
 from qa_agent.models import (
+    DiscoveryResult,
+    DiscoveryStatus,
     ExecutionStatus,
     Precondition,
     QATestPlan,
     QATestStep,
+    PlanVersionOrigin,
     RunContext,
     TestCase as DomainTestCase,
     TestPlan as DomainTestPlan,
@@ -22,7 +27,6 @@ from qa_agent.models import (
 from qa_agent.browser_runner import BrowserRunner
 from qa_agent.llm.base import LLMProvider
 from qa_agent.llm.router import LLMRouter
-from qa_agent.models import QATestPlan
 from qa_agent.pipeline import QATestPipeline
 from qa_agent.plan_execution import PlanExecutionClassification, PlanExecutionService
 from qa_agent.pinned_execution import PinnedExecutionService, PlanVersionSet, StepPlanSelection
@@ -38,7 +42,7 @@ from qa_agent.storage import create_sqlite_storage
 from qa_agent.test_case_authoring import TestCaseAuthoringService
 from qa_agent.test_case_decomposer import TestCaseDecomposer
 from qa_agent.test_case_execution import TestCaseExecutionService
-from qa_agent.test_plan_generator import LLMTestPlanGenerator
+from qa_agent.test_plan_generator import GeneratedTestPlan, LLMTestPlanGenerator, TestPlanGenerator
 from qa_agent.web import LocalWebApplication, create_http_server
 from qa_agent.workflows import AutomationWorkflow, RegressionWorkflow, ValidationWorkflow
 
@@ -226,6 +230,239 @@ class ProductDemoSliceTests(unittest.TestCase):
             self.assertEqual([item.run_id for item in recent], [passing.test_run.id, failed.test_run.id])
             self.assertEqual(recent[0].workflow_type, WorkflowType.REGRESSION)
             self.assertEqual(recent[1].workflow_type, WorkflowType.VALIDATION)
+
+    def test_partial_automation_generation_retries_saved_steps_on_local_browser(self) -> None:
+        class FailingOnceGenerator(TestPlanGenerator):
+            def __init__(self, target_url: str) -> None:
+                self.target_url = target_url
+                self.calls = 0
+                self.failed_once = False
+
+            def generate_with_plan(
+                self,
+                test_step,
+                discovery_result,
+                *,
+                existing_test_plan=None,
+                version_number=1,
+            ):
+                self.calls += 1
+                if test_step.order == 2 and not self.failed_once:
+                    self.failed_once = True
+                    raise RuntimeError(
+                        "provider payload LEAK_MARKER at C:\\private\\provider-response.txt"
+                    )
+                test_plan = existing_test_plan or DomainTestPlan(
+                    test_step_id=test_step.id,
+                    name=test_step.name,
+                )
+                plan = QATestPlan(url=self.target_url, steps=[
+                    QATestStep(action="navigate", parameters={"url": self.target_url}),
+                    QATestStep(action="fill", parameters={
+                        "selector": "#delayed-email",
+                        "value": "local-test@example.test",
+                    }),
+                    QATestStep(action="assert_text_contains", parameters={
+                        "expected_text": "Local-only registration page",
+                    }),
+                ])
+                version = DomainTestPlanVersion(
+                    test_plan_id=test_plan.id,
+                    version=version_number,
+                    origin=(
+                        PlanVersionOrigin.REGENERATED
+                        if existing_test_plan is not None
+                        else PlanVersionOrigin.AI_GENERATED
+                    ),
+                    qa_test_plan=plan,
+                )
+                return GeneratedTestPlan(test_plan=test_plan, test_plan_version=version)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "partial-automation.sqlite3"
+            evidence_root = root / "evidence"
+            class LocalTargetHandler(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    body = (
+                        "<!doctype html><html><head><title>Local target</title>"
+                        "<script>window.addEventListener('load', () => window.setTimeout(() => {"
+                        "const input = document.createElement('input'); input.id = 'delayed-email';"
+                        "document.body.append(input); }, 150));</script></head>"
+                        "<body><main><p>Local-only registration page</p></main></body></html>"
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, _format, *_args):
+                    return
+
+            target_server = ThreadingHTTPServer(("127.0.0.1", 0), LocalTargetHandler)
+            port = target_server.server_address[1]
+            target_url = f"http://127.0.0.1:{port}/registration"
+            storage = create_sqlite_storage(database)
+            steps = [
+                DomainTestStep(
+                    name=name,
+                    description="Open the local page and verify its static content.",
+                    expected="The local registration page is visible.",
+                    order=index,
+                )
+                for index, name in enumerate((
+                    "Open registration page",
+                    "Verify page heading",
+                    "Submit registration",
+                    "Verify confirmation",
+                ))
+            ]
+            test_case = DomainTestCase(
+                name="Partial generation retry",
+                description="Exercise retry after one plan generation failure.",
+                base_url=target_url,
+                steps=steps,
+            )
+            storage.test_case_repository.save(test_case)
+            generator = FailingOnceGenerator(target_url)
+            pipeline = QATestPipeline(
+                decomposer=TestCaseDecomposer(),
+                plan_generator=generator,
+                discovery=lambda url: DiscoveryResult(
+                    status=DiscoveryStatus.SUCCESS,
+                    url=url,
+                ),
+                runner=BrowserRunner(evidence_root, headless=True),
+                plan_store=storage.plan_store,
+                execution_repository=storage.execution_repository,
+                run_history=storage.run_history,
+            )
+            run_service = TestCaseExecutionService(
+                storage.test_case_repository,
+                storage.plan_store,
+                storage.execution_repository,
+                storage.run_history,
+                evidence_directory=evidence_root,
+                automation_workflow=AutomationWorkflow(pipeline),
+            )
+            application = LocalWebApplication(
+                storage.run_history,
+                evidence_root=evidence_root,
+                test_cases=storage.test_case_repository,
+                run_service=run_service,
+            )
+            target_thread = threading.Thread(target=target_server.serve_forever, daemon=True)
+            target_thread.start()
+            try:
+                first_response = application.handle(
+                    "POST",
+                    f"/test-cases/{test_case.id}/run",
+                    "workflow=AUTOMATION",
+                )
+                first = _wait_for_progress(application, first_response.headers["Location"])
+                self.assertEqual(first["state"], "FINISHED")
+                self.assertEqual(first["phase"], "Finished")
+                self.assertEqual(first["outcome"], "AUTOMATION_GENERATION_ERROR")
+                self.assertIsNone(first["final_run_id"])
+                self.assertEqual(
+                    [step["state"] for step in first["steps"]],
+                    ["PASSED", "PASSED", "FAILED", "NOT_ATTEMPTED"],
+                )
+                failure = first["automation_generation_failure"]
+                self.assertEqual(failure["test_case_id"], str(test_case.id))
+                self.assertEqual(failure["workflow_type"], "AUTOMATION")
+                self.assertEqual(failure["step_id"], str(steps[2].id))
+                self.assertEqual(failure["step_order"], 2)
+                self.assertEqual(failure["step_name"], "Submit registration")
+                self.assertFalse(failure["prior_plan_exists"])
+                self.assertFalse(failure["new_plan_saved"])
+                self.assertEqual(failure["failure_category"], "AUTOMATION_GENERATION_ERROR")
+                self.assertEqual(failure["technical_classification"], "PLAN_GENERATION_FAILED")
+                self.assertIn("No reliable executable action", failure["safe_reason"])
+                self.assertNotIn("LEAK_MARKER", json.dumps(first))
+                self.assertNotIn("C:\\private", json.dumps(first))
+                self.assertEqual(len(storage.run_history.list_for_test_case(test_case.id)), 0)
+                availability = run_service.workflow_availability(test_case.id)
+                self.assertEqual((availability.usable_plan_count, availability.total_step_count), (2, 4))
+                self.assertFalse(availability.validation_available)
+                self.assertFalse(availability.regression_available)
+                testcase_page = application.handle(
+                    "GET", f"/test-cases/{test_case.id}"
+                ).body.decode("utf-8")
+                self.assertIn("2 / 4 steps have executable plans", testcase_page)
+                self.assertIn("Validation <strong>Not ready", testcase_page)
+                self.assertIn("Regression <strong>Not ready", testcase_page)
+                self.assertEqual(
+                    application.handle("GET", f"/runs/{UUID(int=0)}/report.json").status,
+                    404,
+                )
+
+                failed_page = application.handle(
+                    "GET", f"/runs/progress/{first['progress_id']}"
+                ).body.decode("utf-8")
+                self.assertIn("AUTOMATION GENERATION ERROR", failed_page)
+                self.assertIn("Automation stopped at Step 3 of 4", failed_page)
+                self.assertIn("Submit registration", failed_page)
+                self.assertIn("Remaining: 1 steps not attempted", failed_page)
+                self.assertIn("Retry Automation", failed_page)
+                self.assertNotIn("LEAK_MARKER", failed_page)
+                self.assertNotIn("C:\\private", failed_page)
+
+                first_versions = [storage.plan_store.find(step.id) for step in steps[:2]]
+                retry_response = application.handle(
+                    "POST",
+                    f"/test-cases/{test_case.id}/run",
+                    "workflow=AUTOMATION",
+                )
+                retry = _wait_for_progress(application, retry_response.headers["Location"])
+                self.assertEqual(retry["test_case_id"], str(test_case.id))
+                self.assertEqual(retry["workflow"], "AUTOMATION")
+                self.assertEqual(retry["outcome"], "PASSED")
+                self.assertEqual(retry["state"], "FINISHED")
+                self.assertEqual(generator.calls, 5)
+                reused_step_ids = [
+                    event["step_id"] for event in retry["events"]
+                    if event["type"] == "PLAN_REUSED"
+                ]
+                self.assertEqual(reused_step_ids, [str(steps[0].id), str(steps[1].id)])
+                self.assertEqual(
+                    [storage.plan_store.find(step.id).version for step in steps],
+                    [1, 1, 1, 1],
+                )
+                self.assertEqual(
+                    [storage.plan_store.find(step.id).id for step in steps[:2]],
+                    [version.id for version in first_versions],
+                )
+                connection = sqlite3.connect(database)
+                try:
+                    self.assertEqual(
+                        connection.execute("SELECT COUNT(*) FROM test_plan_versions").fetchone()[0],
+                        4,
+                    )
+                finally:
+                    connection.close()
+                records = storage.run_history.list_for_test_case(test_case.id)
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0].workflow_type, WorkflowType.AUTOMATION)
+                self.assertEqual(records[0].outcome, "PASSED")
+                self.assertEqual(
+                    [step["automation_state"] for step in retry["steps"]],
+                    ["Reused", "Reused", "Generated", "Generated"],
+                )
+                started_steps = set()
+                for event in retry["events"]:
+                    if event["type"] == "STEP_STARTED":
+                        started_steps.add(event["step_id"])
+                    elif event["type"] in {"STEP_PASSED", "STEP_FAILED"}:
+                        self.assertIn(event["step_id"], started_steps)
+                        started_steps.remove(event["step_id"])
+                self.assertEqual(retry["events"][-1]["type"], "RUN_FINISHED")
+            finally:
+                application.close()
+                target_server.shutdown()
+                target_server.server_close()
+                target_thread.join(timeout=5)
 
     def test_ai_authoring_review_save_automation_real_browser_and_pinned_regression(self) -> None:
         class DeterministicProvider(LLMProvider):

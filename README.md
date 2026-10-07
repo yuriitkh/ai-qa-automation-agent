@@ -109,3 +109,20 @@ Finished progress is retained for up to 24 hours, with at most 500 finished
 requests. A server restart clears in-memory progress; job recovery is not
 persisted yet. AI TestCase authoring remains synchronous; it can use a separate
 authoring progress lifecycle in a later extension.
+
+### Partial Automation and manual real-site checks
+
+Automation saves each structurally validated plan version as its step finishes.
+If generation stops later, those earlier versions remain available and the
+TestCase coverage count shows the partial result. Validation and Regression
+remain unavailable until every step has a usable saved plan. An Automation retry
+reuses saved step plans and attempts steps that still need automation. A
+generation failure before a completed TestRun stays in the progress record; it
+does not create a placeholder Run History entry or report.
+
+For optional manual checks against a public site:
+
+- Choose a read-only scenario and avoid credentials, payments, or destructive actions.
+- Expect dynamic page content, cookie banners, and timing to differ between visits.
+- Review the progress classification and the exact step where generation or execution stopped.
+- If generation saved only part of the TestCase, use **Retry Automation** and confirm saved plans are reused.

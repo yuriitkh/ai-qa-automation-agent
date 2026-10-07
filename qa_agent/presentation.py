@@ -90,6 +90,7 @@ def outcome_label(value: str) -> str:
     return {
         "PRODUCT_FAILURE": "PRODUCT FAILURE",
         "AUTOMATION_DRIFT": "AUTOMATION DRIFT",
+        "AUTOMATION_EXECUTION_ERROR": "AUTOMATION EXECUTION ERROR",
         "INFRASTRUCTURE_ERROR": "INFRA ERROR",
         "SETUP_FAILURE": "SETUP FAILURE",
         "CLEANUP_FAILURE": "CLEANUP FAILURE",
@@ -101,6 +102,7 @@ def outcome_tone(value: str) -> str:
         "PASSED": "success",
         "PRODUCT_FAILURE": "product-failure",
         "AUTOMATION_DRIFT": "drift",
+        "AUTOMATION_EXECUTION_ERROR": "infrastructure",
         "INFRASTRUCTURE_ERROR": "infrastructure",
         "SETUP_FAILURE": "setup-failure",
         "CLEANUP_FAILURE": "cleanup-failure",
@@ -114,6 +116,7 @@ def failure_message(value: str) -> str:
         "PASSED": "The run completed successfully.",
         "PRODUCT_FAILURE": "The automation completed the check and detected unexpected product behavior.",
         "AUTOMATION_DRIFT": "The saved automation no longer matches the current UI.",
+        "AUTOMATION_EXECUTION_ERROR": "Automation was generated but could not be executed reliably.",
         "INFRASTRUCTURE_ERROR": "The test could not be reliably executed because of a browser, network, or runtime problem.",
         "SETUP_FAILURE": "Required test conditions could not be established.",
         "AI_GENERATION_ERROR": "The AI could not generate a valid test definition.",

@@ -23,6 +23,7 @@ from qa_agent.run_context import RunContext
 from qa_agent.run_history import RunHistoryService, WorkflowType
 from qa_agent.setup_orchestration import SetupCleanupCoordinator
 from qa_agent.test_case_repository import TestCaseRepository
+from qa_agent.test_plan_validation import validate_executable_plan
 from qa_agent.workflows import (
     AutomationWorkflow,
     PinnedWorkflowResult,
@@ -104,6 +105,10 @@ class TestCaseExecutionService:
                 and version.test_plan_id == plan.id
                 and bool(version.qa_test_plan.steps)
             ):
+                try:
+                    validate_executable_plan(version.qa_test_plan)
+                except (TypeError, ValueError):
+                    continue
                 versions.append((step.id, version.version, version.id))
         complete = bool(steps) and len(versions) == len(steps)
         ready_reason = None if complete else "No complete automation version has been generated yet."

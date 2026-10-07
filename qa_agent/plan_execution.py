@@ -27,6 +27,7 @@ class PlanExecutionClassification(str, Enum):
     PASSED = "PASSED"
     PRODUCT_FAILURE = "PRODUCT_FAILURE"
     AUTOMATION_DRIFT = "AUTOMATION_DRIFT"
+    AUTOMATION_EXECUTION_ERROR = "AUTOMATION_EXECUTION_ERROR"
     INFRASTRUCTURE_ERROR = "INFRASTRUCTURE_ERROR"
 
 
@@ -165,12 +166,18 @@ class PlanExecutionService:
             return PlanExecutionClassification.INFRASTRUCTURE_ERROR
         if execution.status == ExecutionStatus.PASSED:
             return PlanExecutionClassification.PASSED
+        if _is_infrastructure_failure(execution.runner_result):
+            return PlanExecutionClassification.INFRASTRUCTURE_ERROR
         if _is_stale_ui_failure(execution.runner_result):
             return PlanExecutionClassification.AUTOMATION_DRIFT
+        if _is_assertion_target_unavailable(execution.runner_result):
+            return PlanExecutionClassification.AUTOMATION_EXECUTION_ERROR
 
         failed_action = _failed_action(execution.runner_result)
         if failed_action is not None and failed_action.startswith("assert_"):
             return PlanExecutionClassification.PRODUCT_FAILURE
+        if failed_action is not None:
+            return PlanExecutionClassification.AUTOMATION_EXECUTION_ERROR
         # A returned failure without explicit assertion evidence is not
         # attributed to the product; its cause is not sufficiently known.
         return PlanExecutionClassification.INFRASTRUCTURE_ERROR
@@ -242,13 +249,19 @@ def _is_stale_ui_failure(runner_result: dict[str, Any] | None) -> bool:
     for step_result in runner_result.get("steps", []):
         if not isinstance(step_result, dict) or step_result.get("status") != "failed":
             continue
-        if step_result.get("action") not in {"click", "fill"}:
-            continue
-
+        action = step_result.get("action")
         error = str(step_result.get("error") or "").casefold()
-        selector_missing = "selector" in error and (
-            "not found" in error or "was not found" in error
-        )
+        selector_missing = (
+            "selector" in error
+            and any(marker in error for marker in ("not found", "was not found"))
+        ) or any(marker in error for marker in (
+            "resolved to 0 elements",
+            "resolved to 2 elements",
+            "matched multiple elements",
+            "strict mode violation",
+            "not attached to the dom",
+            "detached from the dom",
+        ))
         element_unavailable = any(
             marker in error
             for marker in (
@@ -256,18 +269,89 @@ def _is_stale_ui_failure(runner_result: dict[str, Any] | None) -> bool:
                 "resolved to 0 elements",
                 "element is not visible",
                 "waiting for element to be visible",
-                "not attached to the dom",
-                "detached from the dom",
             )
-        )
+        ) and action in {"click", "fill", "select_option"}
         locator_actionability_timeout = (
             "timeout" in error
             and "waiting for locator" in error
             and (
                 "could not click element matching selector" in error
                 or "could not fill element matching selector" in error
+                or action == "select_option"
             )
         )
-        if selector_missing or element_unavailable or locator_actionability_timeout:
+        option_missing = action == "select_option" and any(marker in error for marker in (
+            "did not match any options",
+            "no options matched",
+            "option label was not found",
+        ))
+        if (
+            (selector_missing and action in {"click", "fill", "select_option"})
+            or element_unavailable
+            or locator_actionability_timeout
+            or option_missing
+        ):
             return True
     return False
+
+
+def _is_assertion_target_unavailable(runner_result: dict[str, Any] | None) -> bool:
+    """Separate a missing generated assertion target from product mismatches."""
+    if not isinstance(runner_result, dict):
+        return False
+    unavailable_markers = (
+        "not found",
+        "was not found",
+        "resolved to 0 elements",
+        "resolved to hidden",
+        "element is not visible",
+        "not attached to the dom",
+        "detached from the dom",
+        "strict mode violation",
+        "matched multiple elements",
+    )
+    for step_result in runner_result.get("steps", []):
+        if not isinstance(step_result, dict) or step_result.get("status") != "failed":
+            continue
+        action = step_result.get("action")
+        error = str(step_result.get("error") or "").casefold()
+        if (
+            isinstance(action, str)
+            and action in {
+                "assert_visible",
+                "assert_checked",
+                "assert_selected",
+                "assert_enabled",
+                "assert_disabled",
+            }
+            and (
+                ("selector" in error and any(marker in error for marker in unavailable_markers))
+                or ("timeout" in error and "waiting for locator" in error)
+            )
+        ):
+            return True
+    return False
+
+
+def _is_infrastructure_failure(runner_result: dict[str, Any] | None) -> bool:
+    if not isinstance(runner_result, dict):
+        return False
+    markers = (
+        "browser has been closed",
+        "browser disconnected",
+        "browser launch failed",
+        "target page, context or browser has been closed",
+        "page has been closed",
+        "page crashed",
+        "net::err_",
+        "connection refused",
+        "connection reset",
+        "name_not_resolved",
+        "protocol error",
+    )
+    return any(
+        isinstance(step_result, dict)
+        and step_result.get("status") == "failed"
+        and any(marker in str(step_result.get("error") or "").casefold() for marker in markers)
+        for step_result in runner_result.get("steps", [])
+    )

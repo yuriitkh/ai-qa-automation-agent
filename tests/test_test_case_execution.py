@@ -6,7 +6,11 @@ from types import SimpleNamespace
 from qa_agent.demo import seed_demo_data
 from qa_agent.models import (
     ExecutionSegment,
+    QATestPlan,
+    QATestStep,
     TestCase as DomainTestCase,
+    TestPlan as DomainTestPlan,
+    TestPlanVersion as DomainTestPlanVersion,
     TestStep as DomainTestStep,
 )
 from qa_agent.run_history import WorkflowType
@@ -142,6 +146,43 @@ class TestCaseExecutionServiceTests(unittest.TestCase):
         self.assertFalse(availability.regression_available)
         self.assertEqual(availability.reason, "No complete automation version has been generated yet.")
         with self.assertRaisesRegex(RunUnavailableError, "no saved plan"):
+            service.run(case.id, WorkflowType.VALIDATION)
+
+    def test_plan_missing_required_action_input_does_not_count_as_usable_coverage(self) -> None:
+        step = DomainTestStep(
+            name="Submit registration",
+            description="Submit the form.",
+            expected="Registration completes.",
+            order=0,
+        )
+        case = DomainTestCase(
+            name="Invalid saved plan",
+            description="The saved click plan has no selector.",
+            segments=[ExecutionSegment(order=0, steps=[step])],
+        )
+        self.storage.test_case_repository.save(case)
+        plan = DomainTestPlan(test_step_id=step.id, name=step.name)
+        version = DomainTestPlanVersion(
+            test_plan_id=plan.id,
+            version=1,
+            qa_test_plan=QATestPlan(
+                url="http://127.0.0.1/",
+                steps=[QATestStep(action="click", parameters={})],
+            ),
+        )
+        self.storage.plan_store.save(step.id, version, test_plan=plan)
+        service = RunCaseService(
+            self.storage.test_case_repository,
+            self.storage.plan_store,
+            self.storage.execution_repository,
+            self.storage.run_history,
+        )
+
+        availability = service.workflow_availability(case.id)
+        self.assertEqual(availability.usable_plan_count, 0)
+        self.assertFalse(availability.validation_available)
+        self.assertFalse(availability.regression_available)
+        with self.assertRaisesRegex(RunUnavailableError, "saved plans are not usable"):
             service.run(case.id, WorkflowType.VALIDATION)
 
     def test_automation_delegates_to_existing_workflow_for_canonical_case(self) -> None:

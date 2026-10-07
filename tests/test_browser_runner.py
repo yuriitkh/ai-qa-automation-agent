@@ -192,7 +192,8 @@ class BrowserRunnerActionTests(unittest.TestCase):
         self.assertEqual(result["status"], "passed")
         self.assertEqual(result["steps"][0]["status"], "passed")
         self.page.locator.assert_called_once_with("#name")
-        self.locator.fill.assert_called_once_with("Ada")
+        self.locator.wait_for.assert_called_once_with(state="visible", timeout=5000)
+        self.locator.fill.assert_called_once_with("Ada", timeout=5000)
 
     def test_assert_url_passes_for_exact_match(self) -> None:
         result = self.run_steps(
@@ -263,7 +264,7 @@ class BrowserRunnerActionTests(unittest.TestCase):
             {"action": "assert_selected", "parameters": {"selector": "select", "expected": "Two"}},
         )
         self.assertEqual(result["status"], "passed")
-        self.locator.select_option.assert_called_once_with(label="Two")
+        self.locator.select_option.assert_called_once_with(label="Two", timeout=5000)
 
     def test_assert_selected_checks_radio_state(self) -> None:
         self.locator.evaluate.return_value = {"tag": "input", "type": "radio"}
@@ -386,10 +387,9 @@ class BrowserRunnerActionTests(unittest.TestCase):
 
         for step in steps:
             with self.subTest(action=step["action"]):
-                if step["action"] == "click":
-                    self.locator.wait_for.side_effect = RuntimeError(
-                        "selector did not become visible"
-                    )
+                self.locator.wait_for.side_effect = RuntimeError(
+                    "selector did not become visible"
+                )
                 result = self.run_steps(step)
                 error = result["steps"][0]["error"]
                 self.assertEqual(result["status"], "failed")
@@ -400,6 +400,7 @@ class BrowserRunnerActionTests(unittest.TestCase):
                     self.locator.wait_for.side_effect = None
                 else:
                     self.assertIn("not found", error)
+                    self.locator.wait_for.side_effect = None
 
     def test_failed_new_action_stops_following_steps(self) -> None:
         self.locator.wait_for.side_effect = RuntimeError(

@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
 
+from pydantic import ValidationError
+
 from qa_agent.browser_discovery import capture_discovery_result, extract_target_url
 from qa_agent.browser_runner import BrowserRunner
 from qa_agent.execution_repository import ExecutionRepository, InMemoryExecutionRepository
@@ -32,6 +34,7 @@ from qa_agent.plan_store import InMemoryPlanStore, PlanStore
 from qa_agent.locator_recovery import RecoveryStatus, recover_locator
 from qa_agent.test_case_decomposer import TestCaseDecomposer
 from qa_agent.test_plan_generator import GeneratedTestPlan, TestPlanGenerator
+from qa_agent.test_plan_validation import validate_executable_plan
 from qa_agent.discovery_fallback import DiscoveryFallback
 from qa_agent.plan_execution import (
     PlanExecutionClassification,
@@ -42,6 +45,7 @@ from qa_agent.plan_execution import (
 from qa_agent.run_context import RunContext
 from qa_agent.run_history import RunHistoryService, WorkflowType
 from qa_agent.execution_progress import ExecutionEventType, emit_progress_event
+from qa_agent.llm.errors import NonRetryableLLMError, RetryableLLMError
 
 
 class PipelineStageError(RuntimeError):
@@ -262,11 +266,25 @@ class QATestPipeline:
                     )
                     if cached_plan.test_step_id != test_step.id:
                         raise ValueError("Cached TestPlan belongs to a different TestStep.")
+                    if cached_version.test_plan_id != cached_plan.id:
+                        raise ValueError("Cached TestPlanVersion belongs to a different TestPlan.")
+                    cached_executable_plan = validate_executable_plan(
+                        cached_version.qa_test_plan
+                    )
+                    generated_plan = GeneratedTestPlan(
+                        test_plan=cached_plan,
+                        test_plan_version=cached_version.model_copy(update={
+                            "qa_test_plan": cached_executable_plan,
+                        }),
+                    )
                 except Exception as error:
                     emit_progress_event(
                         ExecutionEventType.PLAN_GENERATION_FAILED,
                         step=test_step,
                         classification="MISSING_AUTOMATION",
+                        failure_code="SAVED_PLAN_INVALID",
+                        prior_plan_exists=True,
+                        new_plan_saved=False,
                         message="Saved automation could not be loaded.",
                     )
                     raise PipelineStageError(
@@ -344,6 +362,9 @@ class QATestPipeline:
                         ExecutionEventType.PLAN_GENERATION_FAILED,
                         step=test_step,
                         classification="INFRASTRUCTURE_ERROR",
+                        failure_code="DISCOVERY_FAILED",
+                        prior_plan_exists=False,
+                        new_plan_saved=False,
                         message="The browser could not inspect the target page.",
                     )
                     raise PipelineStageError(
@@ -356,17 +377,24 @@ class QATestPipeline:
                     generated_plan = self._plan_generator.generate_with_plan(
                         test_step, discovery_result
                     )
-                    if generated_plan.test_plan.test_step_id != test_step.id:
-                        raise ValueError("Generated TestPlan belongs to a different TestStep.")
+                    generated_plan = _validate_generated_plan(
+                        generated_plan,
+                        test_step,
+                        expected_version=1,
+                    )
                     generated_plan = _with_plan_origin(
                         generated_plan, PlanVersionOrigin.AI_GENERATED
                     )
                 except Exception as error:
+                    failure_code, safe_reason = _generation_failure_details(error)
                     emit_progress_event(
                         ExecutionEventType.PLAN_GENERATION_FAILED,
                         step=test_step,
                         classification="AUTOMATION_GENERATION_ERROR",
-                        message="Executable automation could not be generated for this step.",
+                        failure_code=failure_code,
+                        prior_plan_exists=False,
+                        new_plan_saved=False,
+                        message=safe_reason,
                     )
                     raise PipelineStageError(
                         f"plan generation (step {test_step.order}: {test_step.name})",
@@ -393,6 +421,9 @@ class QATestPipeline:
                         ExecutionEventType.PLAN_GENERATION_FAILED,
                         step=test_step,
                         classification="INFRASTRUCTURE_ERROR",
+                        failure_code="PLAN_PERSISTENCE_FAILED",
+                        prior_plan_exists=False,
+                        new_plan_saved=False,
                         message="Generated automation could not be saved.",
                     )
                     raise PipelineStageError(
@@ -516,6 +547,11 @@ class QATestPipeline:
                 continue
 
             regeneration_started = time.perf_counter()
+            emit_progress_event(
+                ExecutionEventType.PLAN_GENERATION_STARTED,
+                step=test_step,
+                message="Generating updated automation for this step.",
+            )
             try:
                 regenerated_plan = self._plan_generator.generate_with_plan(
                     test_step,
@@ -523,16 +559,27 @@ class QATestPipeline:
                     existing_test_plan=generated_plan.test_plan,
                     version_number=plan_version.version + 1,
                 )
-                regenerated_plan = _with_plan_origin(
-                    regenerated_plan, PlanVersionOrigin.REGENERATED
+                regenerated_plan = _validate_generated_plan(
+                    regenerated_plan,
+                    test_step,
+                    expected_version=plan_version.version + 1,
                 )
                 if regenerated_plan.test_plan.id != generated_plan.test_plan.id:
                     raise ValueError("Regeneration must reuse the existing TestPlan.")
-                if regenerated_plan.test_plan.test_step_id != test_step.id:
-                    raise ValueError("Regenerated TestPlan belongs to a different TestStep.")
-                if regenerated_plan.test_plan_version.version != plan_version.version + 1:
-                    raise ValueError("Regeneration returned an unexpected TestPlanVersion number.")
+                regenerated_plan = _with_plan_origin(
+                    regenerated_plan, PlanVersionOrigin.REGENERATED
+                )
             except Exception as error:
+                failure_code, safe_reason = _generation_failure_details(error)
+                emit_progress_event(
+                    ExecutionEventType.PLAN_GENERATION_FAILED,
+                    step=test_step,
+                    classification="AUTOMATION_GENERATION_ERROR",
+                    failure_code=failure_code,
+                    prior_plan_exists=True,
+                    new_plan_saved=False,
+                    message=safe_reason,
+                )
                 raise PipelineStageError(
                     f"regeneration (step {test_step.order}: {test_step.name})",
                     str(error),
@@ -563,10 +610,24 @@ class QATestPipeline:
                     test_plan=regenerated_plan.test_plan,
                 )
             except Exception as error:
+                emit_progress_event(
+                    ExecutionEventType.PLAN_GENERATION_FAILED,
+                    step=test_step,
+                    classification="INFRASTRUCTURE_ERROR",
+                    failure_code="PLAN_PERSISTENCE_FAILED",
+                    prior_plan_exists=True,
+                    new_plan_saved=False,
+                    message="Updated automation could not be saved.",
+                )
                 raise PipelineStageError(
                     f"plan save (step {test_step.order}: {test_step.name})",
                     str(error),
                 ) from error
+            emit_progress_event(
+                ExecutionEventType.PLAN_GENERATED,
+                step=test_step,
+                message="Updated automation generated for this step.",
+            )
             regenerated_outcome = self._execute_plan(
                 test_step, regenerated_plan.test_plan_version, trace
             )
@@ -648,6 +709,40 @@ def _with_plan_origin(
     )
 
 
+def _validate_generated_plan(
+    generated_plan: GeneratedTestPlan,
+    test_step: TestStep,
+    *,
+    expected_version: int,
+) -> GeneratedTestPlan:
+    """Revalidate plan structure and ownership before any version is saved."""
+    if not isinstance(generated_plan, GeneratedTestPlan):
+        raise TypeError("Plan generator must return a GeneratedTestPlan.")
+    if generated_plan.test_plan.test_step_id != test_step.id:
+        raise ValueError("Generated TestPlan belongs to a different TestStep.")
+    version = generated_plan.test_plan_version
+    if version.test_plan_id != generated_plan.test_plan.id:
+        raise ValueError("Generated TestPlanVersion belongs to a different TestPlan.")
+    if version.version != expected_version:
+        raise ValueError("Plan generator returned an unexpected TestPlanVersion number.")
+    executable_plan = validate_executable_plan(version.qa_test_plan)
+    return GeneratedTestPlan(
+        test_plan=generated_plan.test_plan,
+        test_plan_version=version.model_copy(update={"qa_test_plan": executable_plan}),
+    )
+
+
+def _generation_failure_details(error: Exception) -> tuple[str, str]:
+    """Map internal generation exceptions to stable, safe progress diagnostics."""
+    if isinstance(error, ValidationError):
+        return "PLAN_VALIDATION_FAILED", "Generated automation failed validation."
+    if isinstance(error, (RetryableLLMError, NonRetryableLLMError)):
+        return "LLM_PROVIDER_FAILURE", "The automation provider could not return a usable plan."
+    if isinstance(error, (TypeError, ValueError)):
+        return "PLAN_VALIDATION_FAILED", "Generated automation failed validation."
+    return "PLAN_GENERATION_FAILED", "No reliable executable action could be produced for this step."
+
+
 def _automation_run_outcome(test_run: TestRun) -> str:
     """Preserve product-failure classification in completed Automation runs."""
     if test_run.status == ExecutionStatus.PASSED:
@@ -666,6 +761,8 @@ def _automation_run_outcome(test_run: TestRun) -> str:
         return PlanExecutionClassification.INFRASTRUCTURE_ERROR.value
     if PlanExecutionClassification.AUTOMATION_DRIFT in classifications:
         return PlanExecutionClassification.AUTOMATION_DRIFT.value
+    if PlanExecutionClassification.AUTOMATION_EXECUTION_ERROR in classifications:
+        return PlanExecutionClassification.AUTOMATION_EXECUTION_ERROR.value
     if PlanExecutionClassification.PRODUCT_FAILURE in classifications:
         return PlanExecutionClassification.PRODUCT_FAILURE.value
     return "FAILED"

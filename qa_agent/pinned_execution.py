@@ -25,6 +25,7 @@ from qa_agent.plan_execution import (
 )
 from qa_agent.plan_store import PlanStore
 from qa_agent.run_context import RunContext
+from qa_agent.test_plan_validation import validate_executable_plan
 
 
 @dataclass(frozen=True)
@@ -73,6 +74,7 @@ class WorkflowOutcome(str, Enum):
     PASSED = "PASSED"
     PRODUCT_FAILURE = "PRODUCT_FAILURE"
     AUTOMATION_DRIFT = "AUTOMATION_DRIFT"
+    AUTOMATION_EXECUTION_ERROR = "AUTOMATION_EXECUTION_ERROR"
     INFRASTRUCTURE_ERROR = "INFRASTRUCTURE_ERROR"
     SETUP_FAILURE = "SETUP_FAILURE"
 
@@ -156,6 +158,12 @@ class PinnedExecutionService:
                 raise PlanSelectionError(
                     f"TestPlanVersion {version_id} does not belong to TestStep {step.id}."
                 )
+            try:
+                validate_executable_plan(version.qa_test_plan)
+            except (TypeError, ValueError) as error:
+                raise PlanSelectionError(
+                    f"Selected TestPlanVersion for TestStep {step.id} is not executable."
+                ) from error
             resolved.append(ResolvedStepPlan(step, version))
 
         return ResolvedPlanVersionSet(tuple(resolved))
@@ -248,6 +256,8 @@ def _workflow_outcome(
         return WorkflowOutcome.INFRASTRUCTURE_ERROR
     if PlanExecutionClassification.AUTOMATION_DRIFT in classifications:
         return WorkflowOutcome.AUTOMATION_DRIFT
+    if PlanExecutionClassification.AUTOMATION_EXECUTION_ERROR in classifications:
+        return WorkflowOutcome.AUTOMATION_EXECUTION_ERROR
     if PlanExecutionClassification.PRODUCT_FAILURE in classifications:
         return WorkflowOutcome.PRODUCT_FAILURE
     return WorkflowOutcome.PASSED

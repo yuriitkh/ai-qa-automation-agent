@@ -5,10 +5,17 @@ import time
 import unittest
 from http.client import HTTPConnection
 from pathlib import Path
+from threading import Event
+
+from playwright.sync_api import expect, sync_playwright
 
 from qa_agent.demo import seed_demo_data
 from qa_agent.run_history import WorkflowType
 from qa_agent.storage import create_sqlite_storage
+from qa_agent.test_case_repository import InMemoryTestCaseRepository
+from qa_agent.models import TestCase as DomainTestCase, TestStep as DomainTestStep
+from qa_agent.execution_progress import get_active_execution_progress
+from qa_agent.run_history import InMemoryRunHistoryRepository, RunHistoryService
 from qa_agent.test_case_execution import TestCaseExecutionService
 from qa_agent.web import LocalWebApplication, create_http_server
 
@@ -165,6 +172,86 @@ class PersistedTestCaseBrowserFlowTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
                 server_thread.join(timeout=5)
+
+
+class ProgressLifecycleBrowserTests(unittest.TestCase):
+    def test_finished_phase_and_execution_state_update_together_in_browser(self) -> None:
+        case = DomainTestCase(
+            name="Progress lifecycle",
+            description="Verify the live progress terminal state.",
+            steps=[DomainTestStep(
+                name="Inspect page",
+                description="Inspect the local page.",
+                expected="The page is available.",
+                order=0,
+            )],
+        )
+        started = Event()
+        release = Event()
+
+        class BlockingRunService:
+            def run(self, _test_case_id, _workflow):
+                progress = get_active_execution_progress()
+                progress.test_case_loaded(case)
+                started.set()
+                if not release.wait(timeout=10):
+                    raise TimeoutError("Test release was not signaled.")
+                return type("Result", (), {"test_run": None, "outcome": "PASSED"})()
+
+        history = RunHistoryService(InMemoryRunHistoryRepository())
+        repository = InMemoryTestCaseRepository()
+        repository.save(case)
+        application = LocalWebApplication(
+            history,
+            test_cases=repository,
+            run_service=BlockingRunService(),
+        )
+        server = create_http_server(application, host="127.0.0.1", port=0)
+        port = server.server_address[1]
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        try:
+            response = application.handle(
+                "POST",
+                f"/test-cases/{case.id}/run",
+                "workflow=AUTOMATION",
+            )
+            self.assertEqual(response.status, 303)
+            progress_id = response.headers["Location"].rsplit("/", 1)[1]
+            self.assertTrue(started.wait(timeout=5))
+
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                page = browser.new_page()
+                page.goto(f"http://127.0.0.1:{port}/runs/progress/{progress_id}")
+                expect(page.locator("[data-progress-state]")).to_have_text(
+                    "Running", timeout=5000
+                )
+                release.set()
+                expect(page.locator("[data-progress-phase]").first).to_have_text(
+                    "Finished", timeout=8000
+                )
+                expect(page.locator("[data-progress-state]")).to_have_text(
+                    "Finished", timeout=8000
+                )
+                browser.close()
+
+            snapshot = json.loads(
+                application.handle("GET", f"/api/progress/{progress_id}").body
+            )
+            self.assertEqual(snapshot["state"], "FINISHED")
+            self.assertEqual(snapshot["phase"], "Finished")
+            self.assertTrue(snapshot["finished"])
+            self.assertEqual(snapshot["outcome"], "PASSED")
+            self.assertIsNone(snapshot["run_status"])
+            self.assertNotIn("RUNNING", [step["state"] for step in snapshot["steps"]])
+            self.assertEqual(snapshot["events"][-1]["type"], "RUN_FINISHED")
+        finally:
+            release.set()
+            application.close()
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=5)
 
 
 if __name__ == "__main__":

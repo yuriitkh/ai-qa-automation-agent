@@ -9,6 +9,10 @@ from playwright.sync_api import sync_playwright
 from .models import QATestPlan
 
 
+LOCATOR_TIMEOUT_MS = 5000
+TEXT_ASSERTION_TIMEOUT_MS = 1500
+
+
 class BrowserSession:
     """Own one Playwright runtime, browser, context, and its pages."""
 
@@ -146,7 +150,7 @@ def _run_plan_on_page(
                 selector = step.parameters["selector"]
                 try:
                     element = page.locator(selector)
-                    element.wait_for(state="visible", timeout=5000)
+                    element.wait_for(state="visible", timeout=LOCATOR_TIMEOUT_MS)
                     click_completed = False
                     try:
                         with page.expect_navigation(
@@ -169,13 +173,15 @@ def _run_plan_on_page(
             elif step.action == "fill":
                 selector = step.parameters["selector"]
                 value = step.parameters["value"]
+                element = page.locator(selector)
                 try:
-                    element = page.locator(selector)
-                    if not element.count():
-                        raise AssertionError(
-                            f"Selector {selector!r} was not found on the page."
-                        )
-                    element.fill(value)
+                    element.wait_for(state="visible", timeout=LOCATOR_TIMEOUT_MS)
+                except Exception as error:
+                    raise AssertionError(
+                        f"Selector {selector!r} was not found or visible: {error}"
+                    ) from error
+                try:
+                    element.fill(value, timeout=LOCATOR_TIMEOUT_MS)
                 except AssertionError:
                     raise
                 except Exception as error:
@@ -187,7 +193,9 @@ def _run_plan_on_page(
                 selector = step.parameters["selector"]
                 label = step.parameters["option_label"]
                 try:
-                    page.locator(selector).select_option(label=label)
+                    element = page.locator(selector)
+                    element.wait_for(state="visible", timeout=LOCATOR_TIMEOUT_MS)
+                    element.select_option(label=label, timeout=LOCATOR_TIMEOUT_MS)
                 except Exception as error:
                     raise AssertionError(
                         f"Could not select option label {label!r} in {selector!r}: {error}"
@@ -214,19 +222,16 @@ def _run_plan_on_page(
                 selector = step.parameters["selector"]
                 expected_text = step.parameters.get("expected_text")
                 element = page.locator(selector)
-                element_count = element.count()
-                if not element_count:
-                    raise AssertionError(
-                        f"Selector {selector!r} was not found on the page."
-                    )
+                element.wait_for(state="visible", timeout=LOCATOR_TIMEOUT_MS)
                 element = element.first
-                if not element.is_visible():
-                    raise AssertionError(
-                        f"Element matching selector {selector!r} exists "
-                        "but is not visible."
-                    )
                 if expected_text is not None:
                     try:
+                        element.get_by_text(
+                            expected_text.replace("\\n", "\n"), exact=True
+                        ).wait_for(
+                            state="visible",
+                            timeout=TEXT_ASSERTION_TIMEOUT_MS,
+                        )
                         actual_text = element.inner_text(timeout=1000)
                     except Exception as error:
                         raise AssertionError(
@@ -243,10 +248,12 @@ def _run_plan_on_page(
             elif step.action == "assert_text_contains":
                 expected_text = step.parameters["expected_text"].replace("\\n", "\n")
                 selector = step.parameters.get("selector")
-                actual_text = (
-                    page.locator(selector).inner_text(timeout=1000)
-                    if selector else page.locator("body").inner_text(timeout=1000)
+                target = page.locator(selector) if selector else page.locator("body")
+                target.get_by_text(expected_text, exact=False).wait_for(
+                    state="visible",
+                    timeout=TEXT_ASSERTION_TIMEOUT_MS,
                 )
+                actual_text = target.inner_text(timeout=1000)
                 if expected_text not in actual_text:
                     raise AssertionError(
                         f"Expected text {expected_text!r} to be contained in visible text"
@@ -254,11 +261,14 @@ def _run_plan_on_page(
                     )
             elif step.action == "assert_checked":
                 selector = step.parameters["selector"]
-                if not page.locator(selector).is_checked():
+                element = page.locator(selector)
+                element.wait_for(state="visible", timeout=LOCATOR_TIMEOUT_MS)
+                if not element.is_checked():
                     raise AssertionError(f"Expected checkbox/radio {selector!r} to be checked.")
             elif step.action == "assert_selected":
                 selector = step.parameters["selector"]
                 element = page.locator(selector)
+                element.wait_for(state="visible", timeout=LOCATOR_TIMEOUT_MS)
                 element_info = element.evaluate(
                     "element => ({tag: element.tagName.toLowerCase(), type: element.type})"
                 )
@@ -289,7 +299,9 @@ def _run_plan_on_page(
                     )
             elif step.action in {"assert_enabled", "assert_disabled"}:
                 selector = step.parameters["selector"]
-                enabled = page.locator(selector).is_enabled()
+                element = page.locator(selector)
+                element.wait_for(state="visible", timeout=LOCATOR_TIMEOUT_MS)
+                enabled = element.is_enabled()
                 expected_enabled = step.action == "assert_enabled"
                 if enabled != expected_enabled:
                     state = "enabled" if enabled else "disabled"

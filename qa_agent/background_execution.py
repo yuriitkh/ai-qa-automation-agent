@@ -130,7 +130,20 @@ class BackgroundRunService:
                 return
             except PipelineStageError as error:
                 category = _pipeline_error_category(error)
-                logger.exception("TestCase pipeline stopped during %s", error.stage)
+                snapshot = self.progress_store.get(progress_id)
+                failure = (
+                    snapshot.automation_generation_failure
+                    if snapshot is not None else None
+                )
+                technical_classification = (
+                    failure.technical_classification
+                    if failure is not None else "PIPELINE_STAGE_FAILED"
+                )
+                logger.warning(
+                    "TestCase pipeline stopped (%s; %s)",
+                    category,
+                    technical_classification,
+                )
                 reporter.finish(
                     outcome=category,
                     error_category=category,
@@ -138,7 +151,7 @@ class BackgroundRunService:
                 )
                 return
             except Exception:
-                logger.exception("Unexpected TestCase workflow failure")
+                logger.error("Unexpected TestCase workflow failure (EXECUTION_ERROR)")
                 reporter.finish(
                     outcome="EXECUTION_ERROR",
                     error_category="EXECUTION_ERROR",
@@ -153,6 +166,14 @@ class BackgroundRunService:
                 run_status = _enum_value(
                     record.status if record is not None else getattr(test_run, "status", None)
                 )
+                if run_status == "RUNNING":
+                    logger.error("Workflow returned a nonterminal TestRun (EXECUTION_ERROR)")
+                    reporter.finish(
+                        outcome="EXECUTION_ERROR",
+                        error_category="EXECUTION_ERROR",
+                        message="The workflow returned before execution reached a terminal state.",
+                    )
+                    return
                 outcome = _enum_value(
                     record.outcome
                     if record is not None
@@ -170,6 +191,7 @@ class BackgroundRunService:
                         if outcome in {
                             "PRODUCT_FAILURE",
                             "AUTOMATION_DRIFT",
+                            "AUTOMATION_EXECUTION_ERROR",
                             "INFRASTRUCTURE_ERROR",
                             "SETUP_FAILURE",
                         }
@@ -177,7 +199,7 @@ class BackgroundRunService:
                     ),
                 )
             except Exception:
-                logger.exception("Could not summarize completed TestCase workflow")
+                logger.error("Could not summarize completed TestCase workflow (EXECUTION_ERROR)")
                 reporter.finish(
                     outcome="EXECUTION_ERROR",
                     error_category="EXECUTION_ERROR",

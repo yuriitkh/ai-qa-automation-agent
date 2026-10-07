@@ -10,6 +10,7 @@ from qa_agent.models import (
     TestPlanVersion,
     TestStep,
 )
+from qa_agent.test_plan_validation import validate_executable_plan
 
 
 @dataclass(frozen=True)
@@ -84,7 +85,7 @@ class LLMTestPlanGenerator(TestPlanGenerator):
 
         # Validate at this boundary as well, so a nonconforming Router
         # implementation cannot create a version from invalid plan data.
-        executable_plan = QATestPlan.model_validate(router_result)
+        executable_plan = validate_executable_plan(router_result)
         self._validate_discovery_capabilities(executable_plan, discovery_result, test_step)
         if existing_test_plan is not None:
             if existing_test_plan.test_step_id != test_step.id:

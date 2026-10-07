@@ -36,6 +36,62 @@ from qa_agent.test_plan_generator import GeneratedTestPlan, LLMTestPlanGenerator
 
 
 class QATestPipelineTests(unittest.TestCase):
+    def test_plan_missing_required_browser_parameter_is_not_persisted_or_executed(self) -> None:
+        step = self.make_step(0)
+        case = DomainTestCase(
+            name="Invalid generated plan",
+            description="Reject unsupported generated actions before persistence.",
+            base_url="https://example.test/",
+            steps=[step],
+        )
+
+        class InvalidGenerator(_FakeGenerator):
+            def generate_with_plan(
+                inner_self,
+                test_step,
+                discovery_result,
+                *,
+                existing_test_plan=None,
+                version_number=1,
+            ):
+                generated = super().generate_with_plan(
+                    test_step,
+                    discovery_result,
+                    existing_test_plan=existing_test_plan,
+                    version_number=version_number,
+                )
+                invalid_plan = QATestPlan(
+                    url=generated.test_plan_version.qa_test_plan.url,
+                    steps=[QATestStep(action="click", parameters={})],
+                )
+                invalid_version = generated.test_plan_version.model_copy(
+                    update={"qa_test_plan": invalid_plan}
+                )
+                return GeneratedTestPlan(
+                    test_plan=generated.test_plan,
+                    test_plan_version=invalid_version,
+                )
+
+        store = InMemoryPlanStore()
+        runner_calls = []
+        pipeline = QATestPipeline(
+            decomposer=_FakeDecomposer(case),
+            plan_generator=InvalidGenerator([]),
+            discovery=lambda url: DiscoveryResult(
+                status=DiscoveryStatus.SUCCESS,
+                url=url,
+            ),
+            runner=lambda plan: runner_calls.append(plan) or {"status": "passed", "steps": []},
+            plan_store=store,
+        )
+
+        with self.assertRaises(PipelineStageError) as raised:
+            pipeline.run_test_case(case)
+
+        self.assertIn("plan generation", raised.exception.stage)
+        self.assertIsNone(store.find(step.id))
+        self.assertEqual(runner_calls, [])
+
     def test_ai_discovery_runs_only_for_partial_or_failed_deterministic_results(self) -> None:
         from qa_agent.models import AIDiscoveryResult, NavigationPath
 

@@ -245,6 +245,25 @@ class PinnedWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(len(self.plan_store.get_version(self.versions[self.first.id][0].id).qa_test_plan.steps), 1)
 
+    def test_generated_plan_execution_error_has_its_own_workflow_outcome(self) -> None:
+        def blocked_interaction(_):
+            return {
+                "status": "failed",
+                "steps": [{
+                    "action": "click",
+                    "status": "failed",
+                    "error": "Click failed because an overlay intercepted the action.",
+                }],
+            }
+
+        result = ValidationWorkflow(self.make_executor(blocked_interaction)).run(
+            self.test_case,
+            self.full_selection(),
+        )
+
+        self.assertEqual(result.outcome, WorkflowOutcome.AUTOMATION_EXECUTION_ERROR)
+        self.assertEqual(result.test_run.executions[0].status, ExecutionStatus.FAILED)
+
     def test_infrastructure_error_is_distinct_and_does_not_continue(self) -> None:
         def broken_runner(_):
             raise RuntimeError("browser launch failed")
