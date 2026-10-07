@@ -8,6 +8,7 @@ import secrets
 import threading
 import time
 from dataclasses import dataclass
+from typing import Mapping
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -68,6 +69,101 @@ class TestCaseDraft:
     """Validated canonical-shaped proposal held only until explicit save."""
 
     test_case: TestCase
+    authoring_name: str | None = None
+    authoring_scenario: str | None = None
+    authoring_base_url: str | None = None
+
+
+@dataclass(frozen=True)
+class TestCaseEditResult:
+    """A trusted TestCase rebuilt with validated, user-facing draft edits."""
+
+    test_case: TestCase | None
+    values: dict[str, str]
+    errors: dict[str, str]
+
+
+def editable_test_case_values(test_case: TestCase) -> dict[str, str]:
+    """Return stable form keys for editable text, based on trusted draft order."""
+    values = {
+        "name": test_case.name,
+        "description": test_case.description,
+    }
+    for precondition_index, precondition in enumerate(test_case.preconditions):
+        values[f"precondition.{precondition_index}.description"] = precondition.description
+    for segment_index, segment in enumerate(test_case.segments):
+        for step_index, step in enumerate(segment.steps):
+            prefix = f"segment.{segment_index}.step.{step_index}"
+            values[f"{prefix}.name"] = step.name
+            values[f"{prefix}.description"] = step.description
+            values[f"{prefix}.expected"] = step.expected
+    return values
+
+
+def merge_test_case_edits(
+    test_case: TestCase, submitted_fields: Mapping[str, str]
+) -> TestCaseEditResult:
+    """Merge only known user-facing fields into the server-held TestCase.
+
+    Indices in field names address the original draft structure; submitted IDs,
+    ordering, segment membership, and unsupported fields are never consulted.
+    """
+    original_values = editable_test_case_values(test_case)
+    values = dict(original_values)
+    values.update({
+        key: value
+        for key, value in submitted_fields.items()
+        if key in original_values and isinstance(value, str)
+    })
+    limits = {
+        "name": (200, "TestCase name"),
+        "description": (6000, "Description / scenario"),
+    }
+    for key in original_values:
+        if key.startswith("precondition."):
+            limits[key] = (6000, "Precondition description")
+        elif key.endswith(".name") and key.startswith("segment."):
+            limits[key] = (200, "Step title")
+        elif key.endswith(".description") and key.startswith("segment."):
+            limits[key] = (6000, "Step description")
+        elif key.endswith(".expected") and key.startswith("segment."):
+            limits[key] = (6000, "Expected Result")
+
+    errors: dict[str, str] = {}
+    normalized_values: dict[str, str] = {}
+    for key, (maximum, label) in limits.items():
+        value = values[key].strip()
+        if not value:
+            errors[key] = f"{label} is required."
+        elif len(value) > maximum:
+            errors[key] = f"{label} must be {maximum:,} characters or fewer."
+        else:
+            normalized_values[key] = value
+
+    if errors:
+        return TestCaseEditResult(None, values, errors)
+
+    data = test_case.model_dump(exclude={"steps"})
+    data["name"] = normalized_values["name"]
+    data["description"] = normalized_values["description"]
+    for precondition_index, precondition in enumerate(data["preconditions"]):
+        precondition["description"] = normalized_values[
+            f"precondition.{precondition_index}.description"
+        ]
+    for segment_index, segment in enumerate(data["segments"]):
+        for step_index, step in enumerate(segment["steps"]):
+            prefix = f"segment.{segment_index}.step.{step_index}"
+            for field_name in ("name", "description", "expected"):
+                step[field_name] = normalized_values[f"{prefix}.{field_name}"]
+    try:
+        edited = TestCase.model_validate(data)
+    except (ValidationError, TypeError, ValueError):
+        return TestCaseEditResult(
+            None,
+            values,
+            {"form": "The edited TestCase could not be validated. Check the fields and try again."},
+        )
+    return TestCaseEditResult(edited, values, {})
 
 
 class TestCaseAuthoringError(ValueError):
@@ -177,7 +273,12 @@ class TestCaseAuthoringService:
                 "The AI response could not be converted into a valid TestCase. Try generating again.",
                 category="response",
             ) from None
-        return TestCaseDraft(test_case=test_case)
+        return TestCaseDraft(
+            test_case=test_case,
+            authoring_name=clean_name,
+            authoring_scenario=clean_scenario,
+            authoring_base_url=clean_url,
+        )
 
 
 @dataclass(frozen=True)

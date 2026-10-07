@@ -33,6 +33,8 @@ from qa_agent.test_case_authoring import (
     TestCaseAuthoringService,
     TestCaseDraft,
     TestCaseDraftStore,
+    editable_test_case_values,
+    merge_test_case_edits,
 )
 from qa_agent.test_case_repository import TestCaseRepository
 from qa_agent.storage import create_sqlite_storage
@@ -49,6 +51,8 @@ from qa_agent.workflows import AutomationWorkflow
 
 
 _PAGE_LIMIT = 500
+_MAX_FORM_BODY_BYTES = 8192
+_MAX_DRAFT_SAVE_BODY_BYTES = 256 * 1024
 _WORKFLOWS = {item.value for item in WorkflowType}
 _STATUSES = {"PASSED", "FAILED"}
 _FAILURE_TYPES = {
@@ -434,7 +438,12 @@ class LocalWebApplication:
     def _handle_draft_action(
         self, token: str, action: str, body: bytes | str | None
     ) -> WebResponse:
-        form, form_error = _parse_form_body(body)
+        form, form_error = _parse_form_body(
+            body,
+            max_bytes=(
+                _MAX_DRAFT_SAVE_BODY_BYTES if action == "save" else _MAX_FORM_BODY_BYTES
+            ),
+        )
         if form_error is not None:
             return self._not_found("Draft not found or expired")
         if action == "cancel":
@@ -450,9 +459,9 @@ class LocalWebApplication:
                 ))
             try:
                 new_draft = self._authoring_service.generate(
-                    draft.test_case.name,
-                    draft.test_case.description,
-                    draft.test_case.base_url or "",
+                    draft.authoring_name or draft.test_case.name,
+                    draft.authoring_scenario or draft.test_case.description,
+                    draft.authoring_base_url or draft.test_case.base_url or "",
                 )
             except TestCaseAuthoringError as error:
                 return WebResponse.html(503, self._draft_review_html(draft, token, str(error)))
@@ -465,14 +474,29 @@ class LocalWebApplication:
             return WebResponse.redirect(f"/test-cases/review/{next_token}")
         if action != "save":
             return self._not_found("Draft action not found")
-        # Consume before persistence so the same token cannot create two rows.
+        if self._test_cases is None:
+            return WebResponse.html(503, self._not_found("TestCase storage is not configured.").body.decode("utf-8"))
+        edits = merge_test_case_edits(
+            draft.test_case,
+            {key: items[0] for key, items in form.items()},
+        )
+        if edits.errors:
+            return WebResponse.html(400, self._draft_review_html(
+                draft,
+                token,
+                values=edits.values,
+                field_errors=edits.errors,
+            ))
+        if edits.test_case is None:
+            return self._not_found("Draft not found or expired")
+        # Validation runs before consumption so users can correct the form.
+        # Taking the token only after validation still makes concurrent/repeated
+        # saves single-use.
         consumed = self._draft_store.take(token)
         if consumed is None:
             return self._not_found("Draft not found or expired")
-        if self._test_cases is None:
-            return WebResponse.html(503, self._not_found("TestCase storage is not configured.").body.decode("utf-8"))
         try:
-            self._test_cases.save(consumed.test_case)
+            self._test_cases.save(edits.test_case)
         except Exception:
             return WebResponse.html(500, self._page(
                 "TestCase not saved",
@@ -480,7 +504,7 @@ class LocalWebApplication:
                 '<p>The reviewed TestCase could not be saved. Generate a new draft and try again.</p>'
                 '<a class="button" href="/test-cases">Return to TestCases</a></div>',
             ))
-        return WebResponse.redirect(f"/test-cases/{consumed.test_case.id}")
+        return WebResponse.redirect(f"/test-cases/{edits.test_case.id}")
 
     def _draft_review_page(self, token: str, error: str | None = None) -> WebResponse:
         draft = self._draft_store.get(token)
@@ -489,42 +513,102 @@ class LocalWebApplication:
         return WebResponse.html(200, self._draft_review_html(draft, token, error))
 
     def _draft_review_html(
-        self, draft: TestCaseDraft, token: str, error: str | None = None
+        self,
+        draft: TestCaseDraft,
+        token: str,
+        error: str | None = None,
+        *,
+        values: dict[str, str] | None = None,
+        field_errors: dict[str, str] | None = None,
     ) -> str:
         test_case = draft.test_case
+        original_values = editable_test_case_values(test_case)
+        values = values or original_values
+        field_errors = field_errors or {}
+        user_modified = any(
+            values.get(key, value) != value for key, value in original_values.items()
+        )
+
+        def editable_field(key: str, label: str, *, textarea: bool, maximum: int) -> str:
+            field_id = "edit-" + key.replace(".", "-")
+            current_value = values.get(key, original_values[key])
+            original_value = original_values[key]
+            error_message = field_errors.get(key)
+            error_html = (
+                f'<span class="field-error" role="alert">{escape_html(error_message)}</span>'
+                if error_message else ""
+            )
+            attributes = (
+                f'id="{field_id}" name="{escape_html(key)}" '
+                f'data-editable-field data-original-value="{escape_html(original_value)}" '
+                f'maxlength="{maximum}"'
+            )
+            if textarea:
+                control = f'<textarea {attributes}>{escape_html(current_value)}</textarea>'
+            else:
+                control = f'<input type="text" {attributes} value="{escape_html(current_value)}">'
+            return (
+                f'<div class="field"><label for="{field_id}">{escape_html(label)}</label>'
+                f'{control}{error_html}</div>'
+            )
+
         preconditions = "".join(
-            f"<li>{escape_html(item.description)}</li>"
-            for item in sorted(test_case.preconditions, key=lambda item: item.order)
+            '<li>' + editable_field(
+                f"precondition.{index}.description",
+                f"Precondition {index + 1}",
+                textarea=True,
+                maximum=6000,
+            ) + "</li>"
+            for index, _item in enumerate(test_case.preconditions)
         )
         segments = []
-        for number, segment in enumerate(sorted(test_case.segments, key=lambda item: item.order), start=1):
-            steps = "".join(
-                f'<li><strong>{escape_html(step.name)}</strong>'
-                f'<p>{escape_html(step.description)}</p>'
-                f'<p class="muted">Expected: {escape_html(step.expected)}</p></li>'
-                for step in segment.steps
-            )
+        step_number = 0
+        for segment_index, segment in enumerate(test_case.segments):
+            step_rows = []
+            for step_index, _step in enumerate(segment.steps):
+                step_number += 1
+                prefix = f"segment.{segment_index}.step.{step_index}"
+                fields = (
+                    editable_field(f"{prefix}.name", "Title", textarea=False, maximum=200)
+                    + editable_field(f"{prefix}.description", "Action / Description", textarea=True, maximum=6000)
+                    + editable_field(f"{prefix}.expected", "Expected Result", textarea=True, maximum=6000)
+                )
+                step_rows.append(f'<li><h4>Step {step_number}</h4>{fields}</li>')
+            steps = "".join(step_rows)
             segments.append(
-                f'<section class="subpanel"><h3>Segment {number}</h3><ol>{steps}</ol></section>'
+                f'<section class="subpanel"><h3>Segment {segment_index + 1}</h3><ol>{steps}</ol></section>'
             )
         error_html = (
             f'<div class="error-state"><p>{escape_html(error)}</p></div>' if error else ""
         )
+        form_error_html = (
+            f'<div class="error-state"><p>{escape_html(field_errors["form"])}</p></div>'
+            if "form" in field_errors else ""
+        )
+        edited_badge = (
+            '<span class="badge neutral edited-indicator" data-edited-indicator>Edited</span>'
+            if user_modified else
+            '<span class="badge neutral edited-indicator" data-edited-indicator hidden>Edited</span>'
+        )
         content = (
             '<header class="page-heading"><h1>Review TestCase</h1>'
-            '<p class="lead">Check the generated definition before saving it.</p></header>'
+            '<p class="lead">Review and edit the generated definition before saving it. '
+            + edited_badge + '</p></header>'
             + error_html
+            + form_error_html
+            + f'<form method="post" class="testcase-editor" action="/test-cases/review/{escape_html(token)}/save" data-testcase-editor>'
             + '<section class="panel"><h2>Definition</h2>'
-            + f'<p><strong>Name:</strong> {escape_html(test_case.name)}</p>'
+            + editable_field("name", "TestCase name", textarea=False, maximum=200)
             + f'<p><strong>Base URL:</strong> {escape_html(test_case.base_url or "")}</p>'
-            + f'<p><strong>Scenario:</strong> {escape_html(test_case.description)}</p></section>'
+            + editable_field("description", "Description / scenario", textarea=True, maximum=6000)
+            + '</section>'
             + '<section class="panel"><h2>Preconditions</h2>'
             + (f'<ul>{preconditions}</ul>' if preconditions else '<p class="muted">No preconditions proposed.</p>')
             + '</section><section class="panel"><h2>Steps</h2>'
             + "".join(segments)
             + '</section><div class="actions">'
-            + f'<form method="post" action="/test-cases/review/{escape_html(token)}/save">'
-            + '<button class="button primary" type="submit">Save Test Case</button></form>'
+            + '<button class="button primary" type="submit">Save Test Case</button></div></form>'
+            + '<div class="actions">'
             + f'<form method="post" action="/test-cases/review/{escape_html(token)}/regenerate">'
             + '<button class="button" type="submit">Generate Again</button></form>'
             + f'<form method="post" action="/test-cases/review/{escape_html(token)}/cancel">'
@@ -1138,9 +1222,17 @@ def create_http_server(
                 content_length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
                 content_length = 8193
-            if content_length < 0 or content_length > 8192:
+            request_path = urlsplit(self.path).path.strip("/").split("/")
+            max_body_bytes = (
+                _MAX_DRAFT_SAVE_BODY_BYTES
+                if len(request_path) == 4
+                and request_path[:2] == ["test-cases", "review"]
+                and request_path[3] == "save"
+                else _MAX_FORM_BODY_BYTES
+            )
+            if content_length < 0 or content_length > max_body_bytes:
                 self.close_connection = True
-                body = b"x" * 8193
+                body = b"x" * (max_body_bytes + 1)
             else:
                 body = self.rfile.read(content_length)
             self._send(application.handle("POST", self.path, body))
@@ -1211,6 +1303,8 @@ def _parse_uuid(value: str) -> UUID | None:
 
 def _parse_form_body(
     body: bytes | str | None,
+    *,
+    max_bytes: int = _MAX_FORM_BODY_BYTES,
 ) -> tuple[dict[str, list[str]], str | None]:
     if isinstance(body, bytes):
         try:
@@ -1219,10 +1313,16 @@ def _parse_form_body(
             return {}, "The request was not valid form data."
     else:
         form_body = body or ""
-    if len(form_body) > 8192:
+    if len(form_body) > max_bytes:
         return {}, "The request was too large."
     try:
-        values = parse_qs(form_body, keep_blank_values=True, encoding="utf-8", errors="strict")
+        values = parse_qs(
+            form_body,
+            keep_blank_values=True,
+            encoding="utf-8",
+            errors="strict",
+            max_num_fields=4096,
+        )
     except (UnicodeDecodeError, ValueError):
         return {}, "The request was not valid form data."
     if any(len(items) != 1 for items in values.values()):
@@ -1277,6 +1377,19 @@ def _outcome_badge(record: RunHistoryRecord, *, stacked: bool = False) -> str:
 
 _UI_JAVASCRIPT = r"""
 (() => {
+  const testcaseEditor = document.querySelector('[data-testcase-editor]');
+  if (testcaseEditor) {
+    const editedIndicator = document.querySelector('[data-edited-indicator]');
+    const editableFields = [...testcaseEditor.querySelectorAll('[data-editable-field]')];
+    const updateEditedIndicator = () => {
+      const edited = editableFields.some((field) =>
+        field.value !== field.dataset.originalValue);
+      if (editedIndicator) editedIndicator.hidden = !edited;
+    };
+    testcaseEditor.addEventListener('input', updateEditedIndicator);
+    updateEditedIndicator();
+  }
+
   document.querySelectorAll('[data-run-form]').forEach((form) => {
     form.addEventListener('submit', () => {
       form.querySelectorAll('button[type="submit"]').forEach((button) => {

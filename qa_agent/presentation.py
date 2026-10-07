@@ -34,6 +34,7 @@ th{font-size:.84rem;color:#4e5b6c;background:#f8fafc;font-weight:700}tr:last-chi
 .empty-state,.error-state{padding:1.2rem;text-align:center;border:1px dashed #bac5d2;border-radius:9px;background:#fafbfd;color:#536174}.error-state{border-style:solid;background:#fff5f3}
 .filters{display:flex;align-items:end;gap:.75rem;flex-wrap:wrap}.field{display:grid;gap:.25rem}.field label{font-size:.85rem;font-weight:650}.field select{min-width:155px;padding:.48rem;border:1px solid #aebaca;border-radius:6px;background:#fff;color:var(--ink);font:inherit}
 .field input,.field textarea{width:min(100%,720px);padding:.55rem .62rem;border:1px solid #aebaca;border-radius:6px;background:#fff;color:var(--ink);font:inherit}.field textarea{resize:vertical}
+.testcase-editor .field{margin:.65rem 0}.field-error{color:#8d2519;font-size:.88rem}.edited-indicator{margin-left:.45rem}
 .actions{display:flex;gap:.55rem;flex-wrap:wrap;margin:.8rem 0}.id-code,code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.id-code{font-size:.9rem}
 .eyebrow{color:var(--muted);font-size:.85rem;font-weight:700;letter-spacing:.04em;margin:0}.technical-details{margin:.7rem 0;color:var(--muted)}.technical-details summary,.plan-version-details summary{cursor:pointer}.plan-version-details{display:inline-block;margin-left:.45rem}.plan-version-details>p,.technical-details>p{margin:.35rem 0}
 .evidence-preview{display:block;max-width:min(100%,540px);max-height:380px;object-fit:contain;border:1px solid var(--line);border-radius:7px;margin:.45rem 0}

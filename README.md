@@ -79,7 +79,8 @@ python -m qa_agent.web --database .\qa_agent.db
 
 Open <http://127.0.0.1:8000>, choose **Test Cases → New Test Case**, enter a
 name, the base URL `http://127.0.0.1:8000/demo-target/registration`, and a
-natural-language scenario. Review and save the proposed definition, then select
+natural-language scenario. Edit the proposed TestCase definition on the Review
+page if needed, then save it and select
 **Generate & Run Automation**. Once all steps have usable plan versions,
 Validation and Regression become available for the saved versions.
 
