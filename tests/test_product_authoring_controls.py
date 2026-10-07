@@ -72,10 +72,38 @@ class ProductAuthoringControlsTests(unittest.TestCase):
             "notes": "Needs a local user fixture.",
         })
         self.assertEqual(response.status, 303)
-        draft_id = UUID(urlsplit(response.headers["Location"]).path.rsplit("/", 1)[1])
+        location = response.headers["Location"]
+        draft_id = UUID(urlsplit(location).path.rsplit("/", 1)[1])
+        self.assertEqual(location, f"/drafts/{draft_id}?saved=1")
+        self.assertEqual(len(self.drafts.list()), 1)
+        created = self.drafts.get(draft_id)
+        self.assertIsNotNone(created)
+        self.assertEqual(created.title, "Password reset edge cases")
+        self.assertEqual(created.body, "Check expired links and repeated submissions.")
+
+        detail = self.app.handle("GET", location)
+        self.assertEqual(detail.status, 200)
+        self.assertIn(b"Edit Draft", detail.body)
+        self.assertIn(b"Draft saved successfully.", detail.body)
+        self.assertIn(b"Password reset edge cases", detail.body)
+        self.assertIn(b"Check expired links and repeated submissions.", detail.body)
+        self.assertIn(b"Use this Draft", detail.body)
+        self.assertIn(b"Back to Drafts", detail.body)
+        refreshed = self.app.handle("GET", location)
+        self.assertEqual(refreshed.status, 200)
+        self.assertIn(b"Draft saved successfully.", refreshed.body)
+        self.assertIn(b"Password reset edge cases", refreshed.body)
+        self.assertEqual(len(self.drafts.list()), 1)
+
+        new_draft_page = self.app.handle("GET", "/drafts/new")
+        self.assertEqual(new_draft_page.status, 200)
+        self.assertNotIn(b"Use this Draft", new_draft_page.body)
+        self.assertIn(b"Back to Drafts", new_draft_page.body)
+
         self.assertEqual(self.storage.test_case_repository.list(), [])
         listed = self.app.handle("GET", "/drafts")
         self.assertIn(b"Password reset edge cases", listed.body)
+        self.assertIn(f'href="/drafts/{draft_id}"'.encode(), listed.body)
         self.assertIn(b"Recent Drafts", self.app.handle("GET", "/").body)
         self.assertIn(b"Password reset edge cases", self.app.handle("GET", "/test-cases/new").body)
 
@@ -86,11 +114,21 @@ class ProductAuthoringControlsTests(unittest.TestCase):
             "notes": "Updated notes.",
         })
         self.assertEqual(response.status, 303)
+        updated_location = response.headers["Location"]
+        self.assertEqual(updated_location, f"/drafts/{draft_id}?saved=1")
+        updated_detail = self.app.handle("GET", updated_location)
+        self.assertEqual(updated_detail.status, 200)
+        self.assertIn(b"Draft saved successfully.", updated_detail.body)
+        self.assertIn(b"Password reset links", updated_detail.body)
+        self.assertEqual(len(self.drafts.list()), 1)
         restored = SQLiteDraftRepository(self.database).get(draft_id)
         self.assertEqual(restored.title, "Password reset links")
         self.assertEqual(restored.notes, "Updated notes.")
-        self.assertTrue(self.drafts.delete(draft_id))
+        deleted = self.post(f"/drafts/{draft_id}/delete", {})
+        self.assertEqual(deleted.status, 303)
+        self.assertEqual(deleted.headers["Location"], "/drafts")
         self.assertIsNone(self.drafts.get(draft_id))
+        self.assertEqual(self.app.handle("GET", f"/drafts/{draft_id}").status, 404)
 
     def test_draft_manual_conversion_keeps_draft_until_explicit_delete(self):
         draft = Draft(title="Checkout validation", body="Submit a cart with an invalid postal code.")

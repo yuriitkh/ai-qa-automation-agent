@@ -222,11 +222,13 @@ class LocalWebApplication:
             return self._progress_page(parts[2])
         if len(parts) == 4 and parts[:3] == ["api", "test-cases", "authoring-progress"]:
             return self._authoring_progress_json(parts[3])
-        if len(parts) == 3 and parts[:2] == ["drafts"]:
-            draft_id = _parse_uuid(parts[2])
+        if len(parts) == 2 and parts[0] == "drafts":
+            draft_id = _parse_uuid(parts[1])
             if draft_id is None:
                 return self._not_found("Draft not found")
-            return self._draft_edit_page_response(draft_id)
+            return self._draft_edit_page_response(
+                draft_id, saved=query.get("saved") == ["1"]
+            )
         if len(parts) == 3 and parts[:2] == ["test-cases", "authoring-progress"]:
             return self._authoring_progress_page(parts[2])
         if path == "/":
@@ -740,13 +742,20 @@ class LocalWebApplication:
         )
         return self._page("Drafts", content, current="Drafts", breadcrumbs=[("Dashboard", "/")])
 
-    def _draft_edit_page_response(self, draft_id: UUID) -> WebResponse:
+    def _draft_edit_page_response(self, draft_id: UUID, *, saved: bool = False) -> WebResponse:
         draft = self._drafts.get(draft_id)
         if draft is None:
             return self._not_found("Draft not found")
-        return WebResponse.html(200, self._draft_edit_page(draft))
+        return WebResponse.html(200, self._draft_edit_page(draft, saved=saved))
 
-    def _draft_edit_page(self, draft: Draft | None = None, error: str | None = None, submitted: dict[str, str] | None = None) -> str:
+    def _draft_edit_page(
+        self,
+        draft: Draft | None = None,
+        error: str | None = None,
+        submitted: dict[str, str] | None = None,
+        *,
+        saved: bool = False,
+    ) -> str:
         editing = draft is not None
         submitted = submitted or {}
         action = f"/drafts/{draft.id}/update" if draft else "/drafts"
@@ -755,10 +764,11 @@ class LocalWebApplication:
         base_url = submitted.get("base_url", (draft.base_url or "") if draft else "")
         notes = submitted.get("notes", (draft.notes or "") if draft else "")
         error_html = f'<p class="authoring-error" role="alert">{escape_html(error)}</p>' if error else ""
+        success_html = '<p class="authoring-success" role="status">Draft saved successfully.</p>' if saved else ""
         content = (
             '<header class="page-heading"><h1>' + ("Edit Draft" if editing else "New Draft") + '</h1>'
             '<p class="lead">Drafts stay separate from TestCases, Runs, and Test Suites.</p></header>'
-            + error_html + f'<form method="post" action="{action}" class="panel" data-inline-validation novalidate>'
+            + error_html + success_html + f'<form method="post" action="{action}" class="panel" data-inline-validation novalidate>'
             + '<div class="field"><label for="draft-title">Title</label>'
             + f'<input id="draft-title" name="title" maxlength="200" required value="{escape_html(title)}"></div>'
             + '<div class="field"><label for="draft-body">Testing idea / scenario</label>'
@@ -768,7 +778,7 @@ class LocalWebApplication:
             + '<div class="field"><label for="draft-notes">Notes (optional)</label>'
             + f'<textarea id="draft-notes" name="notes" maxlength="6000" rows="3">{escape_html(notes)}</textarea></div>'
             + '<div class="actions"><button class="button primary" type="submit">Save Draft</button>'
-            + '<a class="button" href="/drafts">Cancel</a></div></form>'
+            + '<a class="button" href="/drafts">Back to Drafts</a></div></form>'
         )
         if draft is not None:
             content += (
@@ -864,7 +874,7 @@ class LocalWebApplication:
             self._drafts.save(draft)
         except (ValueError, TypeError) as save_error:
             return WebResponse.html(400, self._draft_edit_page(existing, str(save_error), values))
-        return WebResponse.redirect(f"/drafts/{draft.id}")
+        return WebResponse.redirect(f"/drafts/{draft.id}?saved=1")
 
     def _manual_test_case_page(
         self,
@@ -1128,7 +1138,7 @@ class LocalWebApplication:
         if action == "save-draft":
             draft = Draft(title=name or "Untitled testing idea", body=scenario, base_url=base_url or None)
             self._drafts.save(draft)
-            return WebResponse.redirect(f"/drafts/{draft.id}")
+            return WebResponse.redirect(f"/drafts/{draft.id}?saved=1")
         try:
             test_case = create_manual_test_case({
                 "name": name,

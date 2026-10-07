@@ -38,6 +38,7 @@ th{font-size:.84rem;color:#4e5b6c;background:#f8fafc;font-weight:700}tr:last-chi
 .authoring-entry .field{margin:.8rem 0}.authoring-entry .field input,.authoring-entry .field textarea{width:100%;max-width:720px}
 .authoring-entry textarea,.testcase-editor textarea{min-height:12rem}.authoring-submit{margin-top:.2rem}
 .authoring-error{padding:.65rem .75rem;border:1px solid #f1c4bc;border-radius:7px;background:#fff0ed;color:#8d2519}
+.authoring-success{padding:.65rem .75rem;border:1px solid #b8e2c5;border-radius:7px;background:#e5f5eb;color:#155c31}
 .voice-controls{display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;margin:.25rem 0}
 .voice-button:disabled{opacity:.68;cursor:wait}.voice-status{margin:0;min-height:1.5em}.voice-privacy{font-size:.86rem;margin:.15rem 0 .8rem}
 .product-flow{display:flex;flex-wrap:wrap;gap:.45rem;list-style:none;margin:1.15rem 0 0;padding:0}
