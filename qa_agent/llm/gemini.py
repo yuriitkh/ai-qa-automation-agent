@@ -6,14 +6,21 @@ from google.genai import types
 
 from ..models import AIDiscoveryResult, QATestPlan
 from .base import LLMProvider
-from .errors import NonRetryableLLMError, RetryableLLMError
+from .errors import (
+    NonRetryableLLMError,
+    RetryableLLMError,
+    provider_http_failure,
+)
 from .json_schema import qa_test_plan_schema
 from .usage_metadata import capture_gemini_usage
 
 
 def _raise_for_gemini_error(error: Exception, operation: str) -> None:
     if isinstance(error, (httpx.TimeoutException, TimeoutError)):
-        raise RetryableLLMError(f"Gemini {operation} timed out.") from error
+        raise RetryableLLMError(
+            f"Gemini {operation} timed out.", category="TIMEOUT",
+            safe_detail="Request timed out",
+        ) from error
 
     status_code = getattr(error, "status_code", None)
     if status_code is None:
@@ -24,15 +31,32 @@ def _raise_for_gemini_error(error: Exception, operation: str) -> None:
             response = getattr(error, "raw_response", None)
         status_code = getattr(response, "status_code", None)
 
-    if status_code in (401, 403, 408, 429) or (
-        isinstance(status_code, int) and status_code >= 500
-    ):
-        raise RetryableLLMError(
-            f"Gemini {operation} failed with HTTP {status_code}."
+    if isinstance(status_code, int):
+        response = getattr(error, "response", None) or getattr(error, "raw_response", None)
+        payload = getattr(error, "body", None)
+        if not isinstance(payload, dict) and response is not None:
+            json_method = getattr(response, "json", None)
+            if callable(json_method):
+                try:
+                    candidate = json_method()
+                except Exception:
+                    candidate = None
+                payload = candidate if isinstance(candidate, dict) else None
+        raise provider_http_failure(
+            "Gemini", status_code, payload=payload,
+            headers=getattr(response, "headers", None),
         ) from error
 
+    if isinstance(error, httpx.RequestError):
+        raise RetryableLLMError(
+            f"Gemini {operation} transport failed.",
+            category="PROVIDER_UNAVAILABLE",
+            safe_detail="Provider unavailable",
+        ) from error
     raise RetryableLLMError(
-        f"Gemini {operation} failed ({type(error).__name__})."
+        f"Gemini {operation} failed.",
+        category="OTHER_PROVIDER_ERROR",
+        safe_detail="Provider request failed",
     ) from error
 
 
@@ -42,10 +66,12 @@ class GeminiProvider(LLMProvider):
         api_key: str | None = None,
         model: str | None = None,
         timeout_seconds: float | None = None,
+        max_output_tokens: int | None = None,
     ) -> None:
         self._api_key = api_key if api_key is not None else os.environ.get("GEMINI_API_KEY")
         self._model = model or os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
         self.model = self._model
+        self.max_output_tokens = max_output_tokens
         http_options = {"retry_options": types.HttpRetryOptions(attempts=0)}
         if timeout_seconds is not None:
             http_options["timeout"] = max(1, round(timeout_seconds * 1000))
@@ -156,6 +182,7 @@ class GeminiProvider(LLMProvider):
                     f"Task: {task}"
                 ),
                 response_format=response_format,
+                **self._generation_config_kwargs(),
             )
             capture_gemini_usage(interaction)
             return QATestPlan.model_validate_json(interaction.output_text)
@@ -173,6 +200,7 @@ class GeminiProvider(LLMProvider):
                        f"URL: {target_url}\nTask: {task}\nPage info: {page_snapshot}"),
                 response_format={"type": "text", "mime_type": "application/json",
                                  "schema": AIDiscoveryResult.model_json_schema()},
+                **self._generation_config_kwargs(),
             )
             capture_gemini_usage(response)
             return AIDiscoveryResult.model_validate_json(response.output_text)
@@ -193,8 +221,14 @@ class GeminiProvider(LLMProvider):
                     "mime_type": "application/json",
                     "schema": schema,
                 },
+                **self._generation_config_kwargs(),
             )
             capture_gemini_usage(response)
             return response.output_text
         except Exception as error:
             _raise_for_gemini_error(error, f"{schema_name} request")
+
+    def _generation_config_kwargs(self) -> dict[str, dict[str, int]]:
+        if self.max_output_tokens is None:
+            return {}
+        return {"generation_config": {"max_output_tokens": self.max_output_tokens}}

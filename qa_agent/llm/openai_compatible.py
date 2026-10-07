@@ -7,7 +7,11 @@ from openai import OpenAI
 
 from ..models import AIDiscoveryResult, QATestPlan
 from .base import LLMProvider
-from .errors import NonRetryableLLMError, RetryableLLMError
+from .errors import (
+    NonRetryableLLMError,
+    RetryableLLMError,
+    provider_http_failure,
+)
 from .json_schema import normalize_strict_json_schema, qa_test_plan_schema
 from .usage_metadata import capture_openai_usage
 
@@ -88,17 +92,60 @@ class OpenAICompatibleProvider(LLMProvider):
                 raise ValueError("empty response")
             return content
         except (httpx.TimeoutException, TimeoutError) as error:
-            raise RetryableLLMError(f"{self.name}: request timed out.") from error
+            raise RetryableLLMError(
+                f"{self.name}: request timed out.", category="TIMEOUT",
+                safe_detail="Request timed out",
+            ) from error
         except httpx.RequestError as error:
-            raise RetryableLLMError(f"{self.name}: transport failed ({type(error).__name__}).") from error
+            raise RetryableLLMError(
+                f"{self.name}: transport failed ({type(error).__name__}).",
+                category="PROVIDER_UNAVAILABLE",
+                safe_detail="Provider unavailable",
+            ) from error
         except Exception as error:
-            # Authentication, rate limits, unsupported schemas, and API failures
-            # may be handled by another configured provider.
             status = getattr(error, "status_code", None)
-            if status is not None or error.__class__.__module__.startswith("openai"):
-                detail = f"HTTP {status}" if status else type(error).__name__
-                raise RetryableLLMError(f"{self.name}: request failed ({detail}).") from error
-            raise RetryableLLMError(f"{self.name}: invalid response ({type(error).__name__}).") from error
+            response = getattr(error, "response", None)
+            if status is None:
+                status = getattr(response, "status_code", None)
+            if isinstance(status, int):
+                body = getattr(error, "body", None)
+                if not isinstance(body, dict) and response is not None:
+                    try:
+                        candidate = response.json()
+                    except Exception:
+                        candidate = None
+                    body = candidate if isinstance(candidate, dict) else None
+                headers = getattr(response, "headers", None)
+                failure = provider_http_failure(
+                    self.name, status, payload=body, headers=headers
+                )
+                raise RetryableLLMError(
+                    f"{self.name}: request failed (HTTP {status}).",
+                    category=failure.category,
+                    http_status=failure.http_status,
+                    safe_detail=failure.safe_detail,
+                    retry_after_seconds=failure.retry_after_seconds,
+                ) from error
+            if error.__class__.__module__.startswith("openai"):
+                category = (
+                    "PROVIDER_UNAVAILABLE"
+                    if "connection" in error.__class__.__name__.casefold()
+                    or "timeout" in error.__class__.__name__.casefold()
+                    else "OTHER_PROVIDER_ERROR"
+                )
+                raise RetryableLLMError(
+                    f"{self.name}: request failed ({error.__class__.__name__}).",
+                    category=category,
+                    safe_detail=(
+                        "Provider unavailable" if category == "PROVIDER_UNAVAILABLE"
+                        else "Provider request failed"
+                    ),
+                ) from error
+            raise RetryableLLMError(
+                f"{self.name}: invalid response ({error.__class__.__name__}).",
+                category="INVALID_RESPONSE",
+                safe_detail="Invalid structured response",
+            ) from error
 
     def create_structured_output(
         self, prompt: str, schema: dict[str, Any], schema_name: str

@@ -2,7 +2,7 @@ import logging
 import re
 import time
 import unicodedata
-from typing import Callable
+from typing import Any, Callable
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -14,7 +14,6 @@ from ..execution_trace import (
     record_safely,
 )
 from ..models import AIDiscoveryResult, QATestPlan
-from ..redaction import safe_failure_reason
 from ..redaction import redact_secrets
 from ..llm_usage import (
     OP_AUTHOR_TESTCASE,
@@ -25,7 +24,14 @@ from ..llm_usage import (
     current_llm_usage_context,
 )
 from .base import LLMProvider
-from .errors import AllProvidersFailedError, NonRetryableLLMError, RetryableLLMError
+from .errors import (
+    AllProvidersFailedError,
+    NonRetryableLLMError,
+    ProviderFailureDetail,
+    RetryableLLMError,
+    category_for_error,
+    failure_detail_for,
+)
 from .usage_metadata import ProviderTokenUsage, capture_provider_usage
 
 logger = logging.getLogger(__name__)
@@ -211,7 +217,7 @@ class LLMRouter:
 
         self._selected_provider_name = None
         self._report_priority(providers)
-        failures: list[str] = []
+        failures: list[ProviderFailureDetail] = []
         unavailable: list[str] = []
         operation_id = str(uuid4())
         usage_context = current_llm_usage_context(OP_GENERATE_AUTOMATION_PLAN)
@@ -245,8 +251,10 @@ class LLMRouter:
                     fallback_from_provider=fallback_from_provider,
                 )
             except RetryableLLMError as error:
-                reason = safe_failure_reason(error)
-                failures.append(f"{provider_name}: {reason}")
+                failure = failure_detail_for(
+                    self._provider_display_name(provider), error
+                )
+                failures.append(failure)
                 fallback_from_provider = self._provider_display_name(provider)
                 self._record_provider_attempt(
                     provider,
@@ -256,10 +264,7 @@ class LLMRouter:
                     started=started,
                 )
                 if index + 1 < len(providers):
-                    print(
-                        f"LLM ROUTER: {provider_name} had a retryable failure "
-                        f"({reason}); trying the next provider."
-                    )
+                    print("LLM ROUTER: provider request failed; trying the next provider.")
             except NonRetryableLLMError as error:
                 self._record_provider_attempt(
                     provider,
@@ -301,7 +306,9 @@ class LLMRouter:
             )
 
         raise RuntimeError(
-            "All LLM providers failed: " + "; ".join(failures)
+            "All LLM providers failed: " + "; ".join(
+                _failure_summary(item) for item in failures
+            )
         )
 
     def create_discovery(self, task: str, target_url: str, page_snapshot: str) -> AIDiscoveryResult:
@@ -310,7 +317,7 @@ class LLMRouter:
         if not providers:
             raise RuntimeError("No LLM providers are configured.")
         self._report_priority(providers)
-        failures = []
+        failures: list[ProviderFailureDetail] = []
         unavailable = []
         operation_id = str(uuid4())
         usage_context = current_llm_usage_context(OP_DISCOVERY)
@@ -341,8 +348,10 @@ class LLMRouter:
                     fallback_from_provider=fallback_from_provider,
                 )
             except RetryableLLMError as error:
-                reason = safe_failure_reason(error)
-                failures.append(f"{name}: {reason}")
+                failure = failure_detail_for(
+                    self._provider_display_name(provider), error
+                )
+                failures.append(failure)
                 fallback_from_provider = self._provider_display_name(provider)
                 self._record_provider_attempt(
                     provider,
@@ -352,10 +361,7 @@ class LLMRouter:
                     started=started,
                 )
                 if index + 1 < len(providers):
-                    print(
-                        f"LLM ROUTER: {name} request failed ({reason}); "
-                        "trying the next provider."
-                    )
+                    print("LLM ROUTER: provider request failed; trying the next provider.")
             except NonRetryableLLMError as error:
                 self._record_provider_attempt(
                     provider,
@@ -391,7 +397,9 @@ class LLMRouter:
                 print(f"Selected provider: {self._selected_provider_name}")
                 return result
         if failures:
-            raise RuntimeError("All LLM providers failed: " + "; ".join(failures))
+            raise RuntimeError("All LLM providers failed: " + "; ".join(
+                _failure_summary(item) for item in failures
+            ))
         raise RuntimeError("No configured LLM providers are available. Unavailable providers: " + ", ".join(unavailable))
 
     def create_structured_output(
@@ -401,6 +409,7 @@ class LLMRouter:
         schema_name: str,
         *,
         progress_callback: Callable[..., None] | None = None,
+        response_validator: Callable[[str], Any] | None = None,
     ) -> str:
         """Route schema-constrained output through the configured provider chain."""
         providers = self._providers
@@ -408,11 +417,11 @@ class LLMRouter:
             raise RuntimeError("No LLM providers are configured.")
         self._selected_provider_name = None
         self._report_priority(providers)
-        failures: list[str] = []
+        failures: list[ProviderFailureDetail] = []
         rate_limited_failures = 0
         timed_out_failures = 0
         unavailable: list[str] = []
-        last_retryable_failure: tuple[str, str] | None = None
+        last_retryable_failure: ProviderFailureDetail | None = None
         operation_id = str(uuid4())
         usage_context = current_llm_usage_context(OP_AUTHOR_TESTCASE)
         if usage_context.operation_type != OP_AUTHOR_TESTCASE:
@@ -430,16 +439,22 @@ class LLMRouter:
                 continue
             display_name = self._provider_display_name(provider)
             if last_retryable_failure is not None:
-                failed_name, category = last_retryable_failure
                 _notify_authoring_progress(
                     progress_callback,
                     "fallback",
-                    failed_name,
+                    last_retryable_failure.provider_name,
                     next_provider=display_name,
-                    category=category,
+                    category=last_retryable_failure.category,
+                    http_status=last_retryable_failure.http_status,
+                    safe_detail=last_retryable_failure.message,
+                    retry_after_seconds=last_retryable_failure.retry_after_seconds,
                 )
                 if usage_context.operation_type == OP_AUTHOR_TESTCASE:
-                    logger.info("LLM authoring fallback: %s", display_name)
+                    logger.info(
+                        "LLM authoring fallback: %s -> %s",
+                        last_retryable_failure.provider_name,
+                        display_name,
+                    )
                 last_retryable_failure = None
             _notify_authoring_progress(
                 progress_callback, "selected", display_name
@@ -451,7 +466,13 @@ class LLMRouter:
             def invoke_structured_output() -> str:
                 value = provider.create_structured_output(prompt, schema, schema_name)
                 if not isinstance(value, str):
-                    raise TypeError("provider structured output must be text")
+                    raise RetryableLLMError(
+                        "Provider returned an invalid structured response.",
+                        category="INVALID_RESPONSE",
+                        safe_detail="Invalid structured response",
+                    )
+                if response_validator is not None:
+                    response_validator(value)
                 return value
 
             try:
@@ -463,20 +484,23 @@ class LLMRouter:
                     fallback_from_provider=fallback_from_provider,
                 )
             except RetryableLLMError as error:
-                reason = safe_failure_reason(error)
-                failures.append(f"{self._provider_observability_name(provider)}: {reason}")
+                failure = failure_detail_for(display_name, error)
+                failures.append(failure)
                 fallback_from_provider = display_name
-                if _is_rate_limit_failure(error):
+                if failure.category == "RATE_LIMIT":
                     rate_limited_failures += 1
-                if _is_timeout_failure(error):
+                if failure.category == "TIMEOUT":
                     timed_out_failures += 1
-                category = _provider_failure_category(error)
                 _notify_authoring_progress(
-                    progress_callback, "failed", display_name, category=category
+                    progress_callback, "failed", display_name,
+                    category=failure.category,
+                    http_status=failure.http_status,
+                    safe_detail=failure.message,
+                    retry_after_seconds=failure.retry_after_seconds,
                 )
                 if usage_context.operation_type == OP_AUTHOR_TESTCASE:
-                    logger.warning("LLM authoring provider failed: %s [%s]", display_name, category)
-                last_retryable_failure = (display_name, category)
+                    _log_authoring_provider_failure(failure)
+                last_retryable_failure = failure
                 self._record_provider_attempt(
                     provider,
                     RequestKind.TEST_CASE_AUTHORING,
@@ -489,12 +513,15 @@ class LLMRouter:
                         "AI provider request failed; trying another configured provider."
                     )
             except NonRetryableLLMError as error:
-                category = _provider_failure_category(error)
+                failure = failure_detail_for(display_name, error)
                 _notify_authoring_progress(
-                    progress_callback, "failed", display_name, category=category
+                    progress_callback, "failed", display_name,
+                    category=failure.category,
+                    http_status=failure.http_status,
+                    safe_detail=failure.message,
                 )
                 if usage_context.operation_type == OP_AUTHOR_TESTCASE:
-                    logger.warning("LLM authoring provider failed: %s [%s]", display_name, category)
+                    _log_authoring_provider_failure(failure)
                 self._record_provider_attempt(
                     provider,
                     RequestKind.TEST_CASE_AUTHORING,
@@ -504,14 +531,20 @@ class LLMRouter:
                 )
                 raise
             except NotImplementedError as error:
+                failure = ProviderFailureDetail(
+                    display_name,
+                    "OTHER_PROVIDER_ERROR",
+                    safe_detail="Structured output is not supported",
+                )
                 _notify_authoring_progress(
                     progress_callback,
                     "failed",
                     display_name,
-                    category="PROVIDER_ERROR",
+                    category=failure.category,
+                    safe_detail=failure.message,
                 )
                 if usage_context.operation_type == OP_AUTHOR_TESTCASE:
-                    logger.warning("LLM authoring provider failed: %s [PROVIDER_ERROR]", display_name)
+                    _log_authoring_provider_failure(failure)
                 self._record_provider_attempt(
                     provider,
                     RequestKind.TEST_CASE_AUTHORING,
@@ -523,12 +556,15 @@ class LLMRouter:
                     f"{self._provider_observability_name(provider)} does not support structured output."
                 ) from error
             except Exception as error:
-                category = _provider_failure_category(error)
+                failure = failure_detail_for(display_name, error)
                 _notify_authoring_progress(
-                    progress_callback, "failed", display_name, category=category
+                    progress_callback, "failed", display_name,
+                    category=failure.category,
+                    http_status=failure.http_status,
+                    safe_detail=failure.message,
                 )
                 if usage_context.operation_type == OP_AUTHOR_TESTCASE:
-                    logger.warning("LLM authoring provider failed: %s [%s]", display_name, category)
+                    _log_authoring_provider_failure(failure)
                 self._record_provider_attempt(
                     provider,
                     RequestKind.TEST_CASE_AUTHORING,
@@ -555,9 +591,10 @@ class LLMRouter:
                 return output
         if failures:
             raise AllProvidersFailedError(
-                "All LLM providers failed: " + "; ".join(failures),
+                "All configured LLM providers failed.",
                 all_rate_limited=(rate_limited_failures == len(failures)),
                 all_timed_out=(timed_out_failures == len(failures)),
+                attempts=tuple(failures),
             )
         raise RuntimeError(
             "No configured LLM providers are available. Unavailable providers: "
@@ -566,49 +603,15 @@ class LLMRouter:
 
 
 def _is_rate_limit_failure(error: Exception) -> bool:
-    status_code = getattr(error, "status_code", None)
-    response = getattr(error, "response", None)
-    if status_code is None and response is not None:
-        status_code = getattr(response, "status_code", None)
-    if status_code == 429:
-        return True
-    message = str(error).casefold()
-    return any(marker in message for marker in (
-        "http 429",
-        "429 rate",
-        "rate limit",
-        "rate limited",
-        "too many requests",
-    ))
+    return category_for_error(error) == "RATE_LIMIT"
 
 
 def _is_timeout_failure(error: Exception) -> bool:
-    current: BaseException | None = error
-    seen: set[int] = set()
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        if isinstance(current, TimeoutError) or "timeout" in type(current).__name__.casefold():
-            return True
-        if "timed out" in str(current).casefold():
-            return True
-        current = current.__cause__ or current.__context__
-    return False
+    return category_for_error(error) == "TIMEOUT"
 
 
 def _provider_failure_category(error: Exception) -> str:
-    if _is_rate_limit_failure(error):
-        return "RATE_LIMIT"
-    if _is_timeout_failure(error):
-        return "TIMEOUT"
-    status = getattr(error, "status_code", None)
-    if status is None:
-        status = getattr(getattr(error, "response", None), "status_code", None)
-    if status is None:
-        match = re.search(r"HTTP\s+(\d{3})", str(error), re.IGNORECASE)
-        status = int(match.group(1)) if match else None
-    if status in {401, 403}:
-        return "AUTHENTICATION"
-    return "PROVIDER_ERROR"
+    return category_for_error(error)
 
 
 def _safe_provider_display_name(value: str) -> str:
@@ -635,33 +638,24 @@ def _safe_provider_display_name(value: str) -> str:
 
 
 def _telemetry_error_category(error: Exception) -> str:
-    current: BaseException | None = error
-    seen: set[int] = set()
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        message = str(current).casefold()
-        if isinstance(current, TimeoutError) or "timeout" in type(current).__name__.casefold() or "timed out" in message:
-            return "TIMEOUT"
-        if any(marker in message for marker in ("http 429", "rate limit", "too many requests")):
-            return "RATE_LIMIT"
-        status = getattr(current, "status_code", None)
-        if status is None:
-            status = getattr(getattr(current, "response", None), "status_code", None)
-        if status is None:
-            match = re.search(r"HTTP\s+(\d{3})", message, re.IGNORECASE)
-            status = int(match.group(1)) if match else None
-        if status in {401, 403}:
-            return "AUTH_ERROR"
-        if status in {408, 429}:
-            return "TIMEOUT" if status == 408 else "RATE_LIMIT"
-        if isinstance(status, int) and status >= 500:
-            return "PROVIDER_UNAVAILABLE"
-        if any(marker in message for marker in ("invalid", "schema", "parse", "json")):
-            return "INVALID_OUTPUT"
-        if "unavailable" in message or "not configured" in message:
-            return "PROVIDER_UNAVAILABLE"
-        current = current.__cause__ or current.__context__
-    return "OTHER"
+    return category_for_error(error)
+
+
+def _failure_summary(failure: ProviderFailureDetail) -> str:
+    status = f" HTTP {failure.http_status}" if failure.http_status else ""
+    return f"{failure.provider_name} [{failure.category}]{status}"
+
+
+def _log_authoring_provider_failure(failure: ProviderFailureDetail) -> None:
+    status = f" HTTP {failure.http_status}" if failure.http_status else ""
+    retry = (
+        f" retry-after={failure.retry_after_seconds}s"
+        if failure.retry_after_seconds is not None else ""
+    )
+    logger.warning(
+        "LLM authoring provider failed: %s [%s]%s%s",
+        failure.provider_name, failure.category, status, retry,
+    )
 
 
 def _notify_authoring_progress(
@@ -671,6 +665,9 @@ def _notify_authoring_progress(
     *,
     next_provider: str | None = None,
     category: str | None = None,
+    http_status: int | None = None,
+    safe_detail: str | None = None,
+    retry_after_seconds: int | None = None,
 ) -> None:
     if callback is None:
         return
@@ -680,6 +677,9 @@ def _notify_authoring_progress(
             provider,
             next_provider=next_provider,
             category=category,
+            http_status=http_status,
+            safe_detail=safe_detail,
+            retry_after_seconds=retry_after_seconds,
         )
     except Exception as error:
         logger.warning(

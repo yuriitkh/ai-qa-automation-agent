@@ -6,13 +6,28 @@ from ..models import QATestStep
 
 
 def normalize_strict_json_schema(schema: dict[str, Any]) -> dict[str, Any]:
-    """Copy a schema and close every object schema for strict structured output."""
+    """Return the strict-schema form expected by OpenAI-compatible endpoints.
+
+    Strict JSON Schema mode requires every declared object property to appear
+    in ``required`` and every object to reject additional properties. Optional
+    application fields remain nullable where their source schema permits it;
+    local Pydantic validation still defines the authoritative output contract.
+    Defaults are annotations and are not part of the request contract.
+    """
     normalized = deepcopy(schema)
 
     def visit(value: Any) -> None:
         if isinstance(value, dict):
             if value.get("type") == "object" or "properties" in value:
                 value["additionalProperties"] = False
+                properties = value.get("properties")
+                if isinstance(properties, dict):
+                    existing = value.get("required", [])
+                    required = list(existing) if isinstance(existing, list) else []
+                    value["required"] = list(dict.fromkeys(
+                        [*required, *properties.keys()]
+                    ))
+            value.pop("default", None)
             for child in value.values():
                 visit(child)
         elif isinstance(value, list):

@@ -80,8 +80,7 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(second.calls, [expected_context])
         self.assertEqual(router.selected_provider_name, "RecordingProvider")
         self.assertIn(
-            "LLM ROUTER: RetryableProvider had a retryable failure "
-            "(temporary provider failure); trying the next provider.",
+            "LLM ROUTER: provider request failed; trying the next provider.",
             output.getvalue(),
         )
 
@@ -244,7 +243,7 @@ class RouterTests(unittest.TestCase):
                     self.task, self.target_url, self.snapshot
                 )
 
-        self.assertIn("HTTP 503 response included [REDACTED]", output.getvalue())
+        self.assertIn("LLM ROUTER: provider request failed; trying the next provider.", output.getvalue())
         self.assertNotIn(secret, output.getvalue())
 
     def test_missing_gemini_key_uses_configured_groq_provider(self) -> None:
@@ -515,19 +514,31 @@ class MultiProviderFallbackTests(unittest.TestCase):
             with (
                 patch.object(
                     router._providers[0], "create_test_plan",
-                    side_effect=RetryableLLMError("OpenAI quota exceeded 429"),
+                    side_effect=RetryableLLMError(
+                        "safe rate limit", category="RATE_LIMIT", http_status=429,
+                        safe_detail="Rate limited",
+                    ),
                 ),
                 patch.object(
                     router._providers[1], "create_test_plan",
-                    side_effect=RetryableLLMError("Gemini unavailable 503"),
+                    side_effect=RetryableLLMError(
+                        "safe unavailable", category="PROVIDER_UNAVAILABLE", http_status=503,
+                        safe_detail="Provider unavailable",
+                    ),
                 ),
                 patch.object(
                     router._providers[2], "create_test_plan",
-                    side_effect=RetryableLLMError("OpenRouter gateway timeout 504"),
+                    side_effect=RetryableLLMError(
+                        "safe timeout", category="TIMEOUT", http_status=504,
+                        safe_detail="Request timed out",
+                    ),
                 ),
                 patch.object(
                     router._providers[3], "create_test_plan",
-                    side_effect=RetryableLLMError("Groq internal error 500"),
+                    side_effect=RetryableLLMError(
+                        "safe unavailable", category="PROVIDER_UNAVAILABLE", http_status=500,
+                        safe_detail="Provider unavailable",
+                    ),
                 ),
                 redirect_stdout(io.StringIO()),
             ):
@@ -536,10 +547,10 @@ class MultiProviderFallbackTests(unittest.TestCase):
 
             error_message = str(context.exception)
             self.assertIn("All LLM providers failed", error_message)
-            self.assertIn("OpenAI quota exceeded 429", error_message)
-            self.assertIn("Gemini unavailable 503", error_message)
-            self.assertIn("OpenRouter gateway timeout 504", error_message)
-            self.assertIn("Groq internal error 500", error_message)
+            self.assertIn("OpenAI [RATE_LIMIT] HTTP 429", error_message)
+            self.assertIn("Gemini [PROVIDER_UNAVAILABLE] HTTP 503", error_message)
+            self.assertIn("OpenRouter [TIMEOUT] HTTP 504", error_message)
+            self.assertIn("Groq [PROVIDER_UNAVAILABLE] HTTP 500", error_message)
             self.assertIsNone(router.selected_provider_name)
 
     def test_scenario_e_custom_provider_order_is_followed(self) -> None:
@@ -618,7 +629,7 @@ class MultiProviderFallbackTests(unittest.TestCase):
             with (
                 patch.object(
                     router._providers[0], "create_test_plan",
-                    side_effect=RetryableLLMError("OpenAI 429"),
+                    side_effect=RetryableLLMError("OpenAI 429", category="RATE_LIMIT", http_status=429),
                 ),
                 patch.object(
                     router._providers[1], "create_test_plan",
@@ -637,7 +648,7 @@ class MultiProviderFallbackTests(unittest.TestCase):
             self.assertIn("2. GeminiProvider [AVAILABLE]", output)
             self.assertIn("3. openrouter [AVAILABLE]", output)
             self.assertIn("4. GroqProvider [AVAILABLE]", output)
-            self.assertIn("had a retryable failure (OpenAI 429); trying the next provider.", output)
+            self.assertIn("LLM ROUTER: provider request failed; trying the next provider.", output)
             self.assertIn("Selected provider: GeminiProvider", output)
 
     def test_non_retryable_error_halts_fallback_immediately(self) -> None:

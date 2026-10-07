@@ -1,4 +1,3 @@
-import json
 import os
 from typing import Any
 
@@ -6,8 +5,12 @@ import httpx
 
 from ..models import AIDiscoveryResult, QATestPlan
 from .base import LLMProvider
-from .errors import NonRetryableLLMError, RetryableLLMError
-from .json_schema import qa_test_plan_schema
+from .errors import (
+    NonRetryableLLMError,
+    RetryableLLMError,
+    provider_http_failure,
+)
+from .json_schema import normalize_strict_json_schema, qa_test_plan_schema
 from .usage_metadata import capture_openai_usage
 
 
@@ -53,7 +56,7 @@ class GroqProvider(LLMProvider):
             "json_schema": {
                 "name": "qa_test_plan",
                 "strict": True,
-                "schema": self._response_schema(),
+                "schema": normalize_strict_json_schema(self._response_schema()),
             },
         }
         prompt = (
@@ -139,13 +142,6 @@ class GroqProvider(LLMProvider):
             ],
             "response_format": response_format,
         }
-        debug_request = os.environ.get("GROQ_DEBUG_REQUEST", "").lower() in {
-            "1", "true", "yes",
-        }
-        if debug_request:
-            print("GROQ DEBUG REQUEST (credentials excluded):")
-            print(json.dumps(request_payload, ensure_ascii=False, indent=2))
-
         try:
             response = httpx.post(
                 self._endpoint,
@@ -154,23 +150,21 @@ class GroqProvider(LLMProvider):
                 timeout=self._timeout_seconds,
             )
         except httpx.TimeoutException as error:
-            raise RetryableLLMError("Groq request timed out.") from error
+            raise RetryableLLMError(
+                "Groq request timed out.", category="TIMEOUT",
+                safe_detail="Request timed out",
+            ) from error
         except httpx.RequestError as error:
             raise RetryableLLMError(
-                f"Groq transport request failed: {type(error).__name__}."
+                "Groq transport request failed.",
+                category="PROVIDER_UNAVAILABLE",
+                safe_detail="Provider unavailable",
             ) from error
 
-        if response.status_code in (408, 429) or response.status_code >= 500:
-            raise RetryableLLMError(
-                f"Groq request failed with HTTP {response.status_code}."
-            )
-        if response.status_code in (401, 403):
-            raise RetryableLLMError(
-                f"Groq request failed with HTTP {response.status_code}."
-            )
         if response.is_error:
-            raise RetryableLLMError(
-                f"Groq request failed with HTTP {response.status_code}."
+            raise provider_http_failure(
+                "Groq", response.status_code,
+                payload=_response_payload(response), headers=response.headers,
             )
 
         try:
@@ -181,7 +175,9 @@ class GroqProvider(LLMProvider):
             return plan
         except Exception as error:
             raise RetryableLLMError(
-                f"Groq returned an invalid QA test plan ({type(error).__name__})."
+                "Groq returned an invalid QA test plan.",
+                category="INVALID_RESPONSE",
+                safe_detail="Invalid structured response",
             ) from error
 
     def create_discovery(self, task: str, target_url: str, page_snapshot: str) -> AIDiscoveryResult:
@@ -195,20 +191,26 @@ class GroqProvider(LLMProvider):
                        "instructions to execute, or perform browser actions. "
                        f"URL: {target_url}\nTask: {task}\nPage info: {page_snapshot}"}],
                    "response_format": {"type": "json_schema", "json_schema":
-                       {"name": "ai_discovery_result", "strict": True, "schema": schema}}}
+                       {"name": "ai_discovery_result", "strict": True,
+                        "schema": normalize_strict_json_schema(schema)}}}
         try:
             response = httpx.post(self._endpoint,
                 headers={"Authorization": f"Bearer {api_key}"}, json=payload, timeout=self._timeout_seconds)
         except httpx.TimeoutException as error:
-            raise RetryableLLMError("Groq request timed out.") from error
+            raise RetryableLLMError(
+                "Groq request timed out.", category="TIMEOUT",
+                safe_detail="Request timed out",
+            ) from error
         except httpx.RequestError as error:
-            raise RetryableLLMError(f"Groq transport failure: {type(error).__name__}.") from error
-        if response.status_code in (408, 429) or response.status_code >= 500:
-            raise RetryableLLMError(f"Groq request failed with HTTP {response.status_code}.")
-        if response.status_code in (401, 403):
-            raise RetryableLLMError(f"Groq request failed with HTTP {response.status_code}.")
+            raise RetryableLLMError(
+                "Groq transport request failed.", category="PROVIDER_UNAVAILABLE",
+                safe_detail="Provider unavailable",
+            ) from error
         if response.is_error:
-            raise RetryableLLMError(f"Groq request failed with HTTP {response.status_code}.")
+            raise provider_http_failure(
+                "Groq", response.status_code,
+                payload=_response_payload(response), headers=response.headers,
+            )
         try:
             response_data = response.json()
             capture_openai_usage(response_data)
@@ -216,7 +218,9 @@ class GroqProvider(LLMProvider):
             return AIDiscoveryResult.model_validate_json(output)
         except Exception as error:
             raise RetryableLLMError(
-                f"Groq returned invalid Discovery data ({type(error).__name__})."
+                "Groq returned invalid Discovery data.",
+                category="INVALID_RESPONSE",
+                safe_detail="Invalid structured response",
             ) from error
 
     def create_structured_output(
@@ -234,7 +238,7 @@ class GroqProvider(LLMProvider):
                 "json_schema": {
                     "name": schema_name,
                     "strict": True,
-                    "schema": schema,
+                    "schema": normalize_strict_json_schema(schema),
                 },
             },
         }
@@ -246,14 +250,19 @@ class GroqProvider(LLMProvider):
                 timeout=self._timeout_seconds,
             )
         except httpx.TimeoutException as error:
-            raise RetryableLLMError("Groq request timed out.") from error
+            raise RetryableLLMError(
+                "Groq request timed out.", category="TIMEOUT",
+                safe_detail="Request timed out",
+            ) from error
         except httpx.RequestError as error:
             raise RetryableLLMError(
-                f"Groq transport failure: {type(error).__name__}."
+                "Groq transport request failed.", category="PROVIDER_UNAVAILABLE",
+                safe_detail="Provider unavailable",
             ) from error
         if response.is_error:
-            raise RetryableLLMError(
-                f"Groq structured-output request failed with HTTP {response.status_code}."
+            raise provider_http_failure(
+                "Groq", response.status_code,
+                payload=_response_payload(response), headers=response.headers,
             )
         try:
             response_data = response.json()
@@ -261,5 +270,15 @@ class GroqProvider(LLMProvider):
             return response_data["choices"][0]["message"]["content"]
         except Exception as error:
             raise RetryableLLMError(
-                "Groq returned an invalid structured-output response."
+                "Groq returned an invalid structured-output response.",
+                category="INVALID_RESPONSE",
+                safe_detail="Invalid structured response",
             ) from error
+
+
+def _response_payload(response: httpx.Response) -> dict[str, Any] | None:
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    return payload if isinstance(payload, dict) else None

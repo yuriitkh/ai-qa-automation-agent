@@ -64,6 +64,18 @@ footer{color:var(--muted);font-size:.85rem;padding:1rem 0;border-top:1px solid v
 [data-progress-result-content]{display:flex;align-items:center;gap:1rem;flex-wrap:wrap}
 [data-progress-result-content] p{margin:0}
 .progress-evidence{display:block;margin-top:.2rem;font-size:.9rem;color:var(--muted)}
+.field-error{display:block;color:#8d2519;font-size:.88rem;margin-top:.15rem}.field-error[hidden]{display:none}
+.is-invalid{border-color:#ba3425!important;box-shadow:0 0 0 2px rgba(186,52,37,.12)}
+.provider-diagnostics{display:grid;gap:.22rem;margin:.3rem 0;color:#4e5b6c;font-size:.9rem}.provider-diagnostic strong{color:var(--ink)}
+.actions form,.button-row form{margin:0}.actions{align-items:center}.button-row{display:flex;align-items:center;gap:.4rem;flex-wrap:wrap}.provider-actions{gap:.42rem}
+.inline-form{display:flex;align-items:end;gap:.65rem;flex-wrap:wrap;margin:.65rem 0}.inline-form select{min-width:min(100%,360px)}
+.suite-form .field{margin:.65rem 0}.suite-form>button{margin-top:.35rem}
+.test-case-list{min-width:920px}.test-case-list td{padding:.48rem .58rem}.test-case-actions{display:flex;align-items:center;gap:.35rem;flex-wrap:wrap}.test-case-actions .button{padding:.3rem .52rem;font-size:.9rem}
+.suite-members{list-style:none;padding:0;margin:.55rem 0}.suite-member{display:flex;align-items:center;justify-content:space-between;gap:.75rem;padding:.55rem .25rem;border-bottom:1px solid #e7ebf0}.suite-member:last-child{border-bottom:0}.suite-member-main{min-width:0;display:flex;align-items:center;gap:.55rem;flex-wrap:wrap}.suite-member-actions{display:flex;align-items:center;gap:.35rem;flex:none}.suite-member-actions .button{padding:.28rem .5rem;min-width:2.1rem}.suite-member .badge{margin-left:.25rem}
+.suite-toolbar{display:flex;align-items:end;gap:.7rem;flex-wrap:wrap}.suite-toolbar .field{margin:0;min-width:min(100%,360px)}.suite-toolbar .button{margin:0}
+.suite-export-blockers{list-style:none;margin:.55rem 0;padding:0}.suite-export-blocker{padding:.65rem .75rem;margin:.45rem 0;border:1px solid #ead69b;border-radius:8px;background:#fffaf0}.suite-export-blocker p{margin:.1rem 0}.suite-export-blocker .actions{margin:.35rem 0 0}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+@media(max-width:640px){.suite-member{align-items:flex-start;flex-direction:column}.suite-member-actions{align-self:flex-end}.test-case-actions{min-width:150px}}
 """
 
 

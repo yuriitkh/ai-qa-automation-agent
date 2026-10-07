@@ -162,7 +162,7 @@ class TestCaseAuthoringServiceTests(unittest.TestCase):
             with self.assertRaises(TestCaseAuthoringError) as raised:
                 self.generate(provider)
         self.assertNotIn(provider_secret, str(raised.exception))
-        self.assertIn("temporarily unavailable", str(raised.exception))
+        self.assertIn("could not complete the request", str(raised.exception))
 
     def test_prompt_treats_malicious_scenario_as_data_and_keeps_output_contract(self):
         provider = StructuredProvider()

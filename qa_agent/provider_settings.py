@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 from contextlib import contextmanager
+import json
 import os
 import re
 import sqlite3
@@ -17,7 +18,11 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from qa_agent.llm.errors import NonRetryableLLMError
+from qa_agent.llm.errors import (
+    category_for_error,
+    failure_detail_for,
+    RetryableLLMError,
+)
 from qa_agent.llm.router import LLMRouter
 from qa_agent.redaction import register_secret
 from qa_agent.llm_usage import OP_OTHER, llm_usage_scope
@@ -288,12 +293,32 @@ class ProviderView:
     is_custom: bool = False
     base_url: str | None = None
     requires_api_key: bool = True
+    connection_category: str | None = None
+    connection_http_status: int | None = None
+    connection_retry_after_seconds: int | None = None
+    capability_status: str | None = None
+    capability_latency_ms: int | None = None
+    capability_category: str | None = None
+    capability_http_status: int | None = None
+    capability_retry_after_seconds: int | None = None
 
 
 @dataclass(frozen=True)
 class ConnectionTestResult:
     status: str
     latency_ms: int | None = None
+    category: str | None = None
+    http_status: int | None = None
+    retry_after_seconds: int | None = None
+
+
+@dataclass(frozen=True)
+class AuthoringCapabilityTestResult:
+    status: str
+    latency_ms: int | None = None
+    category: str | None = None
+    http_status: int | None = None
+    retry_after_seconds: int | None = None
 
 
 class ProviderSettingsService:
@@ -312,6 +337,7 @@ class ProviderSettingsService:
         self._provider_factory = provider_factory
         self._usage_recorder = usage_recorder
         self._health: dict[str, ConnectionTestResult] = {}
+        self._capability: dict[str, AuthoringCapabilityTestResult] = {}
 
     @property
     def definitions(self) -> dict[str, ProviderDefinition]:
@@ -408,6 +434,7 @@ class ProviderSettingsService:
             status = "DISABLED" if not enabled else "CONFIGURED" if has_configuration else "NOT_CONFIGURED"
             model = str(item.get("model") or self._env(definition.model_env, definition.default_model))
             health = self._health.get(provider_id)
+            capability = self._capability.get(provider_id)
             views.append(ProviderView(
                 provider_id, definition.display_name, enabled, int(item["priority"]), status,
                 {"web": "Web settings", "environment": "Environment variable", "unconfigured": "Not configured", "storage_error": "Credential storage unavailable", "no_key_required": "No API key required"}.get(source, "Not configured"),
@@ -415,6 +442,14 @@ class ProviderSettingsService:
                 health.latency_ms if health else None, definition.is_custom,
                 definition.default_base_url if definition.is_custom else None,
                 definition.requires_api_key,
+                health.category if health else None,
+                health.http_status if health else None,
+                health.retry_after_seconds if health else None,
+                capability.status if capability else None,
+                capability.latency_ms if capability else None,
+                capability.category if capability else None,
+                capability.http_status if capability else None,
+                capability.retry_after_seconds if capability else None,
             ))
         return views
 
@@ -441,6 +476,7 @@ class ProviderSettingsService:
                 if model is not None:
                     item["model"] = model or None
                 self._save_ordered(items)
+                self._clear_diagnostics(provider_id)
                 return
         raise ValueError("Unknown provider.")
 
@@ -503,7 +539,7 @@ class ProviderSettingsService:
         if model is not None:
             item["model"] = _validate_model(model, required=True)
         self.repository.save_custom(item)
-        self._health.pop(provider_id, None)
+        self._clear_diagnostics(provider_id)
 
     def delete_custom(self, provider_id: str) -> None:
         item = self._custom_item(provider_id)
@@ -512,7 +548,7 @@ class ProviderSettingsService:
         if bool(item["key_configured"]):
             self.secret_store.delete(provider_id)
         self.repository.delete_custom(provider_id)
-        self._health.pop(provider_id, None)
+        self._clear_diagnostics(provider_id)
         self._save_ordered([entry for entry in self._ordered_settings() if entry["provider_id"] != provider_id])
 
     def _custom_item(self, provider_id: str) -> dict[str, object]:
@@ -536,7 +572,7 @@ class ProviderSettingsService:
         if custom is not None:
             custom["key_configured"] = True
             self.repository.save_custom(custom)
-        self._health.pop(provider_id, None)
+        self._clear_diagnostics(provider_id)
 
     def remove_key(self, provider_id: str) -> None:
         if provider_id not in self.definitions:
@@ -546,7 +582,7 @@ class ProviderSettingsService:
         if custom is not None:
             custom["key_configured"] = False
             self.repository.save_custom(custom)
-        self._health.pop(provider_id, None)
+        self._clear_diagnostics(provider_id)
 
     def create_router(self, *, usage_recorder=None) -> LLMRouter:
         return LLMRouter(
@@ -557,13 +593,20 @@ class ProviderSettingsService:
     def refresh_router(self, router: LLMRouter) -> None:
         router.replace_providers(self._build_providers())
 
-    def _build_providers(self, *, only_provider: str | None = None, timeout: float | None = None):
+    def _build_providers(
+        self,
+        *,
+        only_provider: str | None = None,
+        timeout: float | None = None,
+        max_output_tokens: int | None = None,
+    ):
         from qa_agent.llm.gemini import GeminiProvider
         from qa_agent.llm.groq import GroqProvider
         from qa_agent.llm.openai_compatible import OpenAICompatibleProvider
 
         items = self._settings()
         result = []
+        output_limit = max_output_tokens or (64 if timeout else None)
         for item in items:
             provider_id = str(item["provider_id"])
             if only_provider is not None and provider_id != only_provider:
@@ -576,13 +619,19 @@ class ProviderSettingsService:
             if self._provider_factory is not None:
                 provider = self._provider_factory(provider_id, secret, model, timeout)
             elif provider_id == "gemini":
-                provider = GeminiProvider(api_key=secret, model=model, timeout_seconds=timeout)
+                provider = GeminiProvider(
+                    api_key=secret, model=model, timeout_seconds=timeout,
+                    max_output_tokens=output_limit,
+                )
             elif provider_id == "groq":
-                provider = GroqProvider(api_key=secret, model=model, timeout_seconds=timeout, max_output_tokens=64 if timeout else None)
+                provider = GroqProvider(
+                    api_key=secret, model=model, timeout_seconds=timeout,
+                    max_output_tokens=output_limit,
+                )
             elif definition.is_custom:
                 provider = OpenAICompatibleProvider(
                     provider_id, "", model, definition.default_base_url,
-                    max_output_tokens=64 if timeout else None, api_key=secret or "",
+                    max_output_tokens=output_limit, api_key=secret or "",
                     timeout_seconds=timeout, display_name=definition.display_name,
                     allow_missing_api_key=not definition.requires_api_key,
                 )
@@ -590,7 +639,7 @@ class ProviderSettingsService:
                 base_url = self._env(definition.base_url_env, definition.default_base_url or "") if definition.base_url_env else None
                 provider = OpenAICompatibleProvider(
                     provider_id, definition.env_key, model, base_url,
-                    max_output_tokens=64 if timeout else None, api_key=secret, timeout_seconds=timeout,
+                    max_output_tokens=output_limit, api_key=secret, timeout_seconds=timeout,
                 )
                 provider.display_name = definition.display_name
             if definition.is_custom:
@@ -609,14 +658,16 @@ class ProviderSettingsService:
             result = ConnectionTestResult("configuration_invalid")
             self._health[provider_id] = result
             return result
-        setting = next(item for item in self._settings() if item["provider_id"] == provider_id)
-        model = str(setting.get("model") or self._env(definition.model_env, definition.default_model))
-        if not model:
+        try:
+            provider = self._build_providers(
+                only_provider=provider_id, timeout=timeout_seconds,
+                max_output_tokens=64,
+            )[0]
+        except Exception:
             result = ConnectionTestResult("configuration_invalid")
             self._health[provider_id] = result
             return result
         try:
-            provider = self._build_providers(only_provider=provider_id, timeout=timeout_seconds)[0]
             if not provider.is_available:
                 result = ConnectionTestResult("configuration_invalid")
             else:
@@ -628,12 +679,76 @@ class ProviderSettingsService:
                         'Return only {"ok":true}.',
                         {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"], "additionalProperties": False},
                         "connection_test",
+                        response_validator=_validate_connection_response,
                     )
-                result = ConnectionTestResult("connected", round((time.perf_counter() - started) * 1000))
+                result = ConnectionTestResult(
+                    "connected",
+                    round((time.perf_counter() - started) * 1000),
+                )
         except Exception as error:
-            result = ConnectionTestResult(_classify_connection_error(error))
+            failure = failure_detail_for(definition.display_name, error)
+            result = ConnectionTestResult(
+                _connection_status(failure.category),
+                category=failure.category,
+                http_status=failure.http_status,
+                retry_after_seconds=failure.retry_after_seconds,
+            )
         self._health[provider_id] = result
         return result
+
+    def test_authoring_capability(
+        self, provider_id: str, *, timeout_seconds: float = 12.0
+    ) -> AuthoringCapabilityTestResult:
+        """Exercise the authoring schema, parser, model, and endpoint, without saving a case."""
+        if provider_id not in self.definitions:
+            return AuthoringCapabilityTestResult("not_configured")
+        definition = self.definitions[provider_id]
+        secret, source = self._credential(provider_id)
+        if source == "storage_error" or (not secret and definition.requires_api_key):
+            result = AuthoringCapabilityTestResult("not_configured")
+            self._capability[provider_id] = result
+            return result
+        try:
+            provider = self._build_providers(
+                only_provider=provider_id,
+                timeout=timeout_seconds,
+                max_output_tokens=256,
+            )[0]
+        except Exception:
+            result = AuthoringCapabilityTestResult("not_configured")
+            self._capability[provider_id] = result
+            return result
+        if not provider.is_available:
+            result = AuthoringCapabilityTestResult("not_configured")
+            self._capability[provider_id] = result
+            return result
+
+        from qa_agent.test_case_authoring import TestCaseAuthoringService
+
+        started = time.perf_counter()
+        try:
+            with llm_usage_scope(operation_type=OP_OTHER):
+                TestCaseAuthoringService(
+                    LLMRouter([provider], usage_recorder=self._usage_recorder)
+                ).test_authoring_capability()
+            result = AuthoringCapabilityTestResult(
+                "passed", round((time.perf_counter() - started) * 1000)
+            )
+        except Exception as error:
+            failure = failure_detail_for(definition.display_name, error)
+            result = AuthoringCapabilityTestResult(
+                "failed",
+                round((time.perf_counter() - started) * 1000),
+                category=failure.category,
+                http_status=failure.http_status,
+                retry_after_seconds=failure.retry_after_seconds,
+            )
+        self._capability[provider_id] = result
+        return result
+
+    def _clear_diagnostics(self, provider_id: str) -> None:
+        self._health.pop(provider_id, None)
+        self._capability.pop(provider_id, None)
 
     def _save_ordered(self, items: list[dict[str, object]]) -> None:
         custom_ids = {str(item["provider_id"]) for item in self.repository.get_custom_all()}
@@ -706,32 +821,35 @@ def validate_custom_base_url(value: str) -> str:
 
 
 def _classify_connection_error(error: Exception) -> str:
-    chain: list[Exception] = []
-    current: Exception | None = error
-    while current is not None and current not in chain:
-        chain.append(current)
-        current = current.__cause__ or current.__context__
-    if any(isinstance(item, (TimeoutError, httpx.TimeoutException)) or "timeout" in type(item).__name__.lower() for item in chain):
-        return "timeout"
-    statuses = []
-    for item in chain:
-        status = getattr(item, "status_code", None)
-        if status is None:
-            response = getattr(item, "response", None)
-            status = getattr(response, "status_code", None)
-        if isinstance(status, int):
-            statuses.append(status)
-        match = re.search(r"HTTP\s+(\d{3})", str(item), re.IGNORECASE)
-        if match:
-            statuses.append(int(match.group(1)))
-    if any(status in {401, 403} for status in statuses):
-        return "authentication_failed"
-    if 429 in statuses:
-        return "rate_limited"
-    if any(status >= 500 for status in statuses):
-        return "provider_unavailable"
-    if any(status in {400, 404, 422} for status in statuses):
-        return "configuration_invalid"
-    if any(isinstance(item, (ValueError, NonRetryableLLMError)) for item in chain):
-        return "configuration_invalid"
-    return "provider_unavailable"
+    return _connection_status(category_for_error(error))
+
+
+def _connection_status(category: str) -> str:
+    return {
+        "AUTH_ERROR": "authentication_failed",
+        "MODEL_NOT_FOUND": "model_not_found",
+        "INVALID_REQUEST": "configuration_invalid",
+        "RATE_LIMIT": "rate_limited",
+        "TIMEOUT": "timeout",
+        "SCHEMA_ERROR": "schema_error",
+        "INVALID_RESPONSE": "invalid_response",
+        "PROVIDER_UNAVAILABLE": "provider_unavailable",
+        "OTHER_PROVIDER_ERROR": "other_error",
+    }.get(category, "provider_unavailable")
+
+
+def _validate_connection_response(raw: str) -> None:
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError) as error:
+        raise RetryableLLMError(
+            "Provider returned an invalid connection response.",
+            category="INVALID_RESPONSE",
+            safe_detail="Invalid structured response",
+        ) from error
+    if not isinstance(value, dict) or set(value) != {"ok"} or value.get("ok") is not True:
+        raise RetryableLLMError(
+            "Provider returned an invalid connection response.",
+            category="INVALID_RESPONSE",
+            safe_detail="Invalid structured response",
+        )

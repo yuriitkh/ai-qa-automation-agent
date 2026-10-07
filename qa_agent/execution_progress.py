@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from qa_agent.models import TestCase, TestStep
 from qa_agent.presentation import failure_message
 from qa_agent.redaction import redact_secrets
+from qa_agent.llm.errors import ProviderFailureDetail, SAFE_FAILURE_DETAILS
 from qa_agent.run_context import RunContext
 from qa_agent.test_plan_validation import PlanValidationIssue
 
@@ -301,6 +302,7 @@ class AuthoringProgressSnapshot(BaseModel):
     success: bool | None = None
     error_category: str | None = None
     error_message: str | None = None
+    provider_failures: tuple[ProviderFailureDetail, ...] = ()
     review_url: str | None = None
 
     @model_validator(mode="after")
@@ -343,6 +345,9 @@ class AuthoringProgressSnapshot(BaseModel):
             "success": self.success,
             "error_category": self.error_category,
             "error_message": self.error_message,
+            "provider_failures": [
+                failure.to_public_dict() for failure in self.provider_failures
+            ],
             "review_url": self.review_url,
         }
 
@@ -365,6 +370,7 @@ class _AuthoringProgressRecord:
     success: bool | None = None
     error_category: str | None = None
     error_message: str | None = None
+    provider_failures: tuple[ProviderFailureDetail, ...] = ()
     review_url: str | None = None
 
 
@@ -543,6 +549,7 @@ class ExecutionProgressStore:
         review_url: str | None = None,
         error_category: str | None = None,
         error_message: str | None = None,
+        provider_failures: tuple[ProviderFailureDetail, ...] = (),
     ) -> None:
         with self._lock:
             record = self._require_authoring_record(progress_id)
@@ -573,6 +580,7 @@ class ExecutionProgressStore:
             record.success = success
             record.error_category = error_category
             record.error_message = redact_secrets(error_message) if error_message else None
+            record.provider_failures = tuple(provider_failures[:8])
             record.review_url = review_url
 
     def register_test_case(
@@ -986,6 +994,7 @@ class ExecutionProgressStore:
             success=record.success,
             error_category=record.error_category,
             error_message=record.error_message,
+            provider_failures=record.provider_failures,
             review_url=record.review_url,
         )
 
@@ -1057,23 +1066,40 @@ class AuthoringProgressReporter:
         *,
         next_provider: str | None = None,
         category: str | None = None,
+        http_status: int | None = None,
+        safe_detail: str | None = None,
+        retry_after_seconds: int | None = None,
     ) -> None:
         provider = _safe_provider_display_name(provider)
         next_provider = (
             _safe_provider_display_name(next_provider) if next_provider else None
         )
-        category = category if category in {
-            "RATE_LIMIT", "TIMEOUT", "AUTHENTICATION", "PROVIDER_ERROR"
-        } else "PROVIDER_ERROR"
+        category = category if category in SAFE_FAILURE_DETAILS else "OTHER_PROVIDER_ERROR"
+        safe_detail = (
+            safe_detail if safe_detail in SAFE_FAILURE_DETAILS.values()
+            or safe_detail in {
+                "Response did not match the TestCase schema",
+                "Response did not contain a complete TestCase structure",
+                "Structured output is not supported",
+            }
+            else SAFE_FAILURE_DETAILS[category]
+        )
+        status = f" HTTP {http_status}" if isinstance(http_status, int) else ""
+        retry = (
+            f" Try again in {retry_after_seconds} seconds."
+            if category == "RATE_LIMIT" and isinstance(retry_after_seconds, int)
+            and retry_after_seconds > 0 else " Try again later."
+            if category == "RATE_LIMIT" else ""
+        )
         if event == "selected":
             event_type = AuthoringEventType.LLM_PROVIDER_SELECTED
             message = f"Provider: {provider}"
         elif event == "failed":
             event_type = AuthoringEventType.LLM_PROVIDER_FAILED
-            message = f"{provider} unavailable [{category}]."
+            message = f"{provider} failed: {safe_detail} [{category}{status}].{retry}"
         elif event == "fallback" and next_provider:
             event_type = AuthoringEventType.LLM_PROVIDER_FALLBACK
-            message = f"{provider} unavailable. Trying {next_provider}..."
+            message = f"{provider} failed [{category}{status}]. Trying {next_provider}..."
         elif event == "completed":
             event_type = AuthoringEventType.LLM_PROVIDER_COMPLETED
             message = f"Completed with {provider}."
@@ -1089,11 +1115,18 @@ class AuthoringProgressReporter:
     def finish_success(self, review_url: str) -> None:
         self._store.finish_authoring(self.progress_id, review_url=review_url)
 
-    def finish_failure(self, category: str, message: str) -> None:
+    def finish_failure(
+        self,
+        category: str,
+        message: str,
+        *,
+        provider_failures: tuple[ProviderFailureDetail, ...] = (),
+    ) -> None:
         self._store.finish_authoring(
             self.progress_id,
             error_category=category,
             error_message=redact_secrets(message),
+            provider_failures=provider_failures,
         )
 
 

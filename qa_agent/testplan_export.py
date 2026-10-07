@@ -24,8 +24,23 @@ PORTABLE_SCHEMA_VERSION = 1
 EXPORT_FORMAT_VERSION = "1.0"
 
 
+@dataclass(frozen=True)
+class ExportBlocker:
+    """Safe, actionable reason a TestCase cannot be exported yet."""
+
+    test_case_id: UUID
+    public_id: str
+    test_case_name: str
+    step_order: int | None
+    reason: str
+
+
 class TestPlanExportError(ValueError):
     """Safe error that can be shown to a local user without internal details."""
+
+    def __init__(self, message: str, *, blockers: tuple[ExportBlocker, ...] = ()) -> None:
+        self.blockers = blockers
+        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -54,9 +69,17 @@ def _plans_for_case(test_case: TestCase, plan_store: PlanStore) -> ExportableTes
         for step in sorted(segment.steps, key=lambda item: item.order):
             version = plan_store.find(step.id)
             if version is None:
+                blocker = ExportBlocker(
+                    test_case_id=test_case.id,
+                    public_id=test_case.public_id or "",
+                    test_case_name=test_case.name,
+                    step_order=step.order + 1,
+                    reason="No executable plan is saved.",
+                )
                 raise TestPlanExportError(
                     f"Automation required before export: {test_case.public_id or test_case.name}, "
-                    f"step {step.order + 1} ({step.name}) has no saved executable plan."
+                    f"step {step.order + 1} ({step.name}) has no saved executable plan.",
+                    blockers=(blocker,),
                 )
             test_plan = plan_store.find_test_plan(step.id)
             if (
@@ -119,8 +142,16 @@ def _plans_for_case(test_case: TestCase, plan_store: PlanStore) -> ExportableTes
                 version=version,
             ))
     if not plans:
+        blocker = ExportBlocker(
+            test_case_id=test_case.id,
+            public_id=test_case.public_id or "",
+            test_case_name=test_case.name,
+            step_order=None,
+            reason="No executable plan is saved.",
+        )
         raise TestPlanExportError(
-            f"Automation required before export: {test_case.public_id or test_case.name} has no steps."
+            f"Automation required before export: {test_case.public_id or test_case.name} has no steps.",
+            blockers=(blocker,),
         )
     return ExportableTestCase(test_case=test_case, plans=tuple(plans))
 

@@ -47,6 +47,81 @@ save the provider response. The page shows only a safe result and optional
 latency. This is an explicit live provider request and may use provider quota;
 automated tests replace adapters with fakes.
 
+**Test authoring capability** sends a small TestCase-shaped request through
+the same schema-constrained adapter and the same parser used by TestCase
+authoring. It does not save a TestCase. A provider is configured when it has a
+credential (or does not need one), but it is verified for authoring only after
+this capability check passes. Connection and capability results are kept in
+memory for the current server process; changing that provider's key, model,
+enabled state, or custom configuration clears the prior results.
+
+The connection and capability checks use the model, base URL, and current key
+resolved by the same provider settings used to build the authoring router. The
+connection check uses a tiny `{"ok": true}` schema. Authoring uses the complete
+TestCase schema and strict response mode. Strict OpenAI-compatible schema mode
+requires every declared object property to be required and optional values to
+be nullable. Groq now sends that normalized schema; OpenRouter and other
+OpenAI-compatible providers use the same normalizer. The application parser
+still validates the returned TestCase structure. Gemini keeps its native JSON
+schema response format and can be limited by provider quota.
+
+Provider cards show three separate facts: configuration, the last connection
+result, and the last authoring capability result. A successful connection does
+not mark authoring as healthy. Failures use safe categories such as
+`AUTH_ERROR`, `MODEL_NOT_FOUND`, `INVALID_REQUEST`, `RATE_LIMIT`, `TIMEOUT`,
+`SCHEMA_ERROR`, `INVALID_RESPONSE`, and `PROVIDER_UNAVAILABLE`. HTTP status and
+numeric `Retry-After` are shown when available. A rate limit without a reset
+value says to try again later; the app does not invent a reset time or retry
+aggressively. During authoring, progress reports the selected provider and
+safe fallback reason. Server logs contain provider names and safe categories,
+never credentials, prompts, or raw provider responses. Providers skipped for
+missing credentials or because they are disabled are not counted as failed
+requests in AI Usage.
+
+API-key fields remain password inputs so pasted values stay obscured. They use
+autocomplete and password-manager hints, and saved keys are never rendered
+back into page HTML. Browser extensions may still choose to show a save prompt
+based on their own heuristics.
+
+### Manual provider diagnostics
+
+These steps send real provider requests and may use quota. Automated tests do
+not call provider APIs. No key is needed for the local demo page itself.
+
+1. Start the local app with `python -m qa_agent.web --database .\\qa_agent.db`.
+2. Open `http://127.0.0.1:8000/settings/providers` and configure Groq using a
+   locally stored or environment key; do not paste a key into a shared log or
+   screenshot.
+3. On the Groq card, select **Test connection** and confirm the Connection
+   result and latency appear.
+4. Select **Test authoring capability** and confirm the Authoring capability
+   result appears independently of Connection.
+5. Repeat both checks for OpenRouter. Add or enable Gemini and repeat when
+   quota is available.
+6. Open **Test Cases → New Test Case**, use the local demo URL
+   `http://127.0.0.1:8000/demo-target/registration`, enter a short scenario,
+   and select **Generate Test with AI**. Confirm progress identifies the active
+   provider and records fallback when one occurs.
+7. If a provider fails, inspect its safe category and HTTP status in the
+   provider card or progress page's **Developer details**. These views omit
+   prompts, keys, and raw responses.
+8. Open **AI Usage** and confirm only actual provider requests count as
+   attempts; skipped unconfigured or disabled providers do not count as failed
+   requests.
+9. Save or replace a key on its provider card. Confirm the input is empty
+   afterward and check whether the browser's password-save prompt is reduced
+   or absent.
+10. Submit the Dashboard or New Test Case form with an empty Website and then
+    a malformed Website; confirm each inline message appears below the field.
+    Submit an empty Scenario and confirm its inline message and preserved
+    values.
+11. Open **Test Cases** and review the compact rows and single-TestCase Export
+    action. Open **Test Suites** and confirm each member uses one compact row
+    with horizontally arranged, keyboard-accessible reorder and remove actions.
+12. Add a TestCase without saved automation to a suite and export it. Confirm
+    the page identifies the TestCase and step, explains that no executable plan
+    is saved, and offers **Open TestCase** and **Back to Test Suite**.
+
 OpenAI-compatible requests set an explicit output cap through `LLM_MAX_OUTPUT_TOKENS`, defaulting to 4096 tokens. This applies to OpenAI, OpenRouter, and configured compatible providers; Gemini's native provider keeps its existing request behavior.
 
 For each routed request, the router reports configured priority and availability. Providers with missing keys are skipped. The first successful provider is selected. Compatible-provider request errors are logged without credentials and allow the router to try the next provider. Existing Gemini and Groq handling is retained, including Gemini's native structured Interactions API.

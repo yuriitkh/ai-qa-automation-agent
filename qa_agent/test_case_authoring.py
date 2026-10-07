@@ -14,7 +14,12 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from qa_agent.llm.errors import AllProvidersFailedError
+from qa_agent.llm.errors import (
+    AllProvidersFailedError,
+    ProviderFailureDetail,
+    RetryableLLMError,
+    category_for_error,
+)
 from qa_agent.llm.router import LLMRouter
 from qa_agent.models import (
     ExecutionSegment,
@@ -23,7 +28,7 @@ from qa_agent.models import (
     TestCase,
     TestStep,
 )
-from qa_agent.llm_usage import OP_AUTHOR_TESTCASE, llm_usage_scope
+from qa_agent.llm_usage import OP_AUTHOR_TESTCASE, OP_OTHER, llm_usage_scope
 
 logger = logging.getLogger(__name__)
 
@@ -188,8 +193,10 @@ class TestCaseAuthoringError(ValueError):
         message: str,
         *,
         category: str = "INVALID_AUTHORING_INPUT",
+        provider_failures: tuple[ProviderFailureDetail, ...] = (),
     ) -> None:
         self.category = category
+        self.provider_failures = provider_failures
         super().__init__(message)
 
 
@@ -200,6 +207,16 @@ class TestCaseAuthoringService:
 
     def __init__(self, router: LLMRouter) -> None:
         self._router = router
+
+    def test_authoring_capability(self) -> None:
+        """Exercise the real authoring schema and parser without saving a case."""
+        with llm_usage_scope(operation_type=OP_OTHER):
+            self._router.create_structured_output(
+                _AUTHORING_CAPABILITY_PROMPT,
+                _AuthoringResponse.model_json_schema(),
+                "test_case_authoring_capability",
+                response_validator=_parse_authoring_response,
+            )
 
     @staticmethod
     def validate_input(
@@ -265,6 +282,12 @@ class TestCaseAuthoringService:
         clean_url = authoring_input.base_url
 
         prompt = _build_prompt(prompt_name, clean_scenario, clean_url)
+        validated_response: _AuthoringResponse | None = None
+
+        def validate_provider_response(raw_output: str) -> None:
+            nonlocal validated_response
+            validated_response = _parse_authoring_response(raw_output)
+
         if progress_callback is not None:
             progress_callback("LLM_REQUEST_STARTED")
         try:
@@ -277,59 +300,49 @@ class TestCaseAuthoringService:
                     _AuthoringResponse.model_json_schema(),
                     "test_case_authoring",
                     progress_callback=provider_progress_callback,
+                    response_validator=validate_provider_response,
                 )
         except Exception as error:
-            # Provider failures can contain arbitrary response text. Keep only
-            # the exception class in logs and return a product-level message.
-            logger.warning("TestCase authoring provider failure (%s)", type(error).__name__)
-            category = (
-                "AI_RATE_LIMIT"
-                if _is_rate_limit_error(error)
-                else "AI_TIMEOUT"
-                if _is_timeout_error(error)
-                else "AI_PROVIDER_ERROR"
-            )
+            failures = error.attempts if isinstance(error, AllProvidersFailedError) else ()
+            failure_categories = {item.category for item in failures}
+            only_invalid_responses = bool(failures) and failure_categories == {"INVALID_RESPONSE"}
+            if only_invalid_responses and all(
+                item.safe_detail == "Response did not contain a complete TestCase structure"
+                for item in failures
+            ):
+                category = "AI_GENERATION_ERROR"
+            elif only_invalid_responses:
+                category = "AI_OUTPUT_VALIDATION_ERROR"
+            else:
+                category = (
+                    "AI_RATE_LIMIT" if failures and failure_categories == {"RATE_LIMIT"}
+                    else "AI_TIMEOUT" if failures and failure_categories == {"TIMEOUT"}
+                    else "AI_RATE_LIMIT" if category_for_error(error) == "RATE_LIMIT"
+                    else "AI_TIMEOUT" if category_for_error(error) == "TIMEOUT"
+                    else "AI_PROVIDER_ERROR"
+                )
             message = (
-                "AI provider rate limit reached. Try again later or use another configured provider."
+                "All configured AI providers are rate limited. Try again later or use manual authoring."
                 if category == "AI_RATE_LIMIT"
-                else "AI provider request timed out. Try again or use another configured provider."
+                else "AI providers timed out. Try again or use manual authoring."
                 if category == "AI_TIMEOUT"
-                else "AI generation is temporarily unavailable. Try again later."
+                else "The AI could not generate a complete TestCase structure. Review the scenario or use manual authoring."
+                if category == "AI_GENERATION_ERROR"
+                else "The AI response did not match the TestCase structure. Try another provider or use manual authoring."
+                if category == "AI_OUTPUT_VALIDATION_ERROR"
+                else "AI providers could not complete the request. Review Developer details or use manual authoring."
             )
+            logger.warning("TestCase authoring provider failure [%s]", category)
             raise TestCaseAuthoringError(
                 message,
                 category=category,
+                provider_failures=failures,
             ) from None
 
         if progress_callback is not None:
             progress_callback("LLM_RESPONSE_RECEIVED")
             progress_callback("TESTCASE_VALIDATION_STARTED")
-        if not isinstance(raw, str) or len(raw) > 64_000:
-            logger.warning("TestCase authoring returned an invalid response size")
-            raise TestCaseAuthoringError(
-                "The AI response could not be converted into a valid TestCase.",
-                category="AI_OUTPUT_VALIDATION_ERROR",
-            )
-        try:
-            response = _AuthoringResponse.model_validate_json(raw)
-        except (ValidationError, ValueError, TypeError) as error:
-            logger.warning("TestCase authoring response validation failed (%s)", type(error).__name__)
-            raise TestCaseAuthoringError(
-                "The AI response could not be converted into a valid TestCase.",
-                category="AI_OUTPUT_VALIDATION_ERROR",
-            ) from None
-        try:
-            if not response.segments or any(not segment.steps for segment in response.segments):
-                raise ValueError("The response must contain at least one step in each segment.")
-            steps = [step for segment in response.segments for step in segment.steps]
-            if not steps or len(steps) > 60 or len(response.segments) > 20:
-                raise ValueError("The response contains an unsupported number of segments or steps.")
-        except (ValueError, TypeError) as error:
-            logger.warning("TestCase authoring proposal was incomplete (%s)", type(error).__name__)
-            raise TestCaseAuthoringError(
-                "The AI could not generate a complete TestCase structure. Try generating again.",
-                category="AI_GENERATION_ERROR",
-            ) from None
+        response = validated_response or _parse_authoring_response(raw)
 
         model_name = _valid_generated_name(response.name, clean_scenario)
         clean_name = supplied_name or model_name or _derive_test_case_name(
@@ -585,3 +598,44 @@ def _build_prompt(name: str, scenario: str, base_url: str) -> str:
         "the schema; the application assigns identity, ordering, and trusted URL values.\n"
         f"USER DATA (JSON): {untrusted}"
     )
+
+
+_AUTHORING_CAPABILITY_PROMPT = (
+    "Return one minimal, realistic TestCase proposal for checking that a web page "
+    "opens and displays its page heading. Use a short name, an empty preconditions "
+    "array, one segment, and one step with a clear action and observable expected "
+    "result. Include every field required by the supplied schema. This is a "
+    "provider capability check; do not browse, execute actions, or include secrets."
+)
+
+
+def _parse_authoring_response(raw: str) -> _AuthoringResponse:
+    """The shared parser and semantic limits used by authoring and capability checks."""
+    if not isinstance(raw, str) or len(raw) > 64_000:
+        raise RetryableLLMError(
+            "Provider returned an invalid structured response.",
+            category="INVALID_RESPONSE",
+            safe_detail="Response did not match the TestCase schema",
+        )
+    try:
+        response = _AuthoringResponse.model_validate_json(raw)
+    except (ValidationError, ValueError, TypeError) as error:
+        raise RetryableLLMError(
+            "Provider returned an invalid structured response.",
+            category="INVALID_RESPONSE",
+            safe_detail="Response did not match the TestCase schema",
+        ) from error
+    steps = [step for segment in response.segments for step in segment.steps]
+    if (
+        not response.segments
+        or any(not segment.steps for segment in response.segments)
+        or not steps
+        or len(steps) > 60
+        or len(response.segments) > 20
+    ):
+        raise RetryableLLMError(
+            "Provider returned an incomplete structured response.",
+            category="INVALID_RESPONSE",
+            safe_detail="Response did not contain a complete TestCase structure",
+        )
+    return response

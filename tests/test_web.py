@@ -182,7 +182,9 @@ class LocalWebApplicationTests(unittest.TestCase):
 
         self.assertEqual(response.status, 400)
         self.assertIn("What do you want to test?", body)
-        self.assertIn("valid HTTP or HTTPS", body)
+        self.assertIn("Enter a valid URL, for example https://example.com", body)
+        self.assertIn('class="field-error"', body)
+        self.assertIn('aria-invalid="true"', body)
         self.assertIn("&lt;script&gt;alert(&#x27;xss&#x27;)&lt;/script&gt;", body)
         self.assertNotIn(scenario, body)
 
@@ -199,8 +201,29 @@ class LocalWebApplicationTests(unittest.TestCase):
         body = response.body.decode("utf-8")
 
         self.assertEqual(response.status, 400)
-        self.assertIn("Enter a natural-language scenario.", body)
+        self.assertIn("Describe what you want to test.", body)
+        self.assertIn('class="field-error"', body)
         self.assertIn("What do you want to test?", body)
+
+    def test_dashboard_empty_website_has_specific_inline_error_and_preserves_scenario(self) -> None:
+        scenario = "Check registration from this local scenario."
+        response = self.app.handle(
+            "POST",
+            "/test-cases/generate",
+            urlencode({
+                "authoring_entry": "dashboard",
+                "base_url": "",
+                "scenario": scenario,
+            }),
+        )
+        body = response.body.decode("utf-8")
+
+        self.assertEqual(response.status, 400)
+        self.assertIn("Enter the website URL you want to test.", body)
+        self.assertIn(scenario, body)
+        self.assertIn('id="dashboard-website-error"', body)
+        self.assertIn('aria-describedby="dashboard-website-error"', body)
+        self.assertIn("novalidate", body)
 
     def test_dashboard_summary_uses_public_run_id_and_friendly_time_duration(self) -> None:
         body = self.app.handle("GET", "/").body.decode("utf-8")

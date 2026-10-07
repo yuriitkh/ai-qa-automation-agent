@@ -140,7 +140,7 @@ class TestCaseAuthoringWebTests(unittest.TestCase):
 
         self.assertEqual(response.status, 400)
         self.assertIn(b"What do you want to test?", response.body)
-        self.assertIn(b"valid HTTP or HTTPS", response.body)
+        self.assertIn(b"Enter a valid URL, for example https://example.com", response.body)
         self.assertEqual(self.provider.prompts, [])
 
     def test_post_redirects_before_provider_finishes_and_progress_refresh_does_not_restart(self):

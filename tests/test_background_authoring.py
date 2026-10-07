@@ -109,8 +109,8 @@ class BackgroundAuthoringTests(unittest.TestCase):
             self.assertEqual(snapshot.provider_name, "Gemini")
             public = json.dumps(snapshot.to_public_dict())
             self.assertIn("Provider: Groq", public)
-            self.assertIn("Groq unavailable [RATE_LIMIT]", public)
-            self.assertIn("Groq unavailable. Trying Gemini...", public)
+            self.assertIn("Groq failed: Rate limited [RATE_LIMIT]", public)
+            self.assertIn("Groq failed [RATE_LIMIT]. Trying Gemini...", public)
             self.assertIn("Completed with Gemini", public)
             self.assertNotIn("private-token", public)
             self.assertNotIn("raw provider response", public)
@@ -190,7 +190,7 @@ class BackgroundAuthoringTests(unittest.TestCase):
         log_text = "\n".join(captured.output)
         self.assertIn("LLM authoring provider selected: Groq", log_text)
         self.assertIn("LLM authoring provider failed: Groq [RATE_LIMIT]", log_text)
-        self.assertIn("LLM authoring fallback: Gemini", log_text)
+        self.assertIn("LLM authoring fallback: Groq -> Gemini", log_text)
         self.assertIn("LLM authoring completed: Gemini", log_text)
         for unsafe in (
             "private-key-never-log",

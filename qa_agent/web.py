@@ -453,9 +453,28 @@ class LocalWebApplication:
                     f'href="{escape_html(snapshot.review_url or "")}">Open Review</a>'
                 )
             else:
+                provider_details = ""
+                if snapshot.provider_failures:
+                    rows = "".join(
+                        '<li>'
+                        + escape_html(
+                            f"{failure.provider_name} — {failure.category}"
+                            + (f" · HTTP {failure.http_status}" if failure.http_status else "")
+                            + f" · {failure.message}"
+                            + (f" · Retry after {failure.retry_after_seconds} seconds"
+                               if failure.retry_after_seconds else "")
+                        )
+                        + '</li>'
+                        for failure in snapshot.provider_failures
+                    )
+                    provider_details = (
+                        '<details class="technical-details"><summary>Developer details</summary>'
+                        f'<ul>{rows}</ul></details>'
+                    )
                 result = (
                     f'<p data-authoring-result-message><strong>{_authoring_error_label(snapshot.error_category)}</strong></p>'
                     f'<p>{escape_html(snapshot.error_message or "An unexpected authoring error occurred.")}</p>'
+                    + provider_details
                 )
                 failure_actions = (
                     '<div class="actions">'
@@ -739,7 +758,7 @@ class LocalWebApplication:
         content = (
             '<header class="page-heading"><h1>' + ("Edit Draft" if editing else "New Draft") + '</h1>'
             '<p class="lead">Drafts stay separate from TestCases, Runs, and Test Suites.</p></header>'
-            + error_html + f'<form method="post" action="{action}" class="panel">'
+            + error_html + f'<form method="post" action="{action}" class="panel" data-inline-validation novalidate>'
             + '<div class="field"><label for="draft-title">Title</label>'
             + f'<input id="draft-title" name="title" maxlength="200" required value="{escape_html(title)}"></div>'
             + '<div class="field"><label for="draft-body">Testing idea / scenario</label>'
@@ -876,7 +895,7 @@ class LocalWebApplication:
         content = (
             '<header class="page-heading"><h1>Create TestCase manually</h1>'
             '<p class="lead">This path does not call an AI provider. You can add more steps after saving.</p></header>'
-            + error_html + '<form method="post" action="/test-cases/manual" class="panel">'
+            + error_html + '<form method="post" action="/test-cases/manual" class="panel" data-inline-validation novalidate>'
             + (f'<input type="hidden" name="source_draft_id" value="{escape_html(source_draft_id)}">' if source_draft_id else "")
             + '<div class="field"><label for="manual-name">TestCase name</label>'
             + f'<input id="manual-name" name="name" maxlength="200" required value="{escape_html(name)}"></div>'
@@ -925,7 +944,7 @@ class LocalWebApplication:
             f'<header class="page-heading"><h1>Edit {escape_html(test_case.name)}</h1>'
             '<p class="lead">Step actions stay inside their existing execution segment.</p></header>'
             + (f'<p class="authoring-error" role="alert">{escape_html(error)}</p>' if error else "")
-            + f'<form method="post" action="/test-cases/{test_case.id}/edit" class="testcase-editor">'
+            + f'<form method="post" action="/test-cases/{test_case.id}/edit" class="testcase-editor" data-inline-validation novalidate>'
             + '<section class="panel"><h2>Definition</h2>'
             + f'<div class="field"><label for="edit-name">Name</label><input id="edit-name" name="name" maxlength="200" value="{value("name", test_case.name)}" required></div>'
             + f'<div class="field"><label for="edit-description">Scenario / description</label><textarea id="edit-description" name="description" maxlength="6000" rows="5" required>{value("description", test_case.description)}</textarea></div>'
@@ -1015,6 +1034,7 @@ class LocalWebApplication:
         }
 
         dashboard_entry = form.get("authoring_entry", [""])[0] == "dashboard"
+        field_errors: dict[str, str] = {}
 
         def error_response(status: int, message: str) -> WebResponse:
             if dashboard_entry:
@@ -1022,11 +1042,20 @@ class LocalWebApplication:
                     authoring_error=message,
                     base_url=values["base_url"],
                     scenario=values["scenario"],
+                    field_errors=field_errors,
                 ))
-            return WebResponse.html(status, self._new_test_case_page(message, **values))
+            return WebResponse.html(status, self._new_test_case_page(
+                message, field_errors=field_errors, **values
+            ))
 
         if form_error is not None:
             return error_response(400, form_error)
+        field_errors = _authoring_field_errors(
+            values["name"], values["base_url"], values["scenario"],
+            require_name=not dashboard_entry,
+        )
+        if field_errors:
+            return error_response(400, "")
         try:
             validated = TestCaseAuthoringService.validate_input(
                 **values,
@@ -1334,7 +1363,9 @@ class LocalWebApplication:
         authoring_error: str | None = None,
         base_url: str = "",
         scenario: str = "",
+        field_errors: dict[str, str] | None = None,
     ) -> str:
+        field_errors = field_errors or {}
         records = self._run_history.list_recent(_PAGE_LIMIT)
         counts = {
             "Total runs": len(records),
@@ -1359,17 +1390,23 @@ class LocalWebApplication:
             if authoring_error else ""
         )
         error_description = ' aria-describedby="authoring-entry-error"' if authoring_error else ""
+        website_error = field_errors.get("base_url")
+        scenario_error = field_errors.get("scenario")
+        website_invalid = _inline_invalid_attrs("dashboard-website-error", website_error)
+        scenario_invalid = _inline_invalid_attrs("dashboard-scenario-error", scenario_error)
         authoring_entry = (
             '<section class="panel authoring-entry" aria-labelledby="authoring-entry-title">'
             '<h2 id="authoring-entry-title">What do you want to test?</h2>'
             '<p class="muted">Describe a web scenario in natural language. AI turns it into a reusable automated test.</p>'
-            '<form method="post" action="/test-cases/generate" data-authoring-form>'
+            '<form method="post" action="/test-cases/generate" data-authoring-form data-inline-validation novalidate>'
             '<input type="hidden" name="authoring_entry" value="dashboard">'
             + entry_error
             + '<div class="field"><label for="dashboard-base-url">Website</label>'
-            + f'<input id="dashboard-base-url" name="base_url" type="url" maxlength="2048" required value="{escape_html(base_url)}" placeholder="https://example.com"{error_description}></div>'
+            + f'<input id="dashboard-base-url" name="base_url" type="url" maxlength="2048" required value="{escape_html(base_url)}" placeholder="https://example.com"{error_description}{website_invalid}></div>'
+            + _inline_error_html("dashboard-website-error", "dashboard-base-url", website_error)
             + '<div class="field"><label for="dashboard-scenario">Scenario</label>'
-            + f'<textarea id="dashboard-scenario" name="scenario" rows="8" maxlength="6000" required placeholder="Describe the behavior you want to verify…"{error_description}>{escape_html(scenario)}</textarea></div>'
+            + f'<textarea id="dashboard-scenario" name="scenario" rows="8" maxlength="6000" required placeholder="Describe the behavior you want to verify…"{error_description}{scenario_invalid}>{escape_html(scenario)}</textarea></div>'
+            + _inline_error_html("dashboard-scenario-error", "dashboard-scenario", scenario_error)
             + self._authoring_voice_controls("dashboard-scenario")
             + '<button class="button primary authoring-submit" type="submit">Generate Test with AI</button>'
             + '</form>'
@@ -1423,23 +1460,31 @@ class LocalWebApplication:
         name: str = "",
         base_url: str = "",
         scenario: str = "",
+        field_errors: dict[str, str] | None = None,
     ) -> str:
+        field_errors = field_errors or {}
         error_html = (
             f'<p class="authoring-error" id="new-case-authoring-error" role="alert">{escape_html(error)}</p>'
             if error else ""
         )
+        name_invalid = _inline_invalid_attrs("case-name-error", field_errors.get("name"))
+        website_invalid = _inline_invalid_attrs("case-website-error", field_errors.get("base_url"))
+        scenario_invalid = _inline_invalid_attrs("case-scenario-error", field_errors.get("scenario"))
         content = (
             '<header class="page-heading"><h1>New Test Case</h1>'
             '<p class="lead">Describe the scenario for AI authoring, or create a TestCase yourself.</p></header>'
-            + '<section class="panel authoring-entry"><form method="post" action="/test-cases/generate" data-authoring-form>'
+            + '<section class="panel authoring-entry"><form method="post" action="/test-cases/generate" data-authoring-form data-inline-validation novalidate>'
             + '<input type="hidden" name="authoring_entry" value="new">'
             + error_html
             + '<div class="field"><label for="case-name">Name</label>'
-            + f'<input id="case-name" name="name" maxlength="200" required value="{escape_html(name)}"></div>'
+            + f'<input id="case-name" name="name" maxlength="200" required value="{escape_html(name)}"{name_invalid}></div>'
+            + _inline_error_html("case-name-error", "case-name", field_errors.get("name"))
             + '<div class="field"><label for="case-base-url">Base URL</label>'
-            + f'<input id="case-base-url" name="base_url" type="url" maxlength="2048" required value="{escape_html(base_url)}" placeholder="https://example.com"></div>'
+            + f'<input id="case-base-url" name="base_url" type="url" maxlength="2048" required value="{escape_html(base_url)}" placeholder="https://example.com"{website_invalid}></div>'
+            + _inline_error_html("case-website-error", "case-base-url", field_errors.get("base_url"))
             + '<div class="field"><label for="case-scenario">Scenario</label>'
-            + f'<textarea id="case-scenario" name="scenario" rows="8" maxlength="6000" required placeholder="Describe the behavior you want to verify…">{escape_html(scenario)}</textarea></div>'
+            + f'<textarea id="case-scenario" name="scenario" rows="8" maxlength="6000" required placeholder="Describe the behavior you want to verify…"{scenario_invalid}>{escape_html(scenario)}</textarea></div>'
+            + _inline_error_html("case-scenario-error", "case-scenario", field_errors.get("scenario"))
             + self._authoring_voice_controls("case-scenario")
             + '<button class="button primary" type="submit">Generate Test with AI</button>'
             + '</form></section>'
@@ -1480,6 +1525,10 @@ class LocalWebApplication:
                 history = grouped.get(test_case_id, [])
                 latest = latest_by_case.get(test_case_id)
                 status = badge(latest.status.value) if latest else badge("NOT RUN")
+                automation_status = badge(
+                    _automation_status_label(self._automation_lifecycle.status(test_case)),
+                    "workflow",
+                )
                 outcome = _outcome_badge(latest) if latest else '<span class="muted">—</span>'
                 last_run = escape_html(format_timestamp(latest.started_at)) if latest else "—"
                 latest_workflow = (
@@ -1496,8 +1545,13 @@ class LocalWebApplication:
                     + f'<td><div class="status-line"><span class="id-code">{escape_html(test_case.public_id or "")}</span>'
                     f'<a href="/test-cases/{test_case_id}">{escape_html(test_case.name)}</a></div>'
                     f'<details><summary>Technical ID</summary><code>{escape_html(test_case_id)}</code></details></td>'
-                    f"<td>{status}</td><td>{outcome}</td><td>{last_run}</td>"
-                    f"<td>{len(history)}</td><td>{latest_workflow}</td></tr>"
+                    f"<td>{automation_status}</td><td>{status}</td><td>{outcome}</td><td>{last_run}</td>"
+                    f"<td>{len(history)}</td><td>{latest_workflow}</td>"
+                    '<td><div class="test-case-actions">'
+                    + f'<a class="button" href="/test-cases/{test_case_id}">Open</a>'
+                    + f'<a class="button" href="/test-cases/{test_case_id}/edit">Edit</a>'
+                    + (f'<a class="button" href="/test-cases/{test_case_id}/export/portable">Export</a>' if self._testplan_exports is not None else "")
+                    + '</div></td></tr>'
                 )
         else:
             for test_case_id, latest in latest_by_case.items():
@@ -1507,17 +1561,19 @@ class LocalWebApplication:
                     f'<td><div class="status-line"><span class="id-code">{escape_html(latest.test_case_public_id or "")}</span>'
                     f'<a href="/test-cases/{test_case_id}">{escape_html(latest.test_case_name)}</a></div>'
                     f'<details><summary>Technical ID</summary><code>{escape_html(test_case_id)}</code></details></td>'
+                    '<td><span class="muted">Unavailable</span></td>'
                     f'<td>{badge(latest.status.value)}</td>'
                     f'<td>{_outcome_badge(latest)}</td>'
                     f'<td>{escape_html(format_timestamp(latest.started_at))}</td>'
                     f'<td>{len(history)}</td>'
                     f'<td>{badge(latest.workflow_type.value, "workflow")}</td>'
+                    f'<td><a class="button" href="/test-cases/{test_case_id}">Open</a></td>'
                     "</tr>"
                 )
         selection_column = '<th scope="col"><label><input type="checkbox" data-select-all> Select visible</label></th>' if self._testplan_exports is not None else ""
         table = (
-            '<div class="table-wrap"><table><thead><tr>' + selection_column + '<th>TestCase</th><th>Latest status</th>'
-            '<th>Latest result</th><th>Last run</th><th>Runs</th><th>Latest workflow</th></tr></thead><tbody>'
+            '<div class="table-wrap"><table class="test-case-list"><thead><tr>' + selection_column + '<th>TestCase</th><th>Automation</th><th>Latest status</th>'
+            '<th>Latest result</th><th>Last run</th><th>Runs</th><th>Latest workflow</th><th>Actions</th></tr></thead><tbody>'
             + "".join(rows)
             + "</tbody></table></div>"
         )
@@ -1612,7 +1668,7 @@ class LocalWebApplication:
             '<header class="page-heading"><h1>Test Suites</h1>'
             '<p class="lead">Group saved TestCases for reusable organization and export.</p></header>'
             '<section class="panel"><h2>Create Test Suite</h2>'
-            '<form method="post" action="/test-suites">'
+            '<form method="post" action="/test-suites" class="suite-form" data-inline-validation novalidate>'
             '<div class="field"><label for="suite-name">Name</label><input id="suite-name" name="name" maxlength="120" required></div>'
             '<div class="field"><label for="suite-description">Description</label><textarea id="suite-description" name="description" maxlength="1000" rows="3"></textarea></div>'
             '<button class="button primary" type="submit">Create suite</button></form></section>'
@@ -1635,14 +1691,18 @@ class LocalWebApplication:
         available = [case for case in (self._test_cases.list() if self._test_cases else []) if case.id not in member_ids]
         member_rows = []
         for index, case in enumerate(members):
+            automation_status = self._automation_lifecycle.status(case)
+            automation_label = _automation_status_label(automation_status)
+            automation_tone = "success" if automation_status == AutomationStatus.AUTOMATION_READY else "workflow"
             member_rows.append(
-                "<li class=\"suite-member\"><span>"
+                '<li class="suite-member"><div class="suite-member-main">'
                 f'<span class="id-code">{escape_html(case.public_id or "")}</span> '
-                f'<a href="/test-cases/{case.id}">{escape_html(case.name)}</a></span>'
-                '<div class="button-row">'
-                + _suite_member_form(suite_id, case.id, "move-up", "Move up", disabled=index == 0)
-                + _suite_member_form(suite_id, case.id, "move-down", "Move down", disabled=index == len(members) - 1)
-                + _suite_member_form(suite_id, case.id, "remove", "Remove")
+                f'<a href="/test-cases/{case.id}">{escape_html(case.name)}</a>'
+                f'{badge(automation_label, automation_tone)}</div>'
+                '<div class="suite-member-actions">'
+                + _suite_member_form(suite_id, case.id, "move-up", "↑", accessible_label=f"Move {case.public_id or case.name} up", disabled=index == 0)
+                + _suite_member_form(suite_id, case.id, "move-down", "↓", accessible_label=f"Move {case.public_id or case.name} down", disabled=index == len(members) - 1)
+                + _suite_member_form(suite_id, case.id, "remove", "Remove", accessible_label=f"Remove {case.public_id or case.name}")
                 + '</div></li>'
             )
         options = "".join(
@@ -1650,7 +1710,7 @@ class LocalWebApplication:
             for case in available
         )
         add_form = (
-            '<form method="post" action="/test-suites/' + str(suite_id) + '/members/add" class="inline-form">'
+            '<form method="post" action="/test-suites/' + str(suite_id) + '/members/add" class="inline-form" data-inline-validation novalidate>'
             '<label for="suite-member">Add TestCase</label><select id="suite-member" name="test_case_id" required>'
             '<option value="">Choose a TestCase</option>' + options
             + '</select><button class="button" type="submit">Add</button></form>'
@@ -1666,7 +1726,7 @@ class LocalWebApplication:
             f'<a class="button" href="/test-suites/{suite_id}/export?format=csharp">C# ZIP</a>'
             '</div></div></section>'
             '<section class="panel"><h2>Edit suite</h2>'
-            f'<form method="post" action="/test-suites/{suite_id}/update">'
+            f'<form method="post" action="/test-suites/{suite_id}/update" class="suite-form" data-inline-validation novalidate>'
             f'<div class="field"><label for="suite-name">Name</label><input id="suite-name" name="name" maxlength="120" required value="{escape_html(suite.name)}"></div>'
             f'<div class="field"><label for="suite-description">Description</label><textarea id="suite-description" name="description" maxlength="1000" rows="3">{escape_html(suite.description)}</textarea></div>'
             '<button class="button" type="submit">Save changes</button></form></section>'
@@ -1733,10 +1793,24 @@ class LocalWebApplication:
         suite = self._test_suites.get(suite_id)
         try:
             ids = self._test_suites.member_ids(suite_id)
-            exports = self._testplan_exports.get_many(ids, preserve_order=True)
             target = query.get("format", ["portable"])[0].casefold()
             if target not in {"portable", "python", "typescript", "csharp"}:
                 raise TestPlanExportError("Choose Portable JSON, Python, TypeScript, or C# export.")
+            exports = []
+            blockers = []
+            for case_id in ids:
+                try:
+                    exports.append(self._testplan_exports.get(case_id))
+                except TestPlanExportError as error:
+                    if not error.blockers:
+                        raise
+                    blockers.extend(error.blockers)
+            if blockers:
+                content = _suite_export_blocker_content(suite_id, tuple(blockers))
+                return WebResponse.html(409, self._page(
+                    "Suite export needs attention", content, current="Test Suites",
+                    breadcrumbs=[("Dashboard", "/"), ("Test Suites", "/test-suites"), (suite.name, f"/test-suites/{suite_id}")],
+                ))
             if target == "portable":
                 content = portable_zip(exports, suite_name=suite.name)
                 filename = f"{_safe_download_slug(suite.name)}-portable.zip"
@@ -2417,6 +2491,9 @@ class LocalWebApplication:
             elif operation == "test_connection":
                 settings.test_connection(provider_id)
                 result = "tested"
+            elif operation == "test_authoring_capability":
+                settings.test_authoring_capability(provider_id)
+                result = "capability_tested"
             elif operation == "delete_custom":
                 if form.get("confirmed", [""])[0] != "yes":
                     raise ValueError("Confirm provider deletion first.")
@@ -2463,6 +2540,7 @@ class LocalWebApplication:
             "key_removed": "Web-managed credential removed.",
             "created": "Custom provider added.",
             "tested": "Connection test finished.",
+            "capability_tested": "Authoring capability check finished; review its result below.",
             "invalid": "This change could not be saved. Review the provider settings.",
             "storage_unavailable": "Secure credential storage is unavailable.",
             "unavailable": "This provider operation could not be completed.",
@@ -2474,16 +2552,19 @@ class LocalWebApplication:
             is_configured = provider.credential_source in {"Web settings", "Environment variable", "No API key required"}
             status_label = "Configured" if is_configured else "Needs configuration"
             status_tone = "success" if is_configured else "warning"
-            health = ""
-            if provider.health:
-                health_label = {
-                    "connected": "Connected", "authentication_failed": "Authentication failed",
-                    "rate_limited": "Rate limited", "provider_unavailable": "Provider unavailable",
-                    "timeout": "Timeout", "configuration_invalid": "Configuration invalid",
-                }.get(provider.health, "Provider unavailable")
-                latency = f' · {provider.latency_ms} ms' if provider.latency_ms is not None else ""
-                health = f'<span class="provider-check" role="status">Last check: {escape_html(health_label + latency)}</span>'
             local_result = ""
+            connection = _provider_diagnostic_html(
+                "Connection", provider.health, provider.connection_category,
+                provider.latency_ms, provider.connection_http_status,
+                provider.connection_retry_after_seconds,
+            )
+            capability = _provider_diagnostic_html(
+                "Authoring capability", provider.capability_status,
+                provider.capability_category, provider.capability_latency_ms,
+                provider.capability_http_status,
+                provider.capability_retry_after_seconds,
+            )
+            health = f'<div class="provider-diagnostics">{connection}{capability}</div>'
             if result_provider == provider.id and result_code in result_messages:
                 local_result = f'<p class="provider-feedback" role="status">{escape_html(result_messages[result_code])}</p>'
             toggle = "disable" if provider.enabled else "enable"
@@ -2517,7 +2598,7 @@ class LocalWebApplication:
                     + f'<input type="hidden" name="operation" value="save_model"><input type="hidden" name="provider_id" value="{provider_id}">'
                 )
             key_action = (
-                f'<form class="provider-key-form" method="post" action="/settings/providers"><input type="hidden" name="provider_id" value="{provider_id}"><input type="hidden" name="operation" value="save_key">'
+                f'<form class="provider-key-form" method="post" action="/settings/providers" autocomplete="off"><input type="hidden" name="provider_id" value="{provider_id}"><input type="hidden" name="operation" value="save_key">'
                 f'<div class="field"><label for="key-{provider_id}">{("Replace" if provider.credential_source == "Web settings" else "Add")} API key</label>'
                 f'<input id="key-{provider_id}" name="api_key" type="password" maxlength="2500" autocomplete="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-form-type="other" required></div>'
                 '<button class="button" type="submit">Save key</button></form>'
@@ -2542,6 +2623,8 @@ class LocalWebApplication:
                 + f'<form method="post" action="/settings/providers"><input type="hidden" name="provider_id" value="{provider_id}">'
                 + '<input type="hidden" name="operation" value="test_connection"><button class="button" type="submit">Test connection</button></form>'
                 + f'<form method="post" action="/settings/providers"><input type="hidden" name="provider_id" value="{provider_id}">'
+                + '<input type="hidden" name="operation" value="test_authoring_capability"><button class="button" type="submit">Test authoring capability</button></form>'
+                + f'<form method="post" action="/settings/providers"><input type="hidden" name="provider_id" value="{provider_id}">'
                 + f'<input type="hidden" name="operation" value="{toggle}"><button class="button" type="submit">{toggle_label}</button></form>'
                 + f'<form method="post" action="/settings/providers"><input type="hidden" name="provider_id" value="{provider_id}">'
                 + f'<input type="hidden" name="operation" value="move_up"><button class="button" aria-label="Move {escape_html(provider.display_name)} up" type="submit"{move_up_disabled}>↑</button></form>'
@@ -2552,15 +2635,27 @@ class LocalWebApplication:
             )
         configured_count = sum(view.credential_source in {"Web settings", "Environment variable", "No API key required"} for view in views)
         enabled_count = sum(view.enabled for view in views)
+        ready_count = sum(
+            view.enabled
+            and view.credential_source in {"Web settings", "Environment variable", "No API key required"}
+            and view.capability_status == "passed"
+            for view in views
+        )
         healthy_count = sum(view.health == "connected" for view in views)
-        attention_count = sum(view.credential_source not in {"Web settings", "Environment variable", "No API key required"} or (view.health is not None and view.health != "connected") for view in views)
+        attention_count = sum(
+            view.credential_source not in {"Web settings", "Environment variable", "No API key required"}
+            or view.capability_status == "failed"
+            or (view.health is not None and view.health != "connected")
+            for view in views
+        )
         summary = (
             '<div class="provider-summary" aria-label="Provider summary">'
             + _summary_card("Configured", str(configured_count))
-            + _summary_card("Enabled", str(enabled_count))
-            + _summary_card("Healthy last check", str(healthy_count))
+            + _summary_card("Enabled providers", str(enabled_count))
+            + _summary_card("Ready for authoring", str(ready_count))
+            + _summary_card("Connection healthy", str(healthy_count))
             + _summary_card("Needs attention", str(attention_count))
-            + '</div><p class="muted summary-caption">Health counts reflect the most recent connection test when available.</p>'
+            + '</div><p class="muted summary-caption">Configured providers have a credential or no-key endpoint. TestCase authoring is verified only after the authoring capability check passes.</p>'
         )
         create_form = (
             '<details class="panel add-provider" id="add-provider"><summary>+ Add provider</summary>'
@@ -2877,6 +2972,37 @@ def _export_error_response(message: str, status: int) -> WebResponse:
     return WebResponse.html(status, '<!doctype html><html lang="en"><meta charset="utf-8"><body>' + body + '</body></html>')
 
 
+def _suite_export_blocker_content(suite_id: UUID, blockers) -> str:
+    unique = {}
+    for blocker in blockers:
+        unique.setdefault(blocker.test_case_id, blocker)
+    rows = []
+    count = len(unique)
+    for blocker in unique.values():
+        identity = blocker.public_id or blocker.test_case_name
+        step = (
+            f'<p>Step {blocker.step_order}</p>'
+            if blocker.step_order is not None else ""
+        )
+        rows.append(
+            '<li class="suite-export-blocker"><p><strong>'
+            f'{escape_html(identity)}</strong> · {escape_html(blocker.test_case_name)}</p>'
+            + step
+            + f'<p>{escape_html(blocker.reason)}</p><div class="actions">'
+            + f'<a class="button" href="/test-cases/{blocker.test_case_id}">Open TestCase</a>'
+            + '</div></li>'
+        )
+    noun = "TestCase is" if count == 1 else "TestCases are"
+    return (
+        '<section class="panel error-state">'
+        '<h1>Suite export needs attention</h1>'
+        f'<p>{count} {noun} not fully automated.</p>'
+        f'<ul class="suite-export-blockers">{"".join(rows)}</ul>'
+        f'<a class="button" href="/test-suites/{suite_id}">Back to Test Suite</a>'
+        '</section>'
+    )
+
+
 def _safe_download_slug(value: str) -> str:
     import re
     import unicodedata
@@ -2886,12 +3012,21 @@ def _safe_download_slug(value: str) -> str:
     return (slug or "test-suite")[:80].rstrip("-._ ")
 
 
-def _suite_member_form(suite_id: UUID, case_id: UUID, operation: str, label: str, *, disabled: bool = False) -> str:
+def _suite_member_form(
+    suite_id: UUID,
+    case_id: UUID,
+    operation: str,
+    label: str,
+    *,
+    accessible_label: str,
+    disabled: bool = False,
+) -> str:
     disabled_attr = " disabled" if disabled else ""
     return (
         f'<form method="post" action="/test-suites/{suite_id}/members/{operation}">'
         f'<input type="hidden" name="test_case_id" value="{case_id}">'
-        f'<button class="button" type="submit"{disabled_attr}>{escape_html(label)}</button></form>'
+        f'<button class="button" type="submit" aria-label="{escape_html(accessible_label)}"'
+        f' title="{escape_html(accessible_label)}"{disabled_attr}>{escape_html(label)}</button></form>'
     )
 
 
@@ -3006,6 +3141,102 @@ def _authoring_error_label(category: str | None) -> str:
     }.get(category or "", "AI GENERATION ERROR")
 
 
+def _provider_diagnostic_html(
+    label: str,
+    status: str | None,
+    category: str | None,
+    latency_ms: int | None,
+    http_status: int | None,
+    retry_after_seconds: int | None,
+) -> str:
+    category_labels = {
+        "AUTH_ERROR": "Authentication failed",
+        "MODEL_NOT_FOUND": "Model unavailable",
+        "INVALID_REQUEST": "Invalid request",
+        "RATE_LIMIT": "Rate limited",
+        "TIMEOUT": "Timed out",
+        "SCHEMA_ERROR": "Invalid structured output",
+        "INVALID_RESPONSE": "Invalid response",
+        "PROVIDER_UNAVAILABLE": "Provider unavailable",
+        "OTHER_PROVIDER_ERROR": "Provider request failed",
+    }
+    if status in {None, "not_configured"}:
+        value = "Not tested"
+    elif status in {"connected", "passed"}:
+        value = "Healthy"
+    elif status == "configuration_invalid":
+        value = "Configuration needs attention"
+    elif status == "failed":
+        value = "Failed"
+    elif status == "authentication_failed":
+        value = "Authentication failed"
+    elif status == "rate_limited":
+        value = "Rate limited"
+    elif status == "timeout":
+        value = "Timed out"
+    elif status == "provider_unavailable":
+        value = "Provider unavailable"
+    else:
+        value = "Failed"
+    if category in category_labels and value not in {"Healthy", "Not tested"}:
+        category_label = category_labels[category]
+        value = (
+            f"Failed · {category_label}"
+            if status == "failed" else category_label
+        )
+    if http_status is not None:
+        value += f" · HTTP {http_status}"
+    if latency_ms is not None:
+        value += f" · {max(0, latency_ms)} ms"
+    if category == "RATE_LIMIT" and retry_after_seconds is not None:
+        value += f" · Try again in {max(1, retry_after_seconds)} seconds"
+    elif category == "RATE_LIMIT":
+        value += " · Try again later"
+    return (
+        '<span class="provider-diagnostic" role="status"><strong>'
+        f'{escape_html(label)}:</strong> {escape_html(value)}</span>'
+    )
+
+
+def _authoring_field_errors(
+    name: str, base_url: str, scenario: str, *, require_name: bool
+) -> dict[str, str]:
+    errors: dict[str, str] = {}
+    if not base_url.strip():
+        errors["base_url"] = "Enter the website URL you want to test."
+    else:
+        try:
+            TestCaseAuthoringService.validate_input(
+                "Validation sample", "Describe a sample behavior.", base_url
+            )
+        except TestCaseAuthoringError:
+            errors["base_url"] = "Enter a valid URL, for example https://example.com"
+    if not scenario.strip() or not any(character.isalnum() for character in scenario):
+        errors["scenario"] = "Describe what you want to test."
+    elif len(scenario) > 6000:
+        errors["scenario"] = "Keep the scenario under 6,000 characters."
+    if require_name and not name.strip():
+        errors["name"] = "Enter a TestCase name."
+    elif len(name.strip()) > 200:
+        errors["name"] = "Keep the TestCase name under 200 characters."
+    return errors
+
+
+def _inline_error_html(error_id: str, control_id: str, error: str | None) -> str:
+    hidden = " hidden" if not error else ""
+    return (
+        f'<span class="field-error" id="{escape_html(error_id)}" '
+        f'data-inline-error data-error-for="{escape_html(control_id)}" '
+        f'role="alert"{hidden}>{escape_html(error or "")}</span>'
+    )
+
+
+def _inline_invalid_attrs(error_id: str, error: str | None) -> str:
+    if not error:
+        return ""
+    return f' class="is-invalid" aria-invalid="true" aria-describedby="{escape_html(error_id)}"'
+
+
 _UI_JAVASCRIPT = r"""
 (() => {
   document.querySelectorAll('[data-select-all]').forEach((master) => {
@@ -3039,6 +3270,83 @@ _UI_JAVASCRIPT = r"""
         if (button.textContent.trim() === 'Start run') button.textContent = 'Starting…';
       });
     }, { once: true });
+  });
+
+  let generatedInlineValidationControlId = 0;
+  document.querySelectorAll('form[data-inline-validation]').forEach((form) => {
+    const controls = [...form.querySelectorAll('input[required], textarea[required], select[required]')];
+    const ruleFor = (control) => control.dataset.validationRule ||
+      (control.name === 'base_url' ? 'website' :
+        control.name === 'scenario' || control.name === 'description' || control.name === 'body' ? 'scenario' : 'required');
+    const errorFor = (control) => {
+      if (!control.id) control.id = `inline-validation-control-${++generatedInlineValidationControlId}`;
+      let error = document.querySelector(`[data-error-for="${CSS.escape(control.id)}"]`);
+      if (!error) {
+        error = document.createElement('span');
+        error.className = 'field-error';
+        error.dataset.inlineError = '';
+        error.dataset.errorFor = control.id;
+        error.id = `${control.id}-error`;
+        error.setAttribute('role', 'alert');
+        (control.closest('.field') || control.parentElement)?.append(error);
+      }
+      return error;
+    };
+    const validate = (control) => {
+      const value = control.value.trim();
+      const rule = ruleFor(control);
+      let message = '';
+      if (rule === 'website') {
+        if (!value) message = 'Enter the website URL you want to test.';
+        else {
+          try {
+            const url = new URL(value);
+            if (!['http:', 'https:'].includes(url.protocol) || !url.hostname || url.username || url.password) {
+              message = 'Enter a valid URL, for example https://example.com';
+            }
+          } catch (_error) {
+            message = 'Enter a valid URL, for example https://example.com';
+          }
+        }
+      } else if (rule === 'scenario') {
+        if (!value || !/[\p{L}\p{N}]/u.test(value)) message = 'Describe what you want to test.';
+      } else if (control.required && !value) {
+        message = 'Complete this field.';
+      }
+      const error = errorFor(control);
+      if (error) {
+        error.textContent = message;
+        error.hidden = !message;
+      }
+      control.classList.toggle('is-invalid', Boolean(message));
+      if (message) {
+        control.setAttribute('aria-invalid', 'true');
+        if (error) control.setAttribute('aria-describedby', error.id);
+      } else {
+        control.removeAttribute('aria-invalid');
+      }
+      return message;
+    };
+    controls.forEach((control) => {
+      const existingError = errorFor(control);
+      if (existingError && !existingError.hidden && existingError.textContent.trim()) {
+        control.classList.add('is-invalid');
+        control.setAttribute('aria-invalid', 'true');
+        control.setAttribute('aria-describedby', existingError.id);
+      }
+      control.addEventListener('input', () => {
+        const error = errorFor(control);
+        if (error && !error.hidden) validate(control);
+      });
+    });
+    form.addEventListener('submit', (event) => {
+      const invalid = controls.find((control) => Boolean(validate(control)));
+      if (invalid) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        invalid.focus();
+      }
+    });
   });
 
   document.querySelectorAll('[data-authoring-form]').forEach((form) => {
@@ -3241,6 +3549,23 @@ _UI_JAVASCRIPT = r"""
         const reason = document.createElement('p');
         reason.textContent = `Reason: ${snapshot.error_message || 'An unexpected authoring error occurred.'}`;
         authoringResultContent.append(heading, reason);
+        if (Array.isArray(snapshot.provider_failures) && snapshot.provider_failures.length) {
+          const details = document.createElement('details');
+          details.className = 'technical-details';
+          const summary = document.createElement('summary');
+          summary.textContent = 'Developer details';
+          const list = document.createElement('ul');
+          snapshot.provider_failures.forEach((failure) => {
+            const item = document.createElement('li');
+            const status = failure.http_status ? ` · HTTP ${failure.http_status}` : '';
+            const retry = failure.retry_after_seconds ?
+              ` · Retry after ${failure.retry_after_seconds} seconds` : '';
+            item.textContent = `${failure.provider} — ${failure.category}${status} · ${failure.message}${retry}`;
+            list.append(item);
+          });
+          details.append(summary, list);
+          authoringResultContent.append(details);
+        }
         const actions = document.createElement('div');
         actions.className = 'actions';
         const addAction = (suffix, label, primary) => {

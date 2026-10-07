@@ -153,6 +153,24 @@ class TestSuiteWebTests(unittest.TestCase):
         self.assertIn("C# Playwright", case_html)
         suites_html = self.app.handle("GET", "/test-suites").body.decode("utf-8")
         self.assertIn("Create Test Suite", suites_html)
+        self.assertIn("Export", list_html)
+
+    def test_suite_members_render_as_compact_accessible_rows_with_lifecycle(self):
+        suite = self.suites.create("Compact rows", "")
+        self.suites.add_member(suite.id, self.case.id)
+        self.cases.save(_case("Other available case"))
+        html = self.app.handle("GET", f"/test-suites/{suite.id}").body.decode("utf-8")
+
+        self.assertIn('class="suite-members"', html)
+        self.assertIn('class="suite-member-main"', html)
+        self.assertIn('class="suite-member-actions"', html)
+        self.assertIn('class="suite-form"', html)
+        self.assertIn("Needs validation", html)
+        self.assertRegex(html, r'aria-label="Move TC-[0-9]+ up"')
+        self.assertRegex(html, r'aria-label="Move TC-[0-9]+ down"')
+        self.assertRegex(html, r'aria-label="Remove TC-[0-9]+"')
+        self.assertIn(".suite-member-actions{display:flex", html)
+        self.assertIn('class="inline-form"', html)
 
     def test_bulk_selection_returns_zip_and_rejects_invalid_ids(self):
         body = urlencode([("test_case_id", str(self.case.id)), ("target", "python")])
@@ -218,12 +236,20 @@ class TestSuiteWebTests(unittest.TestCase):
             self.assertIn('"suite": "Smoke"', manifest)
             self.assertTrue(any(name.endswith(".spec.ts") for name in archive.namelist()))
 
-    def test_missing_automation_has_clear_terminal_export_response(self):
+    def test_missing_automation_has_actionable_suite_export_response(self):
         empty = _case("No plan")
         self.cases.save(empty)
-        response = self.app.handle("GET", f"/test-cases/{empty.id}/export/python")
+        suite = self.suites.create("Needs automation", "")
+        self.suites.add_member(suite.id, empty.id)
+        response = self.app.handle("GET", f"/test-suites/{suite.id}/export?format=python")
         self.assertEqual(response.status, 409)
-        self.assertIn(b"Automation required before export", response.body)
+        self.assertIn(b"Suite export needs attention", response.body)
+        self.assertIn(b"1 TestCase is not fully automated", response.body)
+        self.assertIn((empty.public_id or "").encode(), response.body)
+        self.assertIn(b"Step 1", response.body)
+        self.assertIn(b"No executable plan is saved.", response.body)
+        self.assertIn(f'href="/test-cases/{empty.id}"'.encode(), response.body)
+        self.assertIn(f'href="/test-suites/{suite.id}"'.encode(), response.body)
 
 
 if __name__ == "__main__":

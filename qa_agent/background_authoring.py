@@ -22,12 +22,15 @@ from qa_agent.test_case_authoring import (
 logger = logging.getLogger(__name__)
 
 _SAFE_FAILURES = {
-    "AI_PROVIDER_ERROR": "The AI provider could not complete the request.",
+    "AI_PROVIDER_ERROR": (
+        "AI providers could not complete the request. "
+        "Review Developer details or use manual authoring."
+    ),
     "AI_RATE_LIMIT": (
-        "AI provider rate limit reached. Try again later or use another configured provider."
+        "All configured AI providers are rate limited. Try again later or use manual authoring."
     ),
     "AI_TIMEOUT": (
-        "AI provider request timed out. Try again or use another configured provider."
+        "AI providers timed out. Try again or use manual authoring."
     ),
     "AI_GENERATION_ERROR": "The AI could not generate a complete TestCase structure.",
     "AI_OUTPUT_VALIDATION_ERROR": (
@@ -187,7 +190,11 @@ class BackgroundAuthoringService:
                 category = "AUTHORING_EXECUTION_ERROR"
                 message = _SAFE_FAILURES[category]
             logger.warning("TestCase authoring ended (%s)", category)
-            reporter.finish_failure(category, message)
+            reporter.finish_failure(
+                category,
+                message,
+                provider_failures=error.provider_failures,
+            )
         except Exception as error:
             logger.error("Unexpected authoring failure (%s)", type(error).__name__)
             reporter.finish_failure(
