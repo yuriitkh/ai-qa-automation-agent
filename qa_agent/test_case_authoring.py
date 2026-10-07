@@ -8,11 +8,12 @@ import secrets
 import threading
 import time
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Callable, Mapping
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from qa_agent.llm.errors import AllProvidersFailedError
 from qa_agent.llm.router import LLMRouter
 from qa_agent.models import (
     ExecutionSegment,
@@ -72,6 +73,13 @@ class TestCaseDraft:
     authoring_name: str | None = None
     authoring_scenario: str | None = None
     authoring_base_url: str | None = None
+
+
+@dataclass(frozen=True)
+class AuthoringInput:
+    name: str
+    scenario: str
+    base_url: str
 
 
 @dataclass(frozen=True)
@@ -171,7 +179,12 @@ class TestCaseAuthoringError(ValueError):
 
     __test__ = False
 
-    def __init__(self, message: str, *, category: str = "input") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str = "INVALID_AUTHORING_INPUT",
+    ) -> None:
         self.category = category
         super().__init__(message)
 
@@ -184,24 +197,58 @@ class TestCaseAuthoringService:
     def __init__(self, router: LLMRouter) -> None:
         self._router = router
 
-    def generate(self, name: str, scenario: str, base_url: str) -> TestCaseDraft:
+    @staticmethod
+    def validate_input(name: str, scenario: str, base_url: str) -> AuthoringInput:
         clean_name = name.strip() if isinstance(name, str) else ""
         clean_scenario = scenario.strip() if isinstance(scenario, str) else ""
         clean_url = base_url.strip() if isinstance(base_url, str) else ""
         if not clean_name:
-            raise TestCaseAuthoringError("Enter a TestCase name.")
+            raise TestCaseAuthoringError(
+                "Enter a TestCase name.", category="INVALID_AUTHORING_INPUT"
+            )
         if len(clean_name) > 200:
-            raise TestCaseAuthoringError("Keep the TestCase name under 200 characters.")
+            raise TestCaseAuthoringError(
+                "Keep the TestCase name under 200 characters.",
+                category="INVALID_AUTHORING_INPUT",
+            )
         if not clean_scenario:
-            raise TestCaseAuthoringError("Enter a natural-language scenario.")
+            raise TestCaseAuthoringError(
+                "Enter a natural-language scenario.",
+                category="INVALID_AUTHORING_INPUT",
+            )
         if len(clean_scenario) > 6000:
-            raise TestCaseAuthoringError("Keep the scenario under 6,000 characters.")
+            raise TestCaseAuthoringError(
+                "Keep the scenario under 6,000 characters.",
+                category="INVALID_AUTHORING_INPUT",
+            )
+        if len(clean_url) > 2048:
+            raise TestCaseAuthoringError(
+                "Keep the Base URL under 2,048 characters.",
+                category="INVALID_AUTHORING_INPUT",
+            )
         if not _valid_base_url(clean_url):
             raise TestCaseAuthoringError(
-                "Enter a valid HTTP or HTTPS base URL without credentials."
+                "Enter a valid HTTP or HTTPS base URL without credentials.",
+                category="INVALID_AUTHORING_INPUT",
             )
+        return AuthoringInput(clean_name, clean_scenario, clean_url)
+
+    def generate(
+        self,
+        name: str,
+        scenario: str,
+        base_url: str,
+        *,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> TestCaseDraft:
+        authoring_input = self.validate_input(name, scenario, base_url)
+        clean_name = authoring_input.name
+        clean_scenario = authoring_input.scenario
+        clean_url = authoring_input.base_url
 
         prompt = _build_prompt(clean_name, clean_scenario, clean_url)
+        if progress_callback is not None:
+            progress_callback("LLM_REQUEST_STARTED")
         try:
             raw = self._router.create_structured_output(
                 prompt,
@@ -212,29 +259,49 @@ class TestCaseAuthoringService:
             # Provider failures can contain arbitrary response text. Keep only
             # the exception class in logs and return a product-level message.
             logger.warning("TestCase authoring provider failure (%s)", type(error).__name__)
+            category = (
+                "AI_RATE_LIMIT"
+                if _is_rate_limit_error(error)
+                else "AI_PROVIDER_ERROR"
+            )
+            message = (
+                "AI provider rate limit reached. Try again later or use another configured provider."
+                if category == "AI_RATE_LIMIT"
+                else "AI generation is temporarily unavailable. Try again later."
+            )
             raise TestCaseAuthoringError(
-                "AI generation is temporarily unavailable. Configure an LLM provider in the environment and try again.",
-                category="provider",
+                message,
+                category=category,
             ) from None
 
+        if progress_callback is not None:
+            progress_callback("LLM_RESPONSE_RECEIVED")
+            progress_callback("TESTCASE_VALIDATION_STARTED")
         if not isinstance(raw, str) or len(raw) > 64_000:
             logger.warning("TestCase authoring returned an invalid response size")
             raise TestCaseAuthoringError(
-                "The AI response could not be converted into a valid TestCase. Try generating again.",
-                category="response",
+                "The AI response could not be converted into a valid TestCase.",
+                category="AI_OUTPUT_VALIDATION_ERROR",
             )
         try:
             response = _AuthoringResponse.model_validate_json(raw)
+        except (ValidationError, ValueError, TypeError) as error:
+            logger.warning("TestCase authoring response validation failed (%s)", type(error).__name__)
+            raise TestCaseAuthoringError(
+                "The AI response could not be converted into a valid TestCase.",
+                category="AI_OUTPUT_VALIDATION_ERROR",
+            ) from None
+        try:
             if not response.segments or any(not segment.steps for segment in response.segments):
                 raise ValueError("The response must contain at least one step in each segment.")
             steps = [step for segment in response.segments for step in segment.steps]
             if not steps or len(steps) > 60 or len(response.segments) > 20:
                 raise ValueError("The response contains an unsupported number of segments or steps.")
-        except (ValidationError, ValueError, TypeError) as error:
-            logger.warning("TestCase authoring response validation failed (%s)", type(error).__name__)
+        except (ValueError, TypeError) as error:
+            logger.warning("TestCase authoring proposal was incomplete (%s)", type(error).__name__)
             raise TestCaseAuthoringError(
-                "The AI response could not be converted into a valid TestCase. Try generating again.",
-                category="response",
+                "The AI could not generate a complete TestCase structure. Try generating again.",
+                category="AI_GENERATION_ERROR",
             ) from None
 
         preconditions = [
@@ -270,15 +337,36 @@ class TestCaseAuthoringService:
         except (ValidationError, ValueError) as error:
             logger.warning("TestCase authoring domain validation failed (%s)", type(error).__name__)
             raise TestCaseAuthoringError(
-                "The AI response could not be converted into a valid TestCase. Try generating again.",
-                category="response",
+                "The AI response could not be converted into a valid TestCase.",
+                category="AI_OUTPUT_VALIDATION_ERROR",
             ) from None
+        if progress_callback is not None:
+            progress_callback("TESTCASE_VALIDATED")
         return TestCaseDraft(
             test_case=test_case,
             authoring_name=clean_name,
             authoring_scenario=clean_scenario,
             authoring_base_url=clean_url,
         )
+
+
+def _is_rate_limit_error(error: Exception) -> bool:
+    if isinstance(error, AllProvidersFailedError):
+        return error.all_rate_limited
+    status_code = getattr(error, "status_code", None)
+    response = getattr(error, "response", None)
+    if status_code is None and response is not None:
+        status_code = getattr(response, "status_code", None)
+    if status_code == 429:
+        return True
+    message = str(error).casefold()
+    return any(marker in message for marker in (
+        "http 429",
+        "429 rate",
+        "rate limit",
+        "rate limited",
+        "too many requests",
+    ))
 
 
 @dataclass(frozen=True)
@@ -290,8 +378,10 @@ class _StoredDraft:
 class TestCaseDraftStore:
     """Bounded in-memory store; opaque tokens never carry serialized input."""
 
+    __test__ = False
+
     _MAX_DRAFTS = 100
-    _TTL_SECONDS = 60 * 60
+    _TTL_SECONDS = 24 * 60 * 60
 
     def __init__(self) -> None:
         self._drafts: dict[str, _StoredDraft] = {}

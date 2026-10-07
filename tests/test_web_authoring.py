@@ -1,9 +1,12 @@
 from urllib.parse import urlencode
+import json
 import os
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 import io
+from threading import Event
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,7 +18,7 @@ from qa_agent.plan_store import InMemoryPlanStore
 from qa_agent.run_history import InMemoryRunHistoryRepository, RunHistoryService
 from qa_agent.test_case_authoring import TestCaseAuthoringService
 from qa_agent.test_case_repository import InMemoryTestCaseRepository
-from qa_agent.web import LocalWebApplication, create_application
+from qa_agent.web import LocalWebApplication, WebResponse, create_application
 
 
 class AuthoringProvider(LLMProvider):
@@ -52,7 +55,10 @@ class TestCaseAuthoringWebTests(unittest.TestCase):
             plan_store=self.plans,
         )
 
-    def post_generate(self, *, name="User registration", scenario="Register a new user."):
+    def tearDown(self):
+        self.app.close()
+
+    def submit_generate(self, *, name="User registration", scenario="Register a new user."):
         return self.app.handle(
             "POST",
             "/test-cases/generate",
@@ -63,6 +69,30 @@ class TestCaseAuthoringWebTests(unittest.TestCase):
             }),
         )
 
+    def wait_for_authoring(self, response, *, app=None, timeout=3):
+        app = app or self.app
+        self.assertEqual(response.status, 303)
+        progress_url = response.headers["Location"]
+        self.assertIn("/test-cases/authoring-progress/", progress_url)
+        progress_id = progress_url.rsplit("/", 1)[1]
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            result = app.handle("GET", f"/api/test-cases/authoring-progress/{progress_id}")
+            if result.status == 200:
+                snapshot = json.loads(result.body)
+                if snapshot["finished"]:
+                    return snapshot
+            time.sleep(0.005)
+        self.fail("Authoring request did not finish in time.")
+
+    def post_generate(self, *, name="User registration", scenario="Register a new user."):
+        with redirect_stdout(io.StringIO()):
+            response = self.submit_generate(name=name, scenario=scenario)
+            snapshot = self.wait_for_authoring(response)
+        if not snapshot["success"]:
+            self.fail(f"Authoring unexpectedly failed: {snapshot['error_category']}")
+        return WebResponse.redirect(snapshot["review_url"])
+
     def test_list_and_form_expose_ai_authoring(self):
         listing = self.app.handle("GET", "/test-cases")
         page = self.app.handle("GET", "/test-cases/new")
@@ -70,6 +100,94 @@ class TestCaseAuthoringWebTests(unittest.TestCase):
         self.assertIn(b'method="post" action="/test-cases/generate"', page.body)
         self.assertIn(b"Generate Test with AI", page.body)
         self.assertIn(b'name="scenario"', page.body)
+        self.assertIn(b"data-authoring-form", page.body)
+
+    def test_post_redirects_before_provider_finishes_and_progress_refresh_does_not_restart(self):
+        entered = Event()
+        release = Event()
+
+        class BlockingProvider(AuthoringProvider):
+            def create_structured_output(inner_self, prompt, schema, schema_name):
+                inner_self.prompts.append((prompt, schema_name))
+                entered.set()
+                release.wait(3)
+                return inner_self.output
+
+        provider = BlockingProvider()
+        app = LocalWebApplication(
+            self.history,
+            test_cases=self.cases,
+            authoring_service=TestCaseAuthoringService(LLMRouter([provider])),
+            draft_store=self.app._draft_store,
+        )
+        try:
+            with redirect_stdout(io.StringIO()):
+                response = app.handle(
+                    "POST",
+                    "/test-cases/generate",
+                    urlencode({
+                        "name": "Async registration",
+                        "base_url": "http://127.0.0.1:8000/register",
+                        "scenario": "Register and verify confirmation.",
+                    }),
+                )
+                self.assertEqual(response.status, 303)
+                progress_id = response.headers["Location"].rsplit("/", 1)[1]
+                self.assertTrue(entered.wait(1))
+                page = app.handle("GET", response.headers["Location"])
+                refreshed = app.handle("GET", response.headers["Location"])
+                self.assertEqual(page.status, 200)
+                self.assertIn(b"AI TestCase authoring", page.body)
+                self.assertEqual(len(provider.prompts), 1)
+                self.assertEqual(app._draft_store._drafts, {})
+                current = json.loads(app.handle(
+                    "GET", f"/api/test-cases/authoring-progress/{progress_id}"
+                ).body)
+                self.assertEqual(current["kind"], "AUTHORING")
+                self.assertFalse(current["finished"])
+                self.assertNotIn("scenario", current)
+                self.assertIn("Generating TestCase", current["phase"])
+                self.assertEqual(refreshed.status, 200)
+                release.set()
+                completed = self.wait_for_authoring(response, app=app)
+
+            self.assertTrue(completed["success"])
+            self.assertIn("/test-cases/review/", completed["review_url"])
+            self.assertEqual(len(provider.prompts), 1)
+            review = app.handle("GET", completed["review_url"])
+            self.assertIn(b"Review TestCase", review.body)
+            saved = app.handle(
+                "POST",
+                completed["review_url"] + "/save",
+                urlencode({"name": "Async registration edited"}),
+            )
+            self.assertEqual(saved.status, 303)
+            self.assertEqual(self.cases.list()[0].name, "Async registration edited")
+            self.assertEqual(self.history.list_recent(), [])
+        finally:
+            release.set()
+            app.close()
+
+    def test_invalid_input_stays_synchronous_and_unknown_progress_is_not_found(self):
+        with redirect_stdout(io.StringIO()):
+            invalid = self.app.handle(
+                "POST",
+                "/test-cases/generate",
+                urlencode({"name": " ", "base_url": "not-a-url", "scenario": "Check."}),
+            )
+        self.assertEqual(invalid.status, 400)
+        self.assertIn(b"Enter a TestCase name", invalid.body)
+        self.assertEqual(self.provider.prompts, [])
+        self.assertEqual(self.app._draft_store._drafts, {})
+        self.assertEqual(
+            self.app.handle("GET", "/test-cases/authoring-progress/unknown-id").status,
+            404,
+        )
+        missing_json = self.app.handle(
+            "GET", "/api/test-cases/authoring-progress/unknown-id"
+        )
+        self.assertEqual(missing_json.status, 404)
+        self.assertIn(b"no longer available", missing_json.body)
 
     def test_generation_review_and_explicit_save_persist_without_run_history(self):
         with redirect_stdout(io.StringIO()):
@@ -317,25 +435,119 @@ class TestCaseAuthoringWebTests(unittest.TestCase):
                 LLMRouter([AuthoringProvider(error=RetryableLLMError(secret))])
             ),
         )
-        with redirect_stdout(io.StringIO()):
-            response = app.handle(
-                "POST",
-                "/test-cases/generate",
-                urlencode({"name": "Case", "scenario": "Check page", "base_url": "https://example.test"}),
+        try:
+            with redirect_stdout(io.StringIO()):
+                response = app.handle(
+                    "POST",
+                    "/test-cases/generate",
+                    urlencode({"name": "Case", "scenario": "Check page", "base_url": "https://example.test"}),
+                )
+                snapshot = self.wait_for_authoring(response, app=app)
+            self.assertFalse(snapshot["success"])
+            self.assertEqual(snapshot["error_category"], "AI_PROVIDER_ERROR")
+            self.assertIn("could not complete", snapshot["error_message"])
+            self.assertNotIn(secret, json.dumps(snapshot))
+            page = app.handle("GET", response.headers["Location"])
+            self.assertIn(b"Try Again", page.body)
+            self.assertNotIn(secret.encode(), page.body)
+            self.assertEqual(app._draft_store._drafts, {})
+        finally:
+            app.close()
+
+    def test_generate_again_failure_retry_uses_original_input_and_retires_old_draft_once(self):
+        class FlakyProvider(AuthoringProvider):
+            def create_structured_output(inner_self, prompt, schema, schema_name):
+                inner_self.prompts.append((prompt, schema_name))
+                if len(inner_self.prompts) == 2:
+                    raise RetryableLLMError("provider failed with HTTP 503 and private detail")
+                return inner_self.output
+
+        provider = FlakyProvider()
+        app = LocalWebApplication(
+            self.history,
+            test_cases=self.cases,
+            authoring_service=TestCaseAuthoringService(LLMRouter([provider])),
+        )
+        try:
+            with redirect_stdout(io.StringIO()):
+                initial = app.handle(
+                    "POST",
+                    "/test-cases/generate",
+                    urlencode({
+                        "name": "Original authoring name",
+                        "base_url": "https://example.test/register",
+                        "scenario": "Original authoring scenario.",
+                    }),
+                )
+                initial_progress = self.wait_for_authoring(initial, app=app)
+            original_token = initial_progress["review_url"].rsplit("/", 1)[1]
+            regenerate = app.handle(
+                "POST", f"/test-cases/review/{original_token}/regenerate", b""
             )
-        self.assertEqual(response.status, 503)
-        self.assertIn(b"temporarily unavailable", response.body)
-        self.assertNotIn(secret.encode(), response.body)
+            failed = self.wait_for_authoring(regenerate, app=app)
+            self.assertFalse(failed["success"])
+            self.assertEqual(failed["error_category"], "AI_PROVIDER_ERROR")
+            self.assertIsNotNone(app._draft_store.get(original_token))
+            self.assertNotIn(original_token, json.dumps(failed))
+
+            retry_id = regenerate.headers["Location"].rsplit("/", 1)[1]
+            retry_page = app.handle("GET", regenerate.headers["Location"])
+            self.assertIn(b"Try Again", retry_page.body)
+            with redirect_stdout(io.StringIO()):
+                retried = app.handle(
+                    "POST", f"/test-cases/authoring-progress/{retry_id}/retry", b""
+                )
+                completed = self.wait_for_authoring(retried, app=app)
+            self.assertTrue(completed["success"])
+            self.assertNotEqual(retry_id, retried.headers["Location"].rsplit("/", 1)[1])
+            self.assertEqual(len(provider.prompts), 3)
+            for prompt, _schema_name in provider.prompts:
+                self.assertIn('"name": "Original authoring name"', prompt)
+                self.assertIn('"scenario": "Original authoring scenario."', prompt)
+                self.assertNotIn("private detail", prompt)
+            self.assertIsNone(app._draft_store.get(original_token))
+            new_token = completed["review_url"].rsplit("/", 1)[1]
+            self.assertNotEqual(original_token, new_token)
+            self.assertEqual(len(app._draft_store._drafts), 1)
+            self.assertEqual(self.cases.list(), [])
+        finally:
+            app.close()
+
+    def test_progress_page_escapes_user_name_and_hides_url_query_secrets(self):
+        secret = "PRIVATE_QUERY_TOKEN_4481"
+        response = self.app.handle(
+            "POST",
+            "/test-cases/generate",
+            urlencode({
+                "name": '<script>alert("x")</script>',
+                "base_url": f"https://example.test/register?api_token={secret}",
+                "scenario": "Check registration.",
+            }),
+        )
+        progress_id = response.headers["Location"].rsplit("/", 1)[1]
+        with redirect_stdout(io.StringIO()):
+            snapshot = self.wait_for_authoring(response)
+        page = self.app.handle("GET", response.headers["Location"])
+        html = page.body.decode("utf-8")
+        self.assertEqual(snapshot["base_url"], "https://example.test/register")
+        self.assertIn("&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;", html)
+        self.assertNotIn("<script>alert", html)
+        self.assertNotIn(secret, html)
+        self.assertNotIn("Check registration.", json.dumps(snapshot))
+        self.assertEqual(self.app.handle(
+            "GET", f"/api/test-cases/authoring-progress/{progress_id}"
+        ).status, 200)
 
     def test_generation_again_replaces_ephemeral_draft_token(self):
         with redirect_stdout(io.StringIO()):
             generated = self.post_generate()
         old_token = generated.headers["Location"].rsplit("/", 1)[1]
-        regenerated = self.app.handle(
-            "POST", f"/test-cases/review/{old_token}/regenerate", b""
-        )
-        self.assertEqual(regenerated.status, 303)
-        new_token = regenerated.headers["Location"].rsplit("/", 1)[1]
+        with redirect_stdout(io.StringIO()):
+            regenerated = self.app.handle(
+                "POST", f"/test-cases/review/{old_token}/regenerate", b""
+            )
+            completed = self.wait_for_authoring(regenerated)
+        new_token = completed["review_url"].rsplit("/", 1)[1]
         self.assertNotEqual(old_token, new_token)
         self.assertEqual(self.app.handle("GET", f"/test-cases/review/{old_token}").status, 404)
         self.assertEqual(self.app.handle("GET", f"/test-cases/review/{new_token}").status, 200)
@@ -345,12 +557,14 @@ class TestCaseAuthoringWebTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             generated = self.post_generate(name="Original name", scenario="Original scenario.")
         old_token = generated.headers["Location"].rsplit("/", 1)[1]
-        regenerated = self.app.handle(
-            "POST",
-            f"/test-cases/review/{old_token}/regenerate",
-            urlencode({"name": "Unsaved manual edit", "description": "Unsaved scenario edit."}),
-        )
-        self.assertEqual(regenerated.status, 303)
+        with redirect_stdout(io.StringIO()):
+            regenerated = self.app.handle(
+                "POST",
+                f"/test-cases/review/{old_token}/regenerate",
+                urlencode({"name": "Unsaved manual edit", "description": "Unsaved scenario edit."}),
+            )
+            completed = self.wait_for_authoring(regenerated)
+        self.assertTrue(completed["success"])
         self.assertEqual(len(self.provider.prompts), 2)
         second_prompt = self.provider.prompts[1][0]
         self.assertIn('"name": "Original name"', second_prompt)
@@ -376,8 +590,26 @@ class TestCaseAuthoringWebTests(unittest.TestCase):
                         "scenario": "Check the registration form.",
                     }),
                 )
-            self.assertEqual(response.status, 503)
-            self.assertIn(b"Configure an LLM provider", response.body)
+            try:
+                self.assertEqual(response.status, 303)
+                progress_id = response.headers["Location"].rsplit("/", 1)[1]
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    progress = app.handle(
+                        "GET", f"/api/test-cases/authoring-progress/{progress_id}"
+                    )
+                    if progress.status == 200 and json.loads(progress.body)["finished"]:
+                        payload = json.loads(progress.body)
+                        break
+                    time.sleep(0.005)
+                else:
+                    self.fail("Missing-provider authoring did not finish.")
+                self.assertFalse(payload["success"])
+                self.assertEqual(payload["error_category"], "AI_PROVIDER_ERROR")
+                self.assertIn("could not complete", payload["error_message"])
+                self.assertEqual(app._draft_store._drafts, {})
+            finally:
+                app.close()
 
 
 if __name__ == "__main__":

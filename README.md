@@ -107,8 +107,19 @@ when the workflow writes its normal Run History record. Refreshing reconnects
 to the same progress request; progress does not create placeholder TestRuns.
 Finished progress is retained for up to 24 hours, with at most 500 finished
 requests. A server restart clears in-memory progress; job recovery is not
-persisted yet. AI TestCase authoring remains synchronous; it can use a separate
-authoring progress lifecycle in a later extension.
+persisted yet.
+
+### Async AI TestCase authoring
+
+Submit **Generate Test with AI** from **Test Cases в†’ New Test Case** to get an
+immediate authoring progress page. The page polls actual provider and validation
+events, then redirects to the existing editable Review page when the draft is
+ready. **Generate Again** follows the same progress flow and uses the original
+authoring inputs. Drafts remain temporary until **Save Test Case**. A failed
+request creates no draft or persisted TestCase; **Try Again** starts a new
+request with the original inputs. Authoring jobs use a separate bounded worker
+pool so long runs cannot occupy authoring workers. Progress and drafts remain
+in memory and are cleared when the server restarts.
 
 ### Partial Automation and manual real-site checks
 

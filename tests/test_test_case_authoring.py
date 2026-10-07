@@ -85,16 +85,17 @@ class TestCaseAuthoringServiceTests(unittest.TestCase):
 
     def test_rejects_malformed_json_missing_steps_and_model_supplied_ids(self):
         invalid_outputs = (
-            "not json",
-            '{"preconditions":[],"segments":[]}',
-            '{"preconditions":[],"segments":[{"steps":[]}]}',
-            '{"preconditions":[],"segments":[{"steps":[{"id":"00000000-0000-0000-0000-000000000001",'
-            '"name":"Step","description":"Do it.","expected":"Done."}]}]}',
+            ("not json", "AI_OUTPUT_VALIDATION_ERROR"),
+            ('{"preconditions":[],"segments":[]}', "AI_GENERATION_ERROR"),
+            ('{"preconditions":[],"segments":[{"steps":[]}]}', "AI_GENERATION_ERROR"),
+            ('{"preconditions":[],"segments":[{"steps":[{"id":"00000000-0000-0000-0000-000000000001",'
+             '"name":"Step","description":"Do it.","expected":"Done."}]}]}', "AI_OUTPUT_VALIDATION_ERROR"),
         )
-        for output in invalid_outputs:
+        for output, category in invalid_outputs:
             with self.subTest(output=output), redirect_stdout(io.StringIO()):
-                with self.assertRaisesRegex(TestCaseAuthoringError, "could not be converted"):
+                with self.assertRaises(TestCaseAuthoringError) as raised:
                     self.generate(StructuredProvider(output))
+                self.assertEqual(raised.exception.category, category)
 
     def test_retryable_provider_fallback_is_used(self):
         first = StructuredProvider(error=RetryableLLMError("temporary outage"))

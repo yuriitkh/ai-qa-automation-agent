@@ -11,6 +11,7 @@ from enum import Enum
 from secrets import token_urlsafe
 from threading import RLock
 from typing import Any, Iterator
+from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -48,6 +49,19 @@ class ProgressState(str, Enum):
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
     FINISHED = "FINISHED"
+
+
+class AuthoringEventType(str, Enum):
+    AUTHORING_REQUESTED = "AUTHORING_REQUESTED"
+    INPUT_VALIDATED = "INPUT_VALIDATED"
+    AUTHORING_STARTED = "AUTHORING_STARTED"
+    LLM_REQUEST_STARTED = "LLM_REQUEST_STARTED"
+    LLM_RESPONSE_RECEIVED = "LLM_RESPONSE_RECEIVED"
+    TESTCASE_VALIDATION_STARTED = "TESTCASE_VALIDATION_STARTED"
+    TESTCASE_VALIDATED = "TESTCASE_VALIDATED"
+    DRAFT_CREATED = "DRAFT_CREATED"
+    AUTHORING_FINISHED = "AUTHORING_FINISHED"
+    AUTHORING_FAILED = "AUTHORING_FAILED"
 
 
 class ProgressStepState(str, Enum):
@@ -148,6 +162,7 @@ class ExecutionProgressSnapshot(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     progress_id: str
+    kind: str = "EXECUTION"
     test_case_id: UUID
     test_case_name: str | None = None
     workflow_type: str
@@ -185,6 +200,7 @@ class ExecutionProgressSnapshot(BaseModel):
         """Return an allowlisted JSON view; internal state and paths stay private."""
         return {
             "progress_id": self.progress_id,
+            "kind": self.kind,
             "test_case_id": str(self.test_case_id),
             "test_case_name": self.test_case_name,
             "workflow": self.workflow_type,
@@ -216,6 +232,101 @@ class ExecutionProgressSnapshot(BaseModel):
         }
 
 
+class AuthoringProgressEvent(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    id: UUID = Field(default_factory=uuid4)
+    event_type: AuthoringEventType
+    timestamp: datetime
+    message: str
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "id": str(self.id),
+            "type": self.event_type.value,
+            "timestamp": self.timestamp.isoformat(),
+            "message": self.message,
+        }
+
+
+class AuthoringProgressSnapshot(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    progress_id: str
+    kind: str = "AUTHORING"
+    test_case_name: str
+    base_url: str
+    state: ProgressState
+    phase: str
+    requested_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    elapsed_ms: int = 0
+    events: tuple[AuthoringProgressEvent, ...] = ()
+    finished: bool = False
+    success: bool | None = None
+    error_category: str | None = None
+    error_message: str | None = None
+    review_url: str | None = None
+
+    @model_validator(mode="after")
+    def terminal_state_is_coherent(self) -> "AuthoringProgressSnapshot":
+        if self.finished != (self.state == ProgressState.FINISHED):
+            raise ValueError("Authoring finished flag must match its lifecycle state.")
+        if self.finished != (self.finished_at is not None):
+            raise ValueError("Finished authoring progress requires a completion timestamp.")
+        if self.success is True and (not self.finished or not self.review_url):
+            raise ValueError("Successful authoring requires a review URL.")
+        if self.success is False and (
+            not self.finished or not self.error_category or not self.error_message
+        ):
+            raise ValueError("Failed authoring requires a safe category and message.")
+        if self.success is not True and self.review_url is not None:
+            raise ValueError("Only successful authoring may expose a review URL.")
+        return self
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "progress_id": self.progress_id,
+            "kind": self.kind,
+            "test_case_name": self.test_case_name,
+            "base_url": self.base_url,
+            "workflow": "AUTHORING",
+            "state": self.state.value,
+            "phase": self.phase,
+            "requested_at": self.requested_at.isoformat(),
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "finished_at": self.finished_at.isoformat() if self.finished_at else None,
+            "elapsed_ms": self.elapsed_ms,
+            "events": [event.to_public_dict() for event in self.events],
+            "finished": self.finished,
+            "success": self.success,
+            "error_category": self.error_category,
+            "error_message": self.error_message,
+            "review_url": self.review_url,
+        }
+
+
+@dataclass
+class _AuthoringProgressRecord:
+    progress_id: str
+    test_case_name: str
+    base_url: str
+    original_base_url: str
+    scenario: str
+    source_draft_token: str | None
+    requested_at: datetime
+    state: ProgressState = ProgressState.QUEUED
+    phase: str = "Preparing"
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    events: list[AuthoringProgressEvent] = field(default_factory=list)
+    success: bool | None = None
+    error_category: str | None = None
+    error_message: str | None = None
+    review_url: str | None = None
+
+
 @dataclass
 class _ProgressRecord:
     progress_id: str
@@ -240,7 +351,7 @@ class _ProgressRecord:
 
 
 class ExecutionProgressStore:
-    """Small locked progress store; running records are never pruned."""
+    """Shared in-memory store for execution and authoring progress records."""
 
     def __init__(
         self,
@@ -257,13 +368,16 @@ class ExecutionProgressStore:
         self._max_finished_records = max_finished_records
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._records: dict[str, _ProgressRecord] = {}
+        self._authoring_records: dict[str, _AuthoringProgressRecord] = {}
         self._lock = RLock()
 
     def create(self, test_case_id: UUID, workflow_type: str | Enum) -> str:
         now = self._now()
-        progress_id = token_urlsafe(24)
         with self._lock:
             self._prune(now)
+            progress_id = token_urlsafe(24)
+            while progress_id in self._records or progress_id in self._authoring_records:
+                progress_id = token_urlsafe(24)
             self._records[progress_id] = _ProgressRecord(
                 progress_id=progress_id,
                 test_case_id=test_case_id,
@@ -282,6 +396,133 @@ class ExecutionProgressStore:
             self._prune(now)
             record = self._records.get(progress_id)
             return self._snapshot(record, now) if record is not None else None
+
+    def create_authoring(
+        self,
+        *,
+        name: str,
+        base_url: str,
+        scenario: str,
+        source_draft_token: str | None = None,
+    ) -> str:
+        now = self._now()
+        safe_url = redact_secrets(_safe_authoring_base_url(base_url))
+        with self._lock:
+            self._prune(now)
+            progress_id = token_urlsafe(24)
+            while progress_id in self._records or progress_id in self._authoring_records:
+                progress_id = token_urlsafe(24)
+            self._authoring_records[progress_id] = _AuthoringProgressRecord(
+                progress_id=progress_id,
+                test_case_name=name,
+                base_url=safe_url,
+                original_base_url=base_url,
+                scenario=scenario,
+                source_draft_token=source_draft_token,
+                requested_at=now,
+            )
+        return progress_id
+
+    def get_authoring(self, progress_id: str) -> AuthoringProgressSnapshot | None:
+        now = self._now()
+        with self._lock:
+            self._prune(now)
+            record = self._authoring_records.get(progress_id)
+            return self._authoring_snapshot(record, now) if record is not None else None
+
+    def get_authoring_retry_data(
+        self, progress_id: str
+    ) -> tuple[str, str, str, str | None] | None:
+        """Return original input and source draft for a valid failed request retry."""
+        now = self._now()
+        with self._lock:
+            self._prune(now)
+            record = self._authoring_records.get(progress_id)
+            if record is None or record.state != ProgressState.FINISHED or record.success is not False:
+                return None
+            return (
+                record.test_case_name,
+                record.original_base_url,
+                record.scenario,
+                record.source_draft_token,
+            )
+
+    def append_authoring(
+        self,
+        progress_id: str,
+        event_type: AuthoringEventType,
+        *,
+        message: str | None = None,
+    ) -> AuthoringProgressEvent:
+        now = self._now()
+        with self._lock:
+            record = self._require_authoring_record(progress_id)
+            if record.state == ProgressState.FINISHED:
+                raise RuntimeError("Cannot append events to finished authoring progress.")
+            _validate_authoring_event_order(record, event_type)
+            timestamp = max(now, record.events[-1].timestamp) if record.events else now
+            event = AuthoringProgressEvent(
+                event_type=event_type,
+                timestamp=timestamp,
+                message=redact_secrets(message or _authoring_event_message(event_type)),
+            )
+            record.events.append(event)
+            if event_type == AuthoringEventType.AUTHORING_STARTED:
+                record.state = ProgressState.RUNNING
+                record.started_at = event.timestamp
+                record.phase = "Understanding scenario"
+            elif event_type == AuthoringEventType.LLM_REQUEST_STARTED:
+                record.phase = "Generating TestCase"
+            elif event_type in {
+                AuthoringEventType.LLM_RESPONSE_RECEIVED,
+                AuthoringEventType.TESTCASE_VALIDATION_STARTED,
+            }:
+                record.phase = "Validating result"
+            elif event_type in {
+                AuthoringEventType.TESTCASE_VALIDATED,
+                AuthoringEventType.DRAFT_CREATED,
+            }:
+                record.phase = "Preparing review"
+            return event
+
+    def finish_authoring(
+        self,
+        progress_id: str,
+        *,
+        review_url: str | None = None,
+        error_category: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        with self._lock:
+            record = self._require_authoring_record(progress_id)
+            if record.state == ProgressState.FINISHED:
+                return
+            success = review_url is not None
+            if success:
+                if error_category is not None or error_message is not None:
+                    raise ValueError("Successful authoring cannot contain failure details.")
+                event_type = AuthoringEventType.AUTHORING_FINISHED
+                safe_message = _authoring_event_message(event_type)
+            else:
+                if not error_category or not error_message:
+                    raise ValueError("Failed authoring requires a safe category and message.")
+                event_type = AuthoringEventType.AUTHORING_FAILED
+                safe_message = error_message
+            _validate_authoring_event_order(record, event_type)
+            now = self._now()
+            timestamp = max(now, record.events[-1].timestamp) if record.events else now
+            record.events.append(AuthoringProgressEvent(
+                event_type=event_type,
+                timestamp=timestamp,
+                message=redact_secrets(safe_message),
+            ))
+            record.state = ProgressState.FINISHED
+            record.finished_at = timestamp
+            record.phase = "Ready for review" if success else "Finished"
+            record.success = success
+            record.error_category = error_category
+            record.error_message = redact_secrets(error_message) if error_message else None
+            record.review_url = review_url
 
     def register_test_case(
         self,
@@ -538,6 +779,12 @@ class ExecutionProgressStore:
             raise KeyError("Execution progress is no longer available.")
         return record
 
+    def _require_authoring_record(self, progress_id: str) -> _AuthoringProgressRecord:
+        record = self._authoring_records.get(progress_id)
+        if record is None:
+            raise KeyError("Authoring progress is no longer available.")
+        return record
+
     def _snapshot(
         self, record: _ProgressRecord, now: datetime
     ) -> ExecutionProgressSnapshot:
@@ -569,6 +816,29 @@ class ExecutionProgressStore:
             ),
         )
 
+    def _authoring_snapshot(
+        self, record: _AuthoringProgressRecord, now: datetime
+    ) -> AuthoringProgressSnapshot:
+        start = record.started_at or record.requested_at
+        end = record.finished_at or now
+        return AuthoringProgressSnapshot(
+            progress_id=record.progress_id,
+            test_case_name=redact_secrets(record.test_case_name),
+            base_url=record.base_url,
+            state=record.state,
+            phase=record.phase,
+            requested_at=record.requested_at,
+            started_at=record.started_at,
+            finished_at=record.finished_at,
+            elapsed_ms=max(0, int((end - start).total_seconds() * 1000)),
+            events=tuple(record.events),
+            finished=record.state == ProgressState.FINISHED,
+            success=record.success,
+            error_category=record.error_category,
+            error_message=record.error_message,
+            review_url=record.review_url,
+        )
+
     def _prune(self, now: datetime) -> None:
         expired = [
             key for key, item in self._records.items()
@@ -587,12 +857,58 @@ class ExecutionProgressStore:
         )
         for item in finished[:-self._max_finished_records]:
             self._records.pop(item.progress_id, None)
+        authoring_expired = [
+            key for key, item in self._authoring_records.items()
+            if item.state == ProgressState.FINISHED
+            and item.finished_at is not None
+            and now - item.finished_at >= self._finished_ttl
+        ]
+        for key in authoring_expired:
+            self._authoring_records.pop(key, None)
+        finished_authoring = sorted(
+            (
+                item for item in self._authoring_records.values()
+                if item.state == ProgressState.FINISHED
+            ),
+            key=lambda item: item.finished_at or item.requested_at,
+        )
+        for item in finished_authoring[:-self._max_finished_records]:
+            self._authoring_records.pop(item.progress_id, None)
 
     def _now(self) -> datetime:
         value = self._clock()
         if value.tzinfo is None:
             raise ValueError("Progress clock must return timezone-aware datetimes.")
         return value.astimezone(timezone.utc)
+
+
+class AuthoringProgressReporter:
+    """Safe event writer for an authoring request in the shared progress store."""
+
+    def __init__(self, store: ExecutionProgressStore, progress_id: str) -> None:
+        self._store = store
+        self.progress_id = progress_id
+
+    def emit(
+        self,
+        event_type: AuthoringEventType | str,
+        message: str | None = None,
+    ) -> None:
+        self._store.append_authoring(
+            self.progress_id,
+            AuthoringEventType(event_type),
+            message=message,
+        )
+
+    def finish_success(self, review_url: str) -> None:
+        self._store.finish_authoring(self.progress_id, review_url=review_url)
+
+    def finish_failure(self, category: str, message: str) -> None:
+        self._store.finish_authoring(
+            self.progress_id,
+            error_category=category,
+            error_message=redact_secrets(message),
+        )
 
 
 class ExecutionProgressReporter:
@@ -786,3 +1102,56 @@ def _sensitive_values(run_context: RunContext) -> set[str]:
         if item.sensitive:
             collect(item.value)
     return values
+
+
+def _safe_authoring_base_url(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+    except (TypeError, ValueError):
+        return ""
+
+
+def _authoring_event_message(event_type: AuthoringEventType) -> str:
+    return {
+        AuthoringEventType.AUTHORING_REQUESTED: "Scenario received.",
+        AuthoringEventType.INPUT_VALIDATED: "Input validated.",
+        AuthoringEventType.AUTHORING_STARTED: "Understanding scenario.",
+        AuthoringEventType.LLM_REQUEST_STARTED: "Generating TestCase.",
+        AuthoringEventType.LLM_RESPONSE_RECEIVED: "AI response received.",
+        AuthoringEventType.TESTCASE_VALIDATION_STARTED: "Validating TestCase structure.",
+        AuthoringEventType.TESTCASE_VALIDATED: "TestCase structure validated.",
+        AuthoringEventType.DRAFT_CREATED: "Preparing review.",
+        AuthoringEventType.AUTHORING_FINISHED: "TestCase draft ready.",
+        AuthoringEventType.AUTHORING_FAILED: "TestCase authoring failed.",
+    }[event_type]
+
+
+def _validate_authoring_event_order(
+    record: _AuthoringProgressRecord,
+    event_type: AuthoringEventType,
+) -> None:
+    if event_type == AuthoringEventType.AUTHORING_FAILED:
+        if not record.events or record.events[0].event_type != AuthoringEventType.AUTHORING_REQUESTED:
+            raise ValueError("Authoring failure must follow an authoring request.")
+        return
+    predecessors = {
+        AuthoringEventType.AUTHORING_REQUESTED: None,
+        AuthoringEventType.INPUT_VALIDATED: AuthoringEventType.AUTHORING_REQUESTED,
+        AuthoringEventType.AUTHORING_STARTED: AuthoringEventType.INPUT_VALIDATED,
+        AuthoringEventType.LLM_REQUEST_STARTED: AuthoringEventType.AUTHORING_STARTED,
+        AuthoringEventType.LLM_RESPONSE_RECEIVED: AuthoringEventType.LLM_REQUEST_STARTED,
+        AuthoringEventType.TESTCASE_VALIDATION_STARTED: AuthoringEventType.LLM_RESPONSE_RECEIVED,
+        AuthoringEventType.TESTCASE_VALIDATED: AuthoringEventType.TESTCASE_VALIDATION_STARTED,
+        AuthoringEventType.DRAFT_CREATED: AuthoringEventType.TESTCASE_VALIDATED,
+        AuthoringEventType.AUTHORING_FINISHED: AuthoringEventType.DRAFT_CREATED,
+    }
+    expected_previous = predecessors[event_type]
+    if expected_previous is None:
+        if record.events:
+            raise ValueError("Authoring request can only be the first event.")
+        return
+    if not record.events or record.events[-1].event_type != expected_previous:
+        raise ValueError(
+            f"Authoring event {event_type.value} is out of order."
+        )

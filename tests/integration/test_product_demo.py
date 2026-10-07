@@ -61,6 +61,22 @@ def _wait_for_progress(application, location: str, timeout: float = 60.0) -> dic
     raise AssertionError(f"Execution progress {progress_id} did not finish in time.")
 
 
+def _wait_for_authoring(application, location: str, timeout: float = 30.0) -> dict:
+    progress_id = location.rsplit("/", 1)[1]
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        response = application.handle(
+            "GET", f"/api/test-cases/authoring-progress/{progress_id}"
+        )
+        if response.status != 200:
+            raise AssertionError(response.body.decode("utf-8", errors="replace"))
+        snapshot = json.loads(response.body)
+        if snapshot["finished"]:
+            return snapshot
+        time.sleep(0.01)
+    raise AssertionError(f"Authoring progress {progress_id} did not finish in time.")
+
+
 class ProductDemoSliceTests(unittest.TestCase):
     def test_validation_to_sqlite_history_report_and_web_then_successful_regression(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -528,8 +544,11 @@ class ProductDemoSliceTests(unittest.TestCase):
                     }),
                 )
                 self.assertEqual(created.status, 303)
-                token = created.headers["Location"].rsplit("/", 1)[1]
-                review = application.handle("GET", created.headers["Location"])
+                authoring = _wait_for_authoring(application, created.headers["Location"])
+                self.assertTrue(authoring["success"])
+                self.assertEqual(authoring["error_category"], None)
+                token = authoring["review_url"].rsplit("/", 1)[1]
+                review = application.handle("GET", authoring["review_url"])
                 self.assertIn(b"Verify registration confirmation", review.body)
                 self.assertEqual(storage.test_case_repository.list(), [])
 
@@ -738,7 +757,9 @@ class ProductDemoSliceTests(unittest.TestCase):
                     }),
                 )
                 self.assertEqual(created.status, 303)
-                token = created.headers["Location"].rsplit("/", 1)[1]
+                authoring = _wait_for_authoring(application, created.headers["Location"])
+                self.assertTrue(authoring["success"])
+                token = authoring["review_url"].rsplit("/", 1)[1]
                 saved = application.handle(
                     "POST", f"/test-cases/review/{token}/save", b""
                 )

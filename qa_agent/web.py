@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import logging
 import mimetypes
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -39,8 +40,10 @@ from qa_agent.test_case_authoring import (
 from qa_agent.test_case_repository import TestCaseRepository
 from qa_agent.storage import create_sqlite_storage
 from qa_agent.pipeline import QATestPipeline
+from qa_agent.background_authoring import BackgroundAuthoringService
 from qa_agent.background_execution import BackgroundRunService
 from qa_agent.execution_progress import (
+    AuthoringEventType,
     ExecutionProgressStore,
 )
 from qa_agent.models import PlanVersionOrigin
@@ -51,7 +54,9 @@ from qa_agent.workflows import AutomationWorkflow
 
 
 _PAGE_LIMIT = 500
+logger = logging.getLogger(__name__)
 _MAX_FORM_BODY_BYTES = 8192
+_MAX_AUTHORING_FORM_BODY_BYTES = 80_000
 _MAX_DRAFT_SAVE_BODY_BYTES = 256 * 1024
 _WORKFLOWS = {item.value for item in WorkflowType}
 _STATUSES = {"PASSED", "FAILED"}
@@ -80,7 +85,7 @@ class WebResponse:
 
     @classmethod
     def redirect(cls, location: str) -> "WebResponse":
-        return cls(303, "text/plain; charset=utf-8", b"Run recorded. Redirecting.\n", {"Location": location})
+        return cls(303, "text/plain; charset=utf-8", b"Request accepted. Redirecting.\n", {"Location": location})
 
 
 class LocalWebApplication:
@@ -111,6 +116,14 @@ class LocalWebApplication:
             BackgroundRunService(run_service, run_history, self._progress_store)
             if run_service is not None else None
         )
+        self._background_authoring = (
+            BackgroundAuthoringService(
+                authoring_service,
+                self._draft_store,
+                self._progress_store,
+            )
+            if authoring_service is not None else None
+        )
 
     @property
     def progress_store(self) -> ExecutionProgressStore:
@@ -119,6 +132,8 @@ class LocalWebApplication:
     def close(self) -> None:
         if self._background_runs is not None:
             self._background_runs.close()
+        if self._background_authoring is not None:
+            self._background_authoring.close()
 
     def handle(self, method: str, target: str, body: bytes | str | None = None) -> WebResponse:
         parsed = urlsplit(target)
@@ -143,6 +158,10 @@ class LocalWebApplication:
             return self._progress_json(parts[2])
         if len(parts) == 3 and parts[:2] == ["runs", "progress"]:
             return self._progress_page(parts[2])
+        if len(parts) == 4 and parts[:3] == ["api", "test-cases", "authoring-progress"]:
+            return self._authoring_progress_json(parts[3])
+        if len(parts) == 3 and parts[:2] == ["test-cases", "authoring-progress"]:
+            return self._authoring_progress_page(parts[2])
         if path == "/":
             return WebResponse.html(200, self._dashboard())
         if path == "/demo-target/registration":
@@ -210,6 +229,12 @@ class LocalWebApplication:
     def _handle_post(self, parts: list[str], body: bytes | str | None) -> WebResponse:
         if parts == ["test-cases", "generate"]:
             return self._handle_generate_test_case(body)
+        if (
+            len(parts) == 4
+            and parts[:2] == ["test-cases", "authoring-progress"]
+            and parts[3] == "retry"
+        ):
+            return self._handle_authoring_retry(parts[2], body)
         if len(parts) == 4 and parts[:2] == ["test-cases", "review"]:
             return self._handle_draft_action(parts[2], parts[3], body)
         if len(parts) != 3 or parts[0] != "test-cases" or parts[2] != "run":
@@ -260,6 +285,78 @@ class LocalWebApplication:
             200,
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
         )
+
+    def _authoring_progress_json(self, progress_id: str) -> WebResponse:
+        snapshot = self._progress_store.get_authoring(progress_id)
+        if snapshot is None:
+            return WebResponse.json(404, json.dumps({
+                "error": "Authoring progress is no longer available."
+            }))
+        return WebResponse.json(
+            200,
+            json.dumps(snapshot.to_public_dict(), ensure_ascii=False, separators=(",", ":")),
+        )
+
+    def _authoring_progress_page(self, progress_id: str) -> WebResponse:
+        snapshot = self._progress_store.get_authoring(progress_id)
+        if snapshot is None:
+            return self._not_found("Authoring progress is no longer available.")
+        active_event = {
+            "Understanding scenario": AuthoringEventType.AUTHORING_STARTED,
+            "Generating TestCase": AuthoringEventType.LLM_REQUEST_STARTED,
+            "Validating result": AuthoringEventType.TESTCASE_VALIDATION_STARTED,
+        }.get(snapshot.phase)
+        events = "".join(
+            '<li class="progress-event"><span aria-hidden="true">'
+            + ("✕" if event.event_type == AuthoringEventType.AUTHORING_FAILED
+               else "◉" if event.event_type == active_event and not snapshot.finished
+               else "✓")
+            + '</span>'
+            + f'<span>{escape_html(event.message)}</span></li>'
+            for event in snapshot.events
+        )
+        result = ""
+        if snapshot.finished:
+            if snapshot.success:
+                result = (
+                    '<p data-authoring-result-message><strong>TestCase draft ready.</strong> '
+                    'Redirecting to Review…</p>'
+                    f'<a class="button primary" data-authoring-review-link '
+                    f'href="{escape_html(snapshot.review_url or "")}">Open Review</a>'
+                )
+            else:
+                result = (
+                    f'<p data-authoring-result-message><strong>{_authoring_error_label(snapshot.error_category)}</strong></p>'
+                    f'<p>{escape_html(snapshot.error_message or "An unexpected authoring error occurred.")}</p>'
+                )
+        retry_hidden = " hidden" if not snapshot.finished or snapshot.success else ""
+        retry_form = (
+            f'<form method="post" action="/test-cases/authoring-progress/{escape_html(progress_id)}/retry" '
+            f'data-authoring-retry data-authoring-form{retry_hidden}>'
+            '<button class="button" type="submit">Try Again</button></form>'
+        )
+        body = (
+            '<header class="page-heading"><p class="eyebrow">AI TestCase authoring</p>'
+            f'<h1>{escape_html(snapshot.test_case_name)}</h1>'
+            f'<p class="lead">Base URL: <span>{escape_html(snapshot.base_url)}</span></p></header>'
+            '<div class="summary-grid">'
+            + _summary_card("Current phase", f'<span data-authoring-phase>{escape_html(snapshot.phase)}</span>', raw=True)
+            + _summary_card("Elapsed", f'<span data-authoring-elapsed>{escape_html(format_duration(snapshot.elapsed_ms))}</span>', raw=True)
+            + _summary_card("Status", f'<span data-authoring-state>{escape_html(snapshot.state.value.title())}</span>', raw=True)
+            + '</div>'
+            + f'<div class="authoring-progress" data-authoring-progress-id="{escape_html(progress_id)}">'
+            + '<section class="panel"><h2>Progress</h2>'
+            + f'<ul class="compact-list" data-authoring-events>{events}</ul></section>'
+            + '<section class="panel progress-result" data-authoring-result'
+            + ('' if snapshot.finished else ' hidden')
+            + f'><div data-authoring-result-content>{result}</div>{retry_form}</section>'
+            + '<p class="muted" data-authoring-notice aria-live="polite"></p></div>'
+        )
+        return WebResponse.html(200, self._page(
+            "AI TestCase Authoring",
+            body,
+            breadcrumbs=[("Dashboard", "/"), ("Test Cases", "/test-cases")],
+        ))
 
     def _progress_page(self, progress_id: str) -> WebResponse:
         snapshot = self._progress_store.get(progress_id)
@@ -443,33 +540,75 @@ class LocalWebApplication:
         )
 
     def _handle_generate_test_case(self, body: bytes | str | None) -> WebResponse:
-        form, form_error = _parse_form_body(body)
+        form, form_error = _parse_form_body(body, max_bytes=_MAX_AUTHORING_FORM_BODY_BYTES)
         values = {
             key: form.get(key, [""])[0]
             for key in ("name", "base_url", "scenario")
         }
         if form_error is not None:
             return WebResponse.html(400, self._new_test_case_page(form_error, **values))
+        try:
+            validated = TestCaseAuthoringService.validate_input(**values)
+        except TestCaseAuthoringError as error:
+            return WebResponse.html(400, self._new_test_case_page(str(error), **values))
+        except Exception:
+            return WebResponse.html(400, self._new_test_case_page(
+                "Enter a valid name, Base URL, and scenario.", **values
+            ))
         if self._test_cases is None:
             return WebResponse.html(503, self._new_test_case_page(
                 "TestCase storage is not configured.", **values
             ))
-        if self._authoring_service is None:
+        if self._authoring_service is None or self._background_authoring is None:
             return WebResponse.html(503, self._new_test_case_page(
                 "AI generation is unavailable. Configure an LLM provider in the environment and try again.",
                 **values,
             ))
         try:
-            draft = self._authoring_service.generate(**values)
-        except TestCaseAuthoringError as error:
-            status = 400 if error.category == "input" else 503
-            return WebResponse.html(status, self._new_test_case_page(str(error), **values))
+            progress_id = self._background_authoring.start(
+                name=validated.name,
+                base_url=validated.base_url,
+                scenario=validated.scenario,
+            )
         except Exception:
+            logger.error("Could not start authoring request")
             return WebResponse.html(503, self._new_test_case_page(
-                "AI generation is temporarily unavailable. Try again later.", **values
+                "Authoring could not be started. Try again later.", **values
             ))
-        token = self._draft_store.put(draft)
-        return WebResponse.redirect(f"/test-cases/review/{token}")
+        return WebResponse.redirect(f"/test-cases/authoring-progress/{progress_id}")
+
+    def _handle_authoring_retry(
+        self,
+        progress_id: str,
+        body: bytes | str | None,
+    ) -> WebResponse:
+        _form, form_error = _parse_form_body(body)
+        if form_error is not None:
+            return self._not_found("Authoring progress is no longer available.")
+        retry_data = self._progress_store.get_authoring_retry_data(progress_id)
+        if retry_data is None:
+            return self._not_found("Authoring progress is no longer available.")
+        if self._authoring_service is None or self._background_authoring is None:
+            return WebResponse.html(503, self._page(
+                "Authoring unavailable",
+                '<div class="error-state"><p>AI generation is unavailable. Try again later.</p></div>',
+            ))
+        name, base_url, scenario, source_draft_token = retry_data
+        try:
+            validated = self._authoring_service.validate_input(name, scenario, base_url)
+        except TestCaseAuthoringError as error:
+            return WebResponse.html(400, self._new_test_case_page(
+                str(error), name=name, base_url=base_url, scenario=scenario
+            ))
+        new_progress_id = self._background_authoring.start(
+            name=validated.name,
+            base_url=validated.base_url,
+            scenario=validated.scenario,
+            source_draft_token=source_draft_token,
+        )
+        return WebResponse.redirect(
+            f"/test-cases/authoring-progress/{new_progress_id}"
+        )
 
     def _handle_draft_action(
         self, token: str, action: str, body: bytes | str | None
@@ -494,20 +633,28 @@ class LocalWebApplication:
                     draft, token, "AI generation is unavailable. Configure an LLM provider and try again."
                 ))
             try:
-                new_draft = self._authoring_service.generate(
+                validated = self._authoring_service.validate_input(
                     draft.authoring_name or draft.test_case.name,
                     draft.authoring_scenario or draft.test_case.description,
                     draft.authoring_base_url or draft.test_case.base_url or "",
                 )
             except TestCaseAuthoringError as error:
-                return WebResponse.html(503, self._draft_review_html(draft, token, str(error)))
+                return WebResponse.html(400, self._draft_review_html(draft, token, str(error)))
             except Exception:
                 return WebResponse.html(503, self._draft_review_html(
-                    draft, token, "AI generation is temporarily unavailable. Try again later."
+                    draft, token, "Authoring could not be started. Try again later."
                 ))
-            self._draft_store.take(token)
-            next_token = self._draft_store.put(new_draft)
-            return WebResponse.redirect(f"/test-cases/review/{next_token}")
+            if self._background_authoring is None:
+                return WebResponse.html(503, self._draft_review_html(
+                    draft, token, "AI generation is unavailable. Try again later."
+                ))
+            progress_id = self._background_authoring.start(
+                name=validated.name,
+                base_url=validated.base_url,
+                scenario=validated.scenario,
+                source_draft_token=token,
+            )
+            return WebResponse.redirect(f"/test-cases/authoring-progress/{progress_id}")
         if action != "save":
             return self._not_found("Draft action not found")
         if self._test_cases is None:
@@ -645,7 +792,7 @@ class LocalWebApplication:
             + '</section><div class="actions">'
             + '<button class="button primary" type="submit">Save Test Case</button></div></form>'
             + '<div class="actions">'
-            + f'<form method="post" action="/test-cases/review/{escape_html(token)}/regenerate">'
+            + f'<form method="post" action="/test-cases/review/{escape_html(token)}/regenerate" data-authoring-form>'
             + '<button class="button" type="submit">Generate Again</button></form>'
             + f'<form method="post" action="/test-cases/review/{escape_html(token)}/cancel">'
             + '<button class="button" type="submit">Cancel</button></form></div>'
@@ -715,11 +862,11 @@ class LocalWebApplication:
             '<header class="page-heading"><h1>New Test Case</h1>'
             '<p class="lead">Describe the scenario. AI will propose steps for you to review.</p></header>'
             + error_html
-            + '<section class="panel"><form method="post" action="/test-cases/generate">'
+            + '<section class="panel"><form method="post" action="/test-cases/generate" data-authoring-form>'
             + '<div class="field"><label for="case-name">Name</label>'
             + f'<input id="case-name" name="name" maxlength="200" required value="{escape_html(name)}"></div>'
             + '<div class="field"><label for="case-base-url">Base URL</label>'
-            + f'<input id="case-base-url" name="base_url" type="url" required value="{escape_html(base_url)}" placeholder="http://127.0.0.1:8000/demo-target/registration"></div>'
+            + f'<input id="case-base-url" name="base_url" type="url" maxlength="2048" required value="{escape_html(base_url)}" placeholder="http://127.0.0.1:8000/demo-target/registration"></div>'
             + '<div class="field"><label for="case-scenario">Scenario</label>'
             + f'<textarea id="case-scenario" name="scenario" rows="6" maxlength="6000" required>{escape_html(scenario)}</textarea></div>'
             + '<button class="button primary" type="submit">Generate Test with AI</button>'
@@ -1259,13 +1406,16 @@ def create_http_server(
             except ValueError:
                 content_length = 8193
             request_path = urlsplit(self.path).path.strip("/").split("/")
-            max_body_bytes = (
-                _MAX_DRAFT_SAVE_BODY_BYTES
-                if len(request_path) == 4
+            if (
+                len(request_path) == 4
                 and request_path[:2] == ["test-cases", "review"]
                 and request_path[3] == "save"
-                else _MAX_FORM_BODY_BYTES
-            )
+            ):
+                max_body_bytes = _MAX_DRAFT_SAVE_BODY_BYTES
+            elif request_path == ["test-cases", "generate"]:
+                max_body_bytes = _MAX_AUTHORING_FORM_BODY_BYTES
+            else:
+                max_body_bytes = _MAX_FORM_BODY_BYTES
             if content_length < 0 or content_length > max_body_bytes:
                 self.close_connection = True
                 body = b"x" * (max_body_bytes + 1)
@@ -1411,6 +1561,17 @@ def _outcome_badge(record: RunHistoryRecord, *, stacked: bool = False) -> str:
     return f'<div class="row-sub-badge">{shown}</div>' if stacked else shown
 
 
+def _authoring_error_label(category: str | None) -> str:
+    return {
+        "AI_RATE_LIMIT": "AI RATE LIMIT",
+        "AI_PROVIDER_ERROR": "AI PROVIDER ERROR",
+        "AI_GENERATION_ERROR": "AI GENERATION ERROR",
+        "AI_OUTPUT_VALIDATION_ERROR": "AI GENERATION ERROR",
+        "INVALID_AUTHORING_INPUT": "INVALID INPUT",
+        "AUTHORING_EXECUTION_ERROR": "AUTHORING ERROR",
+    }.get(category or "", "AI GENERATION ERROR")
+
+
 _UI_JAVASCRIPT = r"""
 (() => {
   const testcaseEditor = document.querySelector('[data-testcase-editor]');
@@ -1436,6 +1597,119 @@ _UI_JAVASCRIPT = r"""
       });
     }, { once: true });
   });
+
+  document.querySelectorAll('[data-authoring-form]').forEach((form) => {
+    form.addEventListener('submit', () => {
+      form.querySelectorAll('button[type="submit"]').forEach((button) => {
+        button.disabled = true;
+        button.classList.add('is-disabled');
+        button.setAttribute('aria-busy', 'true');
+        button.textContent = 'Starting…';
+      });
+    }, { once: true });
+  });
+
+  const authoringRoot = document.querySelector('.authoring-progress[data-authoring-progress-id]');
+  if (authoringRoot) {
+    const authoringId = authoringRoot.dataset.authoringProgressId;
+    const authoringNotice = authoringRoot.querySelector('[data-authoring-notice]');
+    const authoringEvents = authoringRoot.querySelector('[data-authoring-events]');
+    const authoringResult = authoringRoot.querySelector('[data-authoring-result]');
+    const authoringResultContent = authoringRoot.querySelector('[data-authoring-result-content]');
+    const authoringRetry = authoringRoot.querySelector('[data-authoring-retry]');
+    let authoringStopped = false;
+    let authoringRedirectScheduled = false;
+
+    const appendAuthoringEvent = (event, activeType) => {
+      const row = document.createElement('li');
+      row.className = 'progress-event';
+      const symbol = document.createElement('span');
+      symbol.setAttribute('aria-hidden', 'true');
+      symbol.textContent = event.type.endsWith('FAILED') ? '✕' :
+        (event.type === activeType ? '◉' : '✓');
+      const label = document.createElement('span');
+      label.textContent = event.message;
+      row.append(symbol, label);
+      authoringEvents.append(row);
+    };
+
+    const renderAuthoring = (snapshot) => {
+      authoringRoot.querySelectorAll('[data-authoring-phase]').forEach((node) => {
+        node.textContent = snapshot.phase;
+      });
+      const elapsed = authoringRoot.querySelector('[data-authoring-elapsed]');
+      if (elapsed) elapsed.textContent = `${(snapshot.elapsed_ms / 1000).toFixed(1)} s`;
+      const state = authoringRoot.querySelector('[data-authoring-state]');
+      if (state) state.textContent = snapshot.state.toLowerCase().replaceAll('_', ' ')
+        .replace(/(^|\s)\S/g, (letter) => letter.toUpperCase());
+
+      const activeType = snapshot.phase === 'Understanding scenario' ? 'AUTHORING_STARTED' :
+        snapshot.phase === 'Generating TestCase' ? 'LLM_REQUEST_STARTED' :
+        snapshot.phase === 'Validating result' ? 'TESTCASE_VALIDATION_STARTED' : null;
+      authoringEvents.replaceChildren();
+      snapshot.events.forEach((event) => appendAuthoringEvent(event, activeType));
+
+      if (!snapshot.finished) return;
+      authoringStopped = true;
+      authoringResult.hidden = false;
+      authoringResultContent.replaceChildren();
+      if (snapshot.success && snapshot.review_url) {
+        const ready = document.createElement('p');
+        ready.dataset.authoringResultMessage = '';
+        const strong = document.createElement('strong');
+        strong.textContent = 'TestCase draft ready.';
+        ready.append(strong, document.createTextNode(' Redirecting to Review…'));
+        const link = document.createElement('a');
+        link.className = 'button primary';
+        link.href = snapshot.review_url;
+        link.textContent = 'Open Review';
+        authoringResultContent.append(ready, link);
+        if (authoringRetry) authoringRetry.hidden = true;
+        if (!authoringRedirectScheduled) {
+          authoringRedirectScheduled = true;
+          window.setTimeout(() => window.location.assign(snapshot.review_url), 700);
+        }
+      } else {
+        const heading = document.createElement('p');
+        heading.dataset.authoringResultMessage = '';
+        const strong = document.createElement('strong');
+        const labels = {
+          AI_RATE_LIMIT: 'AI RATE LIMIT',
+          AI_PROVIDER_ERROR: 'AI PROVIDER ERROR',
+          AI_OUTPUT_VALIDATION_ERROR: 'AI GENERATION ERROR',
+          AI_GENERATION_ERROR: 'AI GENERATION ERROR',
+          INVALID_AUTHORING_INPUT: 'INVALID INPUT',
+          AUTHORING_EXECUTION_ERROR: 'AUTHORING ERROR'
+        };
+        strong.textContent = labels[snapshot.error_category] || 'AI GENERATION ERROR';
+        heading.append(strong);
+        const reason = document.createElement('p');
+        reason.textContent = `Reason: ${snapshot.error_message || 'An unexpected authoring error occurred.'}`;
+        authoringResultContent.append(heading, reason);
+        if (authoringRetry) authoringRetry.hidden = false;
+      }
+    };
+
+    const pollAuthoring = async () => {
+      if (authoringStopped) return;
+      try {
+        const response = await fetch(`/api/test-cases/authoring-progress/${encodeURIComponent(authoringId)}`, {
+          headers: { 'Accept': 'application/json' }, cache: 'no-store'
+        });
+        if (response.status === 404) {
+          authoringStopped = true;
+          if (authoringNotice) authoringNotice.textContent = 'Authoring progress is no longer available.';
+          return;
+        }
+        if (!response.ok) throw new Error('Progress unavailable');
+        renderAuthoring(await response.json());
+      } catch (_error) {
+        if (authoringNotice) authoringNotice.textContent = 'Live updates are temporarily unavailable. Retrying…';
+      }
+      if (!authoringStopped) window.setTimeout(pollAuthoring, 500);
+    };
+    pollAuthoring();
+  }
 
   const root = document.querySelector('.progress-live[data-progress-id]');
   if (!root) return;

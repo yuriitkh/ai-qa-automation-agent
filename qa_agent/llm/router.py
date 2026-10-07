@@ -10,7 +10,7 @@ from ..execution_trace import (
 from ..models import AIDiscoveryResult, QATestPlan
 from ..redaction import safe_failure_reason
 from .base import LLMProvider
-from .errors import NonRetryableLLMError, RetryableLLMError
+from .errors import AllProvidersFailedError, NonRetryableLLMError, RetryableLLMError
 
 
 class LLMRouter:
@@ -238,6 +238,7 @@ class LLMRouter:
         self._selected_provider_name = None
         self._report_priority()
         failures: list[str] = []
+        rate_limited_failures = 0
         unavailable: list[str] = []
         for index, provider in enumerate(self._providers):
             name = self._provider_name(provider)
@@ -255,6 +256,8 @@ class LLMRouter:
             except RetryableLLMError as error:
                 reason = safe_failure_reason(error)
                 failures.append(f"{name}: {reason}")
+                if _is_rate_limit_failure(error):
+                    rate_limited_failures += 1
                 self._record_provider_attempt(
                     provider,
                     RequestKind.TEST_CASE_AUTHORING,
@@ -264,8 +267,7 @@ class LLMRouter:
                 )
                 if index + 1 < len(self._providers):
                     print(
-                        f"LLM ROUTER: {name} structured-output request failed "
-                        f"({reason}); trying the next provider."
+                        "AI provider request failed; trying another configured provider."
                     )
             except NonRetryableLLMError as error:
                 self._record_provider_attempt(
@@ -318,8 +320,28 @@ class LLMRouter:
                 print(f"Selected provider: {self._selected_provider_name}")
                 return output
         if failures:
-            raise RuntimeError("All LLM providers failed: " + "; ".join(failures))
+            raise AllProvidersFailedError(
+                "All LLM providers failed: " + "; ".join(failures),
+                all_rate_limited=(rate_limited_failures == len(failures)),
+            )
         raise RuntimeError(
             "No configured LLM providers are available. Unavailable providers: "
             + ", ".join(unavailable)
         )
+
+
+def _is_rate_limit_failure(error: Exception) -> bool:
+    status_code = getattr(error, "status_code", None)
+    response = getattr(error, "response", None)
+    if status_code is None and response is not None:
+        status_code = getattr(response, "status_code", None)
+    if status_code == 429:
+        return True
+    message = str(error).casefold()
+    return any(marker in message for marker in (
+        "http 429",
+        "429 rate",
+        "rate limit",
+        "rate limited",
+        "too many requests",
+    ))
