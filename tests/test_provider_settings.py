@@ -164,6 +164,37 @@ class ProviderSettingsTests(unittest.TestCase):
         raw_db = self.database.read_bytes()
         self.assertNotIn(b"never-store-this-key", raw_db)
 
+    def test_groq_priority_and_enablement_survive_restart_and_drive_router_order(self):
+        self.service.save_key("groq", "groq-test-key")
+        self.service.save_key("gemini", "gemini-test-key")
+        for _ in range(3):
+            self.service.move("groq", -1)
+        self.service.update("openai", enabled=False)
+
+        restarted_service = ProviderSettingsService(
+            ProviderSettingsRepository(self.database),
+            self.secrets,
+            environment=self.environment,
+            provider_factory=self.factory,
+        )
+        views = {item.id: item for item in restarted_service.provider_views()}
+        self.assertEqual(views["groq"].priority, 1)
+        self.assertTrue(views["groq"].enabled)
+        self.assertFalse(views["openai"].enabled)
+        self.assertEqual(views["openai"].status, "DISABLED")
+
+        self.outcomes = {"groq": RetryableLLMError("HTTP 503")}
+        router = restarted_service.create_router()
+        self.assertEqual(
+            [provider.name for provider in router._providers],
+            ["groq", "gemini", "openrouter"],
+        )
+        self.assertEqual(
+            router.create_structured_output("fake request", {}, "test"),
+            '{"ok":true}',
+        )
+        self.assertEqual(self.calls, ["groq", "gemini"])
+
     def test_settings_html_and_public_view_never_expose_raw_key(self):
         key = "secret-that-must-not-render-XYZ9"
         self.service.save_key("groq", key)

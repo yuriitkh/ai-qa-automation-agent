@@ -25,6 +25,9 @@ _SAFE_FAILURES = {
     "AI_RATE_LIMIT": (
         "AI provider rate limit reached. Try again later or use another configured provider."
     ),
+    "AI_TIMEOUT": (
+        "AI provider request timed out. Try again or use another configured provider."
+    ),
     "AI_GENERATION_ERROR": "The AI could not generate a complete TestCase structure.",
     "AI_OUTPUT_VALIDATION_ERROR": (
         "The AI response could not be converted into a valid TestCase."
@@ -147,6 +150,7 @@ class BackgroundAuthoringService:
                 validated.scenario,
                 validated.base_url,
                 progress_callback=reporter.emit,
+                provider_progress_callback=reporter.provider_progress,
             )
             token = self._draft_store.put(draft)
             try:

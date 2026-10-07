@@ -53,6 +53,7 @@ class ProgressState(str, Enum):
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
     FINISHED = "FINISHED"
+    FAILED = "FAILED"
 
 
 class AuthoringEventType(str, Enum):
@@ -60,6 +61,10 @@ class AuthoringEventType(str, Enum):
     INPUT_VALIDATED = "INPUT_VALIDATED"
     AUTHORING_STARTED = "AUTHORING_STARTED"
     LLM_REQUEST_STARTED = "LLM_REQUEST_STARTED"
+    LLM_PROVIDER_SELECTED = "LLM_PROVIDER_SELECTED"
+    LLM_PROVIDER_FAILED = "LLM_PROVIDER_FAILED"
+    LLM_PROVIDER_FALLBACK = "LLM_PROVIDER_FALLBACK"
+    LLM_PROVIDER_COMPLETED = "LLM_PROVIDER_COMPLETED"
     LLM_RESPONSE_RECEIVED = "LLM_RESPONSE_RECEIVED"
     TESTCASE_VALIDATION_STARTED = "TESTCASE_VALIDATION_STARTED"
     TESTCASE_VALIDATED = "TESTCASE_VALIDATED"
@@ -285,6 +290,7 @@ class AuthoringProgressSnapshot(BaseModel):
     base_url: str
     state: ProgressState
     phase: str
+    provider_name: str | None = None
     requested_at: datetime
     started_at: datetime | None = None
     finished_at: datetime | None = None
@@ -298,14 +304,19 @@ class AuthoringProgressSnapshot(BaseModel):
 
     @model_validator(mode="after")
     def terminal_state_is_coherent(self) -> "AuthoringProgressSnapshot":
-        if self.finished != (self.state == ProgressState.FINISHED):
+        terminal = self.state in {ProgressState.FINISHED, ProgressState.FAILED}
+        if self.finished != terminal:
             raise ValueError("Authoring finished flag must match its lifecycle state.")
         if self.finished != (self.finished_at is not None):
             raise ValueError("Finished authoring progress requires a completion timestamp.")
-        if self.success is True and (not self.finished or not self.review_url):
+        if self.success is True and (
+            self.state != ProgressState.FINISHED or not self.review_url
+        ):
             raise ValueError("Successful authoring requires a review URL.")
         if self.success is False and (
-            not self.finished or not self.error_category or not self.error_message
+            self.state != ProgressState.FAILED
+            or not self.error_category
+            or not self.error_message
         ):
             raise ValueError("Failed authoring requires a safe category and message.")
         if self.success is not True and self.review_url is not None:
@@ -321,6 +332,7 @@ class AuthoringProgressSnapshot(BaseModel):
             "workflow": "AUTHORING",
             "state": self.state.value,
             "phase": self.phase,
+            "provider_name": self.provider_name,
             "requested_at": self.requested_at.isoformat(),
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "finished_at": self.finished_at.isoformat() if self.finished_at else None,
@@ -345,6 +357,7 @@ class _AuthoringProgressRecord:
     requested_at: datetime
     state: ProgressState = ProgressState.QUEUED
     phase: str = "Preparing"
+    provider_name: str | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
     events: list[AuthoringProgressEvent] = field(default_factory=list)
@@ -465,7 +478,7 @@ class ExecutionProgressStore:
         with self._lock:
             self._prune(now)
             record = self._authoring_records.get(progress_id)
-            if record is None or record.state != ProgressState.FINISHED or record.success is not False:
+            if record is None or record.state != ProgressState.FAILED or record.success is not False:
                 return None
             return (
                 record.test_case_name,
@@ -480,11 +493,12 @@ class ExecutionProgressStore:
         event_type: AuthoringEventType,
         *,
         message: str | None = None,
+        provider_name: str | None = None,
     ) -> AuthoringProgressEvent:
         now = self._now()
         with self._lock:
             record = self._require_authoring_record(progress_id)
-            if record.state == ProgressState.FINISHED:
+            if record.state in {ProgressState.FINISHED, ProgressState.FAILED}:
                 raise RuntimeError("Cannot append events to finished authoring progress.")
             _validate_authoring_event_order(record, event_type)
             timestamp = max(now, record.events[-1].timestamp) if record.events else now
@@ -500,6 +514,15 @@ class ExecutionProgressStore:
                 record.phase = "Understanding scenario"
             elif event_type == AuthoringEventType.LLM_REQUEST_STARTED:
                 record.phase = "Generating TestCase"
+            elif event_type in {
+                AuthoringEventType.LLM_PROVIDER_SELECTED,
+                AuthoringEventType.LLM_PROVIDER_FALLBACK,
+                AuthoringEventType.LLM_PROVIDER_COMPLETED,
+            }:
+                record.provider_name = (
+                    _safe_provider_display_name(provider_name)
+                    if provider_name else "Configured provider"
+                )
             elif event_type in {
                 AuthoringEventType.LLM_RESPONSE_RECEIVED,
                 AuthoringEventType.TESTCASE_VALIDATION_STARTED,
@@ -522,7 +545,7 @@ class ExecutionProgressStore:
     ) -> None:
         with self._lock:
             record = self._require_authoring_record(progress_id)
-            if record.state == ProgressState.FINISHED:
+            if record.state in {ProgressState.FINISHED, ProgressState.FAILED}:
                 return
             success = review_url is not None
             if success:
@@ -543,7 +566,7 @@ class ExecutionProgressStore:
                 timestamp=timestamp,
                 message=redact_secrets(safe_message),
             ))
-            record.state = ProgressState.FINISHED
+            record.state = ProgressState.FINISHED if success else ProgressState.FAILED
             record.finished_at = timestamp
             record.phase = "Ready for review" if success else "Finished"
             record.success = success
@@ -952,12 +975,13 @@ class ExecutionProgressStore:
             base_url=record.base_url,
             state=record.state,
             phase=record.phase,
+            provider_name=record.provider_name,
             requested_at=record.requested_at,
             started_at=record.started_at,
             finished_at=record.finished_at,
             elapsed_ms=max(0, int((end - start).total_seconds() * 1000)),
             events=tuple(record.events),
-            finished=record.state == ProgressState.FINISHED,
+            finished=record.state in {ProgressState.FINISHED, ProgressState.FAILED},
             success=record.success,
             error_category=record.error_category,
             error_message=record.error_message,
@@ -984,7 +1008,7 @@ class ExecutionProgressStore:
             self._records.pop(item.progress_id, None)
         authoring_expired = [
             key for key, item in self._authoring_records.items()
-            if item.state == ProgressState.FINISHED
+            if item.state in {ProgressState.FINISHED, ProgressState.FAILED}
             and item.finished_at is not None
             and now - item.finished_at >= self._finished_ttl
         ]
@@ -993,7 +1017,7 @@ class ExecutionProgressStore:
         finished_authoring = sorted(
             (
                 item for item in self._authoring_records.values()
-                if item.state == ProgressState.FINISHED
+                if item.state in {ProgressState.FINISHED, ProgressState.FAILED}
             ),
             key=lambda item: item.finished_at or item.requested_at,
         )
@@ -1023,6 +1047,42 @@ class AuthoringProgressReporter:
             self.progress_id,
             AuthoringEventType(event_type),
             message=message,
+        )
+
+    def provider_progress(
+        self,
+        event: str,
+        provider: str,
+        *,
+        next_provider: str | None = None,
+        category: str | None = None,
+    ) -> None:
+        provider = _safe_provider_display_name(provider)
+        next_provider = (
+            _safe_provider_display_name(next_provider) if next_provider else None
+        )
+        category = category if category in {
+            "RATE_LIMIT", "TIMEOUT", "AUTHENTICATION", "PROVIDER_ERROR"
+        } else "PROVIDER_ERROR"
+        if event == "selected":
+            event_type = AuthoringEventType.LLM_PROVIDER_SELECTED
+            message = f"Provider: {provider}"
+        elif event == "failed":
+            event_type = AuthoringEventType.LLM_PROVIDER_FAILED
+            message = f"{provider} unavailable [{category}]."
+        elif event == "fallback" and next_provider:
+            event_type = AuthoringEventType.LLM_PROVIDER_FALLBACK
+            message = f"{provider} unavailable. Trying {next_provider}..."
+        elif event == "completed":
+            event_type = AuthoringEventType.LLM_PROVIDER_COMPLETED
+            message = f"Completed with {provider}."
+        else:
+            return
+        self._store.append_authoring(
+            self.progress_id,
+            event_type,
+            message=message,
+            provider_name=(next_provider if event == "fallback" else provider),
         )
 
     def finish_success(self, review_url: str) -> None:
@@ -1262,6 +1322,10 @@ def _authoring_event_message(event_type: AuthoringEventType) -> str:
         AuthoringEventType.INPUT_VALIDATED: "Input validated.",
         AuthoringEventType.AUTHORING_STARTED: "Understanding scenario.",
         AuthoringEventType.LLM_REQUEST_STARTED: "Generating TestCase.",
+        AuthoringEventType.LLM_PROVIDER_SELECTED: "Provider selected.",
+        AuthoringEventType.LLM_PROVIDER_FAILED: "Provider unavailable.",
+        AuthoringEventType.LLM_PROVIDER_FALLBACK: "Trying the next provider.",
+        AuthoringEventType.LLM_PROVIDER_COMPLETED: "Provider completed.",
         AuthoringEventType.LLM_RESPONSE_RECEIVED: "AI response received.",
         AuthoringEventType.TESTCASE_VALIDATION_STARTED: "Validating TestCase structure.",
         AuthoringEventType.TESTCASE_VALIDATED: "TestCase structure validated.",
@@ -1278,6 +1342,17 @@ def _validate_authoring_event_order(
     if event_type == AuthoringEventType.AUTHORING_FAILED:
         if not record.events or record.events[0].event_type != AuthoringEventType.AUTHORING_REQUESTED:
             raise ValueError("Authoring failure must follow an authoring request.")
+        return
+    provider_events = {
+        AuthoringEventType.LLM_PROVIDER_SELECTED,
+        AuthoringEventType.LLM_PROVIDER_FAILED,
+        AuthoringEventType.LLM_PROVIDER_FALLBACK,
+        AuthoringEventType.LLM_PROVIDER_COMPLETED,
+    }
+    if event_type in provider_events:
+        lifecycle_events = [event.event_type for event in record.events if event.event_type not in provider_events]
+        if not lifecycle_events or lifecycle_events[-1] != AuthoringEventType.LLM_REQUEST_STARTED:
+            raise ValueError("Provider progress is only valid while generating a TestCase.")
         return
     predecessors = {
         AuthoringEventType.AUTHORING_REQUESTED: None,
@@ -1296,6 +1371,23 @@ def _validate_authoring_event_order(
             raise ValueError("Authoring request can only be the first event.")
         return
     if not record.events or record.events[-1].event_type != expected_previous:
+        if event_type == AuthoringEventType.LLM_RESPONSE_RECEIVED:
+            latest = next(
+                (event.event_type for event in reversed(record.events)
+                 if event.event_type not in provider_events),
+                None,
+            )
+            if latest == AuthoringEventType.LLM_REQUEST_STARTED:
+                return
         raise ValueError(
             f"Authoring event {event_type.value} is out of order."
         )
+
+
+def _safe_provider_display_name(value: str) -> str:
+    return {
+        "groq": "Groq",
+        "gemini": "Gemini",
+        "openai": "OpenAI",
+        "openrouter": "OpenRouter",
+    }.get(value.casefold(), "Configured provider")

@@ -253,6 +253,7 @@ class TestCaseAuthoringService:
         base_url: str,
         *,
         progress_callback: Callable[[str], None] | None = None,
+        provider_progress_callback: Callable[..., None] | None = None,
     ) -> TestCaseDraft:
         authoring_input = self.validate_input(name, scenario, base_url)
         supplied_name = name.strip() if isinstance(name, str) else ""
@@ -268,6 +269,7 @@ class TestCaseAuthoringService:
                 prompt,
                 _AuthoringResponse.model_json_schema(),
                 "test_case_authoring",
+                progress_callback=provider_progress_callback,
             )
         except Exception as error:
             # Provider failures can contain arbitrary response text. Keep only
@@ -276,11 +278,15 @@ class TestCaseAuthoringService:
             category = (
                 "AI_RATE_LIMIT"
                 if _is_rate_limit_error(error)
+                else "AI_TIMEOUT"
+                if _is_timeout_error(error)
                 else "AI_PROVIDER_ERROR"
             )
             message = (
                 "AI provider rate limit reached. Try again later or use another configured provider."
                 if category == "AI_RATE_LIMIT"
+                else "AI provider request timed out. Try again or use another configured provider."
+                if category == "AI_TIMEOUT"
                 else "AI generation is temporarily unavailable. Try again later."
             )
             raise TestCaseAuthoringError(
@@ -387,6 +393,19 @@ def _is_rate_limit_error(error: Exception) -> bool:
         "rate limited",
         "too many requests",
     ))
+
+
+def _is_timeout_error(error: Exception) -> bool:
+    if getattr(error, "all_timed_out", False):
+        return True
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, TimeoutError) or "timeout" in type(current).__name__.casefold():
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _valid_generated_name(value: str | None, scenario: str = "") -> str | None:

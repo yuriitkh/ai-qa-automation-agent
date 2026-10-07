@@ -356,6 +356,7 @@ class LocalWebApplication:
             + _summary_card("Current phase", f'<span data-authoring-phase>{escape_html(snapshot.phase)}</span>', raw=True)
             + _summary_card("Elapsed", f'<span data-authoring-elapsed>{escape_html(format_duration(snapshot.elapsed_ms))}</span>', raw=True)
             + _summary_card("Status", f'<span data-authoring-state>{escape_html(snapshot.state.value.title())}</span>', raw=True)
+            + _summary_card("Provider", f'<span data-authoring-provider>{escape_html(snapshot.provider_name or "—")}</span>', raw=True)
             + '</div>'
             + f'<div class="authoring-progress" data-authoring-progress-id="{escape_html(progress_id)}">'
             + '<section class="panel"><h2>Progress</h2>'
@@ -1783,6 +1784,7 @@ def _outcome_badge(record: RunHistoryRecord, *, stacked: bool = False) -> str:
 def _authoring_error_label(category: str | None) -> str:
     return {
         "AI_RATE_LIMIT": "AI RATE LIMIT",
+        "AI_TIMEOUT": "AI TIMEOUT",
         "AI_PROVIDER_ERROR": "AI PROVIDER ERROR",
         "AI_GENERATION_ERROR": "AI GENERATION ERROR",
         "AI_OUTPUT_VALIDATION_ERROR": "AI GENERATION ERROR",
@@ -1925,6 +1927,13 @@ _UI_JAVASCRIPT = r"""
     const authoringRetry = authoringRoot.querySelector('[data-authoring-retry]');
     let authoringStopped = false;
     let authoringRedirectScheduled = false;
+    let elapsedAnchor = null;
+    let elapsedTimer = null;
+
+    const renderAuthoringElapsed = (elapsedMs) => {
+      const elapsed = authoringRoot.querySelector('[data-authoring-elapsed]');
+      if (elapsed) elapsed.textContent = `${(elapsedMs / 1000).toFixed(1)} s`;
+    };
 
     const appendAuthoringEvent = (event, activeType) => {
       const row = document.createElement('li');
@@ -1943,8 +1952,25 @@ _UI_JAVASCRIPT = r"""
       authoringRoot.querySelectorAll('[data-authoring-phase]').forEach((node) => {
         node.textContent = snapshot.phase;
       });
-      const elapsed = authoringRoot.querySelector('[data-authoring-elapsed]');
-      if (elapsed) elapsed.textContent = `${(snapshot.elapsed_ms / 1000).toFixed(1)} s`;
+      if (snapshot.finished) {
+        renderAuthoringElapsed(snapshot.elapsed_ms);
+        if (elapsedTimer !== null) window.clearInterval(elapsedTimer);
+        elapsedTimer = null;
+        elapsedAnchor = null;
+      } else {
+        elapsedAnchor = { milliseconds: snapshot.elapsed_ms, at: performance.now() };
+        renderAuthoringElapsed(snapshot.elapsed_ms);
+        if (elapsedTimer === null) {
+          elapsedTimer = window.setInterval(() => {
+            if (!elapsedAnchor || authoringStopped) return;
+            renderAuthoringElapsed(
+              elapsedAnchor.milliseconds + Math.max(0, performance.now() - elapsedAnchor.at)
+            );
+          }, 100);
+        }
+      }
+      const provider = authoringRoot.querySelector('[data-authoring-provider]');
+      if (provider) provider.textContent = snapshot.provider_name || '—';
       const state = authoringRoot.querySelector('[data-authoring-state]');
       if (state) state.textContent = snapshot.state.toLowerCase().replaceAll('_', ' ')
         .replace(/(^|\s)\S/g, (letter) => letter.toUpperCase());
@@ -1981,6 +2007,7 @@ _UI_JAVASCRIPT = r"""
         const strong = document.createElement('strong');
         const labels = {
           AI_RATE_LIMIT: 'AI RATE LIMIT',
+          AI_TIMEOUT: 'AI TIMEOUT',
           AI_PROVIDER_ERROR: 'AI PROVIDER ERROR',
           AI_OUTPUT_VALIDATION_ERROR: 'AI GENERATION ERROR',
           AI_GENERATION_ERROR: 'AI GENERATION ERROR',
@@ -2004,6 +2031,8 @@ _UI_JAVASCRIPT = r"""
         });
         if (response.status === 404) {
           authoringStopped = true;
+          if (elapsedTimer !== null) window.clearInterval(elapsedTimer);
+          elapsedTimer = null;
           if (authoringNotice) authoringNotice.textContent = 'Authoring progress is no longer available.';
           return;
         }

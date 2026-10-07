@@ -76,6 +76,8 @@ class AuthoringProgressStoreTests(unittest.TestCase):
         self.assertTrue(before.success)
         self.assertEqual(before.phase, "Ready for review")
         self.assertEqual(before.review_url, "/test-cases/review/opaque-draft")
+        self.now += timedelta(seconds=5)
+        self.assertEqual(self.store.get_authoring(progress_id).elapsed_ms, before.elapsed_ms)
         self.assertEqual(before.events[-1].event_type, AuthoringEventType.AUTHORING_FINISHED)
         with self.assertRaises(RuntimeError):
             self.store.append_authoring(progress_id, AuthoringEventType.AUTHORING_STARTED)
@@ -88,6 +90,9 @@ class AuthoringProgressStoreTests(unittest.TestCase):
 
     def test_failure_is_safe_and_expired_progress_returns_none(self) -> None:
         progress_id = self.create_requested()
+        self.now += timedelta(seconds=4)
+        self.store.append_authoring(progress_id, AuthoringEventType.AUTHORING_STARTED)
+        self.now += timedelta(seconds=2)
         with patch.dict("os.environ", {"AUTHORING_TEST_API_KEY": "private-provider-key"}):
             self.store.finish_authoring(
                 progress_id,
@@ -96,7 +101,11 @@ class AuthoringProgressStoreTests(unittest.TestCase):
             )
             snapshot = self.store.get_authoring(progress_id)
         self.assertFalse(snapshot.success)
+        self.assertEqual(snapshot.state, ProgressState.FAILED)
         self.assertEqual(snapshot.error_category, "AI_PROVIDER_ERROR")
+        frozen_elapsed = snapshot.elapsed_ms
+        self.now += timedelta(seconds=10)
+        self.assertEqual(self.store.get_authoring(progress_id).elapsed_ms, frozen_elapsed)
         self.assertNotIn("private-provider-key", str(snapshot.to_public_dict()))
         self.assertFalse(snapshot.review_url)
         self.now += timedelta(minutes=6)

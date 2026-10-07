@@ -65,8 +65,12 @@ class BackgroundAuthoringTests(unittest.TestCase):
         self.fail("Authoring job did not finish in time.")
 
     def test_success_fallback_creates_one_draft_and_emits_real_ordered_events(self):
-        primary = AuthoringProvider(error=RetryableLLMError("HTTP 429 rate limit"))
+        primary = AuthoringProvider(error=RetryableLLMError(
+            "API key private-token; raw provider response; HTTP 429 rate limit"
+        ))
+        primary.name = "groq"
         fallback = AuthoringProvider()
+        fallback.name = "gemini"
         service, progress, drafts = self.make_service([primary, fallback])
         try:
             with redirect_stdout(io.StringIO()):
@@ -90,6 +94,11 @@ class BackgroundAuthoringTests(unittest.TestCase):
                     AuthoringEventType.INPUT_VALIDATED,
                     AuthoringEventType.AUTHORING_STARTED,
                     AuthoringEventType.LLM_REQUEST_STARTED,
+                    AuthoringEventType.LLM_PROVIDER_SELECTED,
+                    AuthoringEventType.LLM_PROVIDER_FAILED,
+                    AuthoringEventType.LLM_PROVIDER_FALLBACK,
+                    AuthoringEventType.LLM_PROVIDER_SELECTED,
+                    AuthoringEventType.LLM_PROVIDER_COMPLETED,
                     AuthoringEventType.LLM_RESPONSE_RECEIVED,
                     AuthoringEventType.TESTCASE_VALIDATION_STARTED,
                     AuthoringEventType.TESTCASE_VALIDATED,
@@ -97,6 +106,14 @@ class BackgroundAuthoringTests(unittest.TestCase):
                     AuthoringEventType.AUTHORING_FINISHED,
                 ],
             )
+            self.assertEqual(snapshot.provider_name, "Gemini")
+            public = json.dumps(snapshot.to_public_dict())
+            self.assertIn("Provider: Groq", public)
+            self.assertIn("Groq unavailable [RATE_LIMIT]", public)
+            self.assertIn("Groq unavailable. Trying Gemini...", public)
+            self.assertIn("Completed with Gemini", public)
+            self.assertNotIn("private-token", public)
+            self.assertNotIn("raw provider response", public)
         finally:
             service.close()
 
@@ -116,12 +133,75 @@ class BackgroundAuthoringTests(unittest.TestCase):
                 snapshot = self.wait_for(progress, progress_id)
             self.assertFalse(snapshot.success)
             self.assertEqual(snapshot.error_category, "AI_RATE_LIMIT")
+            self.assertEqual(snapshot.state.value, "FAILED")
             self.assertIn("Try again later", snapshot.error_message)
             self.assertNotIn("429", snapshot.error_message)
             self.assertEqual(len(drafts._drafts), 0)
             self.assertEqual(snapshot.events[-1].event_type, AuthoringEventType.AUTHORING_FAILED)
         finally:
             service.close()
+
+    def test_all_provider_timeouts_finish_as_failed_with_safe_terminal_message(self):
+        providers = [
+            AuthoringProvider(error=RetryableLLMError("provider request timed out")),
+            AuthoringProvider(error=RetryableLLMError("another request timed out")),
+        ]
+        providers[0].name = "groq"
+        providers[1].name = "gemini"
+        service, progress, _drafts = self.make_service(providers)
+        try:
+            with redirect_stdout(io.StringIO()):
+                progress_id = service.start(
+                    name="Timeout case",
+                    base_url="https://example.test/",
+                    scenario="Check the page.",
+                )
+                snapshot = self.wait_for(progress, progress_id)
+            self.assertEqual(snapshot.state.value, "FAILED")
+            self.assertTrue(snapshot.finished)
+            self.assertEqual(snapshot.error_category, "AI_TIMEOUT")
+            self.assertIn("timed out", snapshot.error_message)
+            self.assertEqual(snapshot.events[-1].event_type, AuthoringEventType.AUTHORING_FAILED)
+        finally:
+            service.close()
+
+    def test_authoring_provider_logs_are_safe_and_name_the_attempt_and_fallback(self):
+        primary = AuthoringProvider(
+            error=RetryableLLMError(
+                "private-key-never-log; raw-provider-body-never-log; HTTP 429"
+            )
+        )
+        primary.name = "groq"
+        fallback = AuthoringProvider()
+        fallback.name = "gemini"
+        router = LLMRouter([primary, fallback])
+        events = []
+        with redirect_stdout(io.StringIO()), self.assertLogs(
+            "qa_agent.llm.router", level="INFO"
+        ) as captured:
+            router.create_structured_output(
+                "private prompt never log",
+                {},
+                "test_case_authoring",
+                progress_callback=lambda event, provider, **details: events.append(
+                    (event, provider, details)
+                ),
+            )
+        log_text = "\n".join(captured.output)
+        self.assertIn("LLM authoring provider selected: Groq", log_text)
+        self.assertIn("LLM authoring provider failed: Groq [RATE_LIMIT]", log_text)
+        self.assertIn("LLM authoring fallback: Gemini", log_text)
+        self.assertIn("LLM authoring completed: Gemini", log_text)
+        for unsafe in (
+            "private-key-never-log",
+            "raw-provider-body-never-log",
+            "private prompt never log",
+        ):
+            self.assertNotIn(unsafe, log_text)
+        self.assertEqual(
+            [event[0] for event in events],
+            ["selected", "failed", "fallback", "selected", "completed"],
+        )
 
     def test_provider_failure_and_invalid_output_do_not_create_drafts(self):
         cases = (
@@ -152,6 +232,7 @@ class BackgroundAuthoringTests(unittest.TestCase):
         entered = Event()
         release = Event()
         provider = AuthoringProvider(entered=entered, release=release)
+        provider.name = "groq"
         service, progress, drafts = self.make_service([provider])
         try:
             with redirect_stdout(io.StringIO()):
@@ -164,10 +245,27 @@ class BackgroundAuthoringTests(unittest.TestCase):
                 snapshot = progress.get_authoring(progress_id)
                 self.assertFalse(snapshot.finished)
                 self.assertEqual(snapshot.phase, "Generating TestCase")
+                # Provider selection is reported before the blocking provider call.
+                # The active progress read therefore shows which provider is in use.
+                snapshot = progress.get_authoring(progress_id)
+                self.assertEqual(snapshot.provider_name, "Groq")
+                elapsed_at_first_poll = snapshot.elapsed_ms
+                time.sleep(0.04)
+                self.assertGreater(
+                    progress.get_authoring(progress_id).elapsed_ms,
+                    elapsed_at_first_poll,
+                )
                 self.assertEqual(provider.calls, 1)
                 self.assertEqual(len(drafts._drafts), 0)
                 release.set()
-                self.assertTrue(self.wait_for(progress, progress_id).success)
+                finished = self.wait_for(progress, progress_id)
+                self.assertTrue(finished.success)
+                frozen_elapsed = finished.elapsed_ms
+                time.sleep(0.02)
+                self.assertEqual(
+                    progress.get_authoring(progress_id).elapsed_ms,
+                    frozen_elapsed,
+                )
         finally:
             release.set()
             service.close()
