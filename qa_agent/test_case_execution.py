@@ -2,11 +2,16 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 from qa_agent.browser_runner import BrowserRunner
+from qa_agent.automation_lifecycle import (
+    AutomationLifecycleService,
+    plan_fingerprint_for_versions,
+)
 from qa_agent.execution_repository import ExecutionRepository
 from qa_agent.execution_progress import get_active_execution_progress
 from qa_agent.models import QATestPlan
@@ -30,6 +35,9 @@ from qa_agent.workflows import (
     RegressionWorkflow,
     ValidationWorkflow,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class RunUnavailableError(ValueError):
@@ -70,6 +78,7 @@ class TestCaseExecutionService:
         runner_factory: RunnerFactory | None = None,
         setup_cleanup_factory: Callable[[], SetupCleanupCoordinator] | None = None,
         automation_workflow: AutomationWorkflow | None = None,
+        automation_lifecycle: AutomationLifecycleService | None = None,
     ) -> None:
         self._test_cases = test_cases
         self._plan_store = plan_store
@@ -86,6 +95,7 @@ class TestCaseExecutionService:
             lambda: SetupCleanupCoordinator({})
         )
         self._automation_workflow = automation_workflow
+        self._automation_lifecycle = automation_lifecycle
 
     def workflow_availability(self, test_case_id: UUID) -> WorkflowAvailability:
         test_case = self._test_cases.get(test_case_id)
@@ -143,7 +153,19 @@ class TestCaseExecutionService:
             if progress is not None:
                 progress.bind_run_context(run_context)
                 progress.test_case_loaded(test_case)
-            return self._automation_workflow.run_test_case(test_case, run_context)
+            try:
+                result = self._automation_workflow.run_test_case(test_case, run_context)
+            except Exception:
+                if self._automation_lifecycle is not None:
+                    self._lifecycle_update(
+                        self._automation_lifecycle.mark_automation_failed, test_case
+                    )
+                raise
+            if self._automation_lifecycle is not None:
+                self._lifecycle_update(
+                    self._automation_lifecycle.mark_automation_completed, test_case
+                )
+            return result
         if workflow_type not in {WorkflowType.VALIDATION, WorkflowType.REGRESSION}:
             raise RunUnavailableError(
                 "Choose Automation, Validation, or Regression before starting a run.",
@@ -191,14 +213,33 @@ class TestCaseExecutionService:
             self._setup_cleanup_factory(),
             self._run_history,
         )
+        selected_plan_fingerprint = plan_fingerprint_for_versions(
+            test_case,
+            {selection.test_step_id: selection.test_plan_version_id for selection in selections},
+        )
         try:
-            return workflow.run(
+            result = workflow.run(
                 test_case,
                 PlanVersionSet(tuple(selections)),
                 run_context,
             )
+            if workflow_type == WorkflowType.VALIDATION and self._automation_lifecycle is not None:
+                self._lifecycle_update(
+                    self._automation_lifecycle.mark_validation_completed,
+                    test_case,
+                    passed=result.outcome.value == "PASSED",
+                    validated_plan_fingerprint=selected_plan_fingerprint,
+                )
+            return result
         except PlanSelectionError as error:
             raise RunUnavailableError(
                 "Saved plans changed before this run started. Reload the TestCase and try again.",
                 category="MISSING_AUTOMATION",
             ) from error
+
+    @staticmethod
+    def _lifecycle_update(method, *args, **kwargs) -> None:
+        try:
+            method(*args, **kwargs)
+        except Exception as error:
+            logger.error("Could not persist automation lifecycle status (%s)", type(error).__name__)

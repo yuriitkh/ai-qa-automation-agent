@@ -5,6 +5,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from qa_agent.execution_repository import ExecutionRepository
+from qa_agent.automation_lifecycle import (
+    AutomationLifecycleRepository,
+    SQLiteAutomationLifecycleRepository,
+)
+from qa_agent.drafts import DraftRepository, SQLiteDraftRepository
 from qa_agent.plan_store import PlanStore
 from qa_agent.run_history import RunHistoryRepository, RunHistoryService
 from qa_agent.sqlite_storage import (
@@ -26,6 +31,8 @@ class SQLiteApplicationStorage:
     run_history: RunHistoryService
     test_case_repository: TestCaseRepository
     llm_usage_repository: LLMUsageRepository
+    draft_repository: DraftRepository
+    automation_lifecycle_repository: AutomationLifecycleRepository
 
 
 def default_database_path() -> Path:
@@ -42,6 +49,8 @@ def create_sqlite_storage(
     plan_store = SQLitePlanStore(path)
     execution_repository = SQLiteExecutionRepository(path)
     test_case_repository = SQLiteTestCaseRepository(path)
+    draft_repository = SQLiteDraftRepository(path)
+    automation_lifecycle_repository = SQLiteAutomationLifecycleRepository(path)
     run_history_repository = SQLiteRunHistoryRepository(path)
     llm_usage_repository = LLMUsageRepository(path)
     run_history = RunHistoryService(
@@ -55,4 +64,6 @@ def create_sqlite_storage(
         run_history=run_history,
         test_case_repository=test_case_repository,
         llm_usage_repository=llm_usage_repository,
+        draft_repository=draft_repository,
+        automation_lifecycle_repository=automation_lifecycle_repository,
     )

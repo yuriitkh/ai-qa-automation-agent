@@ -39,3 +39,4 @@ playwright/.cache/
 /.qa_agent_evidence/
 
 /.evidence/
+/.runtime/

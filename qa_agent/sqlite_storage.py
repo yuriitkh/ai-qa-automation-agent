@@ -9,6 +9,10 @@ from typing import Iterator
 from uuid import UUID, uuid4
 
 from qa_agent.execution_repository import ExecutionRepository
+from qa_agent.automation_lifecycle import (
+    AutomationStatus,
+    definition_fingerprint,
+)
 from qa_agent.models import (
     Execution,
     ExecutionStatus,
@@ -398,6 +402,15 @@ class SQLiteTestCaseRepository(_SQLiteStorage):
                 )
                 """
             )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS test_case_automation_lifecycle (
+                    test_case_id TEXT PRIMARY KEY,
+                    state TEXT NOT NULL,
+                    definition_fingerprint TEXT NOT NULL,
+                    plan_fingerprint TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )"""
+            )
             _migrate_public_ids(
                 connection,
                 namespace="test_case",
@@ -413,7 +426,7 @@ class SQLiteTestCaseRepository(_SQLiteStorage):
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
-                "SELECT public_id FROM test_cases WHERE test_case_id = ?",
+                "SELECT public_id, definition_json FROM test_cases WHERE test_case_id = ?",
                 (str(test_case.id),),
             ).fetchone()
             public_id = existing["public_id"] if existing is not None else test_case.public_id
@@ -438,6 +451,41 @@ class SQLiteTestCaseRepository(_SQLiteStorage):
                 connection, namespace="test_case", sequence=sequence or 0
             )
             stored_case = test_case.model_copy(update={"public_id": public_id})
+            stored_json = stored_case.model_dump_json(exclude={"steps"})
+            if existing is not None:
+                old_case = TestCase.model_validate_json(existing["definition_json"])
+                old_json = old_case.model_dump_json(exclude={"steps"})
+                if old_json != stored_json:
+                    lifecycle = connection.execute(
+                        "SELECT state FROM test_case_automation_lifecycle WHERE test_case_id=?",
+                        (str(test_case.id),),
+                    ).fetchone()
+                    old_steps = [str(step.id) for step in old_case.steps]
+                    plan_table = connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cached_test_plans'"
+                    ).fetchone()
+                    had_saved_plans = False
+                    if plan_table is not None and old_steps:
+                        placeholders = ",".join("?" for _ in old_steps)
+                        had_saved_plans = connection.execute(
+                            f"SELECT 1 FROM cached_test_plans WHERE test_step_id IN ({placeholders}) LIMIT 1",
+                            old_steps,
+                        ).fetchone() is not None
+                    if lifecycle is not None and lifecycle["state"] != AutomationStatus.NOT_AUTOMATED.value:
+                        connection.execute(
+                            "UPDATE test_case_automation_lifecycle SET state=?, updated_at=? WHERE test_case_id=?",
+                            (AutomationStatus.NEEDS_UPDATE.value, now, str(test_case.id)),
+                        )
+                    elif lifecycle is None and had_saved_plans:
+                        # Older databases may contain plans without lifecycle metadata.
+                        # Record the old definition hash so this edit is visibly stale.
+                        connection.execute(
+                            """INSERT INTO test_case_automation_lifecycle
+                                (test_case_id, state, definition_fingerprint, plan_fingerprint, updated_at)
+                                VALUES (?, ?, ?, '', ?)""",
+                            (str(test_case.id), AutomationStatus.NEEDS_UPDATE.value,
+                             definition_fingerprint(old_case), now),
+                        )
             connection.execute(
                 """
                 INSERT INTO test_cases (
@@ -452,7 +500,7 @@ class SQLiteTestCaseRepository(_SQLiteStorage):
                     str(test_case.id),
                     public_id,
                     test_case.name,
-                    stored_case.model_dump_json(exclude={"steps"}),
+                    stored_json,
                     now,
                     now,
                 ),

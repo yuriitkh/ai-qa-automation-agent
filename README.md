@@ -159,11 +159,72 @@ Submit **Generate Test with AI** from **Test Cases в†’ New Test Case** to g
 immediate authoring progress page. The page polls actual provider and validation
 events, then redirects to the existing editable Review page when the draft is
 ready. **Generate Again** follows the same progress flow and uses the original
-authoring inputs. Drafts remain temporary until **Save Test Case**. A failed
+authoring inputs. The generated Review proposal remains temporary until **Save Test Case**. A failed
 request creates no draft or persisted TestCase; **Try Again** starts a new
 request with the original inputs. Authoring jobs use a separate bounded worker
-pool so long runs cannot occupy authoring workers. Progress and drafts remain
-in memory and are cleared when the server restarts.
+pool so long runs cannot occupy authoring workers. Review proposals and their
+progress are temporary and are cleared when the server restarts.
+
+### Persistent Drafts and manual TestCases
+
+Open **Drafts** in the main navigation to save, edit, reopen, or delete an
+unfinished testing idea. Drafts are stored in the `drafts` SQLite table. They
+remain separate from TestCases, Run History, and Test Suites. From a Draft, use
+**Create TestCase manually** or **Generate with AI**; converting it leaves the
+Draft in place until you explicitly delete it.
+
+The **New Test Case** page also has **Create manually**. Manual creation does not
+call an LLM and lets you enter a description, optional Base URL, preconditions,
+and up to eight initial steps. Open a saved TestCase and choose **Edit TestCase**
+to update its name, scenario, preconditions, and steps. Step actions preserve
+their existing segment membership; add, delete, duplicate, and move operations
+are scoped to one segment. A segment keeps at least one step.
+
+AI accelerates authoring and automation, but existing tests, manual TestCase
+editing, execution, validation, regression, export, and suite management remain
+available without an LLM.
+
+### Automation lifecycle
+
+The TestCase page shows a lifecycle status:
+
+- **Not automated**: there is no complete executable plan set.
+- **Needs validation**: complete plans exist, but they have not passed Validation
+  for the current definition and plan versions.
+- **Automation ready**: the current definition and plan versions passed Validation.
+- **Needs update**: the TestCase changed after automation was prepared. Run
+  Automation to refresh the plans, then run Validation.
+- **Automation needs attention**: automation preparation did not finish with a
+  complete usable plan set.
+
+Validation is the gate back to **Automation ready**. A Regression result that
+finds a product failure does not invalidate otherwise ready automation. TestCase
+edits keep all historical TestPlanVersions. **View TestPlan** is currently
+read-only; structured manual plan editing belongs to a future Automation Editor
+milestone. No user identity is stored or attributed.
+
+### Windows Desktop launcher
+
+From the repository folder, install two Desktop shortcuts with built-in
+PowerShell and Windows shortcut support:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-windows-shortcuts.ps1
+```
+
+Use **AI QA Agent** to start the local app or open an already healthy instance;
+use **Stop AI QA Agent** to stop only the process owned by the launcher. A
+different process on port 8000 is left alone and produces a clear error. The
+launcher chooses `.venv\Scripts\python.exe` first, then
+`.venv-original\Scripts\python.exe`; it does not fall back to arbitrary system
+Python. It starts `qa_agent.web` with the repository's `qa_agent.db` and
+`.evidence` directory. Runtime PID ownership data and server logs are kept under
+the ignored `.runtime` folder.
+
+The local `GET /health` endpoint returns only `status` and the application
+service identifier. It does not expose provider settings, credentials, or paths.
+The launcher waits for this endpoint before opening the browser. It does not
+package an executable or install dependencies.
 
 ### Portable automation, code export, and Test Suites
 

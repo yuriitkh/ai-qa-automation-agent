@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from qa_agent.presentation import (
     UI_CSS,
@@ -29,6 +29,13 @@ from qa_agent.provider_settings import (
     create_default_secret_store,
 )
 from qa_agent.run_history import RunHistoryDetail, RunHistoryRecord, RunHistoryService, WorkflowType
+from qa_agent.automation_lifecycle import (
+    AutomationLifecycleRepository,
+    AutomationLifecycleService,
+    AutomationStatus,
+    InMemoryAutomationLifecycleRepository,
+)
+from qa_agent.drafts import Draft, DraftRepository, InMemoryDraftRepository
 from qa_agent.test_case_execution import (
     RunUnavailableError,
     TestCaseExecutionService,
@@ -48,12 +55,13 @@ from qa_agent.llm_usage import LLMUsageService
 from qa_agent.pipeline import QATestPipeline
 from qa_agent.background_authoring import BackgroundAuthoringService
 from qa_agent.background_execution import BackgroundRunService
+from qa_agent.redaction import redact_secrets
 from qa_agent.execution_progress import (
     AuthoringEventType,
     ExecutionProgressStore,
 )
-from qa_agent.models import PlanVersionOrigin
-from qa_agent.plan_store import PlanStore
+from qa_agent.models import PlanVersionOrigin, TestCase
+from qa_agent.plan_store import InMemoryPlanStore, PlanStore
 from qa_agent.testplan_export import (
     TestPlanExportError,
     TestPlanExportService,
@@ -67,6 +75,7 @@ from qa_agent.test_suites import (
 )
 from qa_agent.test_case_decomposer import TestCaseDecomposer
 from qa_agent.test_plan_generator import LLMTestPlanGenerator
+from qa_agent.test_case_editing import TestCaseEditError, create_manual_test_case, edit_test_case
 from qa_agent.workflows import AutomationWorkflow
 
 
@@ -75,6 +84,7 @@ logger = logging.getLogger(__name__)
 _MAX_FORM_BODY_BYTES = 8192
 _MAX_AUTHORING_FORM_BODY_BYTES = 80_000
 _MAX_DRAFT_SAVE_BODY_BYTES = 256 * 1024
+_MAX_MANUAL_FORM_BODY_BYTES = 1024 * 1024
 _WORKFLOWS = {item.value for item in WorkflowType}
 _STATUSES = {"PASSED", "FAILED"}
 _FAILURE_TYPES = {
@@ -123,6 +133,9 @@ class LocalWebApplication:
         provider_router=None,
         llm_usage: LLMUsageService | None = None,
         test_suites: TestSuiteService | None = None,
+        drafts: DraftRepository | None = None,
+        automation_lifecycle: AutomationLifecycleService | None = None,
+        automation_lifecycle_repository: AutomationLifecycleRepository | None = None,
     ) -> None:
         self._run_history = run_history
         self._reports = reports or RunReportGenerator()
@@ -133,6 +146,11 @@ class LocalWebApplication:
         self._draft_store = draft_store or TestCaseDraftStore()
         self._progress_store = progress_store or ExecutionProgressStore()
         self._plan_store = plan_store
+        self._drafts = drafts or InMemoryDraftRepository()
+        lifecycle_repository = automation_lifecycle_repository or InMemoryAutomationLifecycleRepository()
+        self._automation_lifecycle = automation_lifecycle or AutomationLifecycleService(
+            lifecycle_repository, plan_store or InMemoryPlanStore()
+        )
         self._provider_settings = provider_settings
         self._provider_router = provider_router
         self._llm_usage = llm_usage
@@ -185,12 +203,30 @@ class LocalWebApplication:
                 "application/javascript; charset=utf-8",
                 _UI_JAVASCRIPT.encode("utf-8"),
             )
+        if path == "/health":
+            return WebResponse.json(200, '{"status":"ok","service":"ai-qa-agent"}')
+        if path == "/drafts":
+            return WebResponse.html(200, self._drafts_page())
+        if path == "/drafts/new":
+            return WebResponse.html(200, self._draft_edit_page())
+        if path == "/test-cases/manual":
+            return WebResponse.html(200, self._manual_test_case_page(
+                name=query.get("name", [""])[0],
+                base_url=query.get("base_url", [""])[0],
+                scenario=query.get("scenario", [""])[0],
+                source_draft_id=query.get("draft_id", [""])[0],
+            ))
         if len(parts) == 3 and parts[:2] == ["api", "progress"]:
             return self._progress_json(parts[2])
         if len(parts) == 3 and parts[:2] == ["runs", "progress"]:
             return self._progress_page(parts[2])
         if len(parts) == 4 and parts[:3] == ["api", "test-cases", "authoring-progress"]:
             return self._authoring_progress_json(parts[3])
+        if len(parts) == 3 and parts[:2] == ["drafts"]:
+            draft_id = _parse_uuid(parts[2])
+            if draft_id is None:
+                return self._not_found("Draft not found")
+            return self._draft_edit_page_response(draft_id)
         if len(parts) == 3 and parts[:2] == ["test-cases", "authoring-progress"]:
             return self._authoring_progress_page(parts[2])
         if path == "/":
@@ -255,6 +291,12 @@ class LocalWebApplication:
             if test_case_id is None:
                 return self._not_found("TestCase not found")
             return self._test_case_page(test_case_id)
+        if len(parts) == 3 and parts[0] == "test-cases" and parts[2] == "edit":
+            test_case_id = _parse_uuid(parts[1])
+            return self._test_case_edit_page_response(test_case_id) if test_case_id else self._not_found("TestCase not found")
+        if len(parts) == 3 and parts[0] == "test-cases" and parts[2] == "plans":
+            test_case_id = _parse_uuid(parts[1])
+            return self._test_plan_view(test_case_id) if test_case_id else self._not_found("TestCase not found")
         if len(parts) == 4 and parts[0] == "test-cases" and parts[2] == "export":
             test_case_id = _parse_uuid(parts[1])
             if test_case_id is None:
@@ -279,6 +321,29 @@ class LocalWebApplication:
         return self._not_found("Page not found")
 
     def _handle_post(self, parts: list[str], body: bytes | str | None) -> WebResponse:
+        if parts == ["drafts"]:
+            return self._handle_draft_create(body)
+        if len(parts) == 3 and parts[0] == "drafts":
+            return self._handle_draft_post(parts[1], parts[2], body)
+        if parts == ["test-cases", "manual"]:
+            return self._handle_manual_test_case_create(body)
+        if parts == ["test-cases", "manual", "prepare"]:
+            form, error = _parse_form_body(body, max_bytes=_MAX_AUTHORING_FORM_BODY_BYTES)
+            values = {key: items[0] for key, items in form.items()}
+            if error:
+                return WebResponse.html(400, self._manual_test_case_page(error=error))
+            return WebResponse.html(200, self._manual_test_case_page(
+                name=values.get("name", ""), base_url=values.get("base_url", ""),
+                scenario=values.get("description", ""),
+            ))
+        if len(parts) == 3 and parts[0] == "test-cases" and parts[2] == "edit":
+            return self._handle_test_case_edit(parts[1], body)
+        if (
+            len(parts) == 4
+            and parts[:2] == ["test-cases", "authoring-progress"]
+            and parts[3] in {"save-draft", "create-manually"}
+        ):
+            return self._handle_authoring_failure_action(parts[2], parts[3], body)
         if parts == ["settings", "providers"] and self._provider_settings is not None:
             return self._handle_provider_settings_post(body)
         if parts == ["test-cases", "export"]:
@@ -378,6 +443,7 @@ class LocalWebApplication:
             for event in snapshot.events
         )
         result = ""
+        failure_actions = ""
         if snapshot.finished:
             if snapshot.success:
                 result = (
@@ -390,6 +456,13 @@ class LocalWebApplication:
                 result = (
                     f'<p data-authoring-result-message><strong>{_authoring_error_label(snapshot.error_category)}</strong></p>'
                     f'<p>{escape_html(snapshot.error_message or "An unexpected authoring error occurred.")}</p>'
+                )
+                failure_actions = (
+                    '<div class="actions">'
+                    f'<form method="post" action="/test-cases/authoring-progress/{escape_html(progress_id)}/create-manually">'
+                    '<button class="button primary" type="submit">Create manually</button></form>'
+                    f'<form method="post" action="/test-cases/authoring-progress/{escape_html(progress_id)}/save-draft">'
+                    '<button class="button" type="submit">Save as Draft</button></form></div>'
                 )
         retry_hidden = " hidden" if not snapshot.finished or snapshot.success else ""
         retry_form = (
@@ -412,7 +485,7 @@ class LocalWebApplication:
             + f'<ul class="compact-list" data-authoring-events>{events}</ul></section>'
             + '<section class="panel progress-result" data-authoring-result'
             + ('' if snapshot.finished else ' hidden')
-            + f'><div data-authoring-result-content>{result}</div>{retry_form}</section>'
+            + f'><div data-authoring-result-content>{result}{failure_actions}</div>{retry_form}</section>'
             + '<p class="muted" data-authoring-notice aria-live="polite"></p></div>'
         )
         return WebResponse.html(200, self._page(
@@ -516,7 +589,7 @@ class LocalWebApplication:
             )
             version_label = f" v{step.plan_version}" if step.plan_version is not None else ""
             provenance = (
-                f'<span class="muted">Plan {escape_html(step.plan_origin.replace("_", " ").lower())}'
+                f'<span class="muted">Plan {escape_html(_plan_origin_display(step.plan_origin))}'
                 f'{version_label}</span>'
                 if step.plan_origin else ""
             )
@@ -612,6 +685,328 @@ class LocalWebApplication:
             if rows else ""
         )
 
+    def _recent_drafts_panel(self) -> str:
+        drafts = self._drafts.list(5)
+        if not drafts:
+            summary = '<p class="muted">Save an unfinished idea and return to it later.</p>'
+        else:
+            summary = '<ul class="compact-list">' + "".join(
+                f'<li><a href="/drafts/{item.id}">{escape_html(item.title)}</a></li>'
+                for item in drafts
+            ) + '</ul>'
+        return (
+            '<section class="panel"><div class="section-heading"><h2>Recent Drafts</h2>'
+            '<a class="button" href="/drafts">View all drafts</a></div>'
+            + summary + '<a class="button" href="/drafts/new">Save draft</a></section>'
+        )
+
+    def _drafts_page(self) -> str:
+        drafts = self._drafts.list(500)
+        rows = "".join(
+            '<tr><td><a href="/drafts/' + str(item.id) + '">' + escape_html(item.title) + '</a></td>'
+            + f'<td>{escape_html(item.base_url or "—")}</td>'
+            + f'<td>{escape_html(format_timestamp(item.updated_at))}</td>'
+            + '<td><form method="post" action="/drafts/' + str(item.id) + '/delete">'
+            + '<button class="button" type="submit">Delete</button></form></td></tr>'
+            for item in drafts
+        )
+        content = (
+            '<header class="page-heading"><h1>Drafts</h1>'
+            '<p class="lead">Capture unfinished testing ideas without creating a TestCase.</p></header>'
+            '<div class="actions"><a class="button primary" href="/drafts/new">New Draft</a></div>'
+            + ('<section class="panel"><div class="table-wrap"><table><thead><tr>'
+               '<th>Title</th><th>Base URL</th><th>Updated</th><th>Actions</th></tr></thead>'
+               f'<tbody>{rows}</tbody></table></div></section>' if drafts else
+               self._empty_state("No Drafts yet.", "Save a testing idea to work on it later."))
+        )
+        return self._page("Drafts", content, current="Drafts", breadcrumbs=[("Dashboard", "/")])
+
+    def _draft_edit_page_response(self, draft_id: UUID) -> WebResponse:
+        draft = self._drafts.get(draft_id)
+        if draft is None:
+            return self._not_found("Draft not found")
+        return WebResponse.html(200, self._draft_edit_page(draft))
+
+    def _draft_edit_page(self, draft: Draft | None = None, error: str | None = None, submitted: dict[str, str] | None = None) -> str:
+        editing = draft is not None
+        submitted = submitted or {}
+        action = f"/drafts/{draft.id}/update" if draft else "/drafts"
+        title = submitted.get("title", draft.title if draft else "")
+        body = submitted.get("body", draft.body if draft else "")
+        base_url = submitted.get("base_url", (draft.base_url or "") if draft else "")
+        notes = submitted.get("notes", (draft.notes or "") if draft else "")
+        error_html = f'<p class="authoring-error" role="alert">{escape_html(error)}</p>' if error else ""
+        content = (
+            '<header class="page-heading"><h1>' + ("Edit Draft" if editing else "New Draft") + '</h1>'
+            '<p class="lead">Drafts stay separate from TestCases, Runs, and Test Suites.</p></header>'
+            + error_html + f'<form method="post" action="{action}" class="panel">'
+            + '<div class="field"><label for="draft-title">Title</label>'
+            + f'<input id="draft-title" name="title" maxlength="200" required value="{escape_html(title)}"></div>'
+            + '<div class="field"><label for="draft-body">Testing idea / scenario</label>'
+            + f'<textarea id="draft-body" name="body" maxlength="6000" rows="8" required>{escape_html(body)}</textarea></div>'
+            + '<div class="field"><label for="draft-url">Base URL (optional)</label>'
+            + f'<input id="draft-url" name="base_url" maxlength="2048" value="{escape_html(base_url)}"></div>'
+            + '<div class="field"><label for="draft-notes">Notes (optional)</label>'
+            + f'<textarea id="draft-notes" name="notes" maxlength="6000" rows="3">{escape_html(notes)}</textarea></div>'
+            + '<div class="actions"><button class="button primary" type="submit">Save Draft</button>'
+            + '<a class="button" href="/drafts">Cancel</a></div></form>'
+        )
+        if draft is not None:
+            content += (
+                f'<section class="panel"><h2>Use this Draft</h2><div class="actions">'
+                f'<form method="post" action="/drafts/{draft.id}/convert">'
+                '<button class="button primary" type="submit">Create TestCase manually</button></form>'
+                f'<form method="post" action="/drafts/{draft.id}/generate">'
+                '<button class="button" type="submit">Generate with AI</button></form></div></section>'
+            )
+        return self._page(
+            "Edit Draft" if editing else "New Draft",
+            content,
+            current="Drafts",
+            breadcrumbs=[("Dashboard", "/"), ("Drafts", "/drafts")],
+        )
+
+    def _handle_draft_create(self, body: bytes | str | None) -> WebResponse:
+        return self._handle_draft_save(None, body)
+
+    def _handle_draft_post(self, draft_id_text: str, action: str, body: bytes | str | None) -> WebResponse:
+        draft_id = _parse_uuid(draft_id_text)
+        draft = self._drafts.get(draft_id) if draft_id else None
+        if draft is None:
+            return self._not_found("Draft not found")
+        if action == "delete":
+            _form, error = _parse_form_body(body)
+            if error:
+                return self._not_found("Draft not found")
+            self._drafts.delete(draft.id)
+            return WebResponse.redirect("/drafts")
+        if action == "update":
+            return self._handle_draft_save(draft, body)
+        form, error = _parse_form_body(body)
+        if error:
+            return WebResponse.html(400, self._draft_edit_page(draft, error))
+        if action == "convert":
+            try:
+                test_case = create_manual_test_case({
+                    "name": draft.title,
+                    "description": draft.body,
+                    "base_url": draft.base_url or "",
+                    "step_name_0": draft.title,
+                    "step_action_0": draft.body,
+                    "step_expected_0": "The described behavior works as expected.",
+                })
+                if self._test_cases is None:
+                    raise TestCaseEditError("TestCase storage is not configured.")
+                self._test_cases.save(test_case)
+            except (TestCaseEditError, ValueError) as conversion_error:
+                return WebResponse.html(400, self._draft_edit_page(draft, str(conversion_error)))
+            return WebResponse.redirect(f"/test-cases/{test_case.id}/edit")
+        if action == "generate":
+            if self._background_authoring is None or self._authoring_service is None:
+                return WebResponse.html(503, self._draft_edit_page(draft, "AI generation is unavailable. You can still create a TestCase manually."))
+            try:
+                validated = self._authoring_service.validate_input(draft.title, draft.body, draft.base_url or "")
+                progress_id = self._background_authoring.start(
+                    name=validated.name, base_url=validated.base_url, scenario=validated.scenario
+                )
+            except TestCaseAuthoringError as generate_error:
+                return WebResponse.html(400, self._draft_edit_page(draft, str(generate_error)))
+            return WebResponse.redirect(f"/test-cases/authoring-progress/{progress_id}")
+        return self._not_found("Draft action not found")
+
+    def _handle_draft_save(self, existing: Draft | None, body: bytes | str | None) -> WebResponse:
+        form, error = _parse_form_body(body, max_bytes=_MAX_DRAFT_SAVE_BODY_BYTES)
+        values = {key: items[0] for key, items in form.items()}
+        if error:
+            return WebResponse.html(400, self._draft_edit_page(existing, error, values))
+        try:
+            scenario = values.get("body", "").strip()
+            title = values.get("title", "").strip()
+            if not title and scenario:
+                title = next((line.strip() for line in scenario.splitlines() if line.strip()), "")[:200]
+            if not title or len(title) > 200:
+                raise ValueError("Enter a Draft title of 1–200 characters.")
+            if not scenario or len(scenario) > 6000:
+                raise ValueError("Enter a testing idea of 1–6,000 characters.")
+            base_url = values.get("base_url", "").strip()
+            notes = values.get("notes", "").strip()
+            if len(base_url) > 2048 or len(notes) > 6000:
+                raise ValueError("The Base URL or notes are too long.")
+            draft_values = {
+                "id": existing.id if existing else uuid4(),
+                "title": title,
+                "body": scenario,
+                "base_url": base_url or None,
+                "notes": notes or None,
+            }
+            if existing is not None:
+                draft_values["created_at"] = existing.created_at
+            draft = Draft(**draft_values)
+            self._drafts.save(draft)
+        except (ValueError, TypeError) as save_error:
+            return WebResponse.html(400, self._draft_edit_page(existing, str(save_error), values))
+        return WebResponse.redirect(f"/drafts/{draft.id}")
+
+    def _manual_test_case_page(
+        self,
+        *,
+        name: str = "",
+        base_url: str = "",
+        scenario: str = "",
+        source_draft_id: str = "",
+        error: str | None = None,
+    ) -> str:
+        error_html = f'<p class="authoring-error" role="alert">{escape_html(error)}</p>' if error else ""
+        rows = []
+        for index in range(8):
+            required = " required" if index == 0 else ""
+            rows.append(
+                f'<fieldset class="subpanel"><legend>Step {index + 1}</legend>'
+                f'<div class="field"><label for="step-name-{index}">Title</label>'
+                f'<input id="step-name-{index}" name="step_name_{index}" maxlength="200"{required}'
+                f' value="{escape_html(name if index == 0 else "")}"></div>'
+                f'<div class="field"><label for="step-action-{index}">Action / instruction</label>'
+                f'<textarea id="step-action-{index}" name="step_action_{index}" maxlength="6000" rows="3"{required}>'
+                f'{escape_html(scenario if index == 0 else "")}</textarea></div>'
+                f'<div class="field"><label for="step-expected-{index}">Expected result</label>'
+                f'<textarea id="step-expected-{index}" name="step_expected_{index}" maxlength="6000" rows="2"{required}'
+                f'>{escape_html("The described behavior works as expected." if index == 0 else "")}</textarea></div>'
+                '</fieldset>'
+            )
+        content = (
+            '<header class="page-heading"><h1>Create TestCase manually</h1>'
+            '<p class="lead">This path does not call an AI provider. You can add more steps after saving.</p></header>'
+            + error_html + '<form method="post" action="/test-cases/manual" class="panel">'
+            + (f'<input type="hidden" name="source_draft_id" value="{escape_html(source_draft_id)}">' if source_draft_id else "")
+            + '<div class="field"><label for="manual-name">TestCase name</label>'
+            + f'<input id="manual-name" name="name" maxlength="200" required value="{escape_html(name)}"></div>'
+            + '<div class="field"><label for="manual-description">Scenario / description</label>'
+            + f'<textarea id="manual-description" name="description" maxlength="6000" rows="4" required>{escape_html(scenario)}</textarea></div>'
+            + '<div class="field"><label for="manual-base-url">Base URL (optional)</label>'
+            + f'<input id="manual-base-url" name="base_url" maxlength="2048" value="{escape_html(base_url)}"></div>'
+            + '<div class="field"><label for="manual-preconditions">Preconditions (one per line)</label>'
+            + '<textarea id="manual-preconditions" name="preconditions" maxlength="180000" rows="3"></textarea></div>'
+            + '<h2>Steps</h2>' + "".join(rows)
+            + '<div class="actions"><button class="button primary" type="submit">Create TestCase</button>'
+            + '<a class="button" href="/test-cases/new">Back to AI authoring</a></div></form>'
+        )
+        return self._page("Create TestCase manually", content, current="Test Cases", breadcrumbs=[("Dashboard", "/"), ("Test Cases", "/test-cases")])
+
+    def _handle_manual_test_case_create(self, body: bytes | str | None) -> WebResponse:
+        form, error = _parse_form_body(body, max_bytes=_MAX_MANUAL_FORM_BODY_BYTES)
+        values = {key: items[0] for key, items in form.items()}
+        if error:
+            return WebResponse.html(400, self._manual_test_case_page(error=error))
+        try:
+            test_case = create_manual_test_case(values)
+            if self._test_cases is None:
+                raise TestCaseEditError("TestCase storage is not configured.")
+            self._test_cases.save(test_case)
+        except (TestCaseEditError, ValueError) as create_error:
+            return WebResponse.html(400, self._manual_test_case_page(
+                name=values.get("name", ""), base_url=values.get("base_url", ""),
+                scenario=values.get("description", ""),
+                source_draft_id=values.get("source_draft_id", ""), error=str(create_error),
+            ))
+        return WebResponse.redirect(f"/test-cases/{test_case.id}")
+
+    def _test_case_edit_page_response(self, test_case_id: UUID) -> WebResponse:
+        test_case = self._test_cases.get(test_case_id) if self._test_cases is not None else None
+        if test_case is None:
+            return self._not_found("TestCase not found")
+        return WebResponse.html(200, self._test_case_edit_page(test_case))
+
+    def _test_case_edit_page(self, test_case: TestCase, error: str | None = None, submitted: dict[str, str] | None = None) -> str:
+        submitted = submitted or {}
+        def value(key: str, default: str) -> str:
+            return escape_html(submitted.get(key, default))
+        preconditions = "\n".join(item.description for item in test_case.preconditions)
+        content = (
+            f'<header class="page-heading"><h1>Edit {escape_html(test_case.name)}</h1>'
+            '<p class="lead">Step actions stay inside their existing execution segment.</p></header>'
+            + (f'<p class="authoring-error" role="alert">{escape_html(error)}</p>' if error else "")
+            + f'<form method="post" action="/test-cases/{test_case.id}/edit" class="testcase-editor">'
+            + '<section class="panel"><h2>Definition</h2>'
+            + f'<div class="field"><label for="edit-name">Name</label><input id="edit-name" name="name" maxlength="200" value="{value("name", test_case.name)}" required></div>'
+            + f'<div class="field"><label for="edit-description">Scenario / description</label><textarea id="edit-description" name="description" maxlength="6000" rows="5" required>{value("description", test_case.description)}</textarea></div>'
+            + f'<div class="field"><label for="edit-base-url">Base URL</label><input id="edit-base-url" name="base_url" maxlength="2048" value="{value("base_url", test_case.base_url or "")}"></div>'
+            + f'<div class="field"><label for="edit-preconditions">Preconditions (one per line)</label><textarea id="edit-preconditions" name="preconditions" maxlength="180000" rows="4">{value("preconditions", preconditions)}</textarea></div>'
+            + '</section>'
+        )
+        for segment_index, segment in enumerate(test_case.segments):
+            rows = []
+            for step_index, step in enumerate(segment.steps):
+                prefix = f"step_{segment_index}_{step_index}_"
+                rows.append(
+                    f'<li class="subpanel"><h3>Step {step.order + 1}</h3>'
+                    + f'<div class="field"><label>Title</label><input name="{prefix}name" maxlength="200" value="{value(prefix + "name", step.name)}" required></div>'
+                    + f'<div class="field"><label>Action / instruction</label><textarea name="{prefix}action" maxlength="6000" rows="3" required>{value(prefix + "action", step.description)}</textarea></div>'
+                    + f'<div class="field"><label>Expected result</label><textarea name="{prefix}expected" maxlength="6000" rows="2" required>{value(prefix + "expected", step.expected)}</textarea></div>'
+                    + '<div class="button-row">'
+                    + f'<button class="button" name="operation" value="up:{segment_index}:{step_index}" type="submit">Move up</button>'
+                    + f'<button class="button" name="operation" value="down:{segment_index}:{step_index}" type="submit">Move down</button>'
+                    + f'<button class="button" name="operation" value="duplicate:{segment_index}:{step_index}" type="submit">Duplicate</button>'
+                    + f'<button class="button" name="operation" value="delete:{segment_index}:{step_index}" type="submit"'
+                    + (' disabled' if len(segment.steps) == 1 else '') + '>Delete</button></div></li>'
+                )
+            url_label = segment.base_url or test_case.base_url or "No URL configured"
+            content += (
+                f'<section class="panel"><h2>Segment {segment_index + 1}</h2>'
+                f'<p class="muted">Base URL: {escape_html(url_label)}</p><ol>{"".join(rows)}</ol>'
+                f'<button class="button" name="operation" value="add:{segment_index}" type="submit">Add step to this segment</button></section>'
+            )
+        content += (
+            '<section class="panel"><div class="actions"><button class="button primary" name="operation" value="save" type="submit">Save TestCase</button>'
+            f'<a class="button" href="/test-cases/{test_case.id}">Cancel</a></div></section></form>'
+        )
+        return self._page("Edit TestCase", content, current="Test Cases", breadcrumbs=[("Dashboard", "/"), ("Test Cases", "/test-cases"), (test_case.name, f"/test-cases/{test_case.id}")])
+
+    def _handle_test_case_edit(self, test_case_id_text: str, body: bytes | str | None) -> WebResponse:
+        test_case_id = _parse_uuid(test_case_id_text)
+        test_case = self._test_cases.get(test_case_id) if test_case_id and self._test_cases is not None else None
+        if test_case is None:
+            return self._not_found("TestCase not found")
+        form, error = _parse_form_body(body, max_bytes=_MAX_MANUAL_FORM_BODY_BYTES)
+        submitted = {key: items[0] for key, items in form.items()}
+        if error:
+            return WebResponse.html(400, self._test_case_edit_page(test_case, error))
+        try:
+            edited = edit_test_case(test_case, submitted, submitted.get("operation", "save"))
+            self._test_cases.save(edited)
+            self._automation_lifecycle.mark_test_case_changed(edited)
+        except (TestCaseEditError, ValueError) as edit_error:
+            return WebResponse.html(400, self._test_case_edit_page(test_case, str(edit_error), submitted))
+        return WebResponse.redirect(f"/test-cases/{edited.id}")
+
+    def _test_plan_view(self, test_case_id: UUID) -> WebResponse:
+        test_case = self._test_cases.get(test_case_id) if self._test_cases is not None else None
+        if test_case is None:
+            return self._not_found("TestCase not found")
+        if self._plan_store is None:
+            return WebResponse.html(503, self._page("TestPlan unavailable", self._empty_state("TestPlan unavailable", "No saved plan store is configured.")))
+        rows = []
+        for step in test_case.steps:
+            version = self._plan_store.find(step.id)
+            if version is None:
+                rows.append(f'<section class="panel"><h2>Step {step.order + 1}: {escape_html(step.name)}</h2><p class="muted">No saved TestPlan for this step.</p></section>')
+                continue
+            actions = "".join(
+                '<li><code>' + escape_html(action.action) + '</code><pre>'
+                + escape_html(redact_secrets(json.dumps(action.parameters, ensure_ascii=False, sort_keys=True, indent=2)))
+                + '</pre></li>' for action in version.qa_test_plan.steps
+            )
+            rows.append(
+                f'<section class="panel"><h2>Step {step.order + 1}: {escape_html(step.name)}</h2>'
+                f'<p>Plan v{version.version} · {_plan_origin_label(version.origin)}</p>'
+                f'<p>URL: {escape_html(redact_secrets(version.qa_test_plan.url))}</p><ol>{actions}</ol></section>'
+            )
+        content = (
+            f'<header class="page-heading"><h1>View TestPlan: {escape_html(test_case.name)}</h1>'
+            '<p class="lead">Read-only view of the current saved plans. Editing structured automation is planned for a later Automation Editor milestone.</p></header>'
+            + "".join(rows)
+        )
+        return WebResponse.html(200, self._page("View TestPlan", content, current="Test Cases", breadcrumbs=[("Dashboard", "/"), ("Test Cases", "/test-cases"), (test_case.name, f"/test-cases/{test_case.id}")]))
+
     def _handle_generate_test_case(self, body: bytes | str | None) -> WebResponse:
         form, form_error = _parse_form_body(body, max_bytes=_MAX_AUTHORING_FORM_BODY_BYTES)
         values = {
@@ -690,6 +1085,41 @@ class LocalWebApplication:
         return WebResponse.redirect(
             f"/test-cases/authoring-progress/{new_progress_id}"
         )
+
+    def _handle_authoring_failure_action(
+        self, progress_id: str, action: str, body: bytes | str | None
+    ) -> WebResponse:
+        _form, error = _parse_form_body(body)
+        if error:
+            return self._not_found("Authoring progress is no longer available.")
+        retry_data = self._progress_store.get_authoring_retry_data(progress_id)
+        if retry_data is None:
+            return self._not_found("Authoring progress is no longer available.")
+        name, base_url, scenario, _source_draft_token = retry_data
+        if action == "save-draft":
+            draft = Draft(title=name or "Untitled testing idea", body=scenario, base_url=base_url or None)
+            self._drafts.save(draft)
+            return WebResponse.redirect(f"/drafts/{draft.id}")
+        try:
+            test_case = create_manual_test_case({
+                "name": name,
+                "description": scenario,
+                "base_url": base_url,
+                "step_name_0": "Review scenario",
+                "step_action_0": scenario,
+                "step_expected_0": "The described behavior works as expected.",
+            })
+            if self._test_cases is None:
+                return WebResponse.html(503, self._manual_test_case_page(
+                    name=name, base_url=base_url, scenario=scenario,
+                    error="TestCase storage is not configured.",
+                ))
+            self._test_cases.save(test_case)
+        except (TestCaseEditError, ValueError) as create_error:
+            return WebResponse.html(400, self._manual_test_case_page(
+                name=name, base_url=base_url, scenario=scenario, error=str(create_error),
+            ))
+        return WebResponse.redirect(f"/test-cases/{test_case.id}/edit")
 
     def _handle_draft_action(
         self, token: str, action: str, body: bytes | str | None
@@ -943,6 +1373,14 @@ class LocalWebApplication:
             + self._authoring_voice_controls("dashboard-scenario")
             + '<button class="button primary authoring-submit" type="submit">Generate Test with AI</button>'
             + '</form>'
+            + '<form method="post" action="/test-cases/manual/prepare">'
+            + f'<input type="hidden" name="base_url" value="{escape_html(base_url)}">'
+            + f'<input type="hidden" name="description" value="{escape_html(scenario)}">'
+            + '<button class="button" type="submit">Create manually</button></form>'
+            + '<form method="post" action="/drafts">'
+            + f'<input type="hidden" name="body" value="{escape_html(scenario)}">'
+            + f'<input type="hidden" name="base_url" value="{escape_html(base_url)}">'
+            + '<button class="button" type="submit">Save as Draft</button></form>'
             + '<ol class="product-flow" aria-label="Test lifecycle">'
             + '<li>Describe</li><li>Generate</li><li>Run</li><li>Reuse</li></ol>'
             + '</section>'
@@ -950,6 +1388,7 @@ class LocalWebApplication:
         content = (
             '<header class="page-heading"><h1>AI QA Agent</h1></header>'
             + authoring_entry
+            + self._recent_drafts_panel()
             + f'<section aria-label="Run summary"><div class="summary-grid">{cards}</div>'
             '<p class="muted">Summary of the latest recorded history.</p></section>'
             '<section class="panel"><div class="section-heading"><h2>Recent runs</h2>'
@@ -991,7 +1430,7 @@ class LocalWebApplication:
         )
         content = (
             '<header class="page-heading"><h1>New Test Case</h1>'
-            '<p class="lead">Describe the scenario. AI will propose steps for you to review.</p></header>'
+            '<p class="lead">Describe the scenario for AI authoring, or create a TestCase yourself.</p></header>'
             + '<section class="panel authoring-entry"><form method="post" action="/test-cases/generate" data-authoring-form>'
             + '<input type="hidden" name="authoring_entry" value="new">'
             + error_html
@@ -1004,6 +1443,19 @@ class LocalWebApplication:
             + self._authoring_voice_controls("case-scenario")
             + '<button class="button primary" type="submit">Generate Test with AI</button>'
             + '</form></section>'
+            + '<section class="panel"><h2>Create without AI</h2>'
+            + '<p class="muted">Manual creation and editing remain available when providers are unconfigured or unavailable.</p>'
+            + '<form method="post" action="/test-cases/manual/prepare">'
+            + f'<input type="hidden" name="name" value="{escape_html(name)}">'
+            + f'<input type="hidden" name="base_url" value="{escape_html(base_url)}">'
+            + f'<input type="hidden" name="description" value="{escape_html(scenario)}">'
+            + '<button class="button" type="submit">Create manually with these details</button></form> '
+            + '<form method="post" action="/drafts">'
+            + f'<input type="hidden" name="title" value="{escape_html(name)}">'
+            + f'<input type="hidden" name="body" value="{escape_html(scenario)}">'
+            + f'<input type="hidden" name="base_url" value="{escape_html(base_url)}">'
+            + '<button class="button" type="submit">Save as Draft</button></form></section>'
+            + self._recent_drafts_panel()
         )
         return self._page(
             "New Test Case", content, current="Test Cases",
@@ -1469,6 +1921,28 @@ class LocalWebApplication:
             self._test_case_usage_panel(usage_summary)
             if usage_summary is not None else ""
         )
+        automation_status = (
+            self._automation_lifecycle.status(test_case)
+            if test_case is not None else AutomationStatus.NOT_AUTOMATED
+        )
+        lifecycle_label = _automation_status_label(automation_status)
+        lifecycle_note = {
+            AutomationStatus.NOT_AUTOMATED: "No complete executable automation is saved yet.",
+            AutomationStatus.AUTOMATION_READY: "Current saved automation passed Validation for this TestCase definition.",
+            AutomationStatus.NEEDS_UPDATE: "The TestCase changed after its automation was prepared. Generate updated automation before validating it.",
+            AutomationStatus.NEEDS_VALIDATION: "Executable automation exists and must pass Validation before it is marked ready.",
+            AutomationStatus.AUTOMATION_FAILED: "Automation could not be prepared completely. Review the TestCase and try Automation again.",
+        }[automation_status]
+        lifecycle_panel = (
+            '<section class="panel"><h2>Automation status</h2>'
+            f'<p>{badge(lifecycle_label, "workflow")}</p><p class="muted">{escape_html(lifecycle_note)}</p></section>'
+            if test_case is not None else ""
+        )
+        edit_links = (
+            f'<div class="actions"><a class="button" href="/test-cases/{test_case_id}/edit">Edit TestCase</a>'
+            f'<a class="button" href="/test-cases/{test_case_id}/plans">View TestPlan</a></div>'
+            if test_case is not None else ""
+        )
         export_panel = ""
         if test_case is not None and self._testplan_exports is not None:
             try:
@@ -1507,9 +1981,11 @@ class LocalWebApplication:
             + '<h1>' + escape_html(case_name) + '</h1>'
             + f'<p class="lead">{escape_html(case_description)}</p>'
             + f'<p class="muted">{escape_html(source_note)}</p></header>'
+            + edit_links
             + f'<details class="technical-details"><summary>Technical IDs</summary>'
             + f'<p>TestCase UUID: <code>{escape_html(test_case_id)}</code></p></details>'
             + f'<div class="summary-grid">{cards}</div>'
+            + lifecycle_panel
             + run_form
             + export_panel
             + usage_panel
@@ -2127,7 +2603,7 @@ class LocalWebApplication:
         breadcrumbs: list[tuple[str, str]] | None = None,
     ) -> str:
         nav_items = []
-        links = [("Dashboard", "/"), ("Test Cases", "/test-cases"), ("Runs", "/runs")]
+        links = [("Dashboard", "/"), ("Test Cases", "/test-cases"), ("Drafts", "/drafts"), ("Runs", "/runs")]
         if self._test_suites is not None:
             links.append(("Test Suites", "/test-suites"))
         if self._llm_usage is not None:
@@ -2174,6 +2650,9 @@ def create_application(
     evidence_directory: str | Path | None = None,
 ) -> LocalWebApplication:
     storage = create_sqlite_storage(database_path)
+    automation_lifecycle = AutomationLifecycleService(
+        storage.automation_lifecycle_repository, storage.plan_store
+    )
     llm_usage = LLMUsageService(storage.llm_usage_repository)
     evidence_root = (
         Path(evidence_directory).expanduser().resolve()
@@ -2201,6 +2680,7 @@ def create_application(
         storage.run_history,
         evidence_directory=evidence_root,
         automation_workflow=automation_workflow,
+        automation_lifecycle=automation_lifecycle,
     )
     return LocalWebApplication(
         storage.run_history,
@@ -2212,6 +2692,9 @@ def create_application(
         provider_settings=provider_settings,
         provider_router=automation_router,
         llm_usage=llm_usage,
+        drafts=storage.draft_repository,
+        automation_lifecycle=automation_lifecycle,
+        automation_lifecycle_repository=storage.automation_lifecycle_repository,
         test_suites=TestSuiteService(
             SQLiteTestSuiteRepository(storage.database_path),
             storage.test_case_repository,
@@ -2229,13 +2712,27 @@ def create_http_server(
             response = application.handle("GET", self.path)
             self._send(response)
 
+        def log_message(self, format: str, *args) -> None:
+            if should_suppress_successful_progress_log(
+                getattr(self, "command", ""), self.path,
+                getattr(self, "_response_status", None),
+            ):
+                return
+            super().log_message(format, *args)
+
         def do_POST(self) -> None:
             try:
                 content_length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
                 content_length = 8193
             request_path = urlsplit(self.path).path.strip("/").split("/")
-            if (
+            if request_path == ["drafts"] or (
+                len(request_path) == 3 and request_path[0] == "drafts"
+            ) or request_path == ["test-cases", "manual"] or (
+                len(request_path) == 3 and request_path[0] == "test-cases" and request_path[2] == "edit"
+            ) or request_path == ["test-cases", "manual", "prepare"]:
+                max_body_bytes = _MAX_MANUAL_FORM_BODY_BYTES
+            elif (
                 len(request_path) == 4
                 and request_path[:2] == ["test-cases", "review"]
                 and request_path[3] == "save"
@@ -2255,6 +2752,7 @@ def create_http_server(
             self._send(application.handle("POST", self.path, body))
 
         def _send(self, response: WebResponse) -> None:
+            self._response_status = response.status
             self.send_response(response.status)
             self.send_header("Content-Type", response.content_type)
             self.send_header("Content-Length", str(len(response.body)))
@@ -2295,6 +2793,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--evidence-directory", default=None, help="allowed screenshot directory")
     parser.add_argument("--host", default="127.0.0.1", help="bind host (defaults to localhost)")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--launcher-instance", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     serve(create_application(args.database, args.evidence_directory), args.host, args.port)
     return 0
@@ -2316,6 +2815,17 @@ def _parse_uuid(value: str) -> UUID | None:
         return UUID(value)
     except (ValueError, AttributeError):
         return None
+
+
+def should_suppress_successful_progress_log(method: str, target: str, status: int | None) -> bool:
+    if method.upper() != "GET" or status is None or not 200 <= status < 300:
+        return False
+    parts = urlsplit(target).path.strip("/").split("/")
+    return (
+        len(parts) == 3 and parts[:2] == ["api", "progress"]
+    ) or (
+        len(parts) == 4 and parts[:3] == ["api", "test-cases", "authoring-progress"]
+    )
 
 
 def _parse_form_body(
@@ -2453,11 +2963,28 @@ def _operation_label(operation: str) -> str:
 
 def _plan_origin_label(origin: PlanVersionOrigin | None) -> str:
     return {
-        PlanVersionOrigin.AI_GENERATED: "AI generated",
-        PlanVersionOrigin.HUMAN_EDITED: "Human edited",
-        PlanVersionOrigin.REGENERATED: "Regenerated",
-        PlanVersionOrigin.REPAIRED: "Repaired",
+        PlanVersionOrigin.AI_GENERATED: "Generated by AI",
+        PlanVersionOrigin.HUMAN_EDITED: "Edited locally",
+        PlanVersionOrigin.REGENERATED: "Updated automatically",
+        PlanVersionOrigin.REPAIRED: "Repaired automatically",
     }.get(origin, "Unknown origin")
+
+
+def _plan_origin_display(value: str) -> str:
+    try:
+        return _plan_origin_label(PlanVersionOrigin(value))
+    except ValueError:
+        return "Saved automation" if value == "SAVED" else "Unknown origin"
+
+
+def _automation_status_label(status: AutomationStatus) -> str:
+    return {
+        AutomationStatus.NOT_AUTOMATED: "Not automated",
+        AutomationStatus.AUTOMATION_READY: "Automation ready",
+        AutomationStatus.NEEDS_UPDATE: "Needs update",
+        AutomationStatus.NEEDS_VALIDATION: "Needs validation",
+        AutomationStatus.AUTOMATION_FAILED: "Automation needs attention",
+    }[status]
 
 
 def _outcome_badge(record: RunHistoryRecord, *, stacked: bool = False) -> str:
@@ -2714,6 +3241,22 @@ _UI_JAVASCRIPT = r"""
         const reason = document.createElement('p');
         reason.textContent = `Reason: ${snapshot.error_message || 'An unexpected authoring error occurred.'}`;
         authoringResultContent.append(heading, reason);
+        const actions = document.createElement('div');
+        actions.className = 'actions';
+        const addAction = (suffix, label, primary) => {
+          const form = document.createElement('form');
+          form.method = 'post';
+          form.action = `/test-cases/authoring-progress/${encodeURIComponent(authoringId)}/${suffix}`;
+          const button = document.createElement('button');
+          button.type = 'submit';
+          button.className = primary ? 'button primary' : 'button';
+          button.textContent = label;
+          form.append(button);
+          actions.append(form);
+        };
+        addAction('create-manually', 'Create manually', true);
+        addAction('save-draft', 'Save as Draft', false);
+        authoringResultContent.append(actions);
         if (authoringRetry) authoringRetry.hidden = false;
       }
     };
