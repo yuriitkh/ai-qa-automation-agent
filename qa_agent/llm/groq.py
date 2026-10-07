@@ -78,8 +78,8 @@ class GroqProvider(LLMProvider):
             "navigate uses {url: target URL}; assert_page_loaded uses all five common "
             "keys set to null. assert_title uses {expected: expected page title}. "
             'The assert_title parameter name MUST be exactly "expected"; '
-            "never use expected_title. assert_visible uses parameters "
-            "{selector: CSS selector, expected_text: expected visible text}. "
+            "never use expected_title. assert_visible requires selector and may "
+            "include expected_text when the requested verification names visible text. "
             "click uses parameters {selector: CSS selector}. "
             "fill uses {selector: CSS selector, value: text to fill}. "
             "select_option uses {selector, option_label}; option_label is the visible option text. "
@@ -87,6 +87,9 @@ class GroqProvider(LLMProvider):
             "assert_checked verifies checkbox state; assert_selected verifies radio state "
             "using selector with expected null, or select state using selector and expected "
             "option label or value. assert_enabled and assert_disabled use selector. "
+            "One human TestStep may require multiple ordered executable actions, including "
+            "filling several fields and then submitting. Preserve all requested actions "
+            "and verifications. "
             "assert_hidden uses parameters {selector: CSS selector}. "
             "assert_url uses parameters {expected: expected current URL}. "
             'The assert_url parameter name MUST be exactly "expected". '

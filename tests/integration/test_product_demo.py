@@ -78,6 +78,107 @@ def _wait_for_authoring(application, location: str, timeout: float = 30.0) -> di
 
 
 class ProductDemoSliceTests(unittest.TestCase):
+    def test_local_registration_step_generates_and_executes_multiple_actions(self) -> None:
+        class RegistrationProvider(LLMProvider):
+            def __init__(self, target_url: str) -> None:
+                self.target_url = target_url
+                self.calls = 0
+                self.task = ""
+
+            def create_test_plan(self, task, target_url, page_snapshot):
+                self.calls += 1
+                self.task = task
+                return QATestPlan(url=target_url, steps=[
+                    {"action": "navigate", "parameters": {"url": target_url}},
+                    {"action": "fill", "parameters": {"selector": "#first-name", "value": "Ada"}},
+                    {"action": "fill", "parameters": {"selector": "#last-name", "value": "Lovelace"}},
+                    {"action": "fill", "parameters": {"selector": "#email", "value": "ada@example.test"}},
+                    {"action": "fill", "parameters": {"selector": "#password", "value": "local-test-password"}},
+                    {"action": "click", "parameters": {"selector": "#create-account"}},
+                    {"action": "assert_text_contains", "parameters": {"expected_text": "Account created successfully"}},
+                ])
+
+        class RegistrationTargetHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = (
+                    "<!doctype html><html><head><title>Local registration</title></head><body>"
+                    '<form method="post" action="/register">'
+                    '<label>First name <input id="first-name" name="first_name" required></label>'
+                    '<label>Last name <input id="last-name" name="last_name" required></label>'
+                    '<label>Email <input id="email" name="email" type="email" required></label>'
+                    '<label>Password <input id="password" name="password" type="password" required></label>'
+                    '<button id="create-account" type="submit">Create account</button>'
+                    "</form></body></html>"
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                body = (
+                    "<!doctype html><html><head><title>Registration complete</title></head>"
+                    "<body><main><p>Account created successfully</p></main></body></html>"
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format, *_args):
+                return
+
+        target_server = ThreadingHTTPServer(("127.0.0.1", 0), RegistrationTargetHandler)
+        target_url = f"http://127.0.0.1:{target_server.server_address[1]}/register"
+        target_thread = threading.Thread(target=target_server.serve_forever, daemon=True)
+        target_thread.start()
+        provider = RegistrationProvider(target_url)
+        step = DomainTestStep(
+            name="Enter registration details",
+            description="Fill the first name, last name, email, and password, then submit.",
+            expected="The account-created confirmation is visible.",
+            order=0,
+        )
+        case = DomainTestCase(
+            name="Local registration",
+            description="Create an account on the local registration fixture.",
+            base_url=target_url,
+            steps=[step],
+        )
+        discovery = DiscoveryResult(
+            status=DiscoveryStatus.SUCCESS,
+            url=target_url,
+            interactive_elements=[
+                {"kind": "input", "tag": "input", "selector": "#first-name", "accessible_name": "First name"},
+                {"kind": "input", "tag": "input", "selector": "#last-name", "accessible_name": "Last name"},
+                {"kind": "input", "tag": "input", "selector": "#email", "accessible_name": "Email"},
+                {"kind": "input", "tag": "input", "selector": "#password", "accessible_name": "Password"},
+                {"kind": "button", "tag": "button", "role": "button", "selector": "#create-account", "accessible_name": "Create account"},
+            ],
+        )
+        try:
+            pipeline = QATestPipeline(
+                decomposer=TestCaseDecomposer(),
+                plan_generator=LLMTestPlanGenerator(LLMRouter([provider])),
+                discovery=lambda _url: discovery,
+                runner=BrowserRunner(headless=True),
+            )
+            result = pipeline.run_test_case(case)
+        finally:
+            target_server.shutdown()
+            target_server.server_close()
+            target_thread.join(timeout=5)
+
+        generated = result.test_plans[0].test_plan_version
+        self.assertEqual(provider.calls, 1)
+        self.assertIn("multiple ordered executable actions", provider.task)
+        self.assertEqual(len(generated.qa_test_plan.steps), 7)
+        self.assertEqual(generated.origin, PlanVersionOrigin.AI_GENERATED)
+        self.assertEqual(result.test_run.status, ExecutionStatus.PASSED)
+
     def test_validation_to_sqlite_history_report_and_web_then_successful_regression(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -796,6 +897,7 @@ class ProductDemoSliceTests(unittest.TestCase):
                 self.assertLess(event_types.index("RUN_STARTED"), event_types.index("TESTCASE_LOADED"))
                 self.assertIn("PLAN_GENERATION_STARTED", event_types)
                 self.assertIn("PLAN_GENERATED", event_types)
+                self.assertFalse(any(event_type.startswith("PLAN_REPAIR_") for event_type in event_types))
                 self.assertEqual(event_types.count("STEP_STARTED"), 4)
                 self.assertIn("EVIDENCE_CAPTURED", event_types)
                 self.assertEqual(event_types[-1], "RUN_FINISHED")

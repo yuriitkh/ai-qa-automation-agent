@@ -27,16 +27,12 @@ def qa_test_plan_schema() -> dict[str, Any]:
     """Return a strict-compatible plan schema with explicit action parameters."""
     step_variants = []
     common_fields = ("url", "expected", "selector", "expected_text", "value")
-    for action, _action_fields in QATestStep.ACTION_PARAMETER_FIELDS.items():
+    for action, action_fields in QATestStep.ACTION_PARAMETER_FIELDS.items():
         parameter_fields = common_fields + (("option_label",) if action == "select_option" else ())
         parameters_schema = {
             "type": "object",
             "properties": {
-                field: (
-                    {"type": "string"}
-                    if field == "option_label"
-                    else {"type": ["string", "null"]}
-                )
+                field: _parameter_schema(field, action_fields)
                 for field in parameter_fields
             },
             "required": list(parameter_fields),
@@ -54,9 +50,18 @@ def qa_test_plan_schema() -> dict[str, Any]:
     return {
         "type": "object",
         "properties": {
-            "url": {"type": "string"},
-            "steps": {"type": "array", "items": {"anyOf": step_variants}},
+            "url": {"type": "string", "minLength": 1, "pattern": r".*\S.*"},
+            "steps": {"type": "array", "minItems": 1, "items": {"anyOf": step_variants}},
         },
         "required": ["url", "steps"],
         "additionalProperties": False,
     }
+
+
+def _parameter_schema(field: str, required_fields: tuple[str, ...]) -> dict[str, Any]:
+    if field == "option_label" or field in required_fields:
+        schema: dict[str, Any] = {"type": "string"}
+        if field in {"url", "selector"}:
+            schema.update({"minLength": 1, "pattern": r".*\S.*"})
+        return schema
+    return {"type": ["string", "null"]}

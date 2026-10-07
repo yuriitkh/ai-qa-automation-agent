@@ -13,7 +13,7 @@ class QATestStep(BaseModel):
         "navigate": ("url",),
         "assert_page_loaded": (),
         "assert_title": ("expected",),
-        "assert_visible": ("selector", "expected_text"),
+        "assert_visible": ("selector",),
         "click": ("selector",),
         "fill": ("selector", "value"),
         "assert_hidden": ("selector",),

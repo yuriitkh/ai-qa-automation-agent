@@ -34,7 +34,7 @@ from qa_agent.plan_store import InMemoryPlanStore, PlanStore
 from qa_agent.locator_recovery import RecoveryStatus, recover_locator
 from qa_agent.test_case_decomposer import TestCaseDecomposer
 from qa_agent.test_plan_generator import GeneratedTestPlan, TestPlanGenerator
-from qa_agent.test_plan_validation import validate_executable_plan
+from qa_agent.test_plan_validation import PlanValidationError, validate_executable_plan
 from qa_agent.discovery_fallback import DiscoveryFallback
 from qa_agent.plan_execution import (
     PlanExecutionClassification,
@@ -395,6 +395,7 @@ class QATestPipeline:
                         prior_plan_exists=False,
                         new_plan_saved=False,
                         message=safe_reason,
+                        validation_issues=(error.issues if isinstance(error, PlanValidationError) else ()),
                     )
                     raise PipelineStageError(
                         f"plan generation (step {test_step.order}: {test_step.name})",
@@ -579,6 +580,7 @@ class QATestPipeline:
                     prior_plan_exists=True,
                     new_plan_saved=False,
                     message=safe_reason,
+                    validation_issues=(error.issues if isinstance(error, PlanValidationError) else ()),
                 )
                 raise PipelineStageError(
                     f"regeneration (step {test_step.order}: {test_step.name})",
@@ -701,7 +703,7 @@ def _with_plan_origin(
     origin: PlanVersionOrigin,
 ) -> GeneratedTestPlan:
     version = generated_plan.test_plan_version
-    if version.origin == origin:
+    if version.origin in {origin, PlanVersionOrigin.REPAIRED}:
         return generated_plan
     return GeneratedTestPlan(
         test_plan=generated_plan.test_plan,
@@ -734,6 +736,9 @@ def _validate_generated_plan(
 
 def _generation_failure_details(error: Exception) -> tuple[str, str]:
     """Map internal generation exceptions to stable, safe progress diagnostics."""
+    if isinstance(error, PlanValidationError):
+        reason = error.issues[0].message if error.issues else "Generated automation failed validation."
+        return "PLAN_VALIDATION_FAILED", reason
     if isinstance(error, ValidationError):
         return "PLAN_VALIDATION_FAILED", "Generated automation failed validation."
     if isinstance(error, (RetryableLLMError, NonRetryableLLMError)):

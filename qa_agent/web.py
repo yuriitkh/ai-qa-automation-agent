@@ -408,7 +408,17 @@ class LocalWebApplication:
                     f'<p>Saved automation: {escape_html(saved_automation)}</p>'
                     f'<p>New plan saved: {new_plan}.</p>'
                     '<details class="technical-details"><summary>Developer details</summary>'
-                    f'<p>Classification: <code>{escape_html(failure.technical_classification)}</code></p></details>'
+                    f'<p>Classification: <code>{escape_html(failure.technical_classification)}</code></p>'
+                    + (
+                        '<ul class="validation-issues">' + ''.join(
+                            '<li><code>' + escape_html(issue.code) + '</code> at '
+                            '<code>' + escape_html(issue.path) + '</code>: '
+                            + escape_html(issue.message) + '</li>'
+                            for issue in failure.validation_issues
+                        ) + '</ul>'
+                        if failure.validation_issues else ''
+                    )
+                    + '</details>'
                 )
             else:
                 result = (
@@ -473,6 +483,7 @@ class LocalWebApplication:
         }, "preparation")
         automation = self._progress_event_list(events, {
             "AUTOMATION_PREPARATION_STARTED", "PLAN_REUSED", "PLAN_GENERATION_STARTED",
+            "PLAN_REPAIR_STARTED", "PLAN_REPAIR_SUCCEEDED", "PLAN_REPAIR_FAILED",
             "PLAN_GENERATED", "PLAN_GENERATION_FAILED",
         }, "automation")
         cleanup = self._progress_event_list(events, {
@@ -1495,7 +1506,7 @@ class LocalWebApplication:
                 + '<form class="provider-key-form" method="post" action="/settings/providers">'
                 + f'<input type="hidden" name="provider_id" value="{escape_html(provider.id)}"><input type="hidden" name="operation" value="save_key">'
                 + f'<div class="field"><label for="key-{escape_html(provider.id)}">{("Replace" if provider.credential_source == "Web settings" else "Add")} API key</label>'
-                + f'<input id="key-{escape_html(provider.id)}" name="api_key" type="password" maxlength="2500" autocomplete="new-password" required></div>'
+                + f'<input id="key-{escape_html(provider.id)}" name="api_key" type="password" maxlength="2500" autocomplete="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-form-type="other" required></div>'
                 + '<button class="button" type="submit">Save key</button></form>'
                 + '<form method="post" action="/settings/providers">'
                 + f'<input type="hidden" name="provider_id" value="{escape_html(provider.id)}"><input type="hidden" name="operation" value="remove_key">'
@@ -2019,7 +2030,7 @@ _UI_JAVASCRIPT = r"""
 
   const eventGroups = {
     preparation: new Set(['TESTCASE_LOADED', 'SETUP_STARTED', 'SETUP_SUCCEEDED', 'SETUP_FAILED']),
-    automation: new Set(['AUTOMATION_PREPARATION_STARTED', 'PLAN_REUSED', 'PLAN_GENERATION_STARTED', 'PLAN_GENERATED', 'PLAN_GENERATION_FAILED']),
+    automation: new Set(['AUTOMATION_PREPARATION_STARTED', 'PLAN_REUSED', 'PLAN_GENERATION_STARTED', 'PLAN_REPAIR_STARTED', 'PLAN_REPAIR_SUCCEEDED', 'PLAN_REPAIR_FAILED', 'PLAN_GENERATED', 'PLAN_GENERATION_FAILED']),
     cleanup: new Set(['CLEANUP_STARTED', 'CLEANUP_SUCCEEDED', 'CLEANUP_FAILED'])
   };
   const stepStates = {
@@ -2126,6 +2137,16 @@ _UI_JAVASCRIPT = r"""
         const classification = document.createElement('p');
         classification.textContent = `Classification: ${failure.technical_classification}`;
         technical.append(technicalSummary, classification);
+        if (failure.validation_issues && failure.validation_issues.length) {
+          const issueList = document.createElement('ul');
+          issueList.className = 'validation-issues';
+          failure.validation_issues.forEach((issue) => {
+            const item = document.createElement('li');
+            item.textContent = `${issue.code} at ${issue.path}: ${issue.message}`;
+            issueList.append(item);
+          });
+          technical.append(issueList);
+        }
         resultContent.replaceChildren(summary, generated, remaining, stopped, reason, saved, newPlan, technical);
       } else {
         const summary = document.createElement('p');

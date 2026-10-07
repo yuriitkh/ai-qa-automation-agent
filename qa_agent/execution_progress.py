@@ -20,6 +20,7 @@ from qa_agent.models import TestCase, TestStep
 from qa_agent.presentation import failure_message
 from qa_agent.redaction import redact_secrets
 from qa_agent.run_context import RunContext
+from qa_agent.test_plan_validation import PlanValidationIssue
 
 
 class ExecutionEventType(str, Enum):
@@ -32,6 +33,9 @@ class ExecutionEventType(str, Enum):
     AUTOMATION_PREPARATION_STARTED = "AUTOMATION_PREPARATION_STARTED"
     PLAN_REUSED = "PLAN_REUSED"
     PLAN_GENERATION_STARTED = "PLAN_GENERATION_STARTED"
+    PLAN_REPAIR_STARTED = "PLAN_REPAIR_STARTED"
+    PLAN_REPAIR_SUCCEEDED = "PLAN_REPAIR_SUCCEEDED"
+    PLAN_REPAIR_FAILED = "PLAN_REPAIR_FAILED"
     PLAN_GENERATED = "PLAN_GENERATED"
     PLAN_GENERATION_FAILED = "PLAN_GENERATION_FAILED"
     STEP_STARTED = "STEP_STARTED"
@@ -100,6 +104,7 @@ class AutomationGenerationFailure(BaseModel):
     failure_category: str
     safe_reason: str
     technical_classification: str
+    validation_issues: tuple[PlanValidationIssue, ...] = ()
 
 
 class ExecutionProgressEvent(BaseModel):
@@ -119,6 +124,7 @@ class ExecutionProgressEvent(BaseModel):
     prior_plan_exists: bool | None = None
     new_plan_saved: bool | None = None
     message: str | None = None
+    validation_issues: tuple[PlanValidationIssue, ...] = ()
     run_id: UUID | None = None
     run_status: str | None = None
     outcome: str | None = None
@@ -145,6 +151,7 @@ class ExecutionProgressEvent(BaseModel):
             "prior_plan_exists": self.prior_plan_exists,
             "new_plan_saved": self.new_plan_saved,
             "message": self.message,
+            "validation_issues": [issue.model_dump(mode="json") for issue in self.validation_issues],
             "run_id": str(self.run_id) if self.run_id else None,
             "run_status": self.run_status,
             "outcome": self.outcome,
@@ -552,6 +559,7 @@ class ExecutionProgressStore:
         prior_plan_exists: bool | None = None,
         new_plan_saved: bool | None = None,
         message: str | None = None,
+        validation_issues: tuple[PlanValidationIssue, ...] = (),
         run_id: UUID | None = None,
         run_status: str | None = None,
         outcome: str | None = None,
@@ -578,6 +586,7 @@ class ExecutionProgressStore:
                 prior_plan_exists=prior_plan_exists,
                 new_plan_saved=new_plan_saved,
                 message=message,
+                validation_issues=validation_issues,
                 run_id=run_id,
                 run_status=run_status,
                 outcome=outcome,
@@ -656,6 +665,13 @@ class ExecutionProgressStore:
         elif event.event_type == ExecutionEventType.PLAN_GENERATION_STARTED:
             record.phase = "Generating automation"
             self._update_step(record, event.step_id, state=ProgressStepState.PREPARING_AUTOMATION)
+        elif event.event_type == ExecutionEventType.PLAN_REPAIR_STARTED:
+            record.phase = "Repairing automation"
+            self._update_step(record, event.step_id, state=ProgressStepState.PREPARING_AUTOMATION)
+        elif event.event_type == ExecutionEventType.PLAN_REPAIR_SUCCEEDED:
+            record.phase = "Validating automation"
+        elif event.event_type == ExecutionEventType.PLAN_REPAIR_FAILED:
+            record.phase = "Preparing automation"
         elif event.event_type == ExecutionEventType.PLAN_REUSED:
             self._update_step(
                 record, event.step_id,
@@ -689,6 +705,7 @@ class ExecutionProgressStore:
                     failure_category=event.classification,
                     safe_reason=event.message or "No reliable executable action could be produced for this step.",
                     technical_classification=event.failure_code or "PLAN_GENERATION_FAILED",
+                    validation_issues=event.validation_issues,
                 )
         elif event.event_type == ExecutionEventType.STEP_STARTED:
             if event.step_id is not None:
@@ -956,6 +973,7 @@ class ExecutionProgressReporter:
         prior_plan_exists: bool | None = None,
         new_plan_saved: bool | None = None,
         message: str | None = None,
+        validation_issues: tuple[PlanValidationIssue, ...] = (),
         run_id: UUID | None = None,
         run_status: str | None = None,
         outcome: str | None = None,
@@ -976,6 +994,14 @@ class ExecutionProgressReporter:
             prior_plan_exists=prior_plan_exists,
             new_plan_saved=new_plan_saved,
             message=self.safe_text(message) if message else None,
+            validation_issues=tuple(
+                PlanValidationIssue(
+                    code=issue.code,
+                    path=self.safe_text(issue.path),
+                    message=self.safe_text(issue.message),
+                )
+                for issue in validation_issues
+            ),
             run_id=run_id,
             run_status=run_status,
             outcome=outcome,
@@ -1059,6 +1085,7 @@ def emit_progress_event(
     prior_plan_exists: bool | None = None,
     new_plan_saved: bool | None = None,
     message: str | None = None,
+    validation_issues: tuple[PlanValidationIssue, ...] = (),
     evidence_execution_id: UUID | None = None,
     evidence_index: int | None = None,
 ) -> None:
@@ -1073,6 +1100,7 @@ def emit_progress_event(
             prior_plan_exists=prior_plan_exists,
             new_plan_saved=new_plan_saved,
             message=message,
+            validation_issues=validation_issues,
             evidence_execution_id=evidence_execution_id,
             evidence_index=evidence_index,
         )

@@ -7,6 +7,7 @@ from google.genai import types
 from ..models import AIDiscoveryResult, QATestPlan
 from .base import LLMProvider
 from .errors import NonRetryableLLMError, RetryableLLMError
+from .json_schema import qa_test_plan_schema
 
 
 def _raise_for_gemini_error(error: Exception, operation: str) -> None:
@@ -78,7 +79,7 @@ class GeminiProvider(LLMProvider):
             response_format = {
                 "type": "text",
                 "mime_type": "application/json",
-                "schema": QATestPlan.model_json_schema(),
+                "schema": qa_test_plan_schema(),
             }
             interaction = self._client.interactions.create(
                 model=self._model,
@@ -96,8 +97,8 @@ class GeminiProvider(LLMProvider):
                     "assert_page_loaded uses parameters {}; "
                     "assert_title uses parameters {expected: expected page title}. "
                     'The assert_title parameter name MUST be exactly "expected"; '
-                    "never use expected_title. assert_visible uses parameters "
-                    "{selector: CSS selector, expected_text: expected visible text}. "
+                    "never use expected_title. assert_visible requires selector and may "
+                    "include expected_text when the requested verification names visible text. "
                     "click uses parameters {selector: CSS selector}; "
                     "fill uses parameters {selector: CSS selector, value: text to fill}; "
                     "select_option uses {selector: CSS selector, option_label: visible option label}; "
@@ -106,6 +107,9 @@ class GeminiProvider(LLMProvider):
                     "radio selection using only selector (expected must be null or omitted), "
                     "or verifies a select option using selector and expected option label or value. "
                     "assert_enabled and assert_disabled verify actual enabled state. "
+                    "One human TestStep may require multiple ordered executable actions, "
+                    "including filling several fields and then submitting. Preserve all "
+                    "requested actions and verifications. "
                     "assert_hidden uses parameters {selector: CSS selector}. "
                     "assert_url uses parameters {expected: expected current URL}. "
                     'The assert_url parameter name MUST be exactly "expected". '

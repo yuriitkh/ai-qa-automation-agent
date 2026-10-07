@@ -10,6 +10,7 @@ import httpx
 from qa_agent.llm.gemini import GeminiProvider
 from qa_agent.llm.errors import RetryableLLMError
 from qa_agent.llm.groq import GroqProvider
+from qa_agent.llm.json_schema import qa_test_plan_schema
 from qa_agent.models import QATestPlan
 
 
@@ -58,7 +59,7 @@ class LLMProviderContractTests(unittest.TestCase):
         for parameter_contract in (
             "{url: target URL}",
             "{expected: expected page title}",
-            "{selector: CSS selector, expected_text: expected visible text}",
+            "assert_visible requires selector and may include expected_text",
             "click uses parameters {selector: CSS selector}",
             "{selector: CSS selector, value: text to fill}",
             "assert_hidden uses parameters {selector: CSS selector}",
@@ -86,6 +87,7 @@ class LLMProviderContractTests(unittest.TestCase):
         self.assertIn("assert_selected", prompt)
         self.assertIn("radio", prompt)
         self.assertIn("never invent an expected URL", prompt)
+        self.assertIn("multiple ordered executable actions", prompt)
 
     def test_gemini_prompt_and_plan_cover_all_actions(self) -> None:
         client = MagicMock()
@@ -100,7 +102,7 @@ class LLMProviderContractTests(unittest.TestCase):
         self._assert_prompt_contract(call["input"])
         self.assertIn("assert_page_loaded uses parameters {}", call["input"])
         self.assertEqual(
-            call["response_format"]["schema"], QATestPlan.model_json_schema()
+            call["response_format"]["schema"], qa_test_plan_schema()
         )
 
     def test_gemini_interactions_retry_config_disables_sdk_retries(self) -> None:

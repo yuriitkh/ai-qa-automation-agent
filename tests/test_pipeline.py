@@ -1365,7 +1365,7 @@ class QATestPipelineTests(unittest.TestCase):
         self.assertEqual(repository.list_for_test_step(step.id), [])
         self.assertEqual(len(step_trace.execution_attempts), 0)
 
-    def test_incompatible_generated_plan_fails_plan_generation_without_version(
+    def test_incompatible_generated_plan_fails_after_one_repair_without_version(
         self,
     ) -> None:
         # P2-4 characterization: an LLM plan that is schema-valid but
@@ -1451,13 +1451,14 @@ class QATestPipelineTests(unittest.TestCase):
         self.assertEqual(trace.status, TraceStatus.ERROR)
         self.assertIn("plan generation", trace.error_stage or "")
 
-        # Provider attempt was recorded BEFORE validation failed:
-        # SUCCESS + selected, even though the plan was later rejected.
+        # Both generation and the single bounded repair went through the
+        # configured router and recorded the provider response before the
+        # capability validator rejected it.
         step_trace = trace.steps[0]
         attempts = step_trace.provider_attempts
-        self.assertEqual(len(attempts), 1)
-        self.assertEqual(attempts[0].outcome, ProviderAttemptOutcome.SUCCESS)
-        self.assertTrue(attempts[0].is_selected)
+        self.assertEqual(len(attempts), 2)
+        self.assertTrue(all(attempt.outcome == ProviderAttemptOutcome.SUCCESS for attempt in attempts))
+        self.assertTrue(all(attempt.is_selected for attempt in attempts))
 
         # Rejected before any version or execution exists.
         self.assertIsNone(step_trace.plan_generation)
@@ -1466,9 +1467,9 @@ class QATestPipelineTests(unittest.TestCase):
         self.assertEqual(runner_calls, [])
         self.assertEqual(len(step_trace.execution_attempts), 0)
 
-        # Discovery and provider each ran exactly once (no retries/fallback).
+        # Discovery ran once; semantic repair is bounded to one extra router call.
         self.assertEqual(len(discovery_calls), 1)
-        self.assertEqual(provider.calls, 1)
+        self.assertEqual(provider.calls, 2)
 
     def test_runner_error_is_propagated_with_execution_stage_context(self) -> None:
         runner_error = RuntimeError("browser launch failed")

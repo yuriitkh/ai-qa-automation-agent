@@ -27,6 +27,7 @@ from qa_agent.run_history import (
     WorkflowType,
 )
 from qa_agent.test_case_execution import RunUnavailableError
+from qa_agent.test_plan_validation import PlanValidationIssue
 from qa_agent.setup_orchestration import SetupCleanupCoordinator
 from qa_agent.web import LocalWebApplication
 
@@ -362,6 +363,11 @@ class ExecutionProgressWebTests(unittest.TestCase):
             prior_plan_exists=False,
             new_plan_saved=False,
             message="Generated automation failed validation.",
+            validation_issues=(PlanValidationIssue(
+                code="MISSING_LOCATOR",
+                path="steps[0].parameters.selector",
+                message="CLICK action requires a locator.",
+            ),),
         )
         reporter.finish(outcome="AUTOMATION_GENERATION_ERROR", error_category="AUTOMATION_GENERATION_ERROR")
         app = LocalWebApplication(
@@ -381,6 +387,9 @@ class ExecutionProgressWebTests(unittest.TestCase):
             self.assertIn("Remaining: 1 steps not attempted", page)
             self.assertIn("Retry Automation", page)
             self.assertIn("PLAN_VALIDATION_FAILED", page)
+            self.assertIn("MISSING_LOCATOR", page)
+            self.assertIn("steps[0].parameters.selector", page)
+            self.assertIn("CLICK action requires a locator.", page)
             self.assertIn("data-progress-state", script)
             self.assertIn("snapshot.state.toLowerCase()", script)
             self.assertEqual(payload["state"], "FINISHED")
@@ -388,6 +397,10 @@ class ExecutionProgressWebTests(unittest.TestCase):
             self.assertEqual(payload["run_status"], None)
             self.assertEqual(payload["steps"][2]["state"], "NOT_ATTEMPTED")
             self.assertEqual(payload["automation_generation_failure"]["step_name"], "Submit registration")
+            self.assertEqual(
+                payload["automation_generation_failure"]["validation_issues"][0]["code"],
+                "MISSING_LOCATOR",
+            )
             self.assertNotIn("Traceback", json.dumps(payload))
         finally:
             app.close()

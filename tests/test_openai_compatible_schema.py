@@ -52,7 +52,16 @@ class OpenAICompatibleSchemaTests(unittest.TestCase):
         }
         visible = by_action["assert_visible"]["properties"]["parameters"]
         self.assertEqual(visible["required"], ["url", "expected", "selector", "expected_text", "value"])
+        self.assertEqual(visible["properties"]["selector"]["type"], "string")
+        self.assertEqual(visible["properties"]["expected_text"]["type"], ["string", "null"])
         self.assertFalse(visible["additionalProperties"])
+        click = by_action["click"]["properties"]["parameters"]
+        self.assertEqual(click["properties"]["selector"]["type"], "string")
+        fill = by_action["fill"]["properties"]["parameters"]
+        self.assertEqual(fill["properties"]["selector"]["type"], "string")
+        self.assertEqual(fill["properties"]["value"]["type"], "string")
+        navigate = by_action["navigate"]["properties"]["parameters"]
+        self.assertEqual(navigate["properties"]["url"]["type"], "string")
         select = by_action["select_option"]["properties"]["parameters"]
         self.assertIn("option_label", select["required"])
         self.assertFalse(by_action["assert_page_loaded"]["additionalProperties"])

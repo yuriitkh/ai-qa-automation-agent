@@ -2,6 +2,7 @@ import json
 from dataclasses import dataclass
 
 from qa_agent.llm.router import LLMRouter
+from qa_agent.execution_progress import ExecutionEventType, emit_progress_event
 from qa_agent.models import (
     DiscoveryResult,
     PlanVersionOrigin,
@@ -10,7 +11,11 @@ from qa_agent.models import (
     TestPlanVersion,
     TestStep,
 )
-from qa_agent.test_plan_validation import validate_executable_plan
+from qa_agent.test_plan_validation import (
+    PlanValidationError,
+    PlanValidationIssue,
+    validate_executable_plan,
+)
 
 
 @dataclass(frozen=True)
@@ -85,8 +90,48 @@ class LLMTestPlanGenerator(TestPlanGenerator):
 
         # Validate at this boundary as well, so a nonconforming Router
         # implementation cannot create a version from invalid plan data.
-        executable_plan = validate_executable_plan(router_result)
-        self._validate_discovery_capabilities(executable_plan, discovery_result, test_step)
+        repaired = False
+        try:
+            executable_plan = self._validate_generated_plan(
+                router_result, discovery_result, test_step
+            )
+        except PlanValidationError as initial_error:
+            repaired = True
+            emit_progress_event(
+                ExecutionEventType.PLAN_REPAIR_STARTED,
+                step=test_step,
+                message="Generated automation requires correction. Repairing once.",
+            )
+            repair_task = self._build_repair_task(task, initial_error.issues)
+            try:
+                repaired_result = self._router.create_test_plan(
+                    task=repair_task,
+                    target_url=discovery_result.url,
+                    page_snapshot=page_snapshot,
+                )
+            except Exception:
+                emit_progress_event(
+                    ExecutionEventType.PLAN_REPAIR_FAILED,
+                    step=test_step,
+                    message="Automation repair did not produce a validated plan.",
+                )
+                raise
+            try:
+                executable_plan = self._validate_generated_plan(
+                    repaired_result, discovery_result, test_step
+                )
+            except PlanValidationError:
+                emit_progress_event(
+                    ExecutionEventType.PLAN_REPAIR_FAILED,
+                    step=test_step,
+                    message="Generated automation still failed validation.",
+                )
+                raise
+            emit_progress_event(
+                ExecutionEventType.PLAN_REPAIR_SUCCEEDED,
+                step=test_step,
+                message="Automation validated after repair.",
+            )
         if existing_test_plan is not None:
             if existing_test_plan.test_step_id != test_step.id:
                 raise ValueError("Existing TestPlan belongs to a different TestStep.")
@@ -99,14 +144,45 @@ class LLMTestPlanGenerator(TestPlanGenerator):
         version = TestPlanVersion(
             test_plan_id=test_plan.id,
             version=version_number,
-            origin=(
+            origin=(PlanVersionOrigin.REPAIRED if repaired else (
                 PlanVersionOrigin.REGENERATED
                 if existing_test_plan is not None
                 else PlanVersionOrigin.AI_GENERATED
-            ),
+            )),
             qa_test_plan=executable_plan,
         )
         return GeneratedTestPlan(test_plan=test_plan, test_plan_version=version)
+
+    @staticmethod
+    def _validate_generated_plan(
+        value: object,
+        discovery_result: DiscoveryResult,
+        test_step: TestStep,
+    ) -> QATestPlan:
+        executable_plan = validate_executable_plan(value)
+        LLMTestPlanGenerator._validate_discovery_capabilities(
+            executable_plan, discovery_result, test_step
+        )
+        return executable_plan
+
+    @staticmethod
+    def _build_repair_task(
+        original_task: str,
+        issues: tuple[PlanValidationIssue, ...],
+    ) -> str:
+        issue_lines = "\n".join(
+            f"- {issue.code} at {issue.path}: {issue.message}"
+            for issue in issues
+        )
+        return (
+            f"{original_task}\n\n"
+            "The previous plan failed executable-plan validation. Regenerate a "
+            "corrected plan for the same TestStep, preserving every requested "
+            "action and verification. Fix each listed issue. A human TestStep "
+            "may require multiple ordered executable actions. Use only actions "
+            "and selectors supported by the supplied schema and page snapshot.\n"
+            f"Safe validation issues:\n{issue_lines}"
+        )
 
     @staticmethod
     def _build_task_context(
@@ -115,9 +191,11 @@ class LLMTestPlanGenerator(TestPlanGenerator):
     ) -> str:
         return (
             "Generate an executable Playwright-oriented QATestPlan for this "
-            "single atomic TestStep only. Do not generate a TestCase, split the "
-            "step, or add unrelated checks. Preserve every requested action and "
-            "verification from the TestStep. Treat deterministic interactive_elements "
+            "one human TestStep. Do not generate a TestCase or add unrelated "
+            "checks. A human TestStep may require multiple ordered executable "
+            "actions, such as filling several fields before submitting a form. "
+            "Preserve every requested action and verification from the TestStep. "
+            "Treat deterministic interactive_elements "
             "as authoritative: when a requested control matches an accessible_name, "
             "use its exact selector unchanged. Use select_option for selects, "
             "assert_checked for checkbox/radio, assert_selected for select state, "
@@ -166,7 +244,8 @@ class LLMTestPlanGenerator(TestPlanGenerator):
             if isinstance(test_step, str)
             else f"{test_step.name} {test_step.description} {test_step.expected}".casefold()
         )
-        for step in plan.steps:
+        for index, step in enumerate(plan.steps):
+            path = f"steps[{index}].parameters.selector"
             selector = step.parameters.get("selector")
             element = elements.get(selector) if isinstance(selector, str) else None
             relevant_actions = {
@@ -180,23 +259,44 @@ class LLMTestPlanGenerator(TestPlanGenerator):
                 actions = next((allowed for kind, allowed in relevant_actions.items()
                                 if kind in (discovered.kind + " " + discovered.tag + " " + discovered.role).casefold()), set())
                 if label and label in intent and step.action in actions and selector != discovered.selector:
-                    raise ValueError(
-                        f"Plan must use deterministic Discovery selector {discovered.selector!r} "
-                        f"for {discovered.accessible_name!r}, not {selector!r}."
-                    )
+                    raise PlanValidationError([PlanValidationIssue(
+                        code="DISCOVERY_SELECTOR_MISMATCH",
+                        path=path,
+                        message="The action must use the deterministic Discovery selector for the requested control.",
+                    )])
             if element is None:
                 continue
             kind = (element.kind + " " + element.tag + " " + element.role).casefold()
             if step.action == "select_option" and "select" not in kind:
-                raise ValueError(f"select_option selector {selector!r} targets discovered {element.kind!r}, not a select.")
+                raise PlanValidationError([PlanValidationIssue(
+                    code="ACTION_TARGET_MISMATCH",
+                    path=path,
+                    message="SELECT_OPTION must target a discovered select control.",
+                )])
             if step.action == "assert_selected":
                 if "radio" in kind:
                     if step.parameters.get("expected") is not None:
-                        raise ValueError("assert_selected for a radio must not include expected.")
+                        raise PlanValidationError([PlanValidationIssue(
+                            code="INVALID_PARAMETER",
+                            path=f"steps[{index}].parameters.expected",
+                            message="A radio selection assertion does not take an expected option value.",
+                        )])
                 elif "select" in kind:
                     if not isinstance(step.parameters.get("expected"), str):
-                        raise ValueError("assert_selected for a select requires an expected option label or value.")
+                        raise PlanValidationError([PlanValidationIssue(
+                            code="MISSING_EXPECTED_VALUE",
+                            path=f"steps[{index}].parameters.expected",
+                            message="A select assertion requires an expected option value.",
+                        )])
                 else:
-                    raise ValueError(f"assert_selected selector {selector!r} does not target a radio or select.")
+                    raise PlanValidationError([PlanValidationIssue(
+                        code="ACTION_TARGET_MISMATCH",
+                        path=path,
+                        message="ASSERT_SELECTED does not target a radio or select control supported by Discovery.",
+                    )])
             if step.action == "assert_checked" and "checkbox" not in kind:
-                raise ValueError(f"assert_checked selector {selector!r} does not target a checkbox.")
+                raise PlanValidationError([PlanValidationIssue(
+                    code="ACTION_TARGET_MISMATCH",
+                    path=path,
+                    message="ASSERT_CHECKED must target a discovered checkbox control.",
+                )])

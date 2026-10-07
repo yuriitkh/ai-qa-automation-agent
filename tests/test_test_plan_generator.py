@@ -4,8 +4,9 @@ import unittest
 from typing import get_type_hints
 from unittest.mock import patch
 
-from pydantic import ValidationError
-
+from qa_agent.llm.base import LLMProvider
+from qa_agent.llm.errors import RetryableLLMError
+from qa_agent.llm.router import LLMRouter
 from qa_agent.models import (
     DiscoveryResult,
     PlanVersionOrigin,
@@ -18,6 +19,13 @@ from qa_agent.models import (
     TestStep as DomainTestStep,
 )
 from qa_agent.test_plan_generator import LLMTestPlanGenerator, TestPlanGenerator
+from qa_agent.test_plan_validation import PlanValidationError
+from qa_agent.execution_progress import (
+    ExecutionEventType,
+    ExecutionProgressReporter,
+    ExecutionProgressStore,
+    active_execution_progress,
+)
 
 
 class TestPlanGeneratorTests(unittest.TestCase):
@@ -206,14 +214,123 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
 
         self.assertIs(raised.exception, error)
 
-    def test_invalid_router_plan_fails_validation_before_version_creation(self) -> None:
+    def test_invalid_router_plan_gets_one_repair_and_never_creates_a_version(self) -> None:
         router = _StubRouter({"url": "", "steps": []})
 
         with patch("qa_agent.test_plan_generator.TestPlan") as plan_factory:
-            with self.assertRaises(ValidationError):
+            with self.assertRaises(PlanValidationError) as raised:
                 LLMTestPlanGenerator(router).generate(self.make_test_step(), self.make_discovery_result())
 
         plan_factory.assert_not_called()
+        self.assertEqual(len(router.calls), 2)
+        self.assertEqual(raised.exception.issues[0].code, "MISSING_TARGET_URL")
+
+    def test_invalid_plan_is_repaired_once_for_multi_field_registration_step(self) -> None:
+        target_url = "http://127.0.0.1:43123/register"
+        step = DomainTestStep(
+            name="Enter registration details",
+            description="Fill first name, last name, email, and password, then create the account.",
+            expected="The account confirmation is shown.",
+            order=1,
+        )
+        discovery = DiscoveryResult(
+            status=DiscoveryStatus.SUCCESS,
+            url=target_url,
+            interactive_elements=[
+                InteractiveElement(kind="input", tag="input", selector="#first-name", accessible_name="First name"),
+                InteractiveElement(kind="input", tag="input", selector="#last-name", accessible_name="Last name"),
+                InteractiveElement(kind="input", tag="input", selector="#email", accessible_name="Email"),
+                InteractiveElement(kind="input", tag="input", selector="#password", accessible_name="Password"),
+                InteractiveElement(kind="button", tag="button", role="button", selector="#create-account", accessible_name="Create account"),
+            ],
+        )
+        invalid = QATestPlan(url=target_url, steps=[
+            QATestStep(action="fill", parameters={"selector": "#first-name"}),
+        ])
+        repaired = QATestPlan(url=target_url, steps=[
+            QATestStep(action="fill", parameters={"selector": "#first-name", "value": "Ada"}),
+            QATestStep(action="fill", parameters={"selector": "#last-name", "value": "Lovelace"}),
+            QATestStep(action="fill", parameters={"selector": "#email", "value": "ada@example.test"}),
+            QATestStep(action="fill", parameters={"selector": "#password", "value": "local-test-password"}),
+            QATestStep(action="click", parameters={"selector": "#create-account"}),
+            QATestStep(action="assert_text_contains", parameters={"expected_text": "Account created"}),
+        ])
+        router = _SequencedRouter([invalid, repaired])
+        generated = LLMTestPlanGenerator(router).generate_with_plan(step, discovery)
+
+        self.assertEqual(len(router.calls), 2)
+        self.assertEqual(len(generated.test_plan_version.qa_test_plan.steps), 6)
+        self.assertEqual(generated.test_plan_version.origin, PlanVersionOrigin.REPAIRED)
+        self.assertIn("MISSING_INPUT_VALUE", router.calls[1]["task"])
+        self.assertIn("Enter registration details", router.calls[1]["task"])
+
+    def test_repair_lifecycle_is_reported_without_exposing_candidate_output(self) -> None:
+        step = self.make_test_step()
+        invalid = QATestPlan(url="https://www.dnb.no/", steps=[
+            QATestStep(action="click", parameters={}),
+        ])
+        valid = QATestPlan(url="https://www.dnb.no/", steps=[
+            QATestStep(action="assert_page_loaded"),
+        ])
+        router = _SequencedRouter([invalid, valid])
+        store = ExecutionProgressStore()
+        progress_id = store.create(step.id, "AUTOMATION")
+        reporter = ExecutionProgressReporter(store, progress_id)
+
+        with active_execution_progress(reporter):
+            LLMTestPlanGenerator(router).generate(step, self.make_discovery_result())
+
+        events = store.get(progress_id).events
+        repair_events = [event for event in events if event.event_type in {
+            ExecutionEventType.PLAN_REPAIR_STARTED,
+            ExecutionEventType.PLAN_REPAIR_SUCCEEDED,
+            ExecutionEventType.PLAN_REPAIR_FAILED,
+        }]
+        self.assertEqual(
+            [event.event_type for event in repair_events],
+            [ExecutionEventType.PLAN_REPAIR_STARTED, ExecutionEventType.PLAN_REPAIR_SUCCEEDED],
+        )
+        self.assertNotIn("model output", json.dumps([event.to_public_dict() for event in events]))
+
+    def test_repair_uses_router_fallback_without_changing_provider_order(self) -> None:
+        class FirstProvider(LLMProvider):
+            def __init__(self):
+                self.calls = 0
+
+            @property
+            def is_available(self):
+                return True
+
+            def create_test_plan(self, task, target_url, page_snapshot):
+                self.calls += 1
+                if self.calls == 1:
+                    return QATestPlan(url=target_url, steps=[{"action": "click", "parameters": {}}])
+                raise RetryableLLMError("fake repair provider outage")
+
+        class FallbackProvider(LLMProvider):
+            def __init__(self):
+                self.calls = 0
+
+            @property
+            def is_available(self):
+                return True
+
+            def create_test_plan(self, task, target_url, page_snapshot):
+                self.calls += 1
+                return QATestPlan(url=target_url, steps=[{"action": "assert_page_loaded", "parameters": {}}])
+
+        first = FirstProvider()
+        fallback = FallbackProvider()
+        router = LLMRouter([first, fallback])
+
+        generated = LLMTestPlanGenerator(router).generate_with_plan(
+            self.make_test_step(), self.make_discovery_result()
+        )
+
+        self.assertEqual(generated.test_plan_version.origin, PlanVersionOrigin.REPAIRED)
+        self.assertEqual(first.calls, 2)
+        self.assertEqual(fallback.calls, 1)
+        self.assertEqual(router.selected_provider_name, "FallbackProvider")
 
     def test_discovery_context_and_single_step_task_are_passed_to_router(self) -> None:
         router = _StubRouter(QATestPlan(
@@ -228,7 +345,8 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
         self.assertEqual(len(router.calls), 1)
         call = router.calls[0]
         self.assertEqual(call["target_url"], result.url)
-        self.assertIn("single atomic TestStep only", call["task"])
+        self.assertIn("one human TestStep", call["task"])
+        self.assertIn("multiple ordered executable actions", call["task"])
         self.assertIn(step.name, call["task"])
         self.assertIn(step.description, call["task"])
         self.assertIn(step.expected, call["task"])
@@ -253,7 +371,8 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
 
         self.assertEqual(len(router.calls), 1)
         self.assertEqual(router.calls[0]["task"].count("TestStep order:"), 1)
-        self.assertIn("Do not generate a TestCase, split the step", router.calls[0]["task"])
+        self.assertIn("Do not generate a TestCase", router.calls[0]["task"])
+        self.assertIn("multiple ordered executable actions", router.calls[0]["task"])
 
     def test_enabled_state_assertions_require_matching_discovered_input_selector(self) -> None:
         selector = 'input[name="my-disabled"]'
@@ -286,11 +405,11 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
                     steps=[QATestStep(action=action, parameters={"selector": "input"})],
                 )
 
-                with self.assertRaisesRegex(ValueError, "deterministic Discovery selector"):
+                with self.assertRaisesRegex(PlanValidationError, "deterministic Discovery selector"):
                     LLMTestPlanGenerator(_StubRouter(plan)).generate(step, discovery)
 
                 plan.steps[0].parameters["selector"] = "#my-disabled"
-                with self.assertRaisesRegex(ValueError, "deterministic Discovery selector"):
+                with self.assertRaisesRegex(PlanValidationError, "deterministic Discovery selector"):
                     LLMTestPlanGenerator(_StubRouter(plan)).generate(step, discovery)
 
                 plan.steps[0].parameters["selector"] = selector
@@ -329,7 +448,7 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
         LLMTestPlanGenerator(_StubRouter(plan)).generate(test_step, discovery)
 
         plan.steps[1].parameters["selector"] = "input[type=radio]"
-        with self.assertRaisesRegex(ValueError, "deterministic Discovery selector"):
+        with self.assertRaisesRegex(PlanValidationError, "deterministic Discovery selector"):
             LLMTestPlanGenerator(_StubRouter(plan)).generate(test_step, discovery)
 
 
@@ -348,6 +467,16 @@ class _StubRouter:
         if self.error:
             raise self.error
         return self.result
+
+
+class _SequencedRouter:
+    def __init__(self, results: list[object]) -> None:
+        self.results = list(results)
+        self.calls: list[dict[str, str]] = []
+
+    def create_test_plan(self, *, task: str, target_url: str, page_snapshot: str) -> object:
+        self.calls.append({"task": task, "target_url": target_url, "page_snapshot": page_snapshot})
+        return self.results.pop(0)
 
 
 if __name__ == "__main__":

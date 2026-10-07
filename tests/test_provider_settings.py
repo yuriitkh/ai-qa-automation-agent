@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import tempfile
 import unittest
 from dataclasses import asdict
@@ -184,6 +185,15 @@ class ProviderSettingsTests(unittest.TestCase):
         self.assertNotIn(key, html)
         self.assertNotIn(key, safe_json)
         self.assertNotIn(key, safe_failure_reason(RuntimeError(f"provider echoed {key}")))
+        key_input = re.search(r'<input id="key-groq"[^>]*>', html)
+        self.assertIsNotNone(key_input)
+        self.assertIn('type="password"', key_input.group(0))
+        self.assertIn('autocomplete="off"', key_input.group(0))
+        self.assertIn('autocapitalize="off"', key_input.group(0))
+        self.assertIn('spellcheck="false"', key_input.group(0))
+        self.assertIn('data-lpignore="true"', key_input.group(0))
+        self.assertIn('data-1p-ignore="true"', key_input.group(0))
+        self.assertNotRegex(html, r"(?i)onpaste\s*=|addEventListener\s*\(\s*['\"]paste")
 
     def test_provider_settings_post_uses_post_redirect_get_and_refreshes_router(self):
         router = self.service.create_router()
