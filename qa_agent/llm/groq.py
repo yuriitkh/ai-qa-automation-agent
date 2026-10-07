@@ -14,6 +14,23 @@ class GroqProvider(LLMProvider):
     _model = "openai/gpt-oss-20b"
     _endpoint = "https://api.groq.com/openai/v1/chat/completions"
 
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str | None = None,
+        timeout_seconds: float | None = None,
+        max_output_tokens: int | None = None,
+    ) -> None:
+        self._api_key = api_key
+        self.model = model or os.getenv("GROQ_MODEL", self._model)
+        self._timeout_seconds = timeout_seconds or 30.0
+        self._max_output_tokens = max_output_tokens or 4096
+
+    def _resolved_api_key(self) -> str:
+        if self._api_key is not None:
+            return self._api_key.strip()
+        return os.environ.get("GROQ_API_KEY", "").strip()
+
     @staticmethod
     def _response_schema() -> dict[str, Any]:
         """Return strict variants with an explicit common parameter shape."""
@@ -21,12 +38,12 @@ class GroqProvider(LLMProvider):
 
     @property
     def is_available(self) -> bool:
-        return bool(os.environ.get("GROQ_API_KEY"))
+        return bool(self._resolved_api_key())
 
     def create_test_plan(
         self, task: str, target_url: str, page_snapshot: str
     ) -> QATestPlan:
-        api_key = os.environ.get("GROQ_API_KEY")
+        api_key = self._resolved_api_key()
         if not api_key:
             raise NonRetryableLLMError("GROQ_API_KEY is not set.")
 
@@ -111,7 +128,7 @@ class GroqProvider(LLMProvider):
         )
 
         request_payload = {
-            "model": os.getenv("GROQ_MODEL", self._model),
+            "model": self.model,
             "max_completion_tokens": 8192,
             "messages": [
                 {"role": "user", "content": prompt},
@@ -130,7 +147,7 @@ class GroqProvider(LLMProvider):
                 self._endpoint,
                 headers={"Authorization": f"Bearer {api_key}"},
                 json=request_payload,
-                timeout=30.0,
+                timeout=self._timeout_seconds,
             )
         except httpx.TimeoutException as error:
             raise RetryableLLMError("Groq request timed out.") from error
@@ -159,16 +176,15 @@ class GroqProvider(LLMProvider):
             return plan
         except Exception as error:
             raise RetryableLLMError(
-                f"Groq returned an invalid QA test plan: "
-                f"{type(error).__name__}: {error}"
+                f"Groq returned an invalid QA test plan ({type(error).__name__})."
             ) from error
 
     def create_discovery(self, task: str, target_url: str, page_snapshot: str) -> AIDiscoveryResult:
-        api_key = os.environ.get("GROQ_API_KEY")
+        api_key = self._resolved_api_key()
         if not api_key:
             raise NonRetryableLLMError("GROQ_API_KEY is not set.")
         schema = AIDiscoveryResult.model_json_schema()
-        payload = {"model": os.getenv("GROQ_MODEL", self._model), "max_completion_tokens": 4096,
+        payload = {"model": self.model, "max_completion_tokens": self._max_output_tokens,
                    "messages": [{"role": "user", "content":
                        "Return grounded structured discovery candidates only. Never return code, "
                        "instructions to execute, or perform browser actions. "
@@ -177,7 +193,7 @@ class GroqProvider(LLMProvider):
                        {"name": "ai_discovery_result", "strict": True, "schema": schema}}}
         try:
             response = httpx.post(self._endpoint,
-                headers={"Authorization": f"Bearer {api_key}"}, json=payload, timeout=30.0)
+                headers={"Authorization": f"Bearer {api_key}"}, json=payload, timeout=self._timeout_seconds)
         except httpx.TimeoutException as error:
             raise RetryableLLMError("Groq request timed out.") from error
         except httpx.RequestError as error:
@@ -192,17 +208,19 @@ class GroqProvider(LLMProvider):
             output = response.json()["choices"][0]["message"]["content"]
             return AIDiscoveryResult.model_validate_json(output)
         except Exception as error:
-            raise RetryableLLMError(f"Groq returned invalid Discovery data: {error}") from error
+            raise RetryableLLMError(
+                f"Groq returned invalid Discovery data ({type(error).__name__})."
+            ) from error
 
     def create_structured_output(
         self, prompt: str, schema: dict[str, Any], schema_name: str
     ) -> str:
-        api_key = os.environ.get("GROQ_API_KEY")
+        api_key = self._resolved_api_key()
         if not api_key:
             raise NonRetryableLLMError("GROQ_API_KEY is not set.")
         payload = {
-            "model": os.getenv("GROQ_MODEL", self._model),
-            "max_completion_tokens": 4096,
+            "model": self.model,
+            "max_completion_tokens": self._max_output_tokens,
             "messages": [{"role": "user", "content": prompt}],
             "response_format": {
                 "type": "json_schema",
@@ -218,7 +236,7 @@ class GroqProvider(LLMProvider):
                 self._endpoint,
                 headers={"Authorization": f"Bearer {api_key}"},
                 json=payload,
-                timeout=30.0,
+                timeout=self._timeout_seconds,
             )
         except httpx.TimeoutException as error:
             raise RetryableLLMError("Groq request timed out.") from error

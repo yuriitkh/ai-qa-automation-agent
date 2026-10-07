@@ -2,13 +2,50 @@
 
 ## LLM providers
 
-The agent supports OpenAI, Google Gemini, OpenRouter, and Groq. The default fallback order is configured by `LLM_PROVIDER_ORDER`:
+The agent supports OpenAI, Google Gemini, OpenRouter, and Groq. Environment-only use gets its default order from `LLM_PROVIDER_ORDER`:
 
 ```env
 LLM_PROVIDER_ORDER=openai,gemini,openrouter,groq
 ```
 
 Provider credentials and model settings are `OPENAI_API_KEY` / `OPENAI_MODEL`, `GEMINI_API_KEY` / `GEMINI_MODEL`, `OPENROUTER_API_KEY` / `OPENROUTER_MODEL`, and `GROQ_API_KEY` / `GROQ_MODEL`. OpenRouter uses `https://openrouter.ai/api/v1` by default and can be changed with `OPENROUTER_BASE_URL`. See `.env.example` for a template. Keep real keys in your local `.env`; do not commit it.
+
+### Web provider settings
+
+Start the web application and open **Settings → AI Providers** (or visit
+`http://127.0.0.1:8000/settings/providers`). The page shows each provider's
+configured state, credential source, enabled state, model, and priority. Use
+Enable/Disable and Move up/Move down to manage the chain. For example:
+
+1. Groq
+2. Gemini
+3. OpenAI
+4. OpenRouter
+
+The web router tries enabled, configured providers in this order. It skips
+providers without credentials and falls back to the next provider after a
+retryable failure. Nonretryable errors keep the router's existing behavior and
+stop that request. Before any web setting is saved, `LLM_PROVIDER_ORDER`
+continues to provide the initial order; after an enablement, priority, or model
+setting is saved, the persisted order and enablement control the web application.
+The CLI continues to use its
+environment-based order.
+
+Environment variables remain supported. A key entered in the web settings takes
+precedence over the corresponding environment key. Removing the web key falls
+back to the environment value. On Windows, web-managed keys are stored in the
+current user's Windows Credential Manager, separate from SQLite provider
+settings. The database stores only provider ID, enabled state, order, and an
+optional model override. The page never renders a full key; it displays only a
+masked value. On non-Windows systems, environment keys work, but entering a
+web-managed key is unavailable because this release does not add a cross-platform
+credential-vault dependency.
+
+**Test connection** sends a small structured-output request through that
+provider's existing adapter with an eight-second request timeout. It does not
+save the provider response. The page shows only a safe result and optional
+latency. This is an explicit live provider request and may use provider quota;
+automated tests replace adapters with fakes.
 
 OpenAI-compatible requests set an explicit output cap through `LLM_MAX_OUTPUT_TOKENS`, defaulting to 4096 tokens. This applies to OpenAI, OpenRouter, and configured compatible providers; Gemini's native provider keeps its existing request behavior.
 

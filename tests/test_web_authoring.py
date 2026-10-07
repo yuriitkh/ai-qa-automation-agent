@@ -15,6 +15,7 @@ from qa_agent.llm.errors import RetryableLLMError
 from qa_agent.llm.router import LLMRouter
 from qa_agent.models import QATestPlan
 from qa_agent.plan_store import InMemoryPlanStore
+from qa_agent.provider_settings import UnavailableSecretStore
 from qa_agent.run_history import InMemoryRunHistoryRepository, RunHistoryService
 from qa_agent.test_case_authoring import TestCaseAuthoringService
 from qa_agent.test_case_repository import InMemoryTestCaseRepository
@@ -617,7 +618,7 @@ class TestCaseAuthoringWebTests(unittest.TestCase):
             os.environ,
             {"LLM_PROVIDER_ORDER": "openai,gemini,openrouter,groq"},
             clear=True,
-        ):
+        ), patch("qa_agent.web.create_default_secret_store", return_value=UnavailableSecretStore()):
             app = create_application(Path(directory) / "ui.sqlite3")
             self.assertEqual(app.handle("GET", "/test-cases/new").status, 200)
             with redirect_stdout(io.StringIO()):

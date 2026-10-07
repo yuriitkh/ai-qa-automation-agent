@@ -22,7 +22,12 @@ from qa_agent.presentation import (
 )
 from qa_agent.reporting import RunAttemptReport, RunEvidenceReport, RunReportGenerator, RunStepReport
 from qa_agent.browser_runner import BrowserRunner
-from qa_agent.llm.registry import create_router
+from qa_agent.provider_settings import (
+    ProviderSettingsRepository,
+    ProviderSettingsService,
+    SecretStoreError,
+    create_default_secret_store,
+)
 from qa_agent.run_history import RunHistoryDetail, RunHistoryRecord, RunHistoryService, WorkflowType
 from qa_agent.test_case_execution import (
     RunUnavailableError,
@@ -102,6 +107,8 @@ class LocalWebApplication:
         draft_store: TestCaseDraftStore | None = None,
         progress_store: ExecutionProgressStore | None = None,
         plan_store: PlanStore | None = None,
+        provider_settings: ProviderSettingsService | None = None,
+        provider_router=None,
     ) -> None:
         self._run_history = run_history
         self._reports = reports or RunReportGenerator()
@@ -112,6 +119,8 @@ class LocalWebApplication:
         self._draft_store = draft_store or TestCaseDraftStore()
         self._progress_store = progress_store or ExecutionProgressStore()
         self._plan_store = plan_store
+        self._provider_settings = provider_settings
+        self._provider_router = provider_router
         self._background_runs = (
             BackgroundRunService(run_service, run_history, self._progress_store)
             if run_service is not None else None
@@ -164,6 +173,8 @@ class LocalWebApplication:
             return self._authoring_progress_page(parts[2])
         if path == "/":
             return WebResponse.html(200, self._dashboard())
+        if path == "/settings/providers" and self._provider_settings is not None:
+            return WebResponse.html(200, self._provider_settings_page(query))
         if path == "/demo-target/registration":
             return WebResponse.html(200, _local_demo_page())
         if path == "/test-cases":
@@ -227,6 +238,8 @@ class LocalWebApplication:
         return self._not_found("Page not found")
 
     def _handle_post(self, parts: list[str], body: bytes | str | None) -> WebResponse:
+        if parts == ["settings", "providers"] and self._provider_settings is not None:
+            return self._handle_provider_settings_post(body)
         if parts == ["test-cases", "generate"]:
             return self._handle_generate_test_case(body)
         if (
@@ -1362,6 +1375,140 @@ class LocalWebApplication:
             return None
         return f"/runs/{run_id}/evidence/{attempt.execution_id}/{index}"
 
+    def _handle_provider_settings_post(self, body: bytes | str | None) -> WebResponse:
+        form, form_error = _parse_form_body(body)
+        if form_error is not None:
+            return WebResponse.redirect("/settings/providers?notice=invalid")
+        provider_id = form.get("provider_id", [""])[0]
+        operation = form.get("operation", [""])[0]
+        settings = self._provider_settings
+        if settings is None:
+            return WebResponse.redirect("/settings/providers?notice=unavailable")
+
+        try:
+            if operation == "enable":
+                settings.update(provider_id, enabled=True)
+                self._refresh_provider_router()
+                notice = "updated"
+            elif operation == "disable":
+                settings.update(provider_id, enabled=False)
+                self._refresh_provider_router()
+                notice = "updated"
+            elif operation in {"move_up", "move_down"}:
+                settings.move(provider_id, -1 if operation == "move_up" else 1)
+                self._refresh_provider_router()
+                notice = "updated"
+            elif operation == "save_key":
+                settings.save_key(provider_id, form.get("api_key", [""])[0])
+                self._refresh_provider_router()
+                notice = "key_saved"
+            elif operation == "remove_key":
+                settings.remove_key(provider_id)
+                self._refresh_provider_router()
+                notice = "key_removed"
+            elif operation == "save_model":
+                model = form.get("model", [""])[0].strip()
+                if len(model) > 200 or any(ord(char) < 32 for char in model):
+                    raise ValueError("Invalid model.")
+                settings.update(provider_id, model=model)
+                self._refresh_provider_router()
+                notice = "updated"
+            elif operation == "test_connection":
+                settings.test_connection(provider_id)
+                notice = "tested"
+            else:
+                notice = "invalid"
+        except SecretStoreError:
+            notice = "storage_unavailable"
+        except ValueError:
+            notice = "invalid"
+        except Exception:
+            # Provider and credential errors are intentionally reduced to a stable notice.
+            notice = "unavailable"
+        return WebResponse.redirect(f"/settings/providers?notice={notice}")
+
+    def _refresh_provider_router(self) -> None:
+        if self._provider_settings is not None and self._provider_router is not None:
+            self._provider_settings.refresh_router(self._provider_router)
+
+    def _provider_settings_page(self, query: dict[str, list[str]]) -> str:
+        settings = self._provider_settings
+        if settings is None:
+            return self._page("AI Providers", self._empty_state("Settings unavailable", "Provider settings are not configured."), current="Settings")
+        messages = {
+            "updated": "Provider settings saved.",
+            "key_saved": "Provider credential saved securely.",
+            "key_removed": "Web-managed credential removed. An environment key will be used when present.",
+            "tested": "Connection test finished. See the provider status below.",
+            "invalid": "The settings request was invalid. Review the values and try again.",
+            "storage_unavailable": "Secure credential storage is unavailable on this system.",
+            "unavailable": "The requested provider operation could not be completed.",
+        }
+        notice_code = (query.get("notice") or [""])[0]
+        notice = (
+            f'<div class="notice" role="status">{escape_html(messages[notice_code])}</div>'
+            if notice_code in messages else ""
+        )
+        views = settings.provider_views()
+        cards = []
+        for index, provider in enumerate(views):
+            status_label = {
+                "CONFIGURED": "Configured", "NOT_CONFIGURED": "Not configured", "DISABLED": "Disabled",
+            }.get(provider.status, "Unavailable")
+            status_tone = "success" if provider.status == "CONFIGURED" else "neutral" if provider.status == "DISABLED" else "warning"
+            health = ""
+            if provider.health:
+                health_label = {
+                    "connected": "Connected", "authentication_failed": "Authentication failed",
+                    "rate_limited": "Rate limited", "provider_unavailable": "Provider unavailable",
+                    "timeout": "Timeout", "configuration_invalid": "Configuration invalid",
+                }.get(provider.health, "Provider unavailable")
+                latency = f' · {provider.latency_ms} ms' if provider.latency_ms is not None else ""
+                health = f'<p class="provider-health" role="status">Last connection test: {escape_html(health_label + latency)}</p>'
+            toggle = "disable" if provider.enabled else "enable"
+            toggle_label = "Disable" if provider.enabled else "Enable"
+            toggle_button = f'<button class="button" type="submit">{toggle_label}</button>'
+            move_up_disabled = " disabled" if index == 0 else ""
+            move_down_disabled = " disabled" if index == len(views) - 1 else ""
+            cards.append(
+                '<section class="panel provider-card" aria-labelledby="provider-title-' + escape_html(provider.id) + '">'
+                '<div class="section-heading"><div><p class="eyebrow">Priority ' + str(provider.priority) + '</p>'
+                '<h2 id="provider-title-' + escape_html(provider.id) + '">' + escape_html(provider.display_name) + '</h2></div>'
+                + badge(status_label, status_tone)
+                + '</div><div class="provider-meta"><p><strong>Enabled:</strong> ' + ("Yes" if provider.enabled else "No") + '</p>'
+                '<p><strong>Credential:</strong> ' + escape_html(provider.credential_source) + '</p>'
+                '<p><strong>Key:</strong> <code>' + escape_html(provider.masked_key) + '</code></p></div>'
+                + health
+                + '<div class="actions provider-actions">'
+                + f'<form method="post" action="/settings/providers"><input type="hidden" name="provider_id" value="{escape_html(provider.id)}">'
+                + f'<input type="hidden" name="operation" value="{toggle}">{toggle_button}</form>'
+                + f'<form method="post" action="/settings/providers"><input type="hidden" name="provider_id" value="{escape_html(provider.id)}">'
+                + f'<input type="hidden" name="operation" value="move_up"><button class="button" type="submit"{move_up_disabled}>Move up</button></form>'
+                + f'<form method="post" action="/settings/providers"><input type="hidden" name="provider_id" value="{escape_html(provider.id)}">'
+                + f'<input type="hidden" name="operation" value="move_down"><button class="button" type="submit"{move_down_disabled}>Move down</button></form>'
+                + f'<form method="post" action="/settings/providers"><input type="hidden" name="provider_id" value="{escape_html(provider.id)}">'
+                + '<input type="hidden" name="operation" value="test_connection"><button class="button" type="submit">Test connection</button></form>'
+                + '</div><form class="provider-model-form" method="post" action="/settings/providers">'
+                + f'<input type="hidden" name="provider_id" value="{escape_html(provider.id)}"><input type="hidden" name="operation" value="save_model">'
+                + f'<div class="field"><label for="model-{escape_html(provider.id)}">Model</label><input id="model-{escape_html(provider.id)}" name="model" maxlength="200" value="{escape_html(provider.model)}"></div>'
+                + '<button class="button" type="submit">Save model</button></form>'
+                + '<form class="provider-key-form" method="post" action="/settings/providers">'
+                + f'<input type="hidden" name="provider_id" value="{escape_html(provider.id)}"><input type="hidden" name="operation" value="save_key">'
+                + f'<div class="field"><label for="key-{escape_html(provider.id)}">{("Replace" if provider.credential_source == "Web settings" else "Add")} API key</label>'
+                + f'<input id="key-{escape_html(provider.id)}" name="api_key" type="password" maxlength="2500" autocomplete="new-password" required></div>'
+                + '<button class="button" type="submit">Save key</button></form>'
+                + '<form method="post" action="/settings/providers">'
+                + f'<input type="hidden" name="provider_id" value="{escape_html(provider.id)}"><input type="hidden" name="operation" value="remove_key">'
+                + '<button class="button" type="submit">Remove web key</button></form></section>'
+            )
+        content = (
+            '<header class="page-heading"><p class="eyebrow">Settings</p><h1>AI Providers</h1>'
+            '<p class="lead">The router tries enabled providers in priority order and falls back after retryable provider failures.</p></header>'
+            + notice + '<p class="muted">Environment keys remain supported. A key saved here takes precedence and is stored in the operating system credential vault.</p>'
+            + ''.join(cards)
+        )
+        return self._page("AI Providers", content, current="Settings", breadcrumbs=[("Dashboard", "/")])
+
     def _page(
         self,
         title: str,
@@ -1371,7 +1518,10 @@ class LocalWebApplication:
         breadcrumbs: list[tuple[str, str]] | None = None,
     ) -> str:
         nav_items = []
-        for label, href in (("Dashboard", "/"), ("Test Cases", "/test-cases"), ("Runs", "/runs")):
+        links = [("Dashboard", "/"), ("Test Cases", "/test-cases"), ("Runs", "/runs")]
+        if self._provider_settings is not None:
+            links.append(("Settings", "/settings/providers"))
+        for label, href in links:
             current_attribute = ' aria-current="page"' if label == current else ""
             nav_items.append(
                 f'<a href="{href}"{current_attribute}>{escape_html(label)}</a>'
@@ -1416,7 +1566,11 @@ def create_application(
         if evidence_directory is not None
         else (storage.database_path.parent / ".qa_agent_evidence").resolve()
     )
-    automation_router = create_router()
+    provider_settings = ProviderSettingsService(
+        ProviderSettingsRepository(storage.database_path),
+        create_default_secret_store(),
+    )
+    automation_router = provider_settings.create_router()
     automation_workflow = AutomationWorkflow(QATestPipeline(
         decomposer=TestCaseDecomposer(),
         plan_generator=LLMTestPlanGenerator(automation_router),
@@ -1438,8 +1592,10 @@ def create_application(
         evidence_root=evidence_root,
         test_cases=storage.test_case_repository,
         run_service=run_service,
-        authoring_service=TestCaseAuthoringService(create_router()),
+        authoring_service=TestCaseAuthoringService(automation_router),
         plan_store=storage.plan_store,
+        provider_settings=provider_settings,
+        provider_router=automation_router,
     )
 
 

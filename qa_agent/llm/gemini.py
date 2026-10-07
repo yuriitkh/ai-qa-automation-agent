@@ -11,7 +11,7 @@ from .errors import NonRetryableLLMError, RetryableLLMError
 
 def _raise_for_gemini_error(error: Exception, operation: str) -> None:
     if isinstance(error, (httpx.TimeoutException, TimeoutError)):
-        raise RetryableLLMError(f"Gemini {operation} timed out: {error}") from error
+        raise RetryableLLMError(f"Gemini {operation} timed out.") from error
 
     status_code = getattr(error, "status_code", None)
     if status_code is None:
@@ -26,24 +26,31 @@ def _raise_for_gemini_error(error: Exception, operation: str) -> None:
         isinstance(status_code, int) and status_code >= 500
     ):
         raise RetryableLLMError(
-            f"Gemini {operation} failed with HTTP {status_code}: {error}"
+            f"Gemini {operation} failed with HTTP {status_code}."
         ) from error
 
     raise RetryableLLMError(
-        f"Gemini {operation} failed: {type(error).__name__}: {error}"
+        f"Gemini {operation} failed ({type(error).__name__})."
     ) from error
 
 
 class GeminiProvider(LLMProvider):
-    def __init__(self) -> None:
-        self._api_key = os.environ.get("GEMINI_API_KEY")
-        self._model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str | None = None,
+        timeout_seconds: float | None = None,
+    ) -> None:
+        self._api_key = api_key if api_key is not None else os.environ.get("GEMINI_API_KEY")
+        self._model = model or os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+        self.model = self._model
+        http_options = {"retry_options": types.HttpRetryOptions(attempts=0)}
+        if timeout_seconds is not None:
+            http_options["timeout"] = max(1, round(timeout_seconds * 1000))
         self._client = (
             genai.Client(
                 api_key=self._api_key,
-                http_options=types.HttpOptions(
-                    retry_options=types.HttpRetryOptions(attempts=0)
-                ),
+                http_options=types.HttpOptions(**http_options),
             )
             if self._api_key
             else None

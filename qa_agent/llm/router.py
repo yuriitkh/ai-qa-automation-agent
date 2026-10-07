@@ -18,6 +18,10 @@ class LLMRouter:
         self._providers = providers
         self._selected_provider_name: str | None = None
 
+    def replace_providers(self, providers: list[LLMProvider]) -> None:
+        """Atomically replace the chain used by subsequent requests."""
+        self._providers = list(providers)
+
     @staticmethod
     def _provider_name(provider: LLMProvider) -> str:
         configured_name = getattr(provider, "name", None)
@@ -25,9 +29,9 @@ class LLMRouter:
             return configured_name
         return type(provider).__name__
 
-    def _report_priority(self) -> None:
+    def _report_priority(self, providers: list[LLMProvider] | None = None) -> None:
         print("LLM provider priority:")
-        for index, provider in enumerate(self._providers, 1):
+        for index, provider in enumerate(providers if providers is not None else self._providers, 1):
             name = self._provider_name(provider)
             state = "AVAILABLE" if provider.is_available else "SKIPPED - API key not configured"
             print(f"{index}. {name} [{state}]")
@@ -72,14 +76,15 @@ class LLMRouter:
     def create_test_plan(
         self, task: str, target_url: str, page_snapshot: str
     ) -> QATestPlan:
-        if not self._providers:
+        providers = self._providers
+        if not providers:
             raise RuntimeError("No LLM providers are configured.")
 
         self._selected_provider_name = None
-        self._report_priority()
+        self._report_priority(providers)
         failures: list[str] = []
         unavailable: list[str] = []
-        for index, provider in enumerate(self._providers):
+        for index, provider in enumerate(providers):
             provider_name = type(provider).__name__
             if not provider.is_available:
                 unavailable.append(provider_name)
@@ -107,7 +112,7 @@ class LLMRouter:
                     error=error,
                     started=started,
                 )
-                if index + 1 < len(self._providers):
+                if index + 1 < len(providers):
                     print(
                         f"LLM ROUTER: {provider_name} had a retryable failure "
                         f"({reason}); trying the next provider."
@@ -158,12 +163,13 @@ class LLMRouter:
 
     def create_discovery(self, task: str, target_url: str, page_snapshot: str) -> AIDiscoveryResult:
         """Route a structured Discovery request through configured providers."""
-        if not self._providers:
+        providers = self._providers
+        if not providers:
             raise RuntimeError("No LLM providers are configured.")
-        self._report_priority()
+        self._report_priority(providers)
         failures = []
         unavailable = []
-        for index, provider in enumerate(self._providers):
+        for index, provider in enumerate(providers):
             name = type(provider).__name__
             if not provider.is_available:
                 unavailable.append(name)
@@ -186,7 +192,7 @@ class LLMRouter:
                     error=error,
                     started=started,
                 )
-                if index + 1 < len(self._providers):
+                if index + 1 < len(providers):
                     print(
                         f"LLM ROUTER: {name} request failed ({reason}); "
                         "trying the next provider."
@@ -233,14 +239,15 @@ class LLMRouter:
         self, prompt: str, schema: dict, schema_name: str
     ) -> str:
         """Route schema-constrained output through the configured provider chain."""
-        if not self._providers:
+        providers = self._providers
+        if not providers:
             raise RuntimeError("No LLM providers are configured.")
         self._selected_provider_name = None
-        self._report_priority()
+        self._report_priority(providers)
         failures: list[str] = []
         rate_limited_failures = 0
         unavailable: list[str] = []
-        for index, provider in enumerate(self._providers):
+        for index, provider in enumerate(providers):
             name = self._provider_name(provider)
             if not provider.is_available:
                 unavailable.append(name)
@@ -265,7 +272,7 @@ class LLMRouter:
                     error=error,
                     started=started,
                 )
-                if index + 1 < len(self._providers):
+                if index + 1 < len(providers):
                     print(
                         "AI provider request failed; trying another configured provider."
                     )

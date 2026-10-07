@@ -21,11 +21,15 @@ class OpenAICompatibleProvider(LLMProvider):
         model: str,
         base_url: str | None = None,
         max_output_tokens: int | None = None,
+        api_key: str | None = None,
+        timeout_seconds: float | None = None,
     ):
         self.name = name
         self.api_key_env = api_key_env
         self.model = model
         self.base_url = base_url
+        self._api_key = api_key
+        self.timeout_seconds = timeout_seconds or 30.0
         if max_output_tokens is None:
             configured_limit = os.getenv("LLM_MAX_OUTPUT_TOKENS")
             try:
@@ -42,14 +46,19 @@ class OpenAICompatibleProvider(LLMProvider):
 
     @property
     def is_available(self) -> bool:
-        return bool(os.environ.get(self.api_key_env, "").strip())
+        return bool(self._resolved_api_key())
+
+    def _resolved_api_key(self) -> str:
+        if self._api_key is not None:
+            return self._api_key.strip()
+        return os.environ.get(self.api_key_env, "").strip()
 
     def _generate_json(self, prompt: str, schema: dict[str, Any], schema_name: str) -> str:
-        api_key = os.environ.get(self.api_key_env, "").strip()
+        api_key = self._resolved_api_key()
         if not api_key:
             raise NonRetryableLLMError(f"{self.name}: {self.api_key_env} is not configured.")
         try:
-            client = OpenAI(api_key=api_key, base_url=self.base_url, timeout=30.0)
+            client = OpenAI(api_key=api_key, base_url=self.base_url, timeout=self.timeout_seconds)
             response = client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
