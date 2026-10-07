@@ -14,7 +14,7 @@ a{color:var(--blue);text-decoration-thickness:1px;text-underline-offset:2px}a:ho
 .nav-links a,.button{display:inline-block;padding:.48rem .72rem;border-radius:7px;text-decoration:none;font-weight:620}
 .nav-links a{color:#344256}.nav-links a[aria-current=page]{background:#eaf1fb;color:#103f85}.button{border:1px solid #b9c7d8;background:#fff;color:#174ea6}
 .button.primary{border-color:#174ea6;background:#174ea6;color:white}.main{padding:1.6rem 0 3rem}.breadcrumbs{color:var(--muted);font-size:.92rem;margin:0 0 .8rem}
-.breadcrumbs span{padding:0 .35rem;color:#8792a0}.page-heading{margin:0 0 1.15rem}.page-heading h1{font-size:clamp(1.65rem,3vw,2.2rem);line-height:1.2;margin:.15rem 0 .35rem;letter-spacing:-.025em}
+.breadcrumbs span{padding:0 .35rem;color:#8792a0}.page-heading{margin:0 0 1.15rem}.page-heading h1{font-size:clamp(1.65rem,3vw,2.2rem);line-height:1.2;margin:.15rem 0 .35rem;letter-spacing:-.025em;overflow-wrap:anywhere}
 .lead,.muted{color:var(--muted)}.lead{margin:.2rem 0}.panel,.card{background:var(--surface);border:1px solid var(--line);border-radius:11px}
 .panel{padding:1.15rem;margin:1rem 0}.panel h2{font-size:1.18rem;margin:0 0 .85rem}.summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.8rem;margin:1rem 0}
 .card{padding:.9rem 1rem}.card-label{color:var(--muted);font-size:.88rem}.card-value{font-size:1.45rem;font-weight:730;margin-top:.2rem}.card-sub{font-size:.86rem;color:var(--muted)}
@@ -36,7 +36,7 @@ th{font-size:.84rem;color:#4e5b6c;background:#f8fafc;font-weight:700}tr:last-chi
 .field input,.field textarea{width:min(100%,720px);padding:.55rem .62rem;border:1px solid #aebaca;border-radius:6px;background:#fff;color:var(--ink);font:inherit}.field textarea{resize:vertical}
 :focus-visible{outline:3px solid #3478c2;outline-offset:2px}
 .authoring-entry .field{margin:.8rem 0}.authoring-entry .field input,.authoring-entry .field textarea{width:100%;max-width:720px}
-.authoring-entry textarea{min-height:12rem}.authoring-submit{margin-top:.2rem}
+.authoring-entry textarea,.testcase-editor textarea{min-height:12rem}.authoring-submit{margin-top:.2rem}
 .authoring-error{padding:.65rem .75rem;border:1px solid #f1c4bc;border-radius:7px;background:#fff0ed;color:#8d2519}
 .voice-controls{display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;margin:.25rem 0}
 .voice-button:disabled{opacity:.68;cursor:wait}.voice-status{margin:0;min-height:1.5em}.voice-privacy{font-size:.86rem;margin:.15rem 0 .8rem}
@@ -55,6 +55,7 @@ footer{color:var(--muted);font-size:.85rem;padding:1rem 0;border-top:1px solid v
 .is-disabled{opacity:.65;cursor:wait}
 .progress-steps{list-style:none;padding:0;margin:0}
 .progress-step{display:grid;grid-template-columns:1.5rem 1fr;gap:.65rem;padding:.8rem 0;border-bottom:1px solid #eef1f5}
+.progress-step>span:last-child{min-width:0;overflow-wrap:anywhere}.progress-step strong{display:block;overflow-wrap:anywhere}.progress-failure{display:block;color:#8d2519;margin-top:.2rem;overflow-wrap:anywhere}
 .progress-symbol{font-size:1.1rem;font-weight:700}
 .progress-step-state,.progress-step .muted{display:block;margin-top:.2rem;font-size:.9rem}
 .progress-result[hidden]{display:none}

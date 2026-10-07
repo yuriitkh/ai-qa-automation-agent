@@ -12,6 +12,7 @@ from uuid import UUID
 from qa_agent.models import (
     DiscoveryResult,
     DiscoveryStatus,
+    ExecutionSegment,
     ExecutionStatus,
     Precondition,
     QATestPlan,
@@ -24,12 +25,14 @@ from qa_agent.models import (
     TestStep as DomainTestStep,
     FailurePolicy,
 )
+from qa_agent.execution_repository import InMemoryExecutionRepository
 from qa_agent.browser_runner import BrowserRunner
 from qa_agent.llm.base import LLMProvider
 from qa_agent.llm.router import LLMRouter
 from qa_agent.pipeline import QATestPipeline
 from qa_agent.plan_execution import PlanExecutionClassification, PlanExecutionService
 from qa_agent.pinned_execution import PinnedExecutionService, PlanVersionSet, StepPlanSelection
+from qa_agent.plan_store import InMemoryPlanStore
 from qa_agent.reporting import RunReportGenerator
 from qa_agent.run_history import RunHistoryService, WorkflowType
 from qa_agent.setup_orchestration import SetupCleanupCoordinator, SetupOperationResult, SetupStatus
@@ -78,6 +81,162 @@ def _wait_for_authoring(application, location: str, timeout: float = 30.0) -> di
 
 
 class ProductDemoSliceTests(unittest.TestCase):
+    def test_test_case_browser_state_continues_across_steps_and_segments(self) -> None:
+        class StatefulTargetHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/state/set":
+                    body = (
+                        '<!doctype html><html><head><title>State Ready</title>'
+                        '<script>window.addEventListener("load", () => '
+                        'localStorage.setItem("case-state", "persisted"));</script>'
+                        '</head><body><main><p>Ready</p></main></body></html>'
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Set-Cookie", "segment_cookie=present; Path=/; SameSite=Lax")
+                elif self.path == "/state/check":
+                    body = (
+                        '<!doctype html><html><head><title>State Check</title>'
+                        '<script>window.addEventListener("load", () => {'
+                        'const found = localStorage.getItem("case-state") === "persisted" '
+                        '&& document.cookie.includes("segment_cookie=present");'
+                        'document.querySelector("#result").textContent = found '
+                        '? "Cookie and localStorage persisted" : "No prior state";'
+                        '});</script></head><body><p id="result">Checking</p></body></html>'
+                    ).encode("utf-8")
+                    self.send_response(200)
+                else:
+                    self.send_error(404)
+                    return
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format, *_args):
+                return
+
+        def step(name: str, order: int, failure_policy=FailurePolicy.CONTINUE):
+            return DomainTestStep(
+                name=name,
+                description=f"Execute {name.lower()}.",
+                expected=f"{name} completes.",
+                order=order,
+                failure_policy=failure_policy,
+            )
+
+        def save_plan(store, target_url, test_step, actions):
+            test_plan = DomainTestPlan(test_step_id=test_step.id, name=test_step.name)
+            version = DomainTestPlanVersion(
+                test_plan_id=test_plan.id,
+                version=1,
+                qa_test_plan=QATestPlan(url=target_url, steps=actions),
+            )
+            store.save(test_step.id, version, test_plan=test_plan)
+            return version
+
+        class NeverGenerate:
+            def generate_with_plan(self, *_args, **_kwargs):
+                raise AssertionError("Cached and pinned plans must not be regenerated.")
+
+        target_server = ThreadingHTTPServer(("127.0.0.1", 0), StatefulTargetHandler)
+        target_url = f"http://127.0.0.1:{target_server.server_address[1]}"
+        target_thread = threading.Thread(target=target_server.serve_forever, daemon=True)
+        target_thread.start()
+        store = InMemoryPlanStore()
+        browser = BrowserRunner(headless=True)
+        try:
+            with tempfile.TemporaryDirectory() as evidence_dir:
+                automation_steps = [
+                    step("Set initial state", 0),
+                    step("Observe an intentional product failure", 1),
+                    step("Continue on the resulting page", 2),
+                    step("Read state from a second segment", 3),
+                ]
+                automation_case = DomainTestCase(
+                    name="Stateful automation",
+                    description="Continue through one shared browser context.",
+                    base_url=target_url,
+                    segments=[
+                        ExecutionSegment(order=0, base_url=target_url, steps=automation_steps[:3]),
+                        ExecutionSegment(order=1, base_url=target_url, steps=automation_steps[3:]),
+                    ],
+                )
+                action_sets = [
+                    [{"action": "navigate", "parameters": {"url": f"{target_url}/state/set"}}],
+                    [{"action": "assert_title", "parameters": {"expected": "Intentional failure"}}],
+                    [{"action": "assert_text_contains", "parameters": {"expected_text": "Ready"}}],
+                    [
+                        {"action": "navigate", "parameters": {"url": f"{target_url}/state/check"}},
+                        {"action": "assert_text_contains", "parameters": {"expected_text": "Cookie and localStorage persisted"}},
+                    ],
+                ]
+                for test_step, actions in zip(automation_steps, action_sets):
+                    save_plan(store, target_url, test_step, actions)
+                pipeline = QATestPipeline(
+                    decomposer=TestCaseDecomposer(),
+                    plan_generator=NeverGenerate(),
+                    discovery=lambda _url: self.fail("Saved automation must not rediscover."),
+                    runner=BrowserRunner(evidence_dir, headless=True),
+                    plan_store=store,
+                    execution_repository=InMemoryExecutionRepository(),
+                )
+                automation_result = pipeline.run_test_case(automation_case)
+                self.assertEqual(
+                    [execution.status for execution in automation_result.executions],
+                    [ExecutionStatus.PASSED, ExecutionStatus.FAILED,
+                     ExecutionStatus.PASSED, ExecutionStatus.PASSED],
+                )
+                self.assertEqual(len(automation_result.executions[1].evidence), 1)
+
+                pinned_steps = [step("Open the persisted state", 0), step("Read it on the same page", 1)]
+                pinned_case = DomainTestCase(
+                    name="Stateful pinned validation",
+                    description="Run exact pinned versions with shared page state.",
+                    base_url=target_url,
+                    segments=[ExecutionSegment(order=0, base_url=target_url, steps=pinned_steps)],
+                )
+                pinned_versions = [
+                    save_plan(store, target_url, pinned_steps[0], [
+                        {"action": "navigate", "parameters": {"url": f"{target_url}/state/set"}},
+                    ]),
+                    save_plan(store, target_url, pinned_steps[1], [
+                        {"action": "assert_text_contains", "parameters": {"expected_text": "Ready"}},
+                    ]),
+                ]
+                pinned = PinnedExecutionService(
+                    store,
+                    PlanExecutionService(browser, InMemoryExecutionRepository()),
+                )
+                resolved = pinned.resolve(
+                    pinned_case,
+                    PlanVersionSet(tuple(
+                        StepPlanSelection(test_step.id, version.id)
+                        for test_step, version in zip(pinned_steps, pinned_versions)
+                    )),
+                )
+                pinned_result = pinned.execute(pinned_case, resolved, RunContext())
+                self.assertEqual(pinned_result.outcome.value, "PASSED")
+                self.assertEqual(len(pinned_result.executions), 2)
+                self.assertTrue(all(item.status == ExecutionStatus.PASSED for item in pinned_result.executions))
+
+                isolated_step = step("Check that prior case state is absent", 0)
+                isolated_case = DomainTestCase(
+                    name="Isolated browser context",
+                    description="A separate TestCase starts without the prior context state.",
+                    base_url=target_url,
+                    segments=[ExecutionSegment(order=0, base_url=target_url, steps=[isolated_step])],
+                )
+                save_plan(store, target_url, isolated_step, [
+                    {"action": "navigate", "parameters": {"url": f"{target_url}/state/check"}},
+                    {"action": "assert_text_contains", "parameters": {"expected_text": "No prior state"}},
+                ])
+                isolated_result = pipeline.run_test_case(isolated_case)
+                self.assertEqual(isolated_result.test_run.status, ExecutionStatus.PASSED)
+        finally:
+            target_server.shutdown()
+            target_server.server_close()
+            target_thread.join(timeout=5)
+
     def test_local_registration_step_generates_and_executes_multiple_actions(self) -> None:
         class RegistrationProvider(LLMProvider):
             def __init__(self, target_url: str) -> None:
@@ -872,6 +1031,7 @@ class ProductDemoSliceTests(unittest.TestCase):
                 )
                 self.assertEqual(run_response.status, 303)
                 progress = _wait_for_progress(application, run_response.headers["Location"])
+                self.assertIsNotNone(progress["final_run_id"], json.dumps(progress))
                 run_id = UUID(progress["final_run_id"])
 
                 case = storage.test_case_repository.get(case_id)

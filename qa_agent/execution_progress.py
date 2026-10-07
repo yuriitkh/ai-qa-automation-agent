@@ -86,7 +86,13 @@ class ProgressStep(BaseModel):
     order: int
     name: str
     state: ProgressStepState = ProgressStepState.PENDING
+    execution_state: ProgressStepState = ProgressStepState.PENDING
     automation_state: str | None = None
+    plan_origin: str | None = None
+    plan_version: int | None = None
+    failure_classification: str | None = None
+    message: str | None = None
+    evidence_count: int = 0
 
 
 class AutomationGenerationFailure(BaseModel):
@@ -120,6 +126,8 @@ class ExecutionProgressEvent(BaseModel):
     step_name: str | None = None
     status: str | None = None
     classification: str | None = None
+    plan_origin: str | None = None
+    plan_version: int | None = None
     failure_code: str | None = None
     prior_plan_exists: bool | None = None
     new_plan_saved: bool | None = None
@@ -147,6 +155,8 @@ class ExecutionProgressEvent(BaseModel):
             "step_name": self.step_name,
             "status": self.status,
             "classification": self.classification,
+            "plan_origin": self.plan_origin,
+            "plan_version": self.plan_version,
             "failure_code": self.failure_code,
             "prior_plan_exists": self.prior_plan_exists,
             "new_plan_saved": self.new_plan_saved,
@@ -195,7 +205,11 @@ class ExecutionProgressSnapshot(BaseModel):
                 raise ValueError("Finished progress must have a terminal phase and timestamp.")
             if self.run_status == "RUNNING":
                 raise ValueError("Finished progress cannot contain a running TestRun.")
-            if any(step.state == ProgressStepState.RUNNING for step in self.steps):
+            if any(
+                step.state == ProgressStepState.RUNNING
+                or step.execution_state == ProgressStepState.RUNNING
+                for step in self.steps
+            ):
                 raise ValueError("Finished progress cannot contain a running step.")
         return self
 
@@ -222,7 +236,13 @@ class ExecutionProgressSnapshot(BaseModel):
                 "order": step.order,
                 "name": step.name,
                 "state": step.state.value,
+                "execution_state": step.execution_state.value,
                 "automation_state": step.automation_state,
+                "plan_origin": step.plan_origin,
+                "plan_version": step.plan_version,
+                "failure_classification": step.failure_classification,
+                "message": step.message,
+                "evidence_count": step.evidence_count,
             } for step in self.steps],
             "events": [event.to_public_dict() for event in self.events],
             "final_run_id": str(self.final_run_id) if self.final_run_id else None,
@@ -555,6 +575,8 @@ class ExecutionProgressStore:
         step_name: str | None = None,
         status: str | None = None,
         classification: str | None = None,
+        plan_origin: str | None = None,
+        plan_version: int | None = None,
         failure_code: str | None = None,
         prior_plan_exists: bool | None = None,
         new_plan_saved: bool | None = None,
@@ -582,6 +604,8 @@ class ExecutionProgressStore:
                 step_name=step_name,
                 status=status,
                 classification=classification,
+                plan_origin=plan_origin,
+                plan_version=plan_version,
                 failure_code=failure_code,
                 prior_plan_exists=prior_plan_exists,
                 new_plan_saved=new_plan_saved,
@@ -664,12 +688,30 @@ class ExecutionProgressStore:
             record.phase = "Preparing automation"
         elif event.event_type == ExecutionEventType.PLAN_GENERATION_STARTED:
             record.phase = "Generating automation"
-            self._update_step(record, event.step_id, state=ProgressStepState.PREPARING_AUTOMATION)
+            self._update_step(
+                record, event.step_id,
+                state=ProgressStepState.PREPARING_AUTOMATION,
+                automation_state="Preparing",
+                message=event.message,
+            )
         elif event.event_type == ExecutionEventType.PLAN_REPAIR_STARTED:
             record.phase = "Repairing automation"
-            self._update_step(record, event.step_id, state=ProgressStepState.PREPARING_AUTOMATION)
+            self._update_step(
+                record, event.step_id,
+                state=ProgressStepState.PREPARING_AUTOMATION,
+                automation_state="Repairing",
+                message=event.message,
+            )
         elif event.event_type == ExecutionEventType.PLAN_REPAIR_SUCCEEDED:
             record.phase = "Validating automation"
+            self._update_step(
+                record, event.step_id,
+                state=ProgressStepState.READY,
+                automation_state="Repaired",
+                plan_origin=event.plan_origin or "REPAIRED",
+                plan_version=event.plan_version,
+                message=event.message,
+            )
         elif event.event_type == ExecutionEventType.PLAN_REPAIR_FAILED:
             record.phase = "Preparing automation"
         elif event.event_type == ExecutionEventType.PLAN_REUSED:
@@ -677,20 +719,33 @@ class ExecutionProgressStore:
                 record, event.step_id,
                 state=ProgressStepState.READY,
                 automation_state="Reused",
+                plan_origin=event.plan_origin,
+                plan_version=event.plan_version,
+                message=event.message,
             )
             record.phase = "Preparing automation"
         elif event.event_type == ExecutionEventType.PLAN_GENERATED:
+            automation_state = {
+                "REPAIRED": "Repaired",
+                "REGENERATED": "Regenerated",
+            }.get(event.plan_origin, "Generated")
             self._update_step(
                 record, event.step_id,
                 state=ProgressStepState.READY,
-                automation_state="Generated",
+                automation_state=automation_state,
+                plan_origin=event.plan_origin,
+                plan_version=event.plan_version,
+                message=event.message,
             )
             record.phase = "Preparing automation"
         elif event.event_type == ExecutionEventType.PLAN_GENERATION_FAILED:
             self._update_step(
                 record, event.step_id,
                 state=ProgressStepState.FAILED,
+                execution_state=ProgressStepState.NOT_ATTEMPTED,
                 automation_state="Failed",
+                failure_classification=event.classification,
+                message=event.message,
             )
             record.phase = "Preparing automation"
             if event.classification == "AUTOMATION_GENERATION_ERROR" and event.step_id is not None:
@@ -717,18 +772,46 @@ class ExecutionProgressStore:
                 }:
                     raise ValueError("A step cannot start from its current progress state.")
                 record.running_step_ids.add(event.step_id)
-            self._update_step(record, event.step_id, state=ProgressStepState.RUNNING)
+            self._update_step(
+                record, event.step_id,
+                state=ProgressStepState.RUNNING,
+                execution_state=ProgressStepState.RUNNING,
+                clear_failure=True,
+                message=event.message,
+            )
             record.phase = "Running test"
         elif event.event_type == ExecutionEventType.STEP_PASSED:
             if event.step_id is not None:
                 record.running_step_ids.discard(event.step_id)
-            self._update_step(record, event.step_id, state=ProgressStepState.PASSED)
+            self._update_step(
+                record, event.step_id,
+                state=ProgressStepState.PASSED,
+                execution_state=ProgressStepState.PASSED,
+                clear_failure=True,
+                message=event.message,
+            )
         elif event.event_type == ExecutionEventType.STEP_FAILED:
             if event.step_id is not None:
                 record.running_step_ids.discard(event.step_id)
-            self._update_step(record, event.step_id, state=ProgressStepState.FAILED)
+            self._update_step(
+                record, event.step_id,
+                state=ProgressStepState.FAILED,
+                execution_state=ProgressStepState.FAILED,
+                failure_classification=event.classification,
+                message=event.message,
+            )
         elif event.event_type == ExecutionEventType.STEP_BLOCKED:
-            self._update_step(record, event.step_id, state=ProgressStepState.BLOCKED)
+            self._update_step(
+                record, event.step_id,
+                state=ProgressStepState.BLOCKED,
+                execution_state=ProgressStepState.BLOCKED,
+                message=event.message,
+            )
+        elif event.event_type == ExecutionEventType.EVIDENCE_CAPTURED:
+            self._update_step(
+                record, event.step_id,
+                evidence_increment=1,
+            )
         elif event.event_type == ExecutionEventType.CLEANUP_STARTED:
             record.phase = "Cleaning up"
         elif event.event_type in {
@@ -740,14 +823,21 @@ class ExecutionProgressStore:
             for step_id, step in tuple(record.steps.items()):
                 if step.state in {
                     ProgressStepState.RUNNING,
-                    ProgressStepState.PREPARING_AUTOMATION,
                 }:
                     record.steps[step_id] = step.model_copy(update={
                         "state": ProgressStepState.FAILED,
+                        "execution_state": ProgressStepState.FAILED,
+                    })
+                elif step.state == ProgressStepState.PREPARING_AUTOMATION:
+                    record.steps[step_id] = step.model_copy(update={
+                        "state": ProgressStepState.FAILED,
+                        "automation_state": "Failed",
+                        "execution_state": ProgressStepState.NOT_ATTEMPTED,
                     })
                 elif step.state in {ProgressStepState.PENDING, ProgressStepState.READY}:
                     record.steps[step_id] = step.model_copy(update={
                         "state": ProgressStepState.NOT_ATTEMPTED,
+                        "execution_state": ProgressStepState.NOT_ATTEMPTED,
                     })
             record.running_step_ids.clear()
             failure = record.automation_generation_failure
@@ -759,6 +849,7 @@ class ExecutionProgressStore:
                     }:
                         record.steps[step_id] = step.model_copy(update={
                             "state": ProgressStepState.NOT_ATTEMPTED,
+                            "execution_state": ProgressStepState.NOT_ATTEMPTED,
                         })
             record.state = ProgressState.FINISHED
             record.finished_at = event.timestamp
@@ -775,19 +866,36 @@ class ExecutionProgressStore:
         record: _ProgressRecord,
         step_id: UUID | None,
         *,
-        state: ProgressStepState,
+        state: ProgressStepState | None = None,
         automation_state: str | None = None,
+        execution_state: ProgressStepState | None = None,
+        plan_origin: str | None = None,
+        plan_version: int | None = None,
+        failure_classification: str | None = None,
+        clear_failure: bool = False,
+        message: str | None = None,
+        evidence_increment: int = 0,
     ) -> None:
         if step_id is None or step_id not in record.steps:
             return
         current = record.steps[step_id]
         record.steps[step_id] = current.model_copy(update={
-            "state": state,
+            "state": state or current.state,
             "automation_state": (
                 automation_state
                 if automation_state is not None
                 else current.automation_state
             ),
+            "execution_state": execution_state or current.execution_state,
+            "plan_origin": plan_origin if plan_origin is not None else current.plan_origin,
+            "plan_version": plan_version if plan_version is not None else current.plan_version,
+            "failure_classification": None if clear_failure else (
+                failure_classification
+                if failure_classification is not None
+                else current.failure_classification
+            ),
+            "message": message if message is not None else current.message,
+            "evidence_count": current.evidence_count + evidence_increment,
         })
 
     def _require_record(self, progress_id: str) -> _ProgressRecord:
@@ -969,6 +1077,8 @@ class ExecutionProgressReporter:
         step: TestStep | None = None,
         status: str | None = None,
         classification: str | None = None,
+        plan_origin: str | None = None,
+        plan_version: int | None = None,
         failure_code: str | None = None,
         prior_plan_exists: bool | None = None,
         new_plan_saved: bool | None = None,
@@ -990,6 +1100,8 @@ class ExecutionProgressReporter:
             step_name=self.safe_text(step.name) if step else None,
             status=status,
             classification=classification,
+            plan_origin=plan_origin,
+            plan_version=plan_version,
             failure_code=failure_code,
             prior_plan_exists=prior_plan_exists,
             new_plan_saved=new_plan_saved,
@@ -1081,6 +1193,8 @@ def emit_progress_event(
     step: TestStep | None = None,
     status: str | None = None,
     classification: str | None = None,
+    plan_origin: str | None = None,
+    plan_version: int | None = None,
     failure_code: str | None = None,
     prior_plan_exists: bool | None = None,
     new_plan_saved: bool | None = None,
@@ -1096,6 +1210,8 @@ def emit_progress_event(
             step=step,
             status=status,
             classification=classification,
+            plan_origin=plan_origin,
+            plan_version=plan_version,
             failure_code=failure_code,
             prior_plan_exists=prior_plan_exists,
             new_plan_saved=new_plan_saved,

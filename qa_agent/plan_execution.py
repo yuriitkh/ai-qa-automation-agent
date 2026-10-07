@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+from inspect import getattr_static
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -19,6 +20,7 @@ from qa_agent.models import (
     QATestPlan,
     TestPlanVersion,
     TestStep,
+    TestCase,
 )
 from qa_agent.presentation import failure_message
 
@@ -42,6 +44,67 @@ class PlanExecutionPersistenceError(RuntimeError):
     """An execution attempt could not be persisted."""
 
 
+class TestCasePlanRunner:
+    """Bind a runner to one TestCase and route steps by segment order."""
+
+    def __init__(self, runner: Callable[[QATestPlan], dict[str, Any]]) -> None:
+        self._runner = runner
+        self._session_context: Any | None = None
+        self._session: Any | None = None
+        self._segment_by_step: dict[Any, int] = {}
+        self._closed = False
+
+    @property
+    def browser_session_started(self) -> bool:
+        return bool(getattr(self._session, "is_started", False))
+
+    def bind(self, test_case: TestCase) -> None:
+        if self._session_context is not None or self._segment_by_step:
+            raise RuntimeError("TestCase runner is already bound.")
+        self._segment_by_step = {
+            step.id: segment.order
+            for segment in test_case.segments
+            for step in segment.steps
+        }
+        try:
+            getattr_static(self._runner, "open_test_case_session")
+        except AttributeError:
+            opener = None
+        else:
+            opener = getattr(self._runner, "open_test_case_session")
+        if callable(opener):
+            context = opener(test_case)
+            session = context.__enter__()
+            self._session_context = context
+            self._session = session
+
+    def for_step(self, test_step: TestStep) -> Callable[[QATestPlan], dict[str, Any]]:
+        if self._closed:
+            raise RuntimeError("TestCase runner is closed.")
+        segment_order = self._segment_by_step.get(test_step.id)
+        if segment_order is None:
+            raise ValueError("TestStep does not belong to the bound TestCase.")
+        if self._session is None:
+            return self._runner
+        return lambda plan: self._session.run_plan(segment_order, plan)
+
+    def close(self, primary_error: BaseException | None = None) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        context = self._session_context
+        self._session_context = None
+        if context is not None:
+            if primary_error is None:
+                context.__exit__(None, None, None)
+            else:
+                context.__exit__(
+                    type(primary_error),
+                    primary_error,
+                    primary_error.__traceback__,
+                )
+
+
 class PlanExecutionService:
     """Run and persist one TestStep against the exact supplied plan version.
 
@@ -57,10 +120,15 @@ class PlanExecutionService:
         self._runner = runner
         self._execution_repository = execution_repository
 
+    def new_test_case_runner(self) -> TestCasePlanRunner:
+        return TestCasePlanRunner(self._runner)
+
     def execute(
         self,
         test_step: TestStep,
         plan_version: TestPlanVersion,
+        *,
+        runner: Callable[[QATestPlan], dict[str, Any]] | None = None,
     ) -> PlanExecutionOutcome:
         started_at = datetime.now(timezone.utc)
         emit_progress_event(
@@ -72,7 +140,8 @@ class PlanExecutionService:
         runner_result: dict[str, Any] | None = None
         execution_error: Exception | None = None
         try:
-            runner_output = self._runner(plan_version.qa_test_plan)
+            active_runner = runner if runner is not None else self._runner
+            runner_output = active_runner(plan_version.qa_test_plan)
             if not isinstance(runner_output, dict):
                 raise TypeError("Browser runner must return a result dictionary.")
             runner_result = runner_output

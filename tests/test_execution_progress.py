@@ -90,13 +90,32 @@ class ExecutionProgressStoreTests(unittest.TestCase):
         self.reporter.test_case_loaded(test_case)
         step = test_case.steps[0]
         self.now += timedelta(seconds=2)
-        self.reporter.emit(ExecutionEventType.PLAN_REUSED, step=step, message="Saved automation loaded.")
+        self.reporter.emit(
+            ExecutionEventType.PLAN_REUSED,
+            step=step,
+            plan_origin="AI_GENERATED",
+            plan_version=3,
+            message="Saved automation loaded.",
+        )
         self.reporter.emit(ExecutionEventType.STEP_STARTED, step=step, message="Running step.")
         snapshot = self.store.get(self.progress_id)
         self.assertEqual(snapshot.state, ProgressState.RUNNING)
         self.assertEqual(snapshot.steps[0].state, ProgressStepState.RUNNING)
         self.assertEqual(snapshot.elapsed_ms, 2000)
-        self.reporter.emit(ExecutionEventType.STEP_PASSED, step=step, status="PASSED")
+        self.reporter.emit(
+            ExecutionEventType.STEP_PASSED,
+            step=step,
+            status="PASSED",
+            classification="PASSED",
+            message="Step passed.",
+        )
+        self.reporter.emit(
+            ExecutionEventType.EVIDENCE_CAPTURED,
+            step=step,
+            evidence_execution_id=uuid4(),
+            evidence_index=0,
+            message="Screenshot evidence captured.",
+        )
         run_id = uuid4()
         self.reporter.finish(
             run_id=run_id,
@@ -109,6 +128,12 @@ class ExecutionProgressStoreTests(unittest.TestCase):
         self.assertEqual(finished.final_run_id, run_id)
         self.assertEqual(finished.final_run_url, f"/runs/{run_id}")
         self.assertEqual(finished.steps[0].state, ProgressStepState.PASSED)
+        self.assertEqual(finished.steps[0].execution_state, ProgressStepState.PASSED)
+        self.assertEqual(finished.steps[0].automation_state, "Reused")
+        self.assertEqual(finished.steps[0].plan_origin, "AI_GENERATED")
+        self.assertEqual(finished.steps[0].plan_version, 3)
+        self.assertIsNone(finished.steps[0].failure_classification)
+        self.assertEqual(finished.steps[0].evidence_count, 1)
         self.assertEqual(
             [event.event_type for event in finished.events],
             [
@@ -117,6 +142,7 @@ class ExecutionProgressStoreTests(unittest.TestCase):
                 ExecutionEventType.PLAN_REUSED,
                 ExecutionEventType.STEP_STARTED,
                 ExecutionEventType.STEP_PASSED,
+                ExecutionEventType.EVIDENCE_CAPTURED,
                 ExecutionEventType.RUN_FINISHED,
             ],
         )
@@ -390,12 +416,16 @@ class ExecutionProgressWebTests(unittest.TestCase):
             self.assertIn("MISSING_LOCATOR", page)
             self.assertIn("steps[0].parameters.selector", page)
             self.assertIn("CLICK action requires a locator.", page)
+            self.assertIn("Developer details", page)
+            self.assertIn('data-progress-events="all"', page)
+            self.assertNotIn('<h2>Preparation</h2>', page)
             self.assertIn("data-progress-state", script)
             self.assertIn("snapshot.state.toLowerCase()", script)
             self.assertEqual(payload["state"], "FINISHED")
             self.assertEqual(payload["phase"], "Finished")
             self.assertEqual(payload["run_status"], None)
             self.assertEqual(payload["steps"][2]["state"], "NOT_ATTEMPTED")
+            self.assertEqual(payload["steps"][2]["execution_state"], "NOT_ATTEMPTED")
             self.assertEqual(payload["automation_generation_failure"]["step_name"], "Submit registration")
             self.assertEqual(
                 payload["automation_generation_failure"]["validation_issues"][0]["code"],

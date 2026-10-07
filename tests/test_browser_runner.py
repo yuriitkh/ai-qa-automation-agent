@@ -4,7 +4,12 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from qa_agent.browser_runner import BrowserRunner, run_test_plan
-from qa_agent.models import QATestPlan
+from qa_agent.models import (
+    ExecutionSegment,
+    QATestPlan,
+    TestCase as DomainTestCase,
+    TestStep as DomainTestStep,
+)
 
 
 class BrowserRunnerActionTests(unittest.TestCase):
@@ -125,6 +130,65 @@ class BrowserRunnerActionTests(unittest.TestCase):
         self.manager.__exit__.assert_called_once_with(None, None, None)
         self.page.close.assert_called_once_with()
         second_page.close.assert_called_once_with()
+
+    def test_test_case_session_reuses_page_per_segment_and_shares_context(self) -> None:
+        second_page = MagicMock()
+        self.context.new_page.side_effect = [self.page, second_page]
+        steps = [
+            DomainTestStep(name=f"Step {index}", description="Check state.",
+                           expected="The state is visible.", order=index)
+            for index in range(3)
+        ]
+        test_case = DomainTestCase(
+            name="Segmented flow",
+            description="Keep browser state between steps and segments.",
+            segments=[
+                ExecutionSegment(order=0, steps=steps[:2]),
+                ExecutionSegment(order=1, steps=steps[2:]),
+            ],
+        )
+        plan = QATestPlan(url="https://example.test", steps=[
+            {"action": "assert_page_loaded", "parameters": {}}
+        ])
+
+        with patch("qa_agent.browser_runner.sync_playwright", return_value=self.manager):
+            with BrowserRunner().open_test_case_session(test_case) as session:
+                self.assertEqual(session.run_plan(0, plan)["status"], "passed")
+                self.assertEqual(session.run_plan(0, plan)["status"], "passed")
+                self.assertEqual(session.run_plan(1, plan)["status"], "passed")
+
+        self.manager.__enter__.assert_called_once_with()
+        self.playwright.chromium.launch.assert_called_once_with(headless=False)
+        self.browser.new_context.assert_called_once_with()
+        self.assertEqual(self.context.new_page.call_count, 2)
+        self.context.close.assert_called_once_with()
+        self.page.close.assert_called_once_with()
+        second_page.close.assert_called_once_with()
+        self.browser.close.assert_called_once_with()
+        self.manager.__exit__.assert_called_once_with(None, None, None)
+
+    def test_test_case_session_closes_owned_resources_once_after_failure(self) -> None:
+        test_case = DomainTestCase(
+            name="Failed flow",
+            description="Exercise session cleanup after a failure.",
+            steps=[DomainTestStep(
+                name="Open page", description="Open it.", expected="It opens.", order=0
+            )],
+        )
+        plan = QATestPlan(url="https://example.test", steps=[
+            {"action": "assert_page_loaded", "parameters": {}}
+        ])
+
+        with patch("qa_agent.browser_runner.sync_playwright", return_value=self.manager):
+            with self.assertRaisesRegex(RuntimeError, "step failed"):
+                with BrowserRunner().open_test_case_session(test_case) as session:
+                    session.run_plan(0, plan)
+                    raise RuntimeError("step failed")
+
+        self.page.close.assert_called_once_with()
+        self.context.close.assert_called_once_with()
+        self.browser.close.assert_called_once_with()
+        self.manager.__exit__.assert_called_once()
 
     def test_session_without_plan_cleans_resources(self) -> None:
         with patch("qa_agent.browser_runner.sync_playwright", return_value=self.manager):

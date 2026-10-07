@@ -182,6 +182,26 @@ class PinnedExecutionService:
             raise PlanSelectionError(
                 "Resolved plan versions must cover this TestCase exactly in step order."
             )
+        case_runner = self._plan_execution.new_test_case_runner()
+        try:
+            case_runner.bind(test_case)
+            result = self._execute_steps(
+                test_case, resolved, run_context, case_runner
+            )
+        except BaseException as error:
+            case_runner.close(primary_error=error)
+            raise
+        else:
+            case_runner.close()
+            return result
+
+    def _execute_steps(
+        self,
+        test_case: TestCase,
+        resolved: ResolvedPlanVersionSet,
+        run_context: RunContext,
+        case_runner,
+    ) -> PinnedExecutionResult:
         executions: list[Execution] = []
         step_executions: list[PinnedStepExecution] = []
         blocked_step_ids: list[UUID] = []
@@ -191,11 +211,17 @@ class PinnedExecutionService:
             emit_progress_event(
                 ExecutionEventType.PLAN_REUSED,
                 step=selected.test_step,
-                message="Saved automation loaded.",
+                plan_origin=(selected.plan_version.origin.value
+                             if selected.plan_version.origin is not None
+                             else "PINNED"),
+                plan_version=selected.plan_version.version,
+                message="Pinned automation loaded.",
             )
             try:
                 result = self._plan_execution.execute(
-                    selected.test_step, selected.plan_version
+                    selected.test_step,
+                    selected.plan_version,
+                    runner=case_runner.for_step(selected.test_step),
                 )
             except PlanExecutionPersistenceError as caught:
                 error = caught

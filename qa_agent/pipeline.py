@@ -1,4 +1,5 @@
 import time
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -161,15 +162,23 @@ class QATestPipeline:
         """
         active_run_context = run_context if run_context is not None else RunContext()
         trace = self._create_trace_recorder(task)
+        case_runner = self._plan_execution.new_test_case_runner()
         with active_trace_recorder(trace):
             try:
-                result = self._run(
-                    task,
-                    base_url,
-                    trace,
-                    active_run_context,
-                    supplied_test_case=supplied_test_case,
-                )
+                try:
+                    result = self._run(
+                        task,
+                        base_url,
+                        trace,
+                        active_run_context,
+                        supplied_test_case=supplied_test_case,
+                        case_runner=case_runner,
+                    )
+                except BaseException as error:
+                    case_runner.close(primary_error=error)
+                    raise
+                else:
+                    case_runner.close()
             except PipelineStageError as error:
                 error.trace = record_safely(
                     trace,
@@ -197,6 +206,16 @@ class QATestPipeline:
     def _create_trace_recorder(self, task: str) -> ExecutionTraceRecorder:
         return ExecutionTraceRecorder(task=task)
 
+    def _discover(self, target_url: str, case_runner=None) -> DiscoveryResult:
+        """Keep discovery's Playwright runtime off the active browser thread."""
+        if case_runner is not None and case_runner.browser_session_started:
+            with ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="qa-browser-discovery",
+            ) as worker:
+                return worker.submit(self._discovery, target_url).result()
+        return self._discovery(target_url)
+
     def _run(
         self,
         task: str,
@@ -205,6 +224,7 @@ class QATestPipeline:
         run_context: RunContext,
         *,
         supplied_test_case: TestCase | None = None,
+        case_runner=None,
     ) -> PipelineResult:
         decomposition_started = time.perf_counter()
         try:
@@ -215,6 +235,8 @@ class QATestPipeline:
             )
         except Exception as error:
             raise PipelineStageError("decomposition", str(error)) from error
+        if case_runner is not None:
+            case_runner.bind(test_case)
         record_safely(
             trace,
             "record_decomposition",
@@ -226,8 +248,17 @@ class QATestPipeline:
             message="Preparing automation for the TestCase.",
         )
 
+        segment_by_step = {
+            step.id: segment
+            for segment in test_case.segments
+            for step in segment.steps
+        }
         try:
-            target_url = test_case.base_url or extract_target_url(task)
+            target_url = (
+                test_case.base_url
+                or next((segment.base_url for segment in test_case.segments if segment.base_url), None)
+                or extract_target_url(task)
+            )
         except Exception as error:
             raise PipelineStageError("target resolution", str(error)) from error
         record_safely(trace, "record_target_url", target_url)
@@ -237,6 +268,7 @@ class QATestPipeline:
         blocked_step_ids: list[UUID] = []
         ordered_steps = sorted(test_case.steps, key=lambda step: step.order)
         for step_index, test_step in enumerate(ordered_steps):
+            step_target_url = segment_by_step[test_step.id].base_url or target_url
             record_safely(trace, "begin_step", test_step)
             try:
                 cached_version = self._plan_store.find(test_step.id)
@@ -294,6 +326,8 @@ class QATestPipeline:
                 emit_progress_event(
                     ExecutionEventType.PLAN_REUSED,
                     step=test_step,
+                    plan_origin=cached_version.origin.value if cached_version.origin is not None else "SAVED",
+                    plan_version=cached_version.version,
                     message="Saved automation loaded.",
                 )
             else:
@@ -304,13 +338,13 @@ class QATestPipeline:
                 )
                 discovery_started = time.perf_counter()
                 try:
-                    discovery_result = self._discovery(target_url)
+                    discovery_result = self._discover(step_target_url, case_runner)
                     if (discovery_result.status != DiscoveryStatus.SUCCESS
                             and self._discovery_fallback is not None):
                         fallback_started = time.perf_counter()
                         try:
                             suggestions = self._discovery_fallback.discover(
-                                task, target_url, test_step, discovery_result
+                                task, step_target_url, test_step, discovery_result
                             )
                         except Exception as fallback_error:
                             # Evidence-first ordering (same principle as the
@@ -434,12 +468,19 @@ class QATestPipeline:
                 emit_progress_event(
                     ExecutionEventType.PLAN_GENERATED,
                     step=test_step,
+                    plan_origin=(generated_plan.test_plan_version.origin.value
+                                 if generated_plan.test_plan_version.origin is not None
+                                 else "AI_GENERATED"),
+                    plan_version=generated_plan.test_plan_version.version,
                     message="Automation generated for this step.",
                 )
 
             plan_version = generated_plan.test_plan_version
             generated_plans.append(generated_plan)
-            execution_outcome = self._execute_plan(test_step, plan_version, trace)
+            execution_outcome = self._execute_plan(
+                test_step, plan_version, trace,
+                runner=case_runner.for_step(test_step) if case_runner is not None else None,
+            )
             execution = execution_outcome.execution
             executions.append(execution)
 
@@ -457,7 +498,7 @@ class QATestPipeline:
 
             rediscovery_started = time.perf_counter()
             try:
-                rediscovery_result = self._discovery(target_url)
+                rediscovery_result = self._discover(step_target_url, case_runner)
             except Exception as error:
                 # The rediscovery callable itself failed, so no result object
                 # exists; record a FAILED attempt anyway so an attempted
@@ -469,7 +510,7 @@ class QATestPipeline:
                     "record_discovery",
                     DiscoveryResult(
                         status=DiscoveryStatus.FAILED,
-                        url=target_url,
+                        url=step_target_url,
                         warnings=[str(error)],
                     ),
                     elapsed_ms(rediscovery_started),
@@ -534,8 +575,16 @@ class QATestPipeline:
                         str(error),
                     ) from error
                 generated_plans.append(repaired)
+                emit_progress_event(
+                    ExecutionEventType.PLAN_REPAIR_SUCCEEDED,
+                    step=test_step,
+                    plan_origin=PlanVersionOrigin.REPAIRED.value,
+                    plan_version=repaired_version.version,
+                    message="Saved automation repaired using current page evidence.",
+                )
                 repaired_outcome = self._execute_plan(
-                    test_step, repaired_version, trace
+                    test_step, repaired_version, trace,
+                    runner=case_runner.for_step(test_step) if case_runner is not None else None,
                 )
                 repaired_execution = repaired_outcome.execution
                 executions.append(repaired_execution)
@@ -628,10 +677,13 @@ class QATestPipeline:
             emit_progress_event(
                 ExecutionEventType.PLAN_GENERATED,
                 step=test_step,
+                plan_origin=PlanVersionOrigin.REGENERATED.value,
+                plan_version=regenerated_plan.test_plan_version.version,
                 message="Updated automation generated for this step.",
             )
             regenerated_outcome = self._execute_plan(
-                test_step, regenerated_plan.test_plan_version, trace
+                test_step, regenerated_plan.test_plan_version, trace,
+                runner=case_runner.for_step(test_step) if case_runner is not None else None,
             )
             regenerated_execution = regenerated_outcome.execution
             executions.append(regenerated_execution)
@@ -670,9 +722,13 @@ class QATestPipeline:
         test_step: TestStep,
         plan_version: TestPlanVersion,
         trace: ExecutionTraceRecorder,
+        *,
+        runner=None,
     ) -> PlanExecutionOutcome:
         try:
-            outcome = self._plan_execution.execute(test_step, plan_version)
+            outcome = self._plan_execution.execute(
+                test_step, plan_version, runner=runner
+            )
         except PlanExecutionPersistenceError as error:
             raise PipelineStageError(
                 f"execution repository (step {test_step.order}: {test_step.name}, "

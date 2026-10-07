@@ -1,0 +1,11 @@
+warning: in the working copy of 'qa_agent/execution_progress.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'qa_agent/pinned_execution.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'qa_agent/plan_execution.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'qa_agent/presentation.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'qa_agent/test_case_authoring.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'qa_agent/web.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/integration/test_dashboard_voice_integration.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/integration/test_product_demo.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_execution_progress.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_test_case_authoring.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_web_authoring.py', LF will be replaced by CRLF the next time Git touches it

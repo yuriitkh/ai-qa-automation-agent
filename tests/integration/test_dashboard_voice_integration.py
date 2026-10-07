@@ -111,7 +111,7 @@ class DashboardVoiceIntegrationTests(unittest.TestCase):
                 self.assertIn(spoken, provider.prompts[0])
                 self.assertEqual(
                     page.locator("#edit-name").input_value(),
-                    "Open the account page",
+                    "Account Page Behavior",
                 )
                 self.assertFalse(page.evaluate("window.__voiceXss || false"))
                 self.assertEqual(page.locator("img").count(), 0)

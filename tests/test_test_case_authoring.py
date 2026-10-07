@@ -75,16 +75,43 @@ class TestCaseAuthoringServiceTests(unittest.TestCase):
 
         with redirect_stdout(io.StringIO()):
             generated = service.generate(None, scenario, self.url)
-        self.assertEqual(
-            generated.test_case.name,
-            "Search for apartments in Oslo and check that results appear",
-        )
+        self.assertEqual(generated.test_case.name, "Search Apartments Oslo Results")
+        self.assertLessEqual(len(generated.test_case.name.split()), 10)
+        self.assertNotIn("...", generated.test_case.name)
+        self.assertNotEqual(generated.test_case.name, scenario)
         self.assertEqual(len(provider.calls), 1)
 
         with redirect_stdout(io.StringIO()):
             named = service.generate("My supplied title", scenario, self.url)
         self.assertEqual(named.test_case.name, "My supplied title")
         self.assertEqual(len(provider.calls), 2)
+
+    def test_prefers_valid_authoring_model_name_and_rejects_noisy_model_name(self):
+        provider = StructuredProvider(
+            '{"name":"User Registration Outcome",' + valid_response()[1:]
+        )
+        service = TestCaseAuthoringService(LLMRouter([provider]))
+        with redirect_stdout(io.StringIO()):
+            generated = service.generate(
+                None,
+                "Register a new user and verify that the account was created successfully.",
+                self.url,
+            )
+        self.assertEqual(generated.test_case.name, "User Registration Outcome")
+        self.assertEqual(len(provider.calls), 1)
+
+        noisy = StructuredProvider(
+            '{"name":"Verify that: 1. Register a new user and verify the complete account confirmation…",'
+            + valid_response()[1:]
+        )
+        with redirect_stdout(io.StringIO()):
+            fallback = TestCaseAuthoringService(LLMRouter([noisy])).generate(
+                None,
+                "Register a new user and verify that the account was created successfully.",
+                self.url,
+            )
+        self.assertEqual(fallback.test_case.name, "User Account Registration")
+        self.assertEqual(len(noisy.calls), 1)
 
     def test_preserves_segment_order_and_assigns_unique_application_owned_ids(self):
         provider = StructuredProvider(

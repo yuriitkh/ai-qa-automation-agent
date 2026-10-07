@@ -6,7 +6,7 @@ from uuid import uuid4
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
-from .models import QATestPlan
+from .models import QATestPlan, TestCase
 
 
 LOCATOR_TIMEOUT_MS = 5000
@@ -110,10 +110,65 @@ class BrowserRunner:
         else:
             session.close()
 
+    @contextmanager
+    def open_test_case_session(self, test_case: TestCase) -> Iterator["TestCaseBrowserSession"]:
+        """Own one browser context across the TestCase's ordered segments.
+
+        Browser startup is lazy so a TestCase that fails while preparing
+        automation does not launch a browser it never uses.
+        """
+        session = TestCaseBrowserSession(self, test_case)
+        try:
+            yield session
+        except BaseException as error:
+            session.close(primary_error=error)
+            raise
+        else:
+            session.close()
+
     def __call__(self, plan: QATestPlan) -> dict[str, Any]:
         with self.open_session() as session:
             page = session.new_page()
             return session.run_plan(page, plan)
+
+
+class TestCaseBrowserSession:
+    """Map each ordered segment to one page inside a shared browser context."""
+
+    def __init__(self, runner: BrowserRunner, test_case: TestCase) -> None:
+        self._runner = runner
+        self._segment_orders = {segment.order for segment in test_case.segments}
+        self._session: BrowserSession | None = None
+        self._pages: dict[int, Any] = {}
+        self._closed = False
+
+    @property
+    def is_started(self) -> bool:
+        return self._session is not None
+
+    def run_plan(self, segment_order: int, plan: QATestPlan) -> dict[str, Any]:
+        if self._closed:
+            raise RuntimeError("TestCase browser session is closed.")
+        if segment_order not in self._segment_orders:
+            raise ValueError("ExecutionSegment does not belong to this TestCase.")
+        if self._session is None:
+            self._session = BrowserSession(
+                self._runner.evidence_directory,
+                headless=self._runner.headless,
+            )
+            self._session.start()
+        page = self._pages.get(segment_order)
+        if page is None:
+            page = self._session.new_page()
+            self._pages[segment_order] = page
+        return self._session.run_plan(page, plan)
+
+    def close(self, primary_error: BaseException | None = None) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._session is not None:
+            self._session.close(primary_error=primary_error)
 
 
 def run_test_plan(

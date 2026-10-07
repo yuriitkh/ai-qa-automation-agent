@@ -123,7 +123,7 @@ class TestCaseAuthoringWebTests(unittest.TestCase):
         draft_token = progress["review_url"].rsplit("/", 1)[1]
         draft = self.app._draft_store.get(draft_token)
         self.assertIsNotNone(draft)
-        self.assertEqual(draft.test_case.name, "Check account details and sign in")
+        self.assertEqual(draft.test_case.name, "Account Details Sign In")
         self.assertEqual(self.cases.list(), [])
 
     def test_dashboard_invalid_input_does_not_start_authoring(self):
@@ -240,6 +240,8 @@ class TestCaseAuthoringWebTests(unittest.TestCase):
         review = self.app.handle("GET", review_path)
         self.assertEqual(review.status, 200)
         self.assertIn(b"Review TestCase", review.body)
+        self.assertIn(b'class="testcase-editor"', review.body)
+        self.assertIn(b".testcase-editor textarea{min-height:12rem}", review.body)
         self.assertIn(b'name="name"', review.body)
         self.assertIn(b'value="User registration"', review.body)
         self.assertIn(b'name="description"', review.body)

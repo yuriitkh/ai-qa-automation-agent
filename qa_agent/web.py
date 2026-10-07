@@ -457,38 +457,40 @@ class LocalWebApplication:
         step_rows = []
         for step in snapshot.steps:
             symbol, label = state_symbols.get(step.state.value, ("○", step.state.value))
+            execution_state = (
+                f'<span class="progress-step-state">Execution {escape_html(step.execution_state.value.replace("_", " ").title())}</span>'
+            )
             automation_state = (
                 f'<span class="muted">Automation {escape_html(step.automation_state.casefold())}</span>'
-                if step.automation_state else ""
+                if step.automation_state else '<span class="muted">Automation not prepared</span>'
             )
-            evidence_count = sum(
-                event.event_type.value == "EVIDENCE_CAPTURED"
-                and event.step_id == step.id
-                for event in snapshot.events
+            version_label = f" v{step.plan_version}" if step.plan_version is not None else ""
+            provenance = (
+                f'<span class="muted">Plan {escape_html(step.plan_origin.replace("_", " ").lower())}'
+                f'{version_label}</span>'
+                if step.plan_origin else ""
+            )
+            failure = (
+                f'<span class="progress-failure">{escape_html(step.failure_classification.replace("_", " ").title())}: '
+                f'{escape_html(step.message or "Step failed.")}</span>'
+                if step.failure_classification else ""
             )
             evidence = (
-                f'<span class="progress-evidence">Screenshot evidence captured ({evidence_count})</span>'
-                if evidence_count else ""
+                f'<span class="progress-evidence">Screenshot evidence captured ({step.evidence_count})</span>'
+                if step.evidence_count else ""
             )
             step_rows.append(
                 f'<li class="progress-step state-{escape_html(step.state.value.casefold())}">'
                 f'<span class="progress-symbol" aria-hidden="true">{symbol}</span>'
                 f'<span><strong>Step {step.order + 1}: {escape_html(step.name)}</strong>'
-                f'<span class="progress-step-state">{escape_html(label)}</span>{automation_state}{evidence}</span></li>'
+                f'<span class="progress-step-state">{escape_html(label)}</span>{execution_state}'
+                f'{automation_state}{provenance}{failure}{evidence}</span></li>'
             )
 
         events = snapshot.events
-        preparation = self._progress_event_list(events, {
-            "TESTCASE_LOADED", "SETUP_STARTED", "SETUP_SUCCEEDED", "SETUP_FAILED",
-        }, "preparation")
-        automation = self._progress_event_list(events, {
-            "AUTOMATION_PREPARATION_STARTED", "PLAN_REUSED", "PLAN_GENERATION_STARTED",
-            "PLAN_REPAIR_STARTED", "PLAN_REPAIR_SUCCEEDED", "PLAN_REPAIR_FAILED",
-            "PLAN_GENERATED", "PLAN_GENERATION_FAILED",
-        }, "automation")
-        cleanup = self._progress_event_list(events, {
-            "CLEANUP_STARTED", "CLEANUP_SUCCEEDED", "CLEANUP_FAILED",
-        }, "cleanup")
+        developer_events = self._progress_event_list(
+            events, {event.event_type.value for event in events}, "all"
+        )
         finished = snapshot.state.value == "FINISHED"
         phase = escape_html(snapshot.phase)
         body = (
@@ -514,18 +516,15 @@ class LocalWebApplication:
             )
             + '</div>'
             + f'<div class="progress-live" data-progress-id="{escape_html(progress_id)}">'
-            + '<section class="panel"><h2>Preparation</h2>'
-            + (preparation if preparation else '<ul class="compact-list" data-progress-events="preparation"></ul>')
-            + '</section><section class="panel"><h2>Automation</h2>'
-            + (automation if automation else '<ul class="compact-list" data-progress-events="automation"></ul>')
-            + '</section><section class="panel"><h2>Execution</h2>'
+            + '<section class="panel"><h2>TestCase progress</h2>'
             + (
                 f'<ol class="progress-steps" id="progress-steps">{"".join(step_rows)}</ol>'
                 if step_rows else '<ol class="progress-steps" id="progress-steps"></ol>'
             )
-            + '</section><section class="panel"><h2>Cleanup</h2>'
-            + (cleanup if cleanup else '<ul class="compact-list" data-progress-events="cleanup"></ul>')
-            + '</section></div>'
+            + '</section><details class="panel technical-details" data-progress-developer-details>'
+            + '<summary>Developer details</summary>'
+            + (developer_events if developer_events else '<ul class="compact-list" data-progress-events="all"></ul>')
+            + '</details></div>'
             + '<section class="panel progress-result" data-progress-result'
             + ('' if finished else ' hidden')
             + '><h2>Result</h2><div data-progress-result-content>' + result + '</div></section>'
@@ -936,7 +935,7 @@ class LocalWebApplication:
         content = (
             '<header class="page-heading"><h1>New Test Case</h1>'
             '<p class="lead">Describe the scenario. AI will propose steps for you to review.</p></header>'
-            + '<section class="panel"><form method="post" action="/test-cases/generate" data-authoring-form>'
+            + '<section class="panel authoring-entry"><form method="post" action="/test-cases/generate" data-authoring-form>'
             + '<input type="hidden" name="authoring_entry" value="new">'
             + error_html
             + '<div class="field"><label for="case-name">Name</label>'
@@ -2029,9 +2028,7 @@ _UI_JAVASCRIPT = r"""
   let redirectScheduled = false;
 
   const eventGroups = {
-    preparation: new Set(['TESTCASE_LOADED', 'SETUP_STARTED', 'SETUP_SUCCEEDED', 'SETUP_FAILED']),
-    automation: new Set(['AUTOMATION_PREPARATION_STARTED', 'PLAN_REUSED', 'PLAN_GENERATION_STARTED', 'PLAN_REPAIR_STARTED', 'PLAN_REPAIR_SUCCEEDED', 'PLAN_REPAIR_FAILED', 'PLAN_GENERATED', 'PLAN_GENERATION_FAILED']),
-    cleanup: new Set(['CLEANUP_STARTED', 'CLEANUP_SUCCEEDED', 'CLEANUP_FAILED'])
+    all: new Set(['RUN_REQUESTED', 'RUN_STARTED', 'TESTCASE_LOADED', 'SETUP_STARTED', 'SETUP_SUCCEEDED', 'SETUP_FAILED', 'AUTOMATION_PREPARATION_STARTED', 'PLAN_REUSED', 'PLAN_GENERATION_STARTED', 'PLAN_REPAIR_STARTED', 'PLAN_REPAIR_SUCCEEDED', 'PLAN_REPAIR_FAILED', 'PLAN_GENERATED', 'PLAN_GENERATION_FAILED', 'STEP_STARTED', 'STEP_PASSED', 'STEP_FAILED', 'STEP_BLOCKED', 'EVIDENCE_CAPTURED', 'CLEANUP_STARTED', 'CLEANUP_SUCCEEDED', 'CLEANUP_FAILED', 'RUN_FINISHED'])
   };
   const stepStates = {
     PENDING: ['○', 'Pending'], PREPARING_AUTOMATION: ['◌', 'Preparing automation'],
@@ -2085,15 +2082,35 @@ _UI_JAVASCRIPT = r"""
       const label = document.createElement('span');
       label.className = 'progress-step-state';
       label.textContent = state[1];
-      content.append(name, label);
+      const execution = document.createElement('span');
+      execution.className = 'progress-step-state';
+      const executionState = step.execution_state || 'PENDING';
+      execution.textContent = `Execution ${executionState.toLowerCase().replaceAll('_', ' ')}`;
+      content.append(name, label, execution);
       if (step.automation_state) {
         const automation = document.createElement('span');
         automation.className = 'muted';
         automation.textContent = `Automation ${step.automation_state.toLowerCase()}`;
         content.append(automation);
+      } else {
+        const automation = document.createElement('span');
+        automation.className = 'muted';
+        automation.textContent = 'Automation not prepared';
+        content.append(automation);
       }
-      const evidenceCount = snapshot.events.filter((event) =>
-        event.type === 'EVIDENCE_CAPTURED' && event.step_id === step.id).length;
+      if (step.plan_origin) {
+        const provenance = document.createElement('span');
+        provenance.className = 'muted';
+        provenance.textContent = `Plan ${step.plan_origin.toLowerCase().replaceAll('_', ' ')}${step.plan_version ? ` v${step.plan_version}` : ''}`;
+        content.append(provenance);
+      }
+      if (step.failure_classification) {
+        const failure = document.createElement('span');
+        failure.className = 'progress-failure';
+        failure.textContent = `${step.failure_classification.toLowerCase().replaceAll('_', ' ')}: ${step.message || 'Step failed.'}`;
+        content.append(failure);
+      }
+      const evidenceCount = step.evidence_count || 0;
       if (evidenceCount) {
         const evidence = document.createElement('span');
         evidence.className = 'progress-evidence';
