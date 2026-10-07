@@ -54,6 +54,17 @@ from qa_agent.execution_progress import (
 )
 from qa_agent.models import PlanVersionOrigin
 from qa_agent.plan_store import PlanStore
+from qa_agent.testplan_export import (
+    TestPlanExportError,
+    TestPlanExportService,
+    portable_zip,
+    project_zip,
+)
+from qa_agent.test_suites import (
+    InMemoryTestSuiteRepository,
+    SQLiteTestSuiteRepository,
+    TestSuiteService,
+)
 from qa_agent.test_case_decomposer import TestCaseDecomposer
 from qa_agent.test_plan_generator import LLMTestPlanGenerator
 from qa_agent.workflows import AutomationWorkflow
@@ -111,6 +122,7 @@ class LocalWebApplication:
         provider_settings: ProviderSettingsService | None = None,
         provider_router=None,
         llm_usage: LLMUsageService | None = None,
+        test_suites: TestSuiteService | None = None,
     ) -> None:
         self._run_history = run_history
         self._reports = reports or RunReportGenerator()
@@ -124,6 +136,13 @@ class LocalWebApplication:
         self._provider_settings = provider_settings
         self._provider_router = provider_router
         self._llm_usage = llm_usage
+        self._test_suites = test_suites or TestSuiteService(
+            InMemoryTestSuiteRepository(), test_cases
+        )
+        self._testplan_exports = (
+            TestPlanExportService(test_cases, plan_store)
+            if test_cases is not None and plan_store is not None else None
+        )
         self._background_runs = (
             BackgroundRunService(run_service, run_history, self._progress_store)
             if run_service is not None else None
@@ -184,6 +203,8 @@ class LocalWebApplication:
             return WebResponse.html(200, _local_demo_page())
         if path == "/test-cases":
             return WebResponse.html(200, self._test_case_list())
+        if path == "/test-suites":
+            return WebResponse.html(200, self._test_suites_page())
         if path == "/test-cases/new":
             return WebResponse.html(200, self._new_test_case_page())
         if len(parts) == 3 and parts[0] == "test-cases" and parts[1] == "review":
@@ -234,6 +255,21 @@ class LocalWebApplication:
             if test_case_id is None:
                 return self._not_found("TestCase not found")
             return self._test_case_page(test_case_id)
+        if len(parts) == 4 and parts[0] == "test-cases" and parts[2] == "export":
+            test_case_id = _parse_uuid(parts[1])
+            if test_case_id is None:
+                return self._not_found("TestCase not found")
+            return self._test_case_export(test_case_id, parts[3])
+        if len(parts) == 3 and parts[0] == "test-suites" and parts[2] == "export":
+            suite_id = _parse_uuid(parts[1])
+            if suite_id is None:
+                return self._not_found("Test Suite not found")
+            return self._test_suite_export(suite_id, query)
+        if len(parts) == 2 and parts[0] == "test-suites":
+            suite_id = _parse_uuid(parts[1])
+            if suite_id is None:
+                return self._not_found("Test Suite not found")
+            return self._test_suite_page(suite_id)
         if len(parts) == 3 and parts[0] == "test-cases" and parts[2] == "run":
             return WebResponse.html(405, self._page(
                 "Method not allowed",
@@ -245,6 +281,14 @@ class LocalWebApplication:
     def _handle_post(self, parts: list[str], body: bytes | str | None) -> WebResponse:
         if parts == ["settings", "providers"] and self._provider_settings is not None:
             return self._handle_provider_settings_post(body)
+        if parts == ["test-cases", "export"]:
+            return self._handle_bulk_export(body)
+        if parts == ["test-suites"]:
+            return self._handle_test_suite_create(body)
+        if len(parts) == 3 and parts[0] == "test-suites" and parts[2] == "update":
+            return self._handle_test_suite_update(parts[1], body)
+        if len(parts) == 4 and parts[0] == "test-suites" and parts[2] == "members":
+            return self._handle_test_suite_members(parts[1], parts[3], body)
         if parts == ["test-cases", "generate"]:
             return self._handle_generate_test_case(body)
         if (
@@ -992,7 +1036,12 @@ class LocalWebApplication:
                 )
                 rows.append(
                     "<tr>"
-                    f'<td><div class="status-line"><span class="id-code">{escape_html(test_case.public_id or "")}</span>'
+                    + (
+                        f'<td><input type="checkbox" name="test_case_id" value="{test_case_id}" '
+                        f'aria-label="Select {escape_html(test_case.public_id or test_case.name)}"></td>'
+                        if self._testplan_exports is not None else ""
+                    )
+                    + f'<td><div class="status-line"><span class="id-code">{escape_html(test_case.public_id or "")}</span>'
                     f'<a href="/test-cases/{test_case_id}">{escape_html(test_case.name)}</a></div>'
                     f'<details><summary>Technical ID</summary><code>{escape_html(test_case_id)}</code></details></td>'
                     f"<td>{status}</td><td>{outcome}</td><td>{last_run}</td>"
@@ -1013,23 +1062,241 @@ class LocalWebApplication:
                     f'<td>{badge(latest.workflow_type.value, "workflow")}</td>'
                     "</tr>"
                 )
+        selection_column = '<th scope="col"><label><input type="checkbox" data-select-all> Select visible</label></th>' if self._testplan_exports is not None else ""
         table = (
-            '<div class="table-wrap"><table><thead><tr><th>TestCase</th><th>Latest status</th>'
+            '<div class="table-wrap"><table><thead><tr>' + selection_column + '<th>TestCase</th><th>Latest status</th>'
             '<th>Latest result</th><th>Last run</th><th>Runs</th><th>Latest workflow</th></tr></thead><tbody>'
             + "".join(rows)
             + "</tbody></table></div>"
+        )
+        bulk_form = (
+            '<form method="post" action="/test-cases/export" class="export-selection">'
+            '<label for="bulk-export-format">Export selected as</label>'
+            '<select id="bulk-export-format" name="target">'
+            '<option value="portable">Portable JSON bundle</option>'
+            '<option value="python">Python Playwright project</option>'
+            '<option value="typescript">TypeScript Playwright project</option>'
+            '<option value="csharp">C# Playwright project</option>'
+            '</select><button class="button" type="submit">Export selected</button>'
+            + table + '</form>'
+            if rows and self._testplan_exports is not None else ""
         )
         content = (
             '<header class="page-heading section-heading"><div><h1>Test Cases</h1>'
             '<p class="lead">Saved TestCase definitions and their run history.</p></div>'
             '<a class="button primary" href="/test-cases/new">+ New Test Case</a></header>'
             '<section class="panel"><h2>TestCases</h2>'
-            + (table if rows else self._empty_state(
+            + (bulk_form if self._testplan_exports is not None and rows else table if rows else self._empty_state(
                 "No TestCases found.", "Create a TestCase from a natural-language scenario to get started."
             ))
             + "</section>"
         )
         return self._page("Test Cases", content, current="Test Cases", breadcrumbs=[("Dashboard", "/")])
+
+    def _test_case_export(self, test_case_id: UUID, target: str) -> WebResponse:
+        if self._testplan_exports is None:
+            return self._not_found("TestCase export is unavailable.")
+        try:
+            if target == "portable":
+                content, filename = self._testplan_exports.portable_json(test_case_id)
+                return _download_response(content.encode("utf-8"), filename, "application/json; charset=utf-8")
+            if target in {"python", "typescript", "csharp"}:
+                content, filename = self._testplan_exports.source(test_case_id, target)
+                return _download_response(content.encode("utf-8"), filename, "text/plain; charset=utf-8")
+            if target.endswith("-zip"):
+                language = target.removesuffix("-zip")
+                exportable = self._testplan_exports.get(test_case_id)
+                if language == "portable":
+                    content = portable_zip([exportable])
+                    filename = f"{exportable.test_case.public_id or 'testcase'}-portable.zip"
+                elif language in {"python", "typescript", "csharp"}:
+                    content = project_zip(language, [exportable])
+                    filename = f"{exportable.test_case.public_id or 'testcase'}-{language}.zip"
+                else:
+                    raise TestPlanExportError("Choose a supported export format.")
+                return _download_response(content, filename, "application/zip")
+            return self._not_found("Export format not found.")
+        except TestPlanExportError as error:
+            return _export_error_response(str(error), 409)
+        except Exception as error:
+            logger.warning("TestCase export failed safely (%s)", type(error).__name__)
+            return _export_error_response("The saved automation could not be exported.", 500)
+
+    def _handle_bulk_export(self, body: bytes | str | None) -> WebResponse:
+        if self._testplan_exports is None:
+            return _export_error_response("TestCase export is unavailable.", 503)
+        form, error = _parse_form_body(
+            body, max_bytes=64 * 1024, allow_repeated_fields={"test_case_id"}
+        )
+        if error:
+            return _export_error_response(error, 400)
+        raw_ids = form.get("test_case_id", [])
+        test_case_ids = [_parse_uuid(value) for value in raw_ids]
+        if not raw_ids or any(value is None for value in test_case_ids):
+            return _export_error_response("Select one or more valid TestCases.", 400)
+        target = form.get("target", [""])[0]
+        try:
+            content, filename = self._testplan_exports.bulk_zip(test_case_ids, target)
+        except TestPlanExportError as export_error:
+            return _export_error_response(str(export_error), 409)
+        except Exception as export_error:
+            logger.warning("Bulk TestCase export failed safely (%s)", type(export_error).__name__)
+            return _export_error_response("The selected automation could not be exported.", 500)
+        return _download_response(content, filename, "application/zip")
+
+    def _test_suites_page(self) -> str:
+        suites = self._test_suites.list()
+        rows = "".join(
+            "<tr>"
+            f'<td><a href="/test-suites/{suite.id}">{escape_html(suite.name)}</a>'
+            f'<div class="muted">{escape_html(suite.description)}</div></td>'
+            f'<td>{len(self._test_suites.members(suite.id))}</td>'
+            f'<td>{escape_html(format_timestamp(suite.updated_at))}</td>'
+            f'<td><a class="button" href="/test-suites/{suite.id}/export?format=portable">Export</a></td>'
+            "</tr>"
+            for suite in suites
+        )
+        content = (
+            '<header class="page-heading"><h1>Test Suites</h1>'
+            '<p class="lead">Group saved TestCases for reusable organization and export.</p></header>'
+            '<section class="panel"><h2>Create Test Suite</h2>'
+            '<form method="post" action="/test-suites">'
+            '<div class="field"><label for="suite-name">Name</label><input id="suite-name" name="name" maxlength="120" required></div>'
+            '<div class="field"><label for="suite-description">Description</label><textarea id="suite-description" name="description" maxlength="1000" rows="3"></textarea></div>'
+            '<button class="button primary" type="submit">Create suite</button></form></section>'
+            '<section class="panel"><h2>Saved Test Suites</h2>'
+            + (
+                '<div class="table-wrap"><table><thead><tr><th>Name</th><th>TestCases</th><th>Updated</th><th>Export</th></tr></thead><tbody>'
+                + rows + '</tbody></table></div>'
+                if suites else self._empty_state("No Test Suites yet.", "Create a suite to group related TestCases.")
+            )
+            + '</section>'
+        )
+        return self._page("Test Suites", content, current="Test Suites", breadcrumbs=[("Dashboard", "/")])
+
+    def _test_suite_page(self, suite_id: UUID) -> WebResponse:
+        suite = self._test_suites.get(suite_id)
+        if suite is None:
+            return self._not_found("Test Suite not found.")
+        members = self._test_suites.members(suite_id)
+        member_ids = {case.id for case in members}
+        available = [case for case in (self._test_cases.list() if self._test_cases else []) if case.id not in member_ids]
+        member_rows = []
+        for index, case in enumerate(members):
+            member_rows.append(
+                "<li class=\"suite-member\"><span>"
+                f'<span class="id-code">{escape_html(case.public_id or "")}</span> '
+                f'<a href="/test-cases/{case.id}">{escape_html(case.name)}</a></span>'
+                '<div class="button-row">'
+                + _suite_member_form(suite_id, case.id, "move-up", "Move up", disabled=index == 0)
+                + _suite_member_form(suite_id, case.id, "move-down", "Move down", disabled=index == len(members) - 1)
+                + _suite_member_form(suite_id, case.id, "remove", "Remove")
+                + '</div></li>'
+            )
+        options = "".join(
+            f'<option value="{case.id}">{escape_html(case.public_id or "")} · {escape_html(case.name)}</option>'
+            for case in available
+        )
+        add_form = (
+            '<form method="post" action="/test-suites/' + str(suite_id) + '/members/add" class="inline-form">'
+            '<label for="suite-member">Add TestCase</label><select id="suite-member" name="test_case_id" required>'
+            '<option value="">Choose a TestCase</option>' + options
+            + '</select><button class="button" type="submit">Add</button></form>'
+            if available else '<p class="muted">All available TestCases are already in this suite.</p>'
+        )
+        content = (
+            '<header class="page-heading"><p class="eyebrow">Test Suite</p>'
+            f'<h1>{escape_html(suite.name)}</h1><p class="lead">{escape_html(suite.description)}</p></header>'
+            '<section class="panel"><div class="section-heading"><h2>Export suite</h2><div class="button-row">'
+            f'<a class="button" href="/test-suites/{suite_id}/export?format=portable">Portable JSON ZIP</a>'
+            f'<a class="button" href="/test-suites/{suite_id}/export?format=python">Python ZIP</a>'
+            f'<a class="button" href="/test-suites/{suite_id}/export?format=typescript">TypeScript ZIP</a>'
+            f'<a class="button" href="/test-suites/{suite_id}/export?format=csharp">C# ZIP</a>'
+            '</div></div></section>'
+            '<section class="panel"><h2>Edit suite</h2>'
+            f'<form method="post" action="/test-suites/{suite_id}/update">'
+            f'<div class="field"><label for="suite-name">Name</label><input id="suite-name" name="name" maxlength="120" required value="{escape_html(suite.name)}"></div>'
+            f'<div class="field"><label for="suite-description">Description</label><textarea id="suite-description" name="description" maxlength="1000" rows="3">{escape_html(suite.description)}</textarea></div>'
+            '<button class="button" type="submit">Save changes</button></form></section>'
+            '<section class="panel"><h2>Suite TestCases</h2>' + add_form
+            + (f'<ol class="suite-members">{"".join(member_rows)}</ol>' if member_rows else self._empty_state("This suite is empty.", "Add saved TestCases above."))
+            + '</section>'
+        )
+        return WebResponse.html(200, self._page(
+            suite.name, content, current="Test Suites",
+            breadcrumbs=[("Dashboard", "/"), ("Test Suites", "/test-suites")],
+        ))
+
+    def _handle_test_suite_create(self, body: bytes | str | None) -> WebResponse:
+        form, error = _parse_form_body(body)
+        if error:
+            return _export_error_response(error, 400)
+        try:
+            suite = self._test_suites.create(form.get("name", [""])[0], form.get("description", [""])[0])
+        except ValueError as suite_error:
+            return _export_error_response(str(suite_error), 400)
+        return WebResponse.redirect(f"/test-suites/{suite.id}")
+
+    def _handle_test_suite_update(self, raw_suite_id: str, body: bytes | str | None) -> WebResponse:
+        suite_id = _parse_uuid(raw_suite_id)
+        if suite_id is None:
+            return self._not_found("Test Suite not found.")
+        form, error = _parse_form_body(body)
+        if error:
+            return _export_error_response(error, 400)
+        try:
+            self._test_suites.update(suite_id, form.get("name", [""])[0], form.get("description", [""])[0])
+        except (KeyError, ValueError) as suite_error:
+            return _export_error_response(str(suite_error), 400)
+        return WebResponse.redirect(f"/test-suites/{suite_id}")
+
+    def _handle_test_suite_members(self, raw_suite_id: str, operation: str, body: bytes | str | None) -> WebResponse:
+        suite_id = _parse_uuid(raw_suite_id)
+        if suite_id is None:
+            return self._not_found("Test Suite not found.")
+        form, error = _parse_form_body(body)
+        if error:
+            return _export_error_response(error, 400)
+        case_id = _parse_uuid(form.get("test_case_id", [""])[0])
+        try:
+            if case_id is None:
+                raise ValueError("Choose a valid TestCase.")
+            if operation == "add":
+                self._test_suites.add_member(suite_id, case_id)
+            elif operation == "remove":
+                self._test_suites.remove_member(suite_id, case_id)
+            elif operation == "move-up":
+                self._test_suites.move_member(suite_id, case_id, -1)
+            elif operation == "move-down":
+                self._test_suites.move_member(suite_id, case_id, 1)
+            else:
+                return self._not_found("Test Suite operation not found.")
+        except (KeyError, ValueError) as suite_error:
+            return _export_error_response(str(suite_error), 400)
+        return WebResponse.redirect(f"/test-suites/{suite_id}")
+
+    def _test_suite_export(self, suite_id: UUID, query: dict[str, list[str]]) -> WebResponse:
+        if self._test_suites.get(suite_id) is None or self._testplan_exports is None:
+            return self._not_found("Test Suite export is unavailable.")
+        suite = self._test_suites.get(suite_id)
+        try:
+            ids = self._test_suites.member_ids(suite_id)
+            exports = self._testplan_exports.get_many(ids, preserve_order=True)
+            target = query.get("format", ["portable"])[0].casefold()
+            if target not in {"portable", "python", "typescript", "csharp"}:
+                raise TestPlanExportError("Choose Portable JSON, Python, TypeScript, or C# export.")
+            if target == "portable":
+                content = portable_zip(exports, suite_name=suite.name)
+                filename = f"{_safe_download_slug(suite.name)}-portable.zip"
+            else:
+                content = project_zip(target, exports, suite_name=suite.name)
+                filename = f"{_safe_download_slug(suite.name)}-{target}.zip"
+        except TestPlanExportError as export_error:
+            return _export_error_response(str(export_error), 409)
+        except Exception as export_error:
+            logger.warning("Test Suite export failed safely (%s)", type(export_error).__name__)
+            return _export_error_response("The saved suite automation could not be exported.", 500)
+        return _download_response(content, filename, "application/zip")
 
     def _runs_page(self, query: dict[str, list[str]]) -> str:
         workflow = _query_choice(query, "workflow", _WORKFLOWS)
@@ -1202,6 +1469,38 @@ class LocalWebApplication:
             self._test_case_usage_panel(usage_summary)
             if usage_summary is not None else ""
         )
+        export_panel = ""
+        if test_case is not None and self._testplan_exports is not None:
+            try:
+                exportable = self._testplan_exports.get(test_case_id)
+            except TestPlanExportError as error:
+                unavailable_message = (
+                    "Automation required before code export. Generate and save a complete set of automation plans first."
+                    if str(error).startswith("Automation required")
+                    else str(error)
+                )
+                export_panel = (
+                    '<section class="panel"><h2>Export</h2>'
+                    f'<p class="muted">{escape_html(unavailable_message)}</p></section>'
+                )
+            else:
+                version_summary = ", ".join(
+                    f"Step {item.step_order + 1}: v{item.version.version} · "
+                    f"{_plan_origin_label(item.version.origin)}"
+                    for item in exportable.plans
+                )
+                export_panel = (
+                    '<section class="panel export-panel"><div class="section-heading"><div>'
+                    '<h2>Export</h2><p class="muted">Saved automation, ready to use outside AI QA Agent.</p>'
+                    '</div><details><summary>Plan versions</summary>'
+                    f'<p class="muted">{escape_html(version_summary)}</p></details></div>'
+                    '<div class="button-row">'
+                    f'<a class="button" href="/test-cases/{test_case_id}/export/portable">Portable JSON</a>'
+                    f'<a class="button" href="/test-cases/{test_case_id}/export/python">Python Playwright</a>'
+                    f'<a class="button" href="/test-cases/{test_case_id}/export/typescript">TypeScript Playwright</a>'
+                    f'<a class="button" href="/test-cases/{test_case_id}/export/csharp">C# Playwright</a>'
+                    '</div></section>'
+                )
         content = (
             '<header class="page-heading">'
             + (f'<p class="eyebrow">{escape_html(case_public_id)}</p>' if case_public_id else '')
@@ -1212,6 +1511,7 @@ class LocalWebApplication:
             + f'<p>TestCase UUID: <code>{escape_html(test_case_id)}</code></p></details>'
             + f'<div class="summary-grid">{cards}</div>'
             + run_form
+            + export_panel
             + usage_panel
             + '<section class="panel"><h2>Preconditions</h2>'
             + (f"<ul>{conditions}</ul>" if conditions else '<p class="muted">No preconditions recorded.</p>')
@@ -1828,6 +2128,8 @@ class LocalWebApplication:
     ) -> str:
         nav_items = []
         links = [("Dashboard", "/"), ("Test Cases", "/test-cases"), ("Runs", "/runs")]
+        if self._test_suites is not None:
+            links.append(("Test Suites", "/test-suites"))
         if self._llm_usage is not None:
             links.append(("AI Usage", "/settings/usage"))
         if self._provider_settings is not None:
@@ -1910,6 +2212,10 @@ def create_application(
         provider_settings=provider_settings,
         provider_router=automation_router,
         llm_usage=llm_usage,
+        test_suites=TestSuiteService(
+            SQLiteTestSuiteRepository(storage.database_path),
+            storage.test_case_repository,
+        ),
     )
 
 
@@ -1937,6 +2243,8 @@ def create_http_server(
                 max_body_bytes = _MAX_DRAFT_SAVE_BODY_BYTES
             elif request_path == ["test-cases", "generate"]:
                 max_body_bytes = _MAX_AUTHORING_FORM_BODY_BYTES
+            elif request_path == ["test-cases", "export"]:
+                max_body_bytes = 64 * 1024
             else:
                 max_body_bytes = _MAX_FORM_BODY_BYTES
             if content_length < 0 or content_length > max_body_bytes:
@@ -2014,6 +2322,7 @@ def _parse_form_body(
     body: bytes | str | None,
     *,
     max_bytes: int = _MAX_FORM_BODY_BYTES,
+    allow_repeated_fields: set[str] | None = None,
 ) -> tuple[dict[str, list[str]], str | None]:
     if isinstance(body, bytes):
         try:
@@ -2034,9 +2343,46 @@ def _parse_form_body(
         )
     except (UnicodeDecodeError, ValueError):
         return {}, "The request was not valid form data."
-    if any(len(items) != 1 for items in values.values()):
+    allowed_repeated = allow_repeated_fields or set()
+    if any(len(items) != 1 and key not in allowed_repeated for key, items in values.items()):
         return {}, "The request contained ambiguous form fields."
     return values, None
+
+
+def _download_response(content: bytes, filename: str, content_type: str) -> WebResponse:
+    safe_name = filename.replace('"', "").replace("\r", "").replace("\n", "")
+    return WebResponse(
+        200,
+        content_type,
+        content,
+        {"Content-Disposition": f'attachment; filename="{safe_name}"'},
+    )
+
+
+def _export_error_response(message: str, status: int) -> WebResponse:
+    body = (
+        '<div class="error-state"><h1>Export unavailable</h1>'
+        f'<p>{escape_html(message)}</p><a class="button" href="/test-cases">Back to TestCases</a></div>'
+    )
+    return WebResponse.html(status, '<!doctype html><html lang="en"><meta charset="utf-8"><body>' + body + '</body></html>')
+
+
+def _safe_download_slug(value: str) -> str:
+    import re
+    import unicodedata
+
+    normalized = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii").casefold()
+    slug = re.sub(r"[^a-z0-9]+", "-", normalized).strip("-._ ")
+    return (slug or "test-suite")[:80].rstrip("-._ ")
+
+
+def _suite_member_form(suite_id: UUID, case_id: UUID, operation: str, label: str, *, disabled: bool = False) -> str:
+    disabled_attr = " disabled" if disabled else ""
+    return (
+        f'<form method="post" action="/test-suites/{suite_id}/members/{operation}">'
+        f'<input type="hidden" name="test_case_id" value="{case_id}">'
+        f'<button class="button" type="submit"{disabled_attr}>{escape_html(label)}</button></form>'
+    )
 
 
 def _query_choice(query: dict[str, list[str]], key: str, choices: set[str]) -> str:
@@ -2135,6 +2481,15 @@ def _authoring_error_label(category: str | None) -> str:
 
 _UI_JAVASCRIPT = r"""
 (() => {
+  document.querySelectorAll('[data-select-all]').forEach((master) => {
+    master.addEventListener('change', () => {
+      const form = master.closest('form');
+      form?.querySelectorAll('input[name="test_case_id"]').forEach((checkbox) => {
+        checkbox.checked = master.checked;
+      });
+    });
+  });
+
   const testcaseEditor = document.querySelector('[data-testcase-editor]');
   if (testcaseEditor) {
     const editedIndicator = document.querySelector('[data-edited-indicator]');

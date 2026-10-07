@@ -165,6 +165,35 @@ request with the original inputs. Authoring jobs use a separate bounded worker
 pool so long runs cannot occupy authoring workers. Progress and drafts remain
 in memory and are cleared when the server restarts.
 
+### Portable automation, code export, and Test Suites
+
+Open a saved TestCase with a complete set of automation plans and use its
+**Export** panel to download a versioned Portable TestPlan JSON file or ordinary
+Playwright source for Python, TypeScript, or C#. Exports use the currently saved
+TestPlanVersion for each TestStep. Export is deterministic and local: it does
+not call an LLM, regenerate automation, or require the AI QA Agent runtime in
+the generated tests. The source preserves the saved Playwright locator strings
+and action order. Review target URLs and test values before running an export.
+Portable JSON includes the TestCase name, base URL, preconditions, ordered
+segments, and exact plan versions; it omits the original authoring scenario and
+provider data.
+
+From **Test Cases**, select multiple rows and choose Portable JSON or one
+Playwright language to download a ZIP project. A Test Suite is an organizational
+group with an explicit member order; create one from **Test Suites**, then add,
+remove, reorder, or export its saved TestCases. ZIP files contain a README,
+portable plan copies, a manifest with TestCase and plan-version provenance, and
+the minimal project files for the selected target. Dependencies are listed but
+never installed by AI QA Agent.
+
+Portable TestPlan JSON is versioned and currently export-only. Import is not
+implemented in this milestone. Export requires a valid saved plan for every
+TestStep; a partial TestCase remains executable through the existing Automation
+workflow but cannot be exported as a complete source project.
+Portable JSON retains each TestStep failure policy. Generated source is one
+standard Playwright test per TestCase, so the target test framework controls
+whether later actions run after a failed assertion.
+
 ### Partial Automation and manual real-site checks
 
 Automation saves each structurally validated plan version as its step finishes.
