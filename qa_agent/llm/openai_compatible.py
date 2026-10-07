@@ -9,6 +9,7 @@ from ..models import AIDiscoveryResult, QATestPlan
 from .base import LLMProvider
 from .errors import NonRetryableLLMError, RetryableLLMError
 from .json_schema import normalize_strict_json_schema, qa_test_plan_schema
+from .usage_metadata import capture_openai_usage
 
 
 class OpenAICompatibleProvider(LLMProvider):
@@ -69,6 +70,7 @@ class OpenAICompatibleProvider(LLMProvider):
                     "schema": normalize_strict_json_schema(schema),
                 }},
             )
+            capture_openai_usage(response)
             content = response.choices[0].message.content
             if not content:
                 raise ValueError("empty response")

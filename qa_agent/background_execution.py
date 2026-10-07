@@ -17,6 +17,7 @@ from qa_agent.pipeline import PipelineStageError
 from qa_agent.run_history import RunHistoryService, WorkflowType
 from qa_agent.run_context import RunContext
 from qa_agent.test_case_execution import RunUnavailableError, TestCaseExecutionService
+from qa_agent.llm_usage import llm_usage_scope
 
 
 logger = logging.getLogger(__name__)
@@ -118,7 +119,11 @@ class BackgroundRunService:
                 message="Run started.",
             )
             try:
-                result = self._run_service.run(test_case_id, workflow_type)
+                with llm_usage_scope(
+                    related_test_case_id=test_case_id,
+                    related_workflow_id=progress_id,
+                ):
+                    result = self._run_service.run(test_case_id, workflow_type)
             except RunUnavailableError as error:
                 category = getattr(error, "category", "MISSING_AUTOMATION")
                 logger.info("TestCase run was not available (%s)", category)

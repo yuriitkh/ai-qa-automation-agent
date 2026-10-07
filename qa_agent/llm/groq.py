@@ -8,6 +8,7 @@ from ..models import AIDiscoveryResult, QATestPlan
 from .base import LLMProvider
 from .errors import NonRetryableLLMError, RetryableLLMError
 from .json_schema import qa_test_plan_schema
+from .usage_metadata import capture_openai_usage
 
 
 class GroqProvider(LLMProvider):
@@ -174,6 +175,7 @@ class GroqProvider(LLMProvider):
 
         try:
             response_data = response.json()
+            capture_openai_usage(response_data)
             output_text = response_data["choices"][0]["message"]["content"]
             plan = QATestPlan.model_validate_json(output_text)
             return plan
@@ -208,7 +210,9 @@ class GroqProvider(LLMProvider):
         if response.is_error:
             raise RetryableLLMError(f"Groq request failed with HTTP {response.status_code}.")
         try:
-            output = response.json()["choices"][0]["message"]["content"]
+            response_data = response.json()
+            capture_openai_usage(response_data)
+            output = response_data["choices"][0]["message"]["content"]
             return AIDiscoveryResult.model_validate_json(output)
         except Exception as error:
             raise RetryableLLMError(
@@ -252,7 +256,9 @@ class GroqProvider(LLMProvider):
                 f"Groq structured-output request failed with HTTP {response.status_code}."
             )
         try:
-            return response.json()["choices"][0]["message"]["content"]
+            response_data = response.json()
+            capture_openai_usage(response_data)
+            return response_data["choices"][0]["message"]["content"]
         except Exception as error:
             raise RetryableLLMError(
                 "Groq returned an invalid structured-output response."

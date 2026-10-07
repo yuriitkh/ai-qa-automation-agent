@@ -23,6 +23,7 @@ from qa_agent.models import (
     TestCase,
     TestStep,
 )
+from qa_agent.llm_usage import OP_AUTHOR_TESTCASE, llm_usage_scope
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,7 @@ class TestCaseDraft:
     authoring_name: str | None = None
     authoring_scenario: str | None = None
     authoring_base_url: str | None = None
+    usage_workflow_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -254,6 +256,7 @@ class TestCaseAuthoringService:
         *,
         progress_callback: Callable[[str], None] | None = None,
         provider_progress_callback: Callable[..., None] | None = None,
+        usage_workflow_id: str | None = None,
     ) -> TestCaseDraft:
         authoring_input = self.validate_input(name, scenario, base_url)
         supplied_name = name.strip() if isinstance(name, str) else ""
@@ -265,12 +268,16 @@ class TestCaseAuthoringService:
         if progress_callback is not None:
             progress_callback("LLM_REQUEST_STARTED")
         try:
-            raw = self._router.create_structured_output(
-                prompt,
-                _AuthoringResponse.model_json_schema(),
-                "test_case_authoring",
-                progress_callback=provider_progress_callback,
-            )
+            with llm_usage_scope(
+                operation_type=OP_AUTHOR_TESTCASE,
+                related_workflow_id=usage_workflow_id,
+            ):
+                raw = self._router.create_structured_output(
+                    prompt,
+                    _AuthoringResponse.model_json_schema(),
+                    "test_case_authoring",
+                    progress_callback=provider_progress_callback,
+                )
         except Exception as error:
             # Provider failures can contain arbitrary response text. Keep only
             # the exception class in logs and return a product-level message.
@@ -373,6 +380,7 @@ class TestCaseAuthoringService:
             authoring_name=clean_name,
             authoring_scenario=clean_scenario,
             authoring_base_url=clean_url,
+            usage_workflow_ids=(usage_workflow_id,) if usage_workflow_id else (),
         )
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 from threading import BoundedSemaphore, Lock
 
@@ -145,12 +146,27 @@ class BackgroundAuthoringService:
         try:
             reporter.emit(AuthoringEventType.AUTHORING_STARTED)
             validated = self._authoring_service.validate_input(name, scenario, base_url)
+            source_draft = (
+                self._draft_store.get(source_draft_token)
+                if source_draft_token is not None else None
+            )
             draft = self._authoring_service.generate(
                 validated.name,
                 validated.scenario,
                 validated.base_url,
                 progress_callback=reporter.emit,
                 provider_progress_callback=reporter.provider_progress,
+                usage_workflow_id=progress_id,
+            )
+            prior_workflows = (
+                source_draft.usage_workflow_ids
+                if source_draft is not None else ()
+            )
+            draft = replace(
+                draft,
+                usage_workflow_ids=tuple(dict.fromkeys(
+                    (*prior_workflows, *draft.usage_workflow_ids)
+                )),
             )
             token = self._draft_store.put(draft)
             try:

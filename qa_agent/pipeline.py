@@ -1,4 +1,5 @@
 import time
+from contextvars import copy_context
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -18,6 +19,7 @@ from qa_agent.execution_trace import (
     elapsed_ms,
     record_safely,
 )
+from qa_agent.llm_usage import OP_DISCOVERY, llm_usage_scope
 from qa_agent.models import (
     DiscoveryResult,
     DiscoveryStatus,
@@ -213,7 +215,8 @@ class QATestPipeline:
                 max_workers=1,
                 thread_name_prefix="qa-browser-discovery",
             ) as worker:
-                return worker.submit(self._discovery, target_url).result()
+                context = copy_context()
+                return worker.submit(context.run, self._discovery, target_url).result()
         return self._discovery(target_url)
 
     def _run(
@@ -338,14 +341,24 @@ class QATestPipeline:
                 )
                 discovery_started = time.perf_counter()
                 try:
-                    discovery_result = self._discover(step_target_url, case_runner)
+                    with llm_usage_scope(
+                        operation_type=OP_DISCOVERY,
+                        related_test_case_id=test_case.id,
+                        related_test_case_public_id=test_case.public_id,
+                    ):
+                        discovery_result = self._discover(step_target_url, case_runner)
                     if (discovery_result.status != DiscoveryStatus.SUCCESS
                             and self._discovery_fallback is not None):
                         fallback_started = time.perf_counter()
                         try:
-                            suggestions = self._discovery_fallback.discover(
-                                task, step_target_url, test_step, discovery_result
-                            )
+                            with llm_usage_scope(
+                                operation_type=OP_DISCOVERY,
+                                related_test_case_id=test_case.id,
+                                related_test_case_public_id=test_case.public_id,
+                            ):
+                                suggestions = self._discovery_fallback.discover(
+                                    task, step_target_url, test_step, discovery_result
+                                )
                         except Exception as fallback_error:
                             # Evidence-first ordering (same principle as the
                             # P0-2 fix): the deterministic discovery already
@@ -408,9 +421,13 @@ class QATestPipeline:
 
                 generation_started = time.perf_counter()
                 try:
-                    generated_plan = self._plan_generator.generate_with_plan(
-                        test_step, discovery_result
-                    )
+                    with llm_usage_scope(
+                        related_test_case_id=test_case.id,
+                        related_test_case_public_id=test_case.public_id,
+                    ):
+                        generated_plan = self._plan_generator.generate_with_plan(
+                            test_step, discovery_result
+                        )
                     generated_plan = _validate_generated_plan(
                         generated_plan,
                         test_step,
@@ -498,7 +515,12 @@ class QATestPipeline:
 
             rediscovery_started = time.perf_counter()
             try:
-                rediscovery_result = self._discover(step_target_url, case_runner)
+                with llm_usage_scope(
+                    operation_type=OP_DISCOVERY,
+                    related_test_case_id=test_case.id,
+                    related_test_case_public_id=test_case.public_id,
+                ):
+                    rediscovery_result = self._discover(step_target_url, case_runner)
             except Exception as error:
                 # The rediscovery callable itself failed, so no result object
                 # exists; record a FAILED attempt anyway so an attempted
@@ -603,12 +625,16 @@ class QATestPipeline:
                 message="Generating updated automation for this step.",
             )
             try:
-                regenerated_plan = self._plan_generator.generate_with_plan(
-                    test_step,
-                    rediscovery_result,
-                    existing_test_plan=generated_plan.test_plan,
-                    version_number=plan_version.version + 1,
-                )
+                with llm_usage_scope(
+                    related_test_case_id=test_case.id,
+                    related_test_case_public_id=test_case.public_id,
+                ):
+                    regenerated_plan = self._plan_generator.generate_with_plan(
+                        test_step,
+                        rediscovery_result,
+                        existing_test_plan=generated_plan.test_plan,
+                        version_number=plan_version.version + 1,
+                    )
                 regenerated_plan = _validate_generated_plan(
                     regenerated_plan,
                     test_step,

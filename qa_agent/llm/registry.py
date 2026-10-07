@@ -12,7 +12,7 @@ def configured_provider_order() -> list[str]:
     return [name.strip().lower() for name in raw.split(",") if name.strip()]
 
 
-def create_router() -> LLMRouter:
+def create_router(*, usage_recorder=None) -> LLMRouter:
     compatible = {
         "openai": OpenAICompatibleProvider(
             "openai", "OPENAI_API_KEY", os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
@@ -41,4 +41,4 @@ def create_router() -> LLMRouter:
     unknown = [name for name in order if name not in providers]
     if unknown:
         raise ValueError("Unknown LLM providers in LLM_PROVIDER_ORDER: " + ", ".join(unknown))
-    return LLMRouter([providers[name] for name in order])
+    return LLMRouter([providers[name] for name in order], usage_recorder=usage_recorder)

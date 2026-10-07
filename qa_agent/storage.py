@@ -14,6 +14,7 @@ from qa_agent.sqlite_storage import (
     SQLiteTestCaseRepository,
 )
 from qa_agent.test_case_repository import TestCaseRepository
+from qa_agent.llm_usage import LLMUsageRepository
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,7 @@ class SQLiteApplicationStorage:
     run_history_repository: RunHistoryRepository
     run_history: RunHistoryService
     test_case_repository: TestCaseRepository
+    llm_usage_repository: LLMUsageRepository
 
 
 def default_database_path() -> Path:
@@ -41,6 +43,7 @@ def create_sqlite_storage(
     execution_repository = SQLiteExecutionRepository(path)
     test_case_repository = SQLiteTestCaseRepository(path)
     run_history_repository = SQLiteRunHistoryRepository(path)
+    llm_usage_repository = LLMUsageRepository(path)
     run_history = RunHistoryService(
         run_history_repository, execution_repository, plan_store=plan_store
     )
@@ -51,4 +54,5 @@ def create_sqlite_storage(
         run_history_repository=run_history_repository,
         run_history=run_history,
         test_case_repository=test_case_repository,
+        llm_usage_repository=llm_usage_repository,
     )

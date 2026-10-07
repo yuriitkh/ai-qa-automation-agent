@@ -44,6 +44,7 @@ from qa_agent.test_case_authoring import (
 )
 from qa_agent.test_case_repository import TestCaseRepository
 from qa_agent.storage import create_sqlite_storage
+from qa_agent.llm_usage import LLMUsageService
 from qa_agent.pipeline import QATestPipeline
 from qa_agent.background_authoring import BackgroundAuthoringService
 from qa_agent.background_execution import BackgroundRunService
@@ -109,6 +110,7 @@ class LocalWebApplication:
         plan_store: PlanStore | None = None,
         provider_settings: ProviderSettingsService | None = None,
         provider_router=None,
+        llm_usage: LLMUsageService | None = None,
     ) -> None:
         self._run_history = run_history
         self._reports = reports or RunReportGenerator()
@@ -121,6 +123,7 @@ class LocalWebApplication:
         self._plan_store = plan_store
         self._provider_settings = provider_settings
         self._provider_router = provider_router
+        self._llm_usage = llm_usage
         self._background_runs = (
             BackgroundRunService(run_service, run_history, self._progress_store)
             if run_service is not None else None
@@ -175,6 +178,8 @@ class LocalWebApplication:
             return WebResponse.html(200, self._dashboard())
         if path == "/settings/providers" and self._provider_settings is not None:
             return WebResponse.html(200, self._provider_settings_page(query))
+        if path == "/settings/usage" and self._llm_usage is not None:
+            return WebResponse.html(200, self._usage_analytics_page(query))
         if path == "/demo-target/registration":
             return WebResponse.html(200, _local_demo_page())
         if path == "/test-cases":
@@ -719,6 +724,13 @@ class LocalWebApplication:
                 '<p>The reviewed TestCase could not be saved. Generate a new draft and try again.</p>'
                 '<a class="button" href="/test-cases">Return to TestCases</a></div>',
             ))
+        if self._llm_usage is not None:
+            for workflow_id in consumed.usage_workflow_ids:
+                self._llm_usage.associate_workflow(
+                    workflow_id,
+                    edits.test_case.id,
+                    edits.test_case.public_id,
+                )
         return WebResponse.redirect(f"/test-cases/{edits.test_case.id}")
 
     def _draft_review_page(self, token: str, error: str | None = None) -> WebResponse:
@@ -1182,6 +1194,14 @@ class LocalWebApplication:
             else:
                 # Compatibility for lightweight adapters that only implement run().
                 run_form = self._run_form(test_case_id)
+        usage_summary = (
+            self._llm_usage.test_case_summary(test_case_id)
+            if self._llm_usage is not None else None
+        )
+        usage_panel = (
+            self._test_case_usage_panel(usage_summary)
+            if usage_summary is not None else ""
+        )
         content = (
             '<header class="page-heading">'
             + (f'<p class="eyebrow">{escape_html(case_public_id)}</p>' if case_public_id else '')
@@ -1192,6 +1212,7 @@ class LocalWebApplication:
             + f'<p>TestCase UUID: <code>{escape_html(test_case_id)}</code></p></details>'
             + f'<div class="summary-grid">{cards}</div>'
             + run_form
+            + usage_panel
             + '<section class="panel"><h2>Preconditions</h2>'
             + (f"<ul>{conditions}</ul>" if conditions else '<p class="muted">No preconditions recorded.</p>')
             + '</section><section class="panel"><h2>Steps</h2>'
@@ -1209,6 +1230,174 @@ class LocalWebApplication:
                 current="Test Cases",
                 breadcrumbs=[("Dashboard", "/"), ("Test Cases", "/test-cases")],
             ),
+        )
+
+    @staticmethod
+    def _test_case_usage_panel(summary: dict[str, object]) -> str:
+        tokens = summary.get("total_tokens")
+        cost = summary.get("estimated_cost_usd")
+        cost_label = "Unknown" if cost is None else f"${float(cost):.6f}"
+        request_count = int(summary.get("requests", 0))
+        usage_known = int(summary.get("usage_known_requests", 0))
+        fallback_count = int(summary.get("fallback_operations", 0))
+        providers = ", ".join(
+            escape_html(name) for name in summary.get("providers", [])
+        ) or "Unknown"
+        operations = summary.get("by_operation", [])
+        rows = "".join(
+            "<tr>"
+            f"<td>{escape_html(_operation_label(str(item.get('operation_type', ''))))}</td>"
+            f"<td>{int(item.get('requests', 0))}</td>"
+            f"<td>{int(item.get('successful_requests', 0))} / {int(item.get('failed_requests', 0))}</td>"
+            f"<td>{_format_usage_cost(item.get('estimated_cost_usd'))}</td>"
+            "</tr>"
+            for item in operations if isinstance(item, dict)
+        )
+        note = (
+            f'<p class="muted">Token usage is available for {usage_known} of '
+            f'{request_count} provider attempts. Cost is estimated only where a verified '
+            f'model price is configured.</p>'
+        )
+        return (
+            '<section class="panel"><h2>AI Usage</h2>'
+            f'<p>Providers: {providers}</p>'
+            '<div class="summary-grid">'
+            + _summary_card("Provider attempts", str(request_count))
+            + _summary_card(
+                "Total tokens",
+                (f"{tokens} (partial)" if summary.get("usage_is_partial") else str(tokens))
+                if tokens is not None else "Unknown",
+            )
+            + _summary_card("Estimated cost", cost_label)
+            + _summary_card("Fallback operations", str(fallback_count))
+            + '</div>' + note
+            + ('<div class="table-wrap"><table><thead><tr><th>Operation</th>'
+               '<th>Provider attempts</th><th>Successful / failed</th><th>Estimated cost</th>'
+               '</tr></thead><tbody>' + rows + '</tbody></table></div>' if rows else '')
+            + '</section>'
+        )
+
+    def _usage_analytics_page(self, query: dict[str, list[str]]) -> str:
+        window = query.get("range", ["30d"])[0]
+        if window not in {"today", "7d", "30d", "all"}:
+            window = "30d"
+        analytics = self._llm_usage.analytics(window)
+        cost = analytics.get("estimated_cost_usd")
+        cost_label = _format_usage_cost(cost)
+        if cost is not None and analytics.get("cost_is_partial"):
+            cost_label += " (partial)"
+        tokens = analytics.get("total_tokens")
+        tokens_label = (
+            "Unknown" if tokens is None else
+            f"{tokens} (partial)" if analytics.get("usage_is_partial") else str(tokens)
+        )
+        attempts = int(analytics.get("requests", 0))
+        successes = int(analytics.get("successful_requests", 0))
+        failures = int(analytics.get("failed_requests", 0))
+        fallback_ops = int(analytics.get("fallbacks", 0))
+        operations = int(analytics.get("operations", 0))
+        limited_sample = bool(analytics.get("limited_sample"))
+        sample_note = (
+            '<p class="notice">Limited sample: fewer than five provider attempts. '
+            'Reliability rates are descriptive and should not be used to rank providers.</p>'
+            if limited_sample else
+            '<p class="muted">Reliability is shown with raw counts. The page does not rank providers.</p>'
+        )
+        links = "".join(
+            f'<a class="button{" primary" if selected == window else ""}" '
+            f'href="/settings/usage?range={selected}">{label}</a>'
+            for selected, label in (
+                ("today", "Today"), ("7d", "7 days"),
+                ("30d", "30 days"), ("all", "All time"),
+            )
+        )
+        provider_rows = []
+        for item in analytics.get("by_provider", []):
+            provider_name = str(item.get("provider_name") or item.get("provider_id", "Unknown"))
+            rate = _format_usage_rate(item.get("success_rate"))
+            if item.get("limited_sample"):
+                rate += ' <span class="muted">Limited sample</span>'
+            tokens_value = item.get("total_tokens")
+            if tokens_value is not None and item.get("usage_is_partial"):
+                tokens_value = f"{tokens_value} (partial)"
+            provider_cost = _format_usage_cost(item.get("estimated_cost_usd"))
+            if item.get("estimated_cost_usd") is not None and item.get("cost_is_partial"):
+                provider_cost += " (partial)"
+            provider_rows.append(
+                "<tr>"
+                f"<td>{escape_html(provider_name)}</td>"
+                f"<td>{int(item.get('requests', 0))}</td>"
+                f"<td>{int(item.get('successful_requests', 0))} / {int(item.get('failed_requests', 0))}</td>"
+                f"<td>{rate}</td>"
+                f"<td>{int(item.get('fallback_requests', 0))}</td>"
+                f"<td>{escape_html(str(tokens_value) if tokens_value is not None else 'Unknown')}</td>"
+                f"<td>{_format_usage_latency(item.get('average_latency_ms'))}</td>"
+                f"<td>{provider_cost}</td></tr>"
+            )
+        model_rows = "".join(
+            "<tr>"
+            f"<td>{escape_html(str(item.get('provider_id', 'unknown')))}</td>"
+            f"<td>{escape_html(str(item.get('model', 'unknown')))}</td>"
+            f"<td>{int(item.get('requests', 0))}</td>"
+            f"<td>{int(item.get('successful_requests', 0))} / {int(item.get('failed_requests', 0))}</td>"
+            f"<td>{escape_html((str(item.get('total_tokens')) + ' (partial)') if item.get('total_tokens') is not None and item.get('usage_is_partial') else str(item.get('total_tokens')) if item.get('total_tokens') is not None else 'Unknown')}</td>"
+            f"<td>{_format_usage_cost(item.get('estimated_cost_usd'))}</td></tr>"
+            for item in analytics.get("by_model", [])
+        )
+        operation_rows = "".join(
+            "<tr>"
+            f"<td>{escape_html(_operation_label(str(item.get('operation_type', ''))))}</td>"
+            f"<td>{int(item.get('requests', 0))}</td>"
+            f"<td>{int(item.get('successful_requests', 0))} / {int(item.get('failed_requests', 0))}</td>"
+            f"<td>{_format_usage_latency(item.get('average_latency_ms'))}</td>"
+            f"<td>{_format_usage_cost(item.get('estimated_cost_usd'))}</td></tr>"
+            for item in analytics.get("by_operation", [])
+        )
+        provider_table = (
+            '<div class="table-wrap"><table><thead><tr><th>Provider</th><th>Attempts</th>'
+            '<th>Success / failure</th><th>Success rate</th><th>Fallback attempts</th>'
+            '<th>Tokens</th><th>Average latency</th><th>Estimated cost</th></tr></thead><tbody>'
+            + "".join(provider_rows) + '</tbody></table></div>'
+            if provider_rows else self._empty_state(
+                "No provider usage recorded yet.",
+                "Usage appears after an LLM provider request completes.",
+            )
+        )
+        model_table = (
+            '<div class="table-wrap"><table><thead><tr><th>Provider</th><th>Model</th>'
+            '<th>Attempts</th><th>Success / failure</th><th>Tokens</th><th>Estimated cost</th>'
+            '</tr></thead><tbody>' + model_rows + '</tbody></table></div>'
+            if model_rows else '<p class="muted">No model usage recorded for this range.</p>'
+        )
+        operation_table = (
+            '<div class="table-wrap"><table><thead><tr><th>Operation</th><th>Attempts</th>'
+            '<th>Success / failure</th><th>Average latency</th><th>Estimated cost</th>'
+            '</tr></thead><tbody>' + operation_rows + '</tbody></table></div>'
+            if operation_rows else '<p class="muted">No operation usage recorded for this range.</p>'
+        )
+        content = (
+            '<header class="page-heading"><p class="eyebrow">Analytics</p><h1>AI Usage</h1>'
+            '<p class="lead">Provider attempts, actual token counts, latency, fallback, and cost estimates.</p></header>'
+            f'<div class="filters">{links}</div>{sample_note}'
+            '<div class="summary-grid">'
+            + _summary_card("Provider attempts", str(attempts))
+            + _summary_card("Successful / failed", f"{successes} / {failures}")
+            + _summary_card("Operations with fallback", f"{fallback_ops} / {operations}")
+            + _summary_card("Total tokens", tokens_label)
+            + _summary_card("Estimated cost", cost_label)
+            + _summary_card("Average latency", _format_usage_latency(analytics.get("average_latency_ms")))
+            + '</div><section class="panel"><h2>Provider reliability and usage</h2>'
+            + provider_table + '</section><section class="panel"><h2>Model comparison</h2>'
+            + model_table + '</section><section class="panel"><h2>Usage by operation</h2>'
+            + operation_table + '</section>'
+            + '<p class="muted">Token counts come from provider response usage metadata. Cost is an estimate '
+            'and is Unknown when no verified rate or complete token breakdown is available.</p>'
+        )
+        return self._page(
+            "AI Usage",
+            content,
+            current="AI Usage",
+            breadcrumbs=[("Dashboard", "/")],
         )
 
     @staticmethod
@@ -1530,6 +1719,8 @@ class LocalWebApplication:
     ) -> str:
         nav_items = []
         links = [("Dashboard", "/"), ("Test Cases", "/test-cases"), ("Runs", "/runs")]
+        if self._llm_usage is not None:
+            links.append(("AI Usage", "/settings/usage"))
         if self._provider_settings is not None:
             links.append(("Settings", "/settings/providers"))
         for label, href in links:
@@ -1572,6 +1763,7 @@ def create_application(
     evidence_directory: str | Path | None = None,
 ) -> LocalWebApplication:
     storage = create_sqlite_storage(database_path)
+    llm_usage = LLMUsageService(storage.llm_usage_repository)
     evidence_root = (
         Path(evidence_directory).expanduser().resolve()
         if evidence_directory is not None
@@ -1580,8 +1772,9 @@ def create_application(
     provider_settings = ProviderSettingsService(
         ProviderSettingsRepository(storage.database_path),
         create_default_secret_store(),
+        usage_recorder=llm_usage,
     )
-    automation_router = provider_settings.create_router()
+    automation_router = provider_settings.create_router(usage_recorder=llm_usage)
     automation_workflow = AutomationWorkflow(QATestPipeline(
         decomposer=TestCaseDecomposer(),
         plan_generator=LLMTestPlanGenerator(automation_router),
@@ -1607,6 +1800,7 @@ def create_application(
         plan_store=storage.plan_store,
         provider_settings=provider_settings,
         provider_router=automation_router,
+        llm_usage=llm_usage,
     )
 
 
@@ -1763,6 +1957,43 @@ def _summary_card(label: str, value: str, *, raw: bool = False) -> str:
         f'<article class="card"><div class="card-label">{escape_html(label)}</div>'
         f'<div class="card-value">{shown}</div></article>'
     )
+
+
+def _format_usage_cost(value: object) -> str:
+    if value is None:
+        return "Unknown"
+    try:
+        return f"${float(value):.6f}"
+    except (TypeError, ValueError, OverflowError):
+        return "Unknown"
+
+
+def _format_usage_rate(value: object) -> str:
+    if value is None:
+        return "Unknown"
+    try:
+        return f"{float(value) * 100:.1f}%"
+    except (TypeError, ValueError, OverflowError):
+        return "Unknown"
+
+
+def _format_usage_latency(value: object) -> str:
+    if value is None:
+        return "Unknown"
+    try:
+        return f"{max(0, int(value))} ms"
+    except (TypeError, ValueError, OverflowError):
+        return "Unknown"
+
+
+def _operation_label(operation: str) -> str:
+    return {
+        "AUTHOR_TESTCASE": "TestCase authoring",
+        "GENERATE_AUTOMATION_PLAN": "Automation plan generation",
+        "REPAIR_AUTOMATION_PLAN": "Automation plan repair",
+        "DISCOVERY": "Discovery",
+        "OTHER": "Other",
+    }.get(operation, "Other")
 
 
 def _plan_origin_label(origin: PlanVersionOrigin | None) -> str:

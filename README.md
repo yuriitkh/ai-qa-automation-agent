@@ -181,3 +181,29 @@ For optional manual checks against a public site:
 - Expect dynamic page content, cookie banners, and timing to differ between visits.
 - Review the progress classification and the exact step where generation or execution stopped.
 - If generation saved only part of the TestCase, use **Retry Automation** and confirm saved plans are reused.
+
+### AI usage analytics
+
+The local UI includes **AI Usage** at `/settings/usage`, with Today, 7 days,
+30 days, and All time views. It records one row per provider attempt, including
+operation type, model, start and finish times, latency, outcome, fallback
+relationship, and token counts only when the provider returns usage metadata.
+Aggregates show raw success and failure counts; rates are marked as a limited
+sample when there are fewer than five attempts. Providers are not automatically
+ranked or labeled best.
+
+Usage rows are stored in the same SQLite database as the application. Provider
+response text, prompts, and API keys are not stored. Saved TestCases show their
+associated AI usage after a reviewed draft is saved; abandoned drafts and older
+TestCases are not retroactively attributed. Telemetry begins with requests made
+after this feature is installed; past provider use and token counts are not
+reconstructed. Provider-reported token counts may be unavailable, so the UI
+labels them Unknown when missing.
+
+Cost is an estimate, not a bill. No model price is shown until a verified rate
+is deliberately configured in the local pricing catalog; therefore the cost
+may appear as Unknown. If only some attempts have a configured rate, the total
+is marked partial. Usage rows are retained in SQLite indefinitely by default;
+estimates are captured when each request is recorded and are not recalculated
+for older rows when the catalog changes. Include the database in your normal
+retention and backup process.

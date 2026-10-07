@@ -20,6 +20,7 @@ from qa_agent.models import ExecutionStatus
 from qa_agent.pipeline import PipelineResult, PipelineStageError, QATestPipeline
 from qa_agent.redaction import safe_failure_reason
 from qa_agent.storage import create_sqlite_storage
+from qa_agent.llm_usage import LLMUsageService
 from qa_agent.test_case_decomposer import TestCaseDecomposer
 from qa_agent.test_plan_generator import LLMTestPlanGenerator
 
@@ -39,8 +40,9 @@ def build_pipeline(
     are backed by the shared SQLite database so completed runs remain
     available to reports and the local Web UI.
     """
-    router = create_router()
     storage = create_sqlite_storage(database_path)
+    usage_service = LLMUsageService(storage.llm_usage_repository)
+    router = create_router(usage_recorder=usage_service)
     return QATestPipeline(
         decomposer=TestCaseDecomposer(),
         plan_generator=LLMTestPlanGenerator(router),

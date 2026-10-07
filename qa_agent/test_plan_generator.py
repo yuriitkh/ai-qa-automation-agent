@@ -16,6 +16,11 @@ from qa_agent.test_plan_validation import (
     PlanValidationIssue,
     validate_executable_plan,
 )
+from qa_agent.llm_usage import (
+    OP_GENERATE_AUTOMATION_PLAN,
+    OP_REPAIR_AUTOMATION_PLAN,
+    llm_usage_scope,
+)
 
 
 @dataclass(frozen=True)
@@ -82,11 +87,12 @@ class LLMTestPlanGenerator(TestPlanGenerator):
     ) -> GeneratedTestPlan:
         task = self._build_task_context(test_step, discovery_result)
         page_snapshot = self._build_discovery_context(discovery_result)
-        router_result = self._router.create_test_plan(
-            task=task,
-            target_url=discovery_result.url,
-            page_snapshot=page_snapshot,
-        )
+        with llm_usage_scope(operation_type=OP_GENERATE_AUTOMATION_PLAN):
+            router_result = self._router.create_test_plan(
+                task=task,
+                target_url=discovery_result.url,
+                page_snapshot=page_snapshot,
+            )
 
         # Validate at this boundary as well, so a nonconforming Router
         # implementation cannot create a version from invalid plan data.
@@ -104,11 +110,12 @@ class LLMTestPlanGenerator(TestPlanGenerator):
             )
             repair_task = self._build_repair_task(task, initial_error.issues)
             try:
-                repaired_result = self._router.create_test_plan(
-                    task=repair_task,
-                    target_url=discovery_result.url,
-                    page_snapshot=page_snapshot,
-                )
+                with llm_usage_scope(operation_type=OP_REPAIR_AUTOMATION_PLAN):
+                    repaired_result = self._router.create_test_plan(
+                        task=repair_task,
+                        target_url=discovery_result.url,
+                        page_snapshot=page_snapshot,
+                    )
             except Exception:
                 emit_progress_event(
                     ExecutionEventType.PLAN_REPAIR_FAILED,

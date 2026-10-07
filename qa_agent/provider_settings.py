@@ -17,6 +17,7 @@ import httpx
 from qa_agent.llm.errors import NonRetryableLLMError
 from qa_agent.llm.router import LLMRouter
 from qa_agent.redaction import register_secret
+from qa_agent.llm_usage import OP_OTHER, llm_usage_scope
 
 
 @dataclass(frozen=True)
@@ -256,11 +257,13 @@ class ProviderSettingsService:
         *,
         environment: dict[str, str] | None = None,
         provider_factory=None,
+        usage_recorder=None,
     ) -> None:
         self.repository = repository
         self.secret_store = secret_store
         self._environment = environment
         self._provider_factory = provider_factory
+        self._usage_recorder = usage_recorder
         self._health: dict[str, ConnectionTestResult] = {}
 
     @property
@@ -382,8 +385,11 @@ class ProviderSettingsService:
         self.secret_store.delete(provider_id)
         self._health.pop(provider_id, None)
 
-    def create_router(self) -> LLMRouter:
-        return LLMRouter(self._build_providers())
+    def create_router(self, *, usage_recorder=None) -> LLMRouter:
+        return LLMRouter(
+            self._build_providers(),
+            usage_recorder=(usage_recorder or self._usage_recorder),
+        )
 
     def refresh_router(self, router: LLMRouter) -> None:
         router.replace_providers(self._build_providers())
@@ -440,11 +446,14 @@ class ProviderSettingsService:
                 result = ConnectionTestResult("configuration_invalid")
             else:
                 started = time.perf_counter()
-                provider.create_structured_output(
-                    'Return only {"ok":true}.',
-                    {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"], "additionalProperties": False},
-                    "connection_test",
-                )
+                with llm_usage_scope(operation_type=OP_OTHER):
+                    LLMRouter(
+                        [provider], usage_recorder=self._usage_recorder
+                    ).create_structured_output(
+                        'Return only {"ok":true}.',
+                        {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"], "additionalProperties": False},
+                        "connection_test",
+                    )
                 result = ConnectionTestResult("connected", round((time.perf_counter() - started) * 1000))
         except Exception as error:
             result = ConnectionTestResult(_classify_connection_error(error))

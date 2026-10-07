@@ -8,6 +8,7 @@ from ..models import AIDiscoveryResult, QATestPlan
 from .base import LLMProvider
 from .errors import NonRetryableLLMError, RetryableLLMError
 from .json_schema import qa_test_plan_schema
+from .usage_metadata import capture_gemini_usage
 
 
 def _raise_for_gemini_error(error: Exception, operation: str) -> None:
@@ -156,6 +157,7 @@ class GeminiProvider(LLMProvider):
                 ),
                 response_format=response_format,
             )
+            capture_gemini_usage(interaction)
             return QATestPlan.model_validate_json(interaction.output_text)
         except Exception as error:
             _raise_for_gemini_error(error, "request")
@@ -172,6 +174,7 @@ class GeminiProvider(LLMProvider):
                 response_format={"type": "text", "mime_type": "application/json",
                                  "schema": AIDiscoveryResult.model_json_schema()},
             )
+            capture_gemini_usage(response)
             return AIDiscoveryResult.model_validate_json(response.output_text)
         except Exception as error:
             _raise_for_gemini_error(error, "Discovery request")
@@ -191,6 +194,7 @@ class GeminiProvider(LLMProvider):
                     "schema": schema,
                 },
             )
+            capture_gemini_usage(response)
             return response.output_text
         except Exception as error:
             _raise_for_gemini_error(error, f"{schema_name} request")
