@@ -7,7 +7,7 @@ import mimetypes
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from uuid import UUID
 
 from qa_agent.presentation import (
@@ -1378,7 +1378,8 @@ class LocalWebApplication:
         content = (
             '<header class="page-heading"><p class="eyebrow">Analytics</p><h1>AI Usage</h1>'
             '<p class="lead">Provider attempts, actual token counts, latency, fallback, and cost estimates.</p></header>'
-            f'<div class="filters">{links}</div>{sample_note}'
+            + self._settings_tabs("usage")
+            + f'<div class="filters">{links}</div>{sample_note}'
             '<div class="summary-grid">'
             + _summary_card("Provider attempts", str(attempts))
             + _summary_card("Successful / failed", f"{successes} / {failures}")
@@ -1585,47 +1586,78 @@ class LocalWebApplication:
         if settings is None:
             return WebResponse.redirect("/settings/providers?notice=unavailable")
 
+        result = "updated"
+        if operation == "create_custom":
+            try:
+                provider_id = settings.create_custom(
+                    form.get("display_name", [""])[0],
+                    form.get("base_url", [""])[0],
+                    form.get("model", [""])[0],
+                    api_key=form.get("api_key", [""])[0] or None,
+                    enabled=form.get("enabled", [""])[0] == "yes",
+                    requires_api_key=form.get("requires_api_key", [""])[0] == "yes",
+                )
+                self._refresh_provider_router()
+                return WebResponse.redirect("/settings/providers?" + urlencode({"provider": provider_id, "result": "created"}) + "#" + quote(provider_id, safe=""))
+            except SecretStoreError:
+                return WebResponse.redirect("/settings/providers?notice=storage_unavailable#add-provider")
+            except ValueError:
+                return WebResponse.redirect("/settings/providers?notice=invalid#add-provider")
+            except Exception:
+                return WebResponse.redirect("/settings/providers?notice=unavailable#add-provider")
+
         try:
             if operation == "enable":
                 settings.update(provider_id, enabled=True)
                 self._refresh_provider_router()
-                notice = "updated"
             elif operation == "disable":
                 settings.update(provider_id, enabled=False)
                 self._refresh_provider_router()
-                notice = "updated"
             elif operation in {"move_up", "move_down"}:
                 settings.move(provider_id, -1 if operation == "move_up" else 1)
                 self._refresh_provider_router()
-                notice = "updated"
             elif operation == "save_key":
                 settings.save_key(provider_id, form.get("api_key", [""])[0])
                 self._refresh_provider_router()
-                notice = "key_saved"
+                result = "key_saved"
             elif operation == "remove_key":
                 settings.remove_key(provider_id)
                 self._refresh_provider_router()
-                notice = "key_removed"
+                result = "key_removed"
             elif operation == "save_model":
                 model = form.get("model", [""])[0].strip()
                 if len(model) > 200 or any(ord(char) < 32 for char in model):
                     raise ValueError("Invalid model.")
                 settings.update(provider_id, model=model)
                 self._refresh_provider_router()
-                notice = "updated"
+            elif operation == "save_custom":
+                settings.update_custom(
+                    provider_id,
+                    display_name=form.get("display_name", [""])[0],
+                    base_url=form.get("base_url", [""])[0],
+                    model=form.get("model", [""])[0],
+                )
+                self._refresh_provider_router()
             elif operation == "test_connection":
                 settings.test_connection(provider_id)
-                notice = "tested"
+                result = "tested"
+            elif operation == "delete_custom":
+                if form.get("confirmed", [""])[0] != "yes":
+                    raise ValueError("Confirm provider deletion first.")
+                display_name = next((view.display_name for view in settings.provider_views() if view.id == provider_id), "Custom provider")
+                settings.delete_custom(provider_id)
+                self._refresh_provider_router()
+                return WebResponse.redirect("/settings/providers?" + urlencode({"notice": "deleted", "deleted_name": display_name}))
             else:
-                notice = "invalid"
+                result = "invalid"
         except SecretStoreError:
-            notice = "storage_unavailable"
+            result = "storage_unavailable"
         except ValueError:
-            notice = "invalid"
+            result = "invalid"
         except Exception:
             # Provider and credential errors are intentionally reduced to a stable notice.
-            notice = "unavailable"
-        return WebResponse.redirect(f"/settings/providers?notice={notice}")
+            result = "unavailable"
+        return WebResponse.redirect("/settings/providers?" + urlencode({"provider": provider_id, "result": result}) + "#" + quote(provider_id, safe=""))
 
     def _refresh_provider_router(self) -> None:
         if self._provider_settings is not None and self._provider_router is not None:
@@ -1636,26 +1668,36 @@ class LocalWebApplication:
         if settings is None:
             return self._page("AI Providers", self._empty_state("Settings unavailable", "Provider settings are not configured."), current="Settings")
         messages = {
-            "updated": "Provider settings saved.",
-            "key_saved": "Provider credential saved securely.",
-            "key_removed": "Web-managed credential removed. An environment key will be used when present.",
-            "tested": "Connection test finished. See the provider status below.",
+            "deleted": "Custom provider removed. Historical AI Usage records are retained.",
             "invalid": "The settings request was invalid. Review the values and try again.",
             "storage_unavailable": "Secure credential storage is unavailable on this system.",
             "unavailable": "The requested provider operation could not be completed.",
         }
         notice_code = (query.get("notice") or [""])[0]
         notice = (
-            f'<div class="notice" role="status">{escape_html(messages[notice_code])}</div>'
+            f'<div class="notice" role="status">{escape_html(messages[notice_code])}'
+            + (f' {escape_html((query.get("deleted_name") or ["Custom provider"])[0])}.' if notice_code == "deleted" else "")
+            + '</div>'
             if notice_code in messages else ""
         )
         views = settings.provider_views()
+        result_messages = {
+            "updated": "Provider settings saved.",
+            "key_saved": "Credential saved securely.",
+            "key_removed": "Web-managed credential removed.",
+            "created": "Custom provider added.",
+            "tested": "Connection test finished.",
+            "invalid": "This change could not be saved. Review the provider settings.",
+            "storage_unavailable": "Secure credential storage is unavailable.",
+            "unavailable": "This provider operation could not be completed.",
+        }
+        result_provider = (query.get("provider") or [""])[0]
+        result_code = (query.get("result") or [""])[0]
         cards = []
         for index, provider in enumerate(views):
-            status_label = {
-                "CONFIGURED": "Configured", "NOT_CONFIGURED": "Not configured", "DISABLED": "Disabled",
-            }.get(provider.status, "Unavailable")
-            status_tone = "success" if provider.status == "CONFIGURED" else "neutral" if provider.status == "DISABLED" else "warning"
+            is_configured = provider.credential_source in {"Web settings", "Environment variable", "No API key required"}
+            status_label = "Configured" if is_configured else "Needs configuration"
+            status_tone = "success" if is_configured else "warning"
             health = ""
             if provider.health:
                 health_label = {
@@ -1664,50 +1706,117 @@ class LocalWebApplication:
                     "timeout": "Timeout", "configuration_invalid": "Configuration invalid",
                 }.get(provider.health, "Provider unavailable")
                 latency = f' · {provider.latency_ms} ms' if provider.latency_ms is not None else ""
-                health = f'<p class="provider-health" role="status">Last connection test: {escape_html(health_label + latency)}</p>'
+                health = f'<span class="provider-check" role="status">Last check: {escape_html(health_label + latency)}</span>'
+            local_result = ""
+            if result_provider == provider.id and result_code in result_messages:
+                local_result = f'<p class="provider-feedback" role="status">{escape_html(result_messages[result_code])}</p>'
             toggle = "disable" if provider.enabled else "enable"
             toggle_label = "Disable" if provider.enabled else "Enable"
-            toggle_button = f'<button class="button" type="submit">{toggle_label}</button>'
             move_up_disabled = " disabled" if index == 0 else ""
             move_down_disabled = " disabled" if index == len(views) - 1 else ""
-            cards.append(
-                '<section class="panel provider-card" aria-labelledby="provider-title-' + escape_html(provider.id) + '">'
-                '<div class="section-heading"><div><p class="eyebrow">Priority ' + str(provider.priority) + '</p>'
-                '<h2 id="provider-title-' + escape_html(provider.id) + '">' + escape_html(provider.display_name) + '</h2></div>'
-                + badge(status_label, status_tone)
-                + '</div><div class="provider-meta"><p><strong>Enabled:</strong> ' + ("Yes" if provider.enabled else "No") + '</p>'
-                '<p><strong>Credential:</strong> ' + escape_html(provider.credential_source) + '</p>'
-                '<p><strong>Key:</strong> <code>' + escape_html(provider.masked_key) + '</code></p></div>'
-                + health
-                + '<div class="actions provider-actions">'
-                + f'<form method="post" action="/settings/providers"><input type="hidden" name="provider_id" value="{escape_html(provider.id)}">'
-                + f'<input type="hidden" name="operation" value="{toggle}">{toggle_button}</form>'
-                + f'<form method="post" action="/settings/providers"><input type="hidden" name="provider_id" value="{escape_html(provider.id)}">'
-                + f'<input type="hidden" name="operation" value="move_up"><button class="button" type="submit"{move_up_disabled}>Move up</button></form>'
-                + f'<form method="post" action="/settings/providers"><input type="hidden" name="provider_id" value="{escape_html(provider.id)}">'
-                + f'<input type="hidden" name="operation" value="move_down"><button class="button" type="submit"{move_down_disabled}>Move down</button></form>'
-                + f'<form method="post" action="/settings/providers"><input type="hidden" name="provider_id" value="{escape_html(provider.id)}">'
-                + '<input type="hidden" name="operation" value="test_connection"><button class="button" type="submit">Test connection</button></form>'
-                + '</div><form class="provider-model-form" method="post" action="/settings/providers">'
-                + f'<input type="hidden" name="provider_id" value="{escape_html(provider.id)}"><input type="hidden" name="operation" value="save_model">'
-                + f'<div class="field"><label for="model-{escape_html(provider.id)}">Model</label><input id="model-{escape_html(provider.id)}" name="model" maxlength="200" value="{escape_html(provider.model)}"></div>'
-                + '<button class="button" type="submit">Save model</button></form>'
-                + '<form class="provider-key-form" method="post" action="/settings/providers">'
-                + f'<input type="hidden" name="provider_id" value="{escape_html(provider.id)}"><input type="hidden" name="operation" value="save_key">'
-                + f'<div class="field"><label for="key-{escape_html(provider.id)}">{("Replace" if provider.credential_source == "Web settings" else "Add")} API key</label>'
-                + f'<input id="key-{escape_html(provider.id)}" name="api_key" type="password" maxlength="2500" autocomplete="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-form-type="other" required></div>'
-                + '<button class="button" type="submit">Save key</button></form>'
-                + '<form method="post" action="/settings/providers">'
-                + f'<input type="hidden" name="provider_id" value="{escape_html(provider.id)}"><input type="hidden" name="operation" value="remove_key">'
-                + '<button class="button" type="submit">Remove web key</button></form></section>'
+            credential = escape_html(provider.credential_source)
+            model = escape_html(provider.model)
+            provider_id = escape_html(provider.id)
+            delete_details = ""
+            if provider.is_custom:
+                delete_details = (
+                    '<details class="provider-delete"><summary>Delete provider</summary>'
+                    '<form method="post" action="/settings/providers">'
+                    f'<input type="hidden" name="provider_id" value="{provider_id}">'
+                    '<input type="hidden" name="operation" value="delete_custom">'
+                    f'<label><input type="checkbox" name="confirmed" value="yes" required> Confirm removal of {escape_html(provider.display_name)} and its saved credential.</label>'
+                    '<button class="button danger-button" type="submit">Delete custom provider</button>'
+                    '</form></details>'
+                )
+            if provider.is_custom:
+                edit_fields = (
+                    f'<div class="field"><label for="name-{provider_id}">Provider name</label><input id="name-{provider_id}" name="display_name" maxlength="80" required value="{escape_html(provider.display_name)}"></div>'
+                    f'<div class="field"><label for="base-{provider_id}">Base URL</label><input id="base-{provider_id}" name="base_url" maxlength="2048" required value="{escape_html(provider.base_url or "")}"></div>'
+                    f'<div class="field"><label for="model-{provider_id}">Model</label><input id="model-{provider_id}" name="model" maxlength="200" required value="{model}"></div>'
+                    + f'<input type="hidden" name="operation" value="save_custom"><input type="hidden" name="provider_id" value="{provider_id}">'
+                )
+            else:
+                edit_fields = (
+                    f'<div class="field"><label for="model-{provider_id}">Model</label><input id="model-{provider_id}" name="model" maxlength="200" value="{model}"></div>'
+                    + f'<input type="hidden" name="operation" value="save_model"><input type="hidden" name="provider_id" value="{provider_id}">'
+                )
+            key_action = (
+                f'<form class="provider-key-form" method="post" action="/settings/providers"><input type="hidden" name="provider_id" value="{provider_id}"><input type="hidden" name="operation" value="save_key">'
+                f'<div class="field"><label for="key-{provider_id}">{("Replace" if provider.credential_source == "Web settings" else "Add")} API key</label>'
+                f'<input id="key-{provider_id}" name="api_key" type="password" maxlength="2500" autocomplete="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-form-type="other" required></div>'
+                '<button class="button" type="submit">Save key</button></form>'
             )
+            remove_key = ""
+            if provider.credential_source == "Web settings":
+                remove_key = (
+                    f'<form method="post" action="/settings/providers"><input type="hidden" name="provider_id" value="{provider_id}"><input type="hidden" name="operation" value="remove_key">'
+                    '<button class="button" type="submit">Remove saved key</button></form>'
+                )
+            cards.append(
+                f'<section class="panel provider-card" id="{provider_id}" aria-labelledby="provider-title-{provider_id}">'
+                '<div class="provider-topline"><div><p class="eyebrow">Priority ' + str(provider.priority) + '</p>'
+                f'<h2 id="provider-title-{provider_id}">{escape_html(provider.display_name)}</h2></div>'
+                + badge(status_label, status_tone)
+                + badge("Enabled" if provider.enabled else "Disabled", "success" if provider.enabled else "neutral")
+                + '</div><div class="provider-quick-meta">'
+                + f'<span><strong>Model:</strong> <code>{model or "Not set"}</code></span>'
+                + f'<span><strong>Credential:</strong> {credential}</span>'
+                + (health or '<span class="muted">No connection test yet</span>')
+                + f'</div>{local_result}<div class="actions provider-actions">'
+                + f'<form method="post" action="/settings/providers"><input type="hidden" name="provider_id" value="{provider_id}">'
+                + '<input type="hidden" name="operation" value="test_connection"><button class="button" type="submit">Test connection</button></form>'
+                + f'<form method="post" action="/settings/providers"><input type="hidden" name="provider_id" value="{provider_id}">'
+                + f'<input type="hidden" name="operation" value="{toggle}"><button class="button" type="submit">{toggle_label}</button></form>'
+                + f'<form method="post" action="/settings/providers"><input type="hidden" name="provider_id" value="{provider_id}">'
+                + f'<input type="hidden" name="operation" value="move_up"><button class="button" aria-label="Move {escape_html(provider.display_name)} up" type="submit"{move_up_disabled}>↑</button></form>'
+                + f'<form method="post" action="/settings/providers"><input type="hidden" name="provider_id" value="{provider_id}">'
+                + f'<input type="hidden" name="operation" value="move_down"><button class="button" aria-label="Move {escape_html(provider.display_name)} down" type="submit"{move_down_disabled}>↓</button></form>'
+                + f'<details class="provider-edit"><summary>Edit</summary><div class="provider-edit-body"><p class="muted">Credential: {credential} · <span>Key: <code>{escape_html(provider.masked_key)}</code></span></p><form class="provider-model-form" method="post" action="/settings/providers">{edit_fields}<button class="button" type="submit">Save settings</button></form>'
+                + key_action + remove_key + delete_details + '</div></details></div></section>'
+            )
+        configured_count = sum(view.credential_source in {"Web settings", "Environment variable", "No API key required"} for view in views)
+        enabled_count = sum(view.enabled for view in views)
+        healthy_count = sum(view.health == "connected" for view in views)
+        attention_count = sum(view.credential_source not in {"Web settings", "Environment variable", "No API key required"} or (view.health is not None and view.health != "connected") for view in views)
+        summary = (
+            '<div class="provider-summary" aria-label="Provider summary">'
+            + _summary_card("Configured", str(configured_count))
+            + _summary_card("Enabled", str(enabled_count))
+            + _summary_card("Healthy last check", str(healthy_count))
+            + _summary_card("Needs attention", str(attention_count))
+            + '</div><p class="muted summary-caption">Health counts reflect the most recent connection test when available.</p>'
+        )
+        create_form = (
+            '<details class="panel add-provider" id="add-provider"><summary>+ Add provider</summary>'
+            '<p class="muted">Connect an endpoint that supports the OpenAI-compatible chat completions API.</p>'
+            '<form method="post" action="/settings/providers" class="custom-provider-form">'
+            '<input type="hidden" name="operation" value="create_custom">'
+            '<div class="field"><label for="custom-display-name">Provider name</label><input id="custom-display-name" name="display_name" maxlength="80" required></div>'
+            '<div class="field"><label for="custom-base-url">Base URL</label><input id="custom-base-url" name="base_url" placeholder="http://localhost:1234/v1" maxlength="2048" required></div>'
+            '<div class="field"><label for="custom-model">Model</label><input id="custom-model" name="model" maxlength="200" required></div>'
+            '<div class="field"><label for="custom-api-key">API key (optional)</label><input id="custom-api-key" name="api_key" type="password" maxlength="2500" autocomplete="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-form-type="other"></div>'
+            '<label><input type="checkbox" name="requires_api_key" value="yes"> Endpoint requires an API key</label>'
+            '<label><input type="checkbox" name="enabled" value="yes" checked> Enable provider</label>'
+            '<button class="button primary" type="submit">Add provider</button></form></details>'
+        )
         content = (
             '<header class="page-heading"><p class="eyebrow">Settings</p><h1>AI Providers</h1>'
-            '<p class="lead">The router tries enabled providers in priority order and falls back after retryable provider failures.</p></header>'
-            + notice + '<p class="muted">Environment keys remain supported. A key saved here takes precedence and is stored in the operating system credential vault.</p>'
-            + ''.join(cards)
+            '<p class="lead">Enabled providers run in priority order. The router falls back after retryable failures.</p></header>'
+            + self._settings_tabs("providers")
+            + notice + '<p class="muted">Built-in providers retain environment key fallback. Keys saved here use the operating system credential vault.</p>'
+            + summary + create_form + ''.join(cards)
         )
         return self._page("AI Providers", content, current="Settings", breadcrumbs=[("Dashboard", "/")])
+
+    @staticmethod
+    def _settings_tabs(active: str) -> str:
+        providers_current = ' aria-current="page"' if active == "providers" else ""
+        usage_current = ' aria-current="page"' if active == "usage" else ""
+        return (
+            '<nav class="settings-tabs" aria-label="Settings sections">'
+            f'<a href="/settings/providers"{providers_current}>AI Providers</a>'
+            f'<a href="/settings/usage"{usage_current}>AI Usage</a></nav>'
+        )
 
     def _page(
         self,

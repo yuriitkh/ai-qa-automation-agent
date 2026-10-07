@@ -8,6 +8,7 @@ from decimal import Decimal
 import logging
 import re
 import sqlite3
+import unicodedata
 from threading import RLock
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
@@ -582,8 +583,11 @@ def _safe_identifier(value: str, *, fallback: str) -> str:
 
 
 def _safe_display(value: str, *, fallback: str) -> str:
-    clean = redact_secrets(str(value)).strip()
-    if "[redacted]" in clean or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _.-]{0,59}", clean):
+    clean = " ".join(redact_secrets(str(value)).split()).strip()
+    if (
+        "[redacted]" in clean or not clean or len(clean) > 80
+        or any(unicodedata.category(char) in {"Cc", "Cf", "Cs"} for char in clean)
+    ):
         return fallback
     return clean
 
@@ -591,8 +595,11 @@ def _safe_display(value: str, *, fallback: str) -> str:
 def _safe_model(value: str | None) -> str:
     if not value:
         return "unknown"
-    clean = redact_secrets(str(value)).strip()
-    if "[redacted]" in clean or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./:@+-]{0,119}", clean):
+    clean = " ".join(redact_secrets(str(value)).split()).strip()
+    if (
+        "[redacted]" in clean or not clean or len(clean) > 200
+        or any(unicodedata.category(char) in {"Cc", "Cf", "Cs"} for char in clean)
+    ):
         return "unknown"
     return clean
 

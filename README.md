@@ -207,3 +207,43 @@ is marked partial. Usage rows are retained in SQLite indefinitely by default;
 estimates are captured when each request is recorded and are not recalculated
 for older rows when the catalog changes. Include the database in your normal
 retention and backup process.
+
+### AI provider settings
+
+Open **Settings → AI Providers** to compare configured, enabled, model, credential
+source, and most recent connection-test status in compact cards. Use **Edit** for
+model and credential controls. The built-in Groq, Gemini, OpenAI, and OpenRouter
+adapters remain first-class; configured environment keys continue to work, and a
+key saved from the local settings page takes precedence in the operating system
+credential vault.
+
+Use **Add provider** to configure an endpoint that implements the supported
+OpenAI-compatible chat completions request and structured JSON response shape.
+The application stores its generated stable provider ID, display name, HTTP(S)
+base URL, model, enabled state, priority, and key-required flag in SQLite. A
+custom provider's API key is stored only through the secret-store abstraction
+(Windows Credential Manager on Windows); it is never written to SQLite or
+rendered back. Endpoints without authentication are supported when the key
+requirement is left unchecked. URL validation rejects embedded credentials,
+query strings, fragments, malformed hosts, and non-HTTP(S) schemes. Localhost and
+private network addresses are allowed. Saving or viewing settings does not make
+a request to the configured URL; a connection test or an actual routed LLM
+operation does.
+
+Enabled providers are tried in persisted priority order. Disabled providers keep
+their position but are skipped by the router. Move Up and Move Down reorder all
+providers deterministically; priorities are compacted after add or deletion.
+Test connection runs a small structured-output request and shows a safe status
+and latency in the provider card. Retryable failures use the existing router
+fallback behavior for authoring and automation.
+
+Custom attempts use the generated provider ID for telemetry identity and record
+the current display name with each attempt. Deleting a custom provider removes
+its active configuration and saved credential but leaves historical usage
+records and their recorded display names available in AI Usage. Usage tokens are
+stored only when the endpoint returns recognizable usage metadata; otherwise
+they remain Unknown. Custom provider cost remains Unknown unless a verified
+catalog price is configured. Provider names can be changed in Edit without
+changing the stable identity. Compatibility is limited to the supported
+OpenAI-compatible API shape; this is not a universal adapter for every LLM
+service.

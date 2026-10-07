@@ -8,9 +8,12 @@ import os
 import re
 import sqlite3
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
+from uuid import uuid4
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -29,6 +32,8 @@ class ProviderDefinition:
     default_model: str
     base_url_env: str | None = None
     default_base_url: str | None = None
+    is_custom: bool = False
+    requires_api_key: bool = True
 
 
 PROVIDER_DEFINITIONS = (
@@ -169,7 +174,7 @@ class WindowsCredentialStore:
 
 
 class ProviderSettingsRepository:
-    """SQLite storage for enablement, order, and optional model overrides only."""
+    """SQLite storage for nonsecret provider configuration and ordering."""
 
     def __init__(self, database_path: str | Path) -> None:
         self._database_path = str(database_path)
@@ -184,6 +189,15 @@ class ProviderSettingsRepository:
                 "CREATE TABLE IF NOT EXISTS provider_settings ("
                 "provider_id TEXT PRIMARY KEY, enabled INTEGER NOT NULL CHECK(enabled IN (0,1)), "
                 "priority INTEGER NOT NULL CHECK(priority >= 1), model TEXT)"
+            )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS custom_provider_settings ("
+                "provider_id TEXT PRIMARY KEY, display_name TEXT NOT NULL, base_url TEXT NOT NULL, "
+                "model TEXT NOT NULL, enabled INTEGER NOT NULL CHECK(enabled IN (0,1)), "
+                "priority INTEGER NOT NULL CHECK(priority >= 1), provider_type TEXT NOT NULL "
+                "CHECK(provider_type = 'OPENAI_COMPATIBLE'), requires_api_key INTEGER NOT NULL "
+                "CHECK(requires_api_key IN (0,1)), key_configured INTEGER NOT NULL "
+                "CHECK(key_configured IN (0,1)))"
             )
 
     def _connect(self):
@@ -228,6 +242,36 @@ class ProviderSettingsRepository:
                 ],
             )
 
+    def get_custom_all(self) -> list[dict[str, object]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT provider_id, display_name, base_url, model, enabled, priority, "
+                "provider_type, requires_api_key, key_configured "
+                "FROM custom_provider_settings"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_custom(self, item: dict[str, object]) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                "INSERT INTO custom_provider_settings(provider_id, display_name, base_url, model, "
+                "enabled, priority, provider_type, requires_api_key, key_configured) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'OPENAI_COMPATIBLE', ?, ?) "
+                "ON CONFLICT(provider_id) DO UPDATE SET display_name=excluded.display_name, "
+                "base_url=excluded.base_url, model=excluded.model, enabled=excluded.enabled, "
+                "priority=excluded.priority, requires_api_key=excluded.requires_api_key, "
+                "key_configured=excluded.key_configured",
+                (item["provider_id"], item["display_name"], item["base_url"], item["model"],
+                 int(bool(item["enabled"])), int(item["priority"]),
+                 int(bool(item["requires_api_key"])), int(bool(item["key_configured"]))),
+            )
+
+    def delete_custom(self, provider_id: str) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                "DELETE FROM custom_provider_settings WHERE provider_id = ?", (provider_id,)
+            )
+
 
 @dataclass(frozen=True)
 class ProviderView:
@@ -241,6 +285,9 @@ class ProviderView:
     model: str
     health: str | None = None
     latency_ms: int | None = None
+    is_custom: bool = False
+    base_url: str | None = None
+    requires_api_key: bool = True
 
 
 @dataclass(frozen=True)
@@ -277,6 +324,12 @@ class ProviderSettingsService:
                 name, name.replace("_", " ").title(), f"{prefix}_API_KEY",
                 f"{prefix}_MODEL", "", f"{prefix}_BASE_URL", None,
             )
+        for item in self.repository.get_custom_all():
+            provider_id = str(item["provider_id"])
+            definitions[provider_id] = ProviderDefinition(
+                provider_id, str(item["display_name"]), "", "", str(item["model"]),
+                None, str(item["base_url"]), True, bool(item["requires_api_key"]),
+            )
         return definitions
 
     def _env(self, key: str, default: str = "") -> str:
@@ -286,8 +339,14 @@ class ProviderSettingsService:
     def _defaults(self) -> list[dict[str, object]]:
         configured_order = [name.strip().lower() for name in self._env("LLM_PROVIDER_ORDER", "openai,gemini,openrouter,groq").split(",") if name.strip()]
         fallback = [provider.id for provider in PROVIDER_DEFINITIONS]
-        fallback.extend(name for name in self.definitions if name not in fallback)
-        ordered = [name for name in configured_order if name in self.definitions]
+        fallback.extend(
+            name for name, definition in self.definitions.items()
+            if name not in fallback and not definition.is_custom
+        )
+        ordered = [
+            name for name in configured_order
+            if name in self.definitions and not self.definitions[name].is_custom
+        ]
         ordered.extend(name for name in fallback if name not in ordered)
         return [
             {"provider_id": name, "enabled": True, "priority": index + 1, "model": None}
@@ -297,22 +356,38 @@ class ProviderSettingsService:
     def _settings(self) -> list[dict[str, object]]:
         stored = self.repository.get_all()
         defaults = self._defaults()
-        if not stored:
-            return defaults
         merged = []
         for default in defaults:
             merged.append({**default, **stored.get(str(default["provider_id"]), {})})
-        return sorted(merged, key=lambda item: int(item["priority"]))
+        custom = sorted(self.repository.get_custom_all(), key=lambda item: (int(item["priority"]), str(item["provider_id"])))
+        next_priority = max((int(item["priority"]) for item in merged), default=0) + 1
+        for index, item in enumerate(custom):
+            merged.append({
+                **item,
+                "priority": int(item["priority"] or next_priority + index),
+                "enabled": bool(item["enabled"]),
+                "requires_api_key": bool(item["requires_api_key"]),
+                "key_configured": bool(item["key_configured"]),
+            })
+        return sorted(merged, key=lambda item: (int(item["priority"]), str(item["provider_id"])))
 
     def _credential(self, provider_id: str) -> tuple[str | None, str]:
+        definition = self.definitions[provider_id]
+        custom = next((item for item in self.repository.get_custom_all() if item["provider_id"] == provider_id), None)
+        if custom is not None and not bool(custom["key_configured"]) and not bool(custom["requires_api_key"]):
+            return None, "no_key_required"
         try:
             web_secret = self.secret_store.get(provider_id)
         except SecretStoreError:
+            if definition.is_custom:
+                return None, "storage_error"
             env_secret = self._env(self.definitions[provider_id].env_key)
             return (env_secret, "environment") if env_secret else (None, "storage_error")
         if web_secret:
             register_secret(web_secret)
             return web_secret, "web"
+        if definition.is_custom:
+            return (None, "unconfigured") if definition.requires_api_key else (None, "no_key_required")
         env_secret = self._env(self.definitions[provider_id].env_key)
         return (env_secret, "environment") if env_secret else (None, "unconfigured")
 
@@ -329,14 +404,17 @@ class ProviderSettingsService:
             definition = self.definitions[provider_id]
             secret, source = self._credential(provider_id)
             enabled = bool(item["enabled"])
-            status = "DISABLED" if not enabled else "CONFIGURED" if secret else "NOT_CONFIGURED"
+            has_configuration = bool(secret) or source == "no_key_required"
+            status = "DISABLED" if not enabled else "CONFIGURED" if has_configuration else "NOT_CONFIGURED"
             model = str(item.get("model") or self._env(definition.model_env, definition.default_model))
             health = self._health.get(provider_id)
             views.append(ProviderView(
                 provider_id, definition.display_name, enabled, int(item["priority"]), status,
-                {"web": "Web settings", "environment": "Environment variable", "unconfigured": "Not configured", "storage_error": "Credential storage unavailable"}.get(source, "Not configured"),
+                {"web": "Web settings", "environment": "Environment variable", "unconfigured": "Not configured", "storage_error": "Credential storage unavailable", "no_key_required": "No API key required"}.get(source, "Not configured"),
                 self._mask(secret), model, health.status if health else None,
-                health.latency_ms if health else None,
+                health.latency_ms if health else None, definition.is_custom,
+                definition.default_base_url if definition.is_custom else None,
+                definition.requires_api_key,
             ))
         return views
 
@@ -366,23 +444,108 @@ class ProviderSettingsService:
                 return
         raise ValueError("Unknown provider.")
 
+    def create_custom(
+        self,
+        display_name: str,
+        base_url: str,
+        model: str,
+        *,
+        api_key: str | None = None,
+        enabled: bool = True,
+        requires_api_key: bool = False,
+    ) -> str:
+        safe_name = _validate_provider_name(display_name)
+        safe_url = validate_custom_base_url(base_url)
+        safe_model = _validate_model(model, required=True)
+        secret = _validate_api_key(api_key) if api_key else None
+        if requires_api_key and not secret:
+            raise ValueError("An API key is required for this provider.")
+        provider_id = "custom_" + uuid4().hex
+        if secret:
+            self.secret_store.set(provider_id, secret)
+            register_secret(secret)
+        items = self._ordered_settings()
+        item = {
+            "provider_id": provider_id, "display_name": safe_name, "base_url": safe_url,
+            "model": safe_model, "enabled": bool(enabled), "priority": len(items) + 1,
+            "requires_api_key": bool(requires_api_key), "key_configured": bool(secret),
+        }
+        try:
+            self.repository.save_custom(item)
+            items.append(item)
+            self._save_ordered(items)
+        except Exception:
+            try:
+                self.repository.delete_custom(provider_id)
+            except Exception:
+                pass
+            if secret:
+                try:
+                    self.secret_store.delete(provider_id)
+                except Exception:
+                    pass
+            raise
+        return provider_id
+
+    def update_custom(
+        self,
+        provider_id: str,
+        *,
+        display_name: str | None = None,
+        base_url: str | None = None,
+        model: str | None = None,
+    ) -> None:
+        item = self._custom_item(provider_id)
+        if display_name is not None:
+            item["display_name"] = _validate_provider_name(display_name)
+        if base_url is not None:
+            item["base_url"] = validate_custom_base_url(base_url)
+        if model is not None:
+            item["model"] = _validate_model(model, required=True)
+        self.repository.save_custom(item)
+        self._health.pop(provider_id, None)
+
+    def delete_custom(self, provider_id: str) -> None:
+        item = self._custom_item(provider_id)
+        # Remove the external secret first so a vault failure cannot leave an
+        # active configuration behind or falsely report a complete deletion.
+        if bool(item["key_configured"]):
+            self.secret_store.delete(provider_id)
+        self.repository.delete_custom(provider_id)
+        self._health.pop(provider_id, None)
+        self._save_ordered([entry for entry in self._ordered_settings() if entry["provider_id"] != provider_id])
+
+    def _custom_item(self, provider_id: str) -> dict[str, object]:
+        item = next((item for item in self.repository.get_custom_all() if item["provider_id"] == provider_id), None)
+        if item is None:
+            if provider_id in _DEFINITIONS:
+                raise ValueError("Built-in providers cannot be deleted or edited as custom providers.")
+            raise ValueError("Unknown custom provider.")
+        return item
+
     def save_key(self, provider_id: str, value: str) -> None:
         if provider_id not in self.definitions:
             raise ValueError("Unknown provider.")
-        secret = value.strip()
-        if not secret or len(secret) > 2500 or any(ord(char) < 32 for char in secret):
-            raise ValueError("Invalid credential.")
+        secret = _validate_api_key(value)
         try:
             self.secret_store.set(provider_id, secret)
         except SecretStoreError:
             raise
         register_secret(secret)
+        custom = next((item for item in self.repository.get_custom_all() if item["provider_id"] == provider_id), None)
+        if custom is not None:
+            custom["key_configured"] = True
+            self.repository.save_custom(custom)
         self._health.pop(provider_id, None)
 
     def remove_key(self, provider_id: str) -> None:
         if provider_id not in self.definitions:
             raise ValueError("Unknown provider.")
         self.secret_store.delete(provider_id)
+        custom = next((item for item in self.repository.get_custom_all() if item["provider_id"] == provider_id), None)
+        if custom is not None:
+            custom["key_configured"] = False
+            self.repository.save_custom(custom)
         self._health.pop(provider_id, None)
 
     def create_router(self, *, usage_recorder=None) -> LLMRouter:
@@ -416,12 +579,23 @@ class ProviderSettingsService:
                 provider = GeminiProvider(api_key=secret, model=model, timeout_seconds=timeout)
             elif provider_id == "groq":
                 provider = GroqProvider(api_key=secret, model=model, timeout_seconds=timeout, max_output_tokens=64 if timeout else None)
+            elif definition.is_custom:
+                provider = OpenAICompatibleProvider(
+                    provider_id, "", model, definition.default_base_url,
+                    max_output_tokens=64 if timeout else None, api_key=secret or "",
+                    timeout_seconds=timeout, display_name=definition.display_name,
+                    allow_missing_api_key=not definition.requires_api_key,
+                )
             else:
                 base_url = self._env(definition.base_url_env, definition.default_base_url or "") if definition.base_url_env else None
                 provider = OpenAICompatibleProvider(
                     provider_id, definition.env_key, model, base_url,
                     max_output_tokens=64 if timeout else None, api_key=secret, timeout_seconds=timeout,
                 )
+                provider.display_name = definition.display_name
+            if definition.is_custom:
+                provider.display_name = definition.display_name
+                provider.is_custom = True
             result.append(provider)
         return result
 
@@ -429,12 +603,13 @@ class ProviderSettingsService:
         if provider_id not in self.definitions:
             return ConnectionTestResult("configuration_invalid")
         secret, source = self._credential(provider_id)
-        if source == "storage_error" or not secret:
+        definition = self.definitions[provider_id]
+        key_missing = not secret and definition.requires_api_key
+        if source == "storage_error" or key_missing:
             result = ConnectionTestResult("configuration_invalid")
             self._health[provider_id] = result
             return result
         setting = next(item for item in self._settings() if item["provider_id"] == provider_id)
-        definition = self.definitions[provider_id]
         model = str(setting.get("model") or self._env(definition.model_env, definition.default_model))
         if not model:
             result = ConnectionTestResult("configuration_invalid")
@@ -461,10 +636,73 @@ class ProviderSettingsService:
         return result
 
     def _save_ordered(self, items: list[dict[str, object]]) -> None:
-        self.repository.save_all([
+        custom_ids = {str(item["provider_id"]) for item in self.repository.get_custom_all()}
+        normalized = [
             {**item, "priority": index + 1}
             for index, item in enumerate(items)
+        ]
+        self.repository.save_all([
+            item for item in normalized if str(item["provider_id"]) not in custom_ids
         ])
+        for item in normalized:
+            if str(item["provider_id"]) in custom_ids:
+                custom = next(
+                    entry for entry in self.repository.get_custom_all()
+                    if entry["provider_id"] == item["provider_id"]
+                )
+                custom["priority"] = item["priority"]
+                custom["enabled"] = item["enabled"]
+                self.repository.save_custom(custom)
+
+
+def _validate_provider_name(value: str) -> str:
+    name = value.strip()
+    if not name or len(name) > 80 or any(unicodedata.category(char) in {"Cc", "Cf", "Cs"} for char in name):
+        raise ValueError("Provider name must be between 1 and 80 characters without control characters.")
+    return name
+
+
+def _validate_model(value: str, *, required: bool) -> str:
+    model = value.strip()
+    if (required and not model) or len(model) > 200 or any(unicodedata.category(char) in {"Cc", "Cf", "Cs"} for char in model):
+        raise ValueError("A valid model name is required.")
+    return model
+
+
+def _validate_api_key(value: str | None) -> str:
+    secret = (value or "").strip()
+    if not secret or len(secret) > 2500 or any(ord(char) < 32 or ord(char) == 127 for char in secret):
+        raise ValueError("Invalid credential.")
+    return secret
+
+
+def validate_custom_base_url(value: str) -> str:
+    """Validate and normalize a configured endpoint without making a request."""
+    raw = value.strip()
+    if (
+        not raw or len(raw) > 2048 or "\\" in raw
+        or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in raw)
+        or "?" in raw or "#" in raw
+    ):
+        raise ValueError("Enter a valid HTTP or HTTPS base URL without credentials, query, or fragment.")
+    try:
+        parsed = urlsplit(raw)
+        # Accessing .port validates its syntax and range.
+        port = parsed.port
+        host = parsed.hostname
+    except ValueError as error:
+        raise ValueError("Enter a valid HTTP or HTTPS base URL.") from error
+    if parsed.scheme.lower() not in {"http", "https"} or not host or "@" in parsed.netloc:
+        raise ValueError("Base URL must use HTTP or HTTPS and must not contain credentials.")
+    if parsed.username is not None or parsed.password is not None or (port is not None and not 1 <= port <= 65535):
+        raise ValueError("Enter a valid HTTP or HTTPS base URL without credentials.")
+    try:
+        normalized = httpx.URL(raw)
+    except Exception as error:
+        raise ValueError("Enter a valid HTTP or HTTPS base URL.") from error
+    if normalized.scheme not in {"http", "https"} or not normalized.host or normalized.username or normalized.password:
+        raise ValueError("Enter a valid HTTP or HTTPS base URL without credentials.")
+    return str(normalized).rstrip("/")
 
 
 def _classify_connection_error(error: Exception) -> str:

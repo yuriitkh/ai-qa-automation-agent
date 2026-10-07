@@ -1,6 +1,7 @@
 import logging
 import re
 import time
+import unicodedata
 from typing import Callable
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -14,6 +15,7 @@ from ..execution_trace import (
 )
 from ..models import AIDiscoveryResult, QATestPlan
 from ..redaction import safe_failure_reason
+from ..redaction import redact_secrets
 from ..llm_usage import (
     OP_AUTHOR_TESTCASE,
     OP_DISCOVERY,
@@ -46,6 +48,19 @@ class LLMRouter:
             return configured_name
         return type(provider).__name__
 
+    @classmethod
+    def _provider_display_name(cls, provider: LLMProvider) -> str:
+        configured = getattr(provider, "display_name", None)
+        if isinstance(configured, str) and configured.strip():
+            return _safe_provider_display_name(configured)
+        return _safe_provider_display_name(cls._provider_name(provider))
+
+    @classmethod
+    def _provider_observability_name(cls, provider: LLMProvider) -> str:
+        if getattr(provider, "is_custom", False):
+            return cls._provider_display_name(provider)
+        return cls._provider_name(provider)
+
     @staticmethod
     def _provider_id(provider: LLMProvider) -> str:
         configured_name = getattr(provider, "name", None)
@@ -60,7 +75,7 @@ class LLMRouter:
     def _report_priority(self, providers: list[LLMProvider] | None = None) -> None:
         print("LLM provider priority:")
         for index, provider in enumerate(providers if providers is not None else self._providers, 1):
-            name = self._provider_name(provider)
+            name = self._provider_observability_name(provider)
             state = "AVAILABLE" if provider.is_available else "SKIPPED - API key not configured"
             print(f"{index}. {name} [{state}]")
 
@@ -87,7 +102,7 @@ class LLMRouter:
         record_safely(
             recorder,
             "record_provider_attempt",
-            self._provider_name(provider),
+            self._provider_observability_name(provider),
             request_kind,
             outcome,
             model=model if isinstance(model, str) else None,
@@ -164,17 +179,14 @@ class LLMRouter:
                 operation_id=operation_id,
                 operation_type=usage_context.operation_type or OP_OTHER,
                 provider_id=self._provider_id(provider),
-                provider_name=_safe_provider_display_name(name),
+                provider_name=self._provider_display_name(provider),
                 model=model if isinstance(model, str) else None,
                 started_at=started_at,
                 finished_at=datetime.now(timezone.utc),
                 latency_ms=elapsed_ms(started),
                 request_status=request_status,
                 usage=usage,
-                fallback_from_provider=(
-                    _safe_provider_display_name(fallback_from_provider)
-                    if fallback_from_provider else None
-                ),
+                fallback_from_provider=fallback_from_provider,
                 error_category=_telemetry_error_category(error) if error else None,
                 related_test_case_id=usage_context.related_test_case_id,
                 related_test_case_public_id=usage_context.related_test_case_public_id,
@@ -205,7 +217,11 @@ class LLMRouter:
         usage_context = current_llm_usage_context(OP_GENERATE_AUTOMATION_PLAN)
         fallback_from_provider: str | None = None
         for index, provider in enumerate(providers):
-            provider_name = type(provider).__name__
+            provider_name = (
+                self._provider_observability_name(provider)
+                if getattr(provider, "is_custom", False)
+                else type(provider).__name__
+            )
             if not provider.is_available:
                 unavailable.append(provider_name)
                 print(
@@ -231,7 +247,7 @@ class LLMRouter:
             except RetryableLLMError as error:
                 reason = safe_failure_reason(error)
                 failures.append(f"{provider_name}: {reason}")
-                fallback_from_provider = self._provider_name(provider)
+                fallback_from_provider = self._provider_display_name(provider)
                 self._record_provider_attempt(
                     provider,
                     RequestKind.TEST_PLAN,
@@ -300,7 +316,11 @@ class LLMRouter:
         usage_context = current_llm_usage_context(OP_DISCOVERY)
         fallback_from_provider: str | None = None
         for index, provider in enumerate(providers):
-            name = type(provider).__name__
+            name = (
+                self._provider_observability_name(provider)
+                if getattr(provider, "is_custom", False)
+                else type(provider).__name__
+            )
             if not provider.is_available:
                 unavailable.append(name)
                 self._record_provider_attempt(
@@ -323,7 +343,7 @@ class LLMRouter:
             except RetryableLLMError as error:
                 reason = safe_failure_reason(error)
                 failures.append(f"{name}: {reason}")
-                fallback_from_provider = self._provider_name(provider)
+                fallback_from_provider = self._provider_display_name(provider)
                 self._record_provider_attempt(
                     provider,
                     RequestKind.DISCOVERY,
@@ -401,14 +421,14 @@ class LLMRouter:
         for index, provider in enumerate(providers):
             name = self._provider_name(provider)
             if not provider.is_available:
-                unavailable.append(name)
+                unavailable.append(self._provider_observability_name(provider))
                 self._record_provider_attempt(
                     provider,
                     RequestKind.TEST_CASE_AUTHORING,
                     ProviderAttemptOutcome.UNAVAILABLE,
                 )
                 continue
-            display_name = _safe_provider_display_name(name)
+            display_name = self._provider_display_name(provider)
             if last_retryable_failure is not None:
                 failed_name, category = last_retryable_failure
                 _notify_authoring_progress(
@@ -444,8 +464,8 @@ class LLMRouter:
                 )
             except RetryableLLMError as error:
                 reason = safe_failure_reason(error)
-                failures.append(f"{name}: {reason}")
-                fallback_from_provider = self._provider_name(provider)
+                failures.append(f"{self._provider_observability_name(provider)}: {reason}")
+                fallback_from_provider = display_name
                 if _is_rate_limit_failure(error):
                     rate_limited_failures += 1
                 if _is_timeout_failure(error):
@@ -500,7 +520,7 @@ class LLMRouter:
                     started=started,
                 )
                 raise RuntimeError(
-                    f"{name} does not support structured output."
+                    f"{self._provider_observability_name(provider)} does not support structured output."
                 ) from error
             except Exception as error:
                 category = _provider_failure_category(error)
@@ -601,10 +621,16 @@ def _safe_provider_display_name(value: str) -> str:
         "openai-compatible": "OpenAI",
         "openrouter": "OpenRouter",
     }
-    if value.casefold() in known:
-        return known[value.casefold()]
-    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,59}", value):
-        return value.replace("_", " ").replace("-", " ").title()
+    normalized = " ".join(redact_secrets(str(value)).split()).strip()
+    if normalized.casefold() in known:
+        return known[normalized.casefold()]
+    if (
+        normalized and len(normalized) <= 80
+        and not any(unicodedata.category(char) in {"Cc", "Cf", "Cs"} for char in normalized)
+    ):
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,59}", normalized):
+            return normalized.replace("_", " ").replace("-", " ").title()
+        return normalized
     return "Configured provider"
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
@@ -1385,9 +1386,17 @@ def _validate_authoring_event_order(
 
 
 def _safe_provider_display_name(value: str) -> str:
-    return {
+    known = {
         "groq": "Groq",
         "gemini": "Gemini",
         "openai": "OpenAI",
         "openrouter": "OpenRouter",
-    }.get(value.casefold(), "Configured provider")
+    }
+    normalized = " ".join(redact_secrets(str(value)).split()).strip()
+    if normalized.casefold() in known:
+        return known[normalized.casefold()]
+    if normalized and len(normalized) <= 80 and not any(
+        unicodedata.category(char) in {"Cc", "Cf", "Cs"} for char in normalized
+    ):
+        return normalized
+    return "Configured provider"
