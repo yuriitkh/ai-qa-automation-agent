@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
+from urllib.parse import urlencode
 from uuid import uuid4
 
 from qa_agent.execution_repository import InMemoryExecutionRepository
@@ -144,6 +145,62 @@ class LocalWebApplicationTests(unittest.TestCase):
         self.assertIn("Sign up &lt;flow&gt;", body)
         self.assertIn(f"/runs/{self.record.run_id}", body)
         self.assertNotIn("<flow>", body)
+
+    def test_dashboard_has_generic_authoring_entry_and_keeps_recent_runs(self) -> None:
+        body = self.app.handle("GET", "/").body.decode("utf-8")
+        entry = body.split('<section class="panel authoring-entry"', 1)[1].split(
+            "</section>", 1
+        )[0]
+
+        self.assertIn("What do you want to test?", entry)
+        self.assertIn('name="base_url"', entry)
+        self.assertIn('name="scenario"', entry)
+        self.assertIn("Generate Test with AI", entry)
+        self.assertIn("Speak scenario", entry)
+        self.assertNotIn('name="name"', entry)
+        self.assertNotIn("FINN.no", entry)
+        self.assertNotIn("checkout", entry.casefold())
+        self.assertIn("Describe", entry)
+        self.assertIn("Generate", entry)
+        self.assertIn("Run", entry)
+        self.assertIn("Reuse", entry)
+        self.assertIn("Recent runs", body)
+        self.assertIn(f"RUN-000001", body)
+
+    def test_dashboard_validation_stays_inline_and_escapes_preserved_input(self) -> None:
+        scenario = "<script>alert('xss')</script>"
+        response = self.app.handle(
+            "POST",
+            "/test-cases/generate",
+            urlencode({
+                "authoring_entry": "dashboard",
+                "base_url": "not-a-url",
+                "scenario": scenario,
+            }),
+        )
+        body = response.body.decode("utf-8")
+
+        self.assertEqual(response.status, 400)
+        self.assertIn("What do you want to test?", body)
+        self.assertIn("valid HTTP or HTTPS", body)
+        self.assertIn("&lt;script&gt;alert(&#x27;xss&#x27;)&lt;/script&gt;", body)
+        self.assertNotIn(scenario, body)
+
+    def test_dashboard_rejects_empty_scenario_without_leaving_entry_page(self) -> None:
+        response = self.app.handle(
+            "POST",
+            "/test-cases/generate",
+            urlencode({
+                "authoring_entry": "dashboard",
+                "base_url": "https://example.test",
+                "scenario": "",
+            }),
+        )
+        body = response.body.decode("utf-8")
+
+        self.assertEqual(response.status, 400)
+        self.assertIn("Enter a natural-language scenario.", body)
+        self.assertIn("What do you want to test?", body)
 
     def test_dashboard_summary_uses_public_run_id_and_friendly_time_duration(self) -> None:
         body = self.app.handle("GET", "/").body.decode("utf-8")

@@ -102,6 +102,46 @@ class TestCaseAuthoringWebTests(unittest.TestCase):
         self.assertIn(b'name="scenario"', page.body)
         self.assertIn(b"data-authoring-form", page.body)
 
+    def test_dashboard_form_uses_async_authoring_and_derives_name_when_omitted(self):
+        scenario = "Check account details and sign in. Confirm the welcome page appears."
+        with redirect_stdout(io.StringIO()):
+            response = self.app.handle(
+                "POST",
+                "/test-cases/generate",
+                urlencode({
+                    "authoring_entry": "dashboard",
+                    "base_url": "https://example.test/account",
+                    "scenario": scenario,
+                }),
+            )
+            progress = self.wait_for_authoring(response)
+
+        self.assertTrue(progress["success"])
+        self.assertEqual(len(self.provider.prompts), 1)
+        self.assertIn(scenario, self.provider.prompts[0][0])
+        draft_token = progress["review_url"].rsplit("/", 1)[1]
+        draft = self.app._draft_store.get(draft_token)
+        self.assertIsNotNone(draft)
+        self.assertEqual(draft.test_case.name, "Check account details and sign in")
+        self.assertEqual(self.cases.list(), [])
+
+    def test_dashboard_invalid_input_does_not_start_authoring(self):
+        with redirect_stdout(io.StringIO()):
+            response = self.app.handle(
+                "POST",
+                "/test-cases/generate",
+                urlencode({
+                    "authoring_entry": "dashboard",
+                    "base_url": "not-a-url",
+                    "scenario": "Check the account page.",
+                }),
+            )
+
+        self.assertEqual(response.status, 400)
+        self.assertIn(b"What do you want to test?", response.body)
+        self.assertIn(b"valid HTTP or HTTPS", response.body)
+        self.assertEqual(self.provider.prompts, [])
+
     def test_post_redirects_before_provider_finishes_and_progress_refresh_does_not_restart(self):
         entered = Event()
         release = Event()

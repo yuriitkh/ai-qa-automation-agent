@@ -111,6 +111,13 @@ persisted yet.
 
 ### Async AI TestCase authoring
 
+The Dashboard provides a direct authoring form for a website and a natural-language
+scenario. If no name is supplied, the app derives a short name from the scenario.
+Where supported, **Speak scenario** uses browser speech recognition and appends
+editable text to the scenario; the app receives text only, never audio. Submitting
+the form follows the same asynchronous progress and editable Review flow as the
+dedicated New Test Case page.
+
 Submit **Generate Test with AI** from **Test Cases в†’ New Test Case** to get an
 immediate authoring progress page. The page polls actual provider and validation
 events, then redirects to the existing editable Review page when the draft is

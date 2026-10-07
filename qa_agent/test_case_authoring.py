@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import secrets
 import threading
 import time
@@ -198,23 +199,33 @@ class TestCaseAuthoringService:
         self._router = router
 
     @staticmethod
-    def validate_input(name: str, scenario: str, base_url: str) -> AuthoringInput:
-        clean_name = name.strip() if isinstance(name, str) else ""
-        clean_scenario = scenario.strip() if isinstance(scenario, str) else ""
+    def validate_input(
+        name: str | None,
+        scenario: str,
+        base_url: str,
+        *,
+        require_name: bool = False,
+    ) -> AuthoringInput:
+        supplied_name = name.strip() if isinstance(name, str) else ""
+        clean_scenario = (
+            scenario.replace("\r\n", "\n").replace("\r", "\n").strip()
+            if isinstance(scenario, str)
+            else ""
+        )
         clean_url = base_url.strip() if isinstance(base_url, str) else ""
-        if not clean_name:
+        if not clean_scenario or not any(character.isalnum() for character in clean_scenario):
             raise TestCaseAuthoringError(
-                "Enter a TestCase name.", category="INVALID_AUTHORING_INPUT"
+                "Enter a natural-language scenario.",
+                category="INVALID_AUTHORING_INPUT",
             )
-        if len(clean_name) > 200:
+        if len(supplied_name) > 200:
             raise TestCaseAuthoringError(
                 "Keep the TestCase name under 200 characters.",
                 category="INVALID_AUTHORING_INPUT",
             )
-        if not clean_scenario:
+        if require_name and not supplied_name:
             raise TestCaseAuthoringError(
-                "Enter a natural-language scenario.",
-                category="INVALID_AUTHORING_INPUT",
+                "Enter a TestCase name.", category="INVALID_AUTHORING_INPUT"
             )
         if len(clean_scenario) > 6000:
             raise TestCaseAuthoringError(
@@ -231,11 +242,12 @@ class TestCaseAuthoringService:
                 "Enter a valid HTTP or HTTPS base URL without credentials.",
                 category="INVALID_AUTHORING_INPUT",
             )
+        clean_name = supplied_name or _derive_test_case_name(clean_scenario)
         return AuthoringInput(clean_name, clean_scenario, clean_url)
 
     def generate(
         self,
-        name: str,
+        name: str | None,
         scenario: str,
         base_url: str,
         *,
@@ -367,6 +379,31 @@ def _is_rate_limit_error(error: Exception) -> bool:
         "rate limited",
         "too many requests",
     ))
+
+
+def _derive_test_case_name(scenario: str) -> str:
+    """Create a stable, readable name from the first sentence of the scenario."""
+    first_line = next((line.strip() for line in scenario.splitlines() if line.strip()), "")
+    phrase = re.split(r"(?<=[.!?])\s+", first_line, maxsplit=1)[0]
+    phrase = phrase.strip(" \t\r\n\"'“”‘’").rstrip(" .!?;:")
+    for prefix in (
+        "please ",
+        "i would like to ",
+        "i'd like to ",
+        "i want to ",
+        "i need to ",
+        "can you ",
+        "could you ",
+    ):
+        if phrase.casefold().startswith(prefix):
+            phrase = phrase[len(prefix):].lstrip()
+            break
+    if len(phrase) > 80:
+        shortened = phrase[:77].rsplit(" ", 1)[0].rstrip(" ,;:-")
+        phrase = f"{shortened or phrase[:77].rstrip()}…"
+    if phrase:
+        phrase = phrase[0].upper() + phrase[1:]
+    return phrase or "Web scenario"
 
 
 @dataclass(frozen=True)

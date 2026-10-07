@@ -68,6 +68,24 @@ class TestCaseAuthoringServiceTests(unittest.TestCase):
         self.assertEqual(provider.calls[0][2], "test_case_authoring")
         self.assertNotIn('"id"', provider.calls[0][1].__str__())
 
+    def test_optional_name_is_derived_without_an_additional_provider_request(self):
+        provider = StructuredProvider()
+        service = TestCaseAuthoringService(LLMRouter([provider]))
+        scenario = "Search for apartments in Oslo and check that results appear. Confirm filters work."
+
+        with redirect_stdout(io.StringIO()):
+            generated = service.generate(None, scenario, self.url)
+        self.assertEqual(
+            generated.test_case.name,
+            "Search for apartments in Oslo and check that results appear",
+        )
+        self.assertEqual(len(provider.calls), 1)
+
+        with redirect_stdout(io.StringIO()):
+            named = service.generate("My supplied title", scenario, self.url)
+        self.assertEqual(named.test_case.name, "My supplied title")
+        self.assertEqual(len(provider.calls), 2)
+
     def test_preserves_segment_order_and_assigns_unique_application_owned_ids(self):
         provider = StructuredProvider(
             '{"preconditions":[],"segments":[{"steps":[{"name":"First",'

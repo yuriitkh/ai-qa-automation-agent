@@ -545,25 +545,35 @@ class LocalWebApplication:
             key: form.get(key, [""])[0]
             for key in ("name", "base_url", "scenario")
         }
+
+        dashboard_entry = form.get("authoring_entry", [""])[0] == "dashboard"
+
+        def error_response(status: int, message: str) -> WebResponse:
+            if dashboard_entry:
+                return WebResponse.html(status, self._dashboard(
+                    authoring_error=message,
+                    base_url=values["base_url"],
+                    scenario=values["scenario"],
+                ))
+            return WebResponse.html(status, self._new_test_case_page(message, **values))
+
         if form_error is not None:
-            return WebResponse.html(400, self._new_test_case_page(form_error, **values))
+            return error_response(400, form_error)
         try:
-            validated = TestCaseAuthoringService.validate_input(**values)
-        except TestCaseAuthoringError as error:
-            return WebResponse.html(400, self._new_test_case_page(str(error), **values))
-        except Exception:
-            return WebResponse.html(400, self._new_test_case_page(
-                "Enter a valid name, Base URL, and scenario.", **values
-            ))
-        if self._test_cases is None:
-            return WebResponse.html(503, self._new_test_case_page(
-                "TestCase storage is not configured.", **values
-            ))
-        if self._authoring_service is None or self._background_authoring is None:
-            return WebResponse.html(503, self._new_test_case_page(
-                "AI generation is unavailable. Configure an LLM provider in the environment and try again.",
+            validated = TestCaseAuthoringService.validate_input(
                 **values,
-            ))
+                require_name=not dashboard_entry,
+            )
+        except TestCaseAuthoringError as error:
+            return error_response(400, str(error))
+        except Exception:
+            return error_response(400, "Enter a valid name, Website, and scenario.")
+        if self._test_cases is None:
+            return error_response(503, "TestCase storage is not configured.")
+        if self._authoring_service is None or self._background_authoring is None:
+            return error_response(503,
+                "AI generation is unavailable. Configure an LLM provider in the environment and try again.",
+            )
         try:
             progress_id = self._background_authoring.start(
                 name=validated.name,
@@ -572,9 +582,7 @@ class LocalWebApplication:
             )
         except Exception:
             logger.error("Could not start authoring request")
-            return WebResponse.html(503, self._new_test_case_page(
-                "Authoring could not be started. Try again later.", **values
-            ))
+            return error_response(503, "Authoring could not be started. Try again later.")
         return WebResponse.redirect(f"/test-cases/authoring-progress/{progress_id}")
 
     def _handle_authoring_retry(
@@ -810,7 +818,13 @@ class LocalWebApplication:
         )
         return WebResponse.html(status, self._page("Run not started", content))
 
-    def _dashboard(self) -> str:
+    def _dashboard(
+        self,
+        *,
+        authoring_error: str | None = None,
+        base_url: str = "",
+        scenario: str = "",
+    ) -> str:
         records = self._run_history.list_recent(_PAGE_LIMIT)
         counts = {
             "Total runs": len(records),
@@ -829,23 +843,59 @@ class LocalWebApplication:
             for label, count in counts.items()
         )
         recent = records[:12]
+        entry_error = (
+            f'<p class="authoring-error" id="authoring-entry-error" role="alert">'
+            f'{escape_html(authoring_error)}</p>'
+            if authoring_error else ""
+        )
+        error_description = ' aria-describedby="authoring-entry-error"' if authoring_error else ""
+        authoring_entry = (
+            '<section class="panel authoring-entry" aria-labelledby="authoring-entry-title">'
+            '<h2 id="authoring-entry-title">What do you want to test?</h2>'
+            '<p class="muted">Describe a web scenario in natural language. AI turns it into a reusable automated test.</p>'
+            '<form method="post" action="/test-cases/generate" data-authoring-form>'
+            '<input type="hidden" name="authoring_entry" value="dashboard">'
+            + entry_error
+            + '<div class="field"><label for="dashboard-base-url">Website</label>'
+            + f'<input id="dashboard-base-url" name="base_url" type="url" maxlength="2048" required value="{escape_html(base_url)}" placeholder="https://example.com"{error_description}></div>'
+            + '<div class="field"><label for="dashboard-scenario">Scenario</label>'
+            + f'<textarea id="dashboard-scenario" name="scenario" rows="8" maxlength="6000" required placeholder="Describe the behavior you want to verify…"{error_description}>{escape_html(scenario)}</textarea></div>'
+            + self._authoring_voice_controls("dashboard-scenario")
+            + '<button class="button primary authoring-submit" type="submit">Generate Test with AI</button>'
+            + '</form>'
+            + '<ol class="product-flow" aria-label="Test lifecycle">'
+            + '<li>Describe</li><li>Generate</li><li>Run</li><li>Reuse</li></ol>'
+            + '</section>'
+        )
         content = (
-            '<header class="page-heading"><h1>AI QA Agent</h1>'
-            '<p class="lead">A clear view of recent automation, validation, and regression runs.</p></header>'
-            f'<section aria-label="Run summary"><div class="summary-grid">{cards}</div>'
+            '<header class="page-heading"><h1>AI QA Agent</h1></header>'
+            + authoring_entry
+            + f'<section aria-label="Run summary"><div class="summary-grid">{cards}</div>'
             '<p class="muted">Summary of the latest recorded history.</p></section>'
             '<section class="panel"><div class="section-heading"><h2>Recent runs</h2>'
             '<a class="button" href="/runs">View all runs</a></div>'
             + self._runs_table(recent)
             + ("" if recent else self._empty_state(
                 "No runs recorded yet.",
-                "Seed demo data or execute a workflow to see results here.",
+                "Run a workflow to see results here.",
             ))
             + '</section><section class="panel"><div class="section-heading"><h2>TestCases</h2>'
             '<a class="button" href="/test-cases">Browse TestCases</a></div>'
             '<p class="muted">Browse saved definitions, including TestCases that have not run yet.</p></section>'
         )
         return self._page("Dashboard", content, current="Dashboard")
+
+    def _authoring_voice_controls(self, scenario_id: str) -> str:
+        return (
+            '<div class="voice-controls" data-voice-control>'
+            f'<button class="button voice-button" type="button" data-voice-button '
+            f'data-voice-target="{escape_html(scenario_id)}" aria-pressed="false" disabled>'
+            '<span aria-hidden="true">&#127908;</span> '
+            '<span data-voice-label>Speak scenario</span></button>'
+            '<p class="voice-status muted" data-voice-status role="status" aria-live="polite"></p>'
+            '</div>'
+            '<p class="voice-privacy muted">Your browser handles speech recognition; this app receives recognized text only and never receives audio.</p>'
+        )
 
     def _new_test_case_page(
         self,
@@ -856,19 +906,22 @@ class LocalWebApplication:
         scenario: str = "",
     ) -> str:
         error_html = (
-            f'<div class="error-state"><p>{escape_html(error)}</p></div>' if error else ""
+            f'<p class="authoring-error" id="new-case-authoring-error" role="alert">{escape_html(error)}</p>'
+            if error else ""
         )
         content = (
             '<header class="page-heading"><h1>New Test Case</h1>'
             '<p class="lead">Describe the scenario. AI will propose steps for you to review.</p></header>'
-            + error_html
             + '<section class="panel"><form method="post" action="/test-cases/generate" data-authoring-form>'
+            + '<input type="hidden" name="authoring_entry" value="new">'
+            + error_html
             + '<div class="field"><label for="case-name">Name</label>'
             + f'<input id="case-name" name="name" maxlength="200" required value="{escape_html(name)}"></div>'
             + '<div class="field"><label for="case-base-url">Base URL</label>'
-            + f'<input id="case-base-url" name="base_url" type="url" maxlength="2048" required value="{escape_html(base_url)}" placeholder="http://127.0.0.1:8000/demo-target/registration"></div>'
+            + f'<input id="case-base-url" name="base_url" type="url" maxlength="2048" required value="{escape_html(base_url)}" placeholder="https://example.com"></div>'
             + '<div class="field"><label for="case-scenario">Scenario</label>'
-            + f'<textarea id="case-scenario" name="scenario" rows="6" maxlength="6000" required>{escape_html(scenario)}</textarea></div>'
+            + f'<textarea id="case-scenario" name="scenario" rows="8" maxlength="6000" required placeholder="Describe the behavior you want to verify…">{escape_html(scenario)}</textarea></div>'
+            + self._authoring_voice_controls("case-scenario")
             + '<button class="button primary" type="submit">Generate Test with AI</button>'
             + '</form></section>'
         )
@@ -1607,6 +1660,93 @@ _UI_JAVASCRIPT = r"""
         button.textContent = 'Starting…';
       });
     }, { once: true });
+  });
+
+  document.querySelectorAll('[data-voice-control]').forEach((control) => {
+    const button = control.querySelector('[data-voice-button]');
+    const label = control.querySelector('[data-voice-label]');
+    const status = control.querySelector('[data-voice-status]');
+    const scenario = document.getElementById(button?.dataset.voiceTarget || '');
+    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!button || !label || !status || !scenario) return;
+
+    let voiceState = 'IDLE';
+    let recognition = null;
+    const setVoiceState = (state, message) => {
+      voiceState = state;
+      control.dataset.voiceState = state;
+      button.disabled = ['UNSUPPORTED', 'LISTENING', 'PROCESSING'].includes(state);
+      button.setAttribute('aria-pressed', String(state === 'LISTENING'));
+      button.setAttribute('aria-label', state === 'LISTENING' ? 'Listening for scenario' :
+        state === 'PROCESSING' ? 'Processing spoken scenario' :
+        state === 'UNSUPPORTED' ? 'Voice input unavailable' : 'Speak scenario');
+      label.textContent = state === 'LISTENING' ? 'Listening…' :
+        state === 'PROCESSING' ? 'Processing…' : 'Speak scenario';
+      status.textContent = message;
+    };
+
+    setVoiceState('IDLE', '');
+    if (!Recognition) {
+      setVoiceState('UNSUPPORTED', 'Voice input is not supported in this browser. You can continue typing.');
+      return;
+    }
+
+    button.addEventListener('click', () => {
+      try {
+        const activeRecognition = new Recognition();
+        recognition = activeRecognition;
+        let resultAdded = false;
+        activeRecognition.lang = (navigator.languages && navigator.languages[0]) ||
+          navigator.language || document.documentElement.lang || '';
+        activeRecognition.continuous = false;
+        activeRecognition.interimResults = false;
+        activeRecognition.maxAlternatives = 1;
+        activeRecognition.onstart = () => setVoiceState('LISTENING', 'Listening. Speak your scenario now.');
+        activeRecognition.onresult = (event) => {
+          if (resultAdded) return;
+          setVoiceState('PROCESSING', 'Adding recognized text…');
+          const transcripts = [];
+          for (let index = event.resultIndex || 0; index < event.results.length; index += 1) {
+            const result = event.results[index];
+            if (result.isFinal === false) continue;
+            const transcript = result[0] && result[0].transcript;
+            if (typeof transcript === 'string' && transcript.trim()) transcripts.push(transcript.trim());
+          }
+          const spokenText = transcripts.join(' ').trim();
+          if (!spokenText) {
+            setVoiceState('ERROR', 'No speech was recognized. You can continue typing.');
+            return;
+          }
+          resultAdded = true;
+          const existingText = scenario.value;
+          const separator = existingText && !existingText.endsWith('\n') ? '\n' : '';
+          scenario.value = existingText + separator + spokenText;
+          scenario.dispatchEvent(new Event('input', { bubbles: true }));
+          scenario.focus();
+          setVoiceState('IDLE', 'Transcription added. Review and edit the scenario before generating.');
+        };
+        activeRecognition.onerror = (event) => {
+          const messages = {
+            'not-allowed': 'Microphone permission was denied. You can continue typing.',
+            'service-not-allowed': 'Microphone permission was denied. You can continue typing.',
+            'no-speech': 'No speech was recognized. You can continue typing.',
+            'audio-capture': 'Microphone is unavailable. You can continue typing.'
+          };
+          setVoiceState('ERROR', messages[event.error] || 'Voice input could not start. You can continue typing.');
+        };
+        activeRecognition.onend = () => {
+          if (voiceState === 'LISTENING') {
+            setVoiceState('IDLE', 'Voice input ended. You can continue typing.');
+          }
+          if (recognition === activeRecognition) recognition = null;
+        };
+        setVoiceState('PROCESSING', 'Starting voice input…');
+        activeRecognition.start();
+      } catch (_error) {
+        recognition = null;
+        setVoiceState('ERROR', 'Voice input could not start. You can continue typing.');
+      }
+    });
   });
 
   const authoringRoot = document.querySelector('.authoring-progress[data-authoring-progress-id]');

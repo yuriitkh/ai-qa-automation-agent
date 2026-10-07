@@ -60,7 +60,9 @@ class AsyncAuthoringWebIntegrationTests(unittest.TestCase):
                 page.goto(f"{origin}/test-cases/new")
                 page.get_by_label("Name").fill("Async browser registration")
                 page.get_by_label("Base URL").fill(f"{origin}/demo-target/registration")
-                page.get_by_label("Scenario").fill("Register and check the confirmation.")
+                page.get_by_role("textbox", name="Scenario", exact=True).fill(
+                    "Register and check the confirmation."
+                )
                 page.get_by_role("button", name="Generate Test with AI").click()
                 page.wait_for_url("**/test-cases/authoring-progress/**")
                 self.assertTrue(entered.wait(2))
