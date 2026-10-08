@@ -146,6 +146,14 @@ class TestSuiteWebTests(unittest.TestCase):
         self.assertIn('name="test_case_id"', list_html)
         self.assertIn("Select visible", list_html)
         self.assertIn("Export selected", list_html)
+        self.assertIn("Needs validation", list_html)
+        self.assertIn("Latest status:", list_html)
+        self.assertIn(f'href="/test-cases/{self.case.id}/edit"', list_html)
+        self.assertIn(f'href="/test-cases/{self.case.id}/export/portable"', list_html)
+        self.assertIn(f'href="/test-cases/{self.case.id}"', list_html)
+        self.assertIn('class="export-selection-controls"', list_html)
+        self.assertIn(".field{display:grid;gap:.42rem}", list_html)
+        self.assertIn(".test-case-list{min-width:700px", list_html)
         case_html = self.app.handle("GET", f"/test-cases/{self.case.id}").body.decode("utf-8")
         self.assertIn("Portable JSON", case_html)
         self.assertIn("Python Playwright", case_html)
@@ -154,6 +162,20 @@ class TestSuiteWebTests(unittest.TestCase):
         suites_html = self.app.handle("GET", "/test-suites").body.decode("utf-8")
         self.assertIn("Create Test Suite", suites_html)
         self.assertIn("Export", list_html)
+
+    def test_suite_list_shows_description_counts_readiness_and_open_action(self):
+        suite = self.suites.create("Smoke <suite>", "Short <description> for local checks.")
+        self.suites.add_member(suite.id, self.case.id)
+        html = self.app.handle("GET", "/test-suites").body.decode("utf-8")
+
+        self.assertIn(f'href="/test-suites/{suite.id}"', html)
+        self.assertIn("Smoke &lt;suite&gt;", html)
+        self.assertIn("Short &lt;description&gt; for local checks.", html)
+        self.assertIn("1 TestCase", html)
+        self.assertIn("0 of 1 Automation ready", html)
+        self.assertIn(f'>Open</a>', html)
+        self.assertIn(f'href="/test-suites/{suite.id}/export?format=portable"', html)
+        self.assertIn('class="button primary" type="submit">Create suite</button>', html)
 
     def test_suite_members_render_as_compact_accessible_rows_with_lifecycle(self):
         suite = self.suites.create("Compact rows", "")
@@ -166,11 +188,15 @@ class TestSuiteWebTests(unittest.TestCase):
         self.assertIn('class="suite-member-actions"', html)
         self.assertIn('class="suite-form"', html)
         self.assertIn("Needs validation", html)
+        self.assertIn("1.", html)
         self.assertRegex(html, r'aria-label="Move TC-[0-9]+ up"')
         self.assertRegex(html, r'aria-label="Move TC-[0-9]+ down"')
         self.assertRegex(html, r'aria-label="Remove TC-[0-9]+"')
+        self.assertIn('class="button danger-button"', html)
+        self.assertIn('class="button primary" type="submit">Save changes</button>', html)
         self.assertIn(".suite-member-actions{display:flex", html)
         self.assertIn('class="inline-form"', html)
+        self.assertIn("@media(max-width:640px){.suite-member", html)
 
     def test_bulk_selection_returns_zip_and_rejects_invalid_ids(self):
         body = urlencode([("test_case_id", str(self.case.id)), ("target", "python")])
@@ -218,9 +244,33 @@ class TestSuiteWebTests(unittest.TestCase):
         added = self.app.handle("POST", f"/test-suites/{suite_id}/members/add", urlencode({"test_case_id": str(self.case.id)}))
         self.assertEqual(added.status, 303)
         self.assertEqual(self.suites.member_ids(UUID(suite_id)), [self.case.id])
+        second = _case("Second member")
+        self.cases.save(second)
+        self.assertEqual(
+            self.app.handle("POST", f"/test-suites/{suite_id}/members/add", urlencode({"test_case_id": str(second.id)})).status,
+            303,
+        )
+        move_down = self.app.handle(
+            "POST", f"/test-suites/{suite_id}/members/move-down",
+            urlencode({"test_case_id": str(self.case.id)}),
+        )
+        self.assertEqual(move_down.status, 303)
+        self.assertEqual(self.suites.member_ids(UUID(suite_id)), [second.id, self.case.id])
+        move_up = self.app.handle(
+            "POST", f"/test-suites/{suite_id}/members/move-up",
+            urlencode({"test_case_id": str(self.case.id)}),
+        )
+        self.assertEqual(move_up.status, 303)
+        self.assertEqual(self.suites.member_ids(UUID(suite_id)), [self.case.id, second.id])
         update = self.app.handle("POST", f"/test-suites/{suite_id}/update", urlencode({"name": "Updated", "description": "Safe"}))
         self.assertEqual(update.status, 303)
         self.assertEqual(self.suites.get(UUID(suite_id)).name, "Updated")
+        remove_second = self.app.handle(
+            "POST", f"/test-suites/{suite_id}/members/remove",
+            urlencode({"test_case_id": str(second.id)}),
+        )
+        self.assertEqual(remove_second.status, 303)
+        self.assertEqual(self.suites.member_ids(UUID(suite_id)), [self.case.id])
         remove = self.app.handle("POST", f"/test-suites/{suite_id}/members/remove", urlencode({"test_case_id": str(self.case.id)}))
         self.assertEqual(remove.status, 303)
         self.assertEqual(self.suites.member_ids(UUID(suite_id)), [])
@@ -237,7 +287,12 @@ class TestSuiteWebTests(unittest.TestCase):
             self.assertTrue(any(name.endswith(".spec.ts") for name in archive.namelist()))
 
     def test_missing_automation_has_actionable_suite_export_response(self):
-        empty = _case("No plan")
+        empty = _case("No plan <script>alert</script>")
+        empty = empty.model_copy(update={
+            "segments": [empty.segments[0].model_copy(update={
+                "steps": [empty.steps[0].model_copy(update={"name": "Dismiss banner with Accept all"})]
+            })]
+        })
         self.cases.save(empty)
         suite = self.suites.create("Needs automation", "")
         self.suites.add_member(suite.id, empty.id)
@@ -247,9 +302,12 @@ class TestSuiteWebTests(unittest.TestCase):
         self.assertIn(b"1 TestCase is not fully automated", response.body)
         self.assertIn((empty.public_id or "").encode(), response.body)
         self.assertIn(b"Step 1", response.body)
+        self.assertIn("Step 1 \u2014 Dismiss banner with Accept all".encode("utf-8"), response.body)
         self.assertIn(b"No executable plan is saved.", response.body)
         self.assertIn(f'href="/test-cases/{empty.id}"'.encode(), response.body)
         self.assertIn(f'href="/test-suites/{suite.id}"'.encode(), response.body)
+        self.assertIn(b"No plan &lt;script&gt;alert&lt;/script&gt;", response.body)
+        self.assertNotIn(b"No plan <script>alert</script>", response.body)
 
 
 if __name__ == "__main__":

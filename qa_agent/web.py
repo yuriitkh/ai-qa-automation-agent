@@ -1539,25 +1539,33 @@ class LocalWebApplication:
                     _automation_status_label(self._automation_lifecycle.status(test_case)),
                     "workflow",
                 )
-                outcome = _outcome_badge(latest) if latest else '<span class="muted">—</span>'
-                last_run = escape_html(format_timestamp(latest.started_at)) if latest else "—"
+                outcome = _outcome_badge(latest) if latest else '<span class="muted">No result</span>'
+                last_run = (
+                    f'<time datetime="{escape_html(latest.started_at.isoformat())}">'
+                    f'{escape_html(format_timestamp(latest.started_at))}</time>'
+                    if latest else '<span class="muted">No runs yet</span>'
+                )
                 latest_workflow = (
                     badge(latest.workflow_type.value, "workflow")
                     if latest else '<span class="muted">—</span>'
                 )
+                run_count = f'{len(history)} {"run" if len(history) == 1 else "runs"}'
                 rows.append(
                     "<tr>"
                     + (
-                        f'<td><input type="checkbox" name="test_case_id" value="{test_case_id}" '
+                        f'<td class="test-case-select-cell"><input type="checkbox" name="test_case_id" value="{test_case_id}" '
                         f'aria-label="Select {escape_html(test_case.public_id or test_case.name)}"></td>'
                         if self._testplan_exports is not None else ""
                     )
-                    + f'<td><div class="status-line"><span class="id-code">{escape_html(test_case.public_id or "")}</span>'
+                    + f'<td class="test-case-main-cell"><div class="status-line"><span class="id-code">{escape_html(test_case.public_id or "")}</span>'
                     f'<a href="/test-cases/{test_case_id}">{escape_html(test_case.name)}</a></div>'
                     f'<details><summary>Technical ID</summary><code>{escape_html(test_case_id)}</code></details></td>'
-                    f"<td>{automation_status}</td><td>{status}</td><td>{outcome}</td><td>{last_run}</td>"
-                    f"<td>{len(history)}</td><td>{latest_workflow}</td>"
-                    '<td><div class="test-case-actions">'
+                    f'<td class="test-case-state-cell"><div class="test-case-state">{automation_status}'
+                    f'<span class="test-case-latest-status"><span class="muted">Latest status:</span> {status}</span></div>'
+                    f'<div class="test-case-meta"><span>Last run: {last_run}</span>'
+                    f'<span>Latest result: {outcome}</span><span>{run_count}</span>'
+                    f'<span>Latest workflow: {latest_workflow}</span></div></td>'
+                    '<td class="test-case-actions-cell"><div class="test-case-actions">'
                     + f'<a class="button" href="/test-cases/{test_case_id}">Open</a>'
                     + f'<a class="button" href="/test-cases/{test_case_id}/edit">Edit</a>'
                     + (f'<a class="button" href="/test-cases/{test_case_id}/export/portable">Export</a>' if self._testplan_exports is not None else "")
@@ -1568,34 +1576,34 @@ class LocalWebApplication:
                 history = grouped[test_case_id]
                 rows.append(
                     "<tr>"
-                    f'<td><div class="status-line"><span class="id-code">{escape_html(latest.test_case_public_id or "")}</span>'
+                    f'<td class="test-case-main-cell"><div class="status-line"><span class="id-code">{escape_html(latest.test_case_public_id or "")}</span>'
                     f'<a href="/test-cases/{test_case_id}">{escape_html(latest.test_case_name)}</a></div>'
                     f'<details><summary>Technical ID</summary><code>{escape_html(test_case_id)}</code></details></td>'
-                    '<td><span class="muted">Unavailable</span></td>'
-                    f'<td>{badge(latest.status.value)}</td>'
-                    f'<td>{_outcome_badge(latest)}</td>'
-                    f'<td>{escape_html(format_timestamp(latest.started_at))}</td>'
-                    f'<td>{len(history)}</td>'
-                    f'<td>{badge(latest.workflow_type.value, "workflow")}</td>'
-                    f'<td><a class="button" href="/test-cases/{test_case_id}">Open</a></td>'
+                    f'<td class="test-case-state-cell"><div class="test-case-state"><span class="badge neutral">Automation unavailable</span>'
+                    f'<span class="test-case-latest-status"><span class="muted">Latest status:</span> {badge(latest.status.value)}</span></div>'
+                    f'<div class="test-case-meta"><span>Last run: <time datetime="{escape_html(latest.started_at.isoformat())}">{escape_html(format_timestamp(latest.started_at))}</time></span>'
+                    f'<span>Latest result: {_outcome_badge(latest)}</span>'
+                    f'<span>{len(history)} {"run" if len(history) == 1 else "runs"}</span>'
+                    f'<span>Latest workflow: {badge(latest.workflow_type.value, "workflow")}</span></div></td>'
+                    f'<td class="test-case-actions-cell"><div class="test-case-actions"><a class="button" href="/test-cases/{test_case_id}">Open</a></div></td>'
                     "</tr>"
                 )
         selection_column = '<th scope="col"><label><input type="checkbox" data-select-all> Select visible</label></th>' if self._testplan_exports is not None else ""
         table = (
-            '<div class="table-wrap"><table class="test-case-list"><thead><tr>' + selection_column + '<th>TestCase</th><th>Automation</th><th>Latest status</th>'
-            '<th>Latest result</th><th>Last run</th><th>Runs</th><th>Latest workflow</th><th>Actions</th></tr></thead><tbody>'
+            '<div class="table-wrap"><table class="test-case-list"><thead><tr>' + selection_column + '<th scope="col">TestCase</th>'
+            '<th scope="col">Automation and run history</th><th scope="col">Actions</th></tr></thead><tbody>'
             + "".join(rows)
             + "</tbody></table></div>"
         )
         bulk_form = (
             '<form method="post" action="/test-cases/export" class="export-selection">'
-            '<label for="bulk-export-format">Export selected as</label>'
-            '<select id="bulk-export-format" name="target">'
+            '<div class="export-selection-controls"><div class="field">'
+            '<label for="bulk-export-format">Export selected as</label><select id="bulk-export-format" name="target">'
             '<option value="portable">Portable JSON bundle</option>'
             '<option value="python">Python Playwright project</option>'
             '<option value="typescript">TypeScript Playwright project</option>'
             '<option value="csharp">C# Playwright project</option>'
-            '</select><button class="button" type="submit">Export selected</button>'
+            '</select></div><button class="button" type="submit">Export selected</button></div>'
             + table + '</form>'
             if rows and self._testplan_exports is not None else ""
         )
@@ -1664,16 +1672,32 @@ class LocalWebApplication:
 
     def _test_suites_page(self) -> str:
         suites = self._test_suites.list()
-        rows = "".join(
-            "<tr>"
-            f'<td><a href="/test-suites/{suite.id}">{escape_html(suite.name)}</a>'
-            f'<div class="muted">{escape_html(suite.description)}</div></td>'
-            f'<td>{len(self._test_suites.members(suite.id))}</td>'
-            f'<td>{escape_html(format_timestamp(suite.updated_at))}</td>'
-            f'<td><a class="button" href="/test-suites/{suite.id}/export?format=portable">Export</a></td>'
-            "</tr>"
-            for suite in suites
-        )
+        suite_rows = []
+        for suite in suites:
+            members = self._test_suites.members(suite.id)
+            automation_ready_count = sum(
+                self._automation_lifecycle.status(case) == AutomationStatus.AUTOMATION_READY
+                for case in members
+            )
+            description = (
+                f'<div class="muted suite-description">{escape_html(suite.description)}</div>'
+                if suite.description.strip() else ""
+            )
+            case_count_label = f'{len(members)} TestCase{"s" if len(members) != 1 else ""}'
+            suite_rows.append(
+                "<tr>"
+                f'<td class="suite-list-name"><a href="/test-suites/{suite.id}">{escape_html(suite.name)}</a>'
+                + description
+                + '</td>'
+                + f'<td><span class="suite-case-count">{case_count_label}</span></td>'
+                + f'<td><span class="suite-automation-count">{automation_ready_count} of {len(members)} Automation ready</span></td>'
+                + f'<td><time datetime="{escape_html(suite.updated_at.isoformat())}">{escape_html(format_timestamp(suite.updated_at))}</time></td>'
+                + '<td><div class="suite-list-actions">'
+                + f'<a class="button" href="/test-suites/{suite.id}">Open</a>'
+                + f'<a class="button" href="/test-suites/{suite.id}/export?format=portable">Export</a>'
+                + '</div></td></tr>'
+            )
+        rows = "".join(suite_rows)
         content = (
             '<header class="page-heading"><h1>Test Suites</h1>'
             '<p class="lead">Group saved TestCases for reusable organization and export.</p></header>'
@@ -1684,7 +1708,9 @@ class LocalWebApplication:
             '<button class="button primary" type="submit">Create suite</button></form></section>'
             '<section class="panel"><h2>Saved Test Suites</h2>'
             + (
-                '<div class="table-wrap"><table><thead><tr><th>Name</th><th>TestCases</th><th>Updated</th><th>Export</th></tr></thead><tbody>'
+                '<div class="table-wrap"><table class="suite-list"><thead><tr><th scope="col">Test Suite</th>'
+                '<th scope="col">TestCases</th><th scope="col">Automation ready</th><th scope="col">Updated</th>'
+                '<th scope="col">Actions</th></tr></thead><tbody>'
                 + rows + '</tbody></table></div>'
                 if suites else self._empty_state("No Test Suites yet.", "Create a suite to group related TestCases.")
             )
@@ -1706,6 +1732,7 @@ class LocalWebApplication:
             automation_tone = "success" if automation_status == AutomationStatus.AUTOMATION_READY else "workflow"
             member_rows.append(
                 '<li class="suite-member"><div class="suite-member-main">'
+                f'<span class="suite-member-position" aria-hidden="true">{index + 1}.</span>'
                 f'<span class="id-code">{escape_html(case.public_id or "")}</span> '
                 f'<a href="/test-cases/{case.id}">{escape_html(case.name)}</a>'
                 f'{badge(automation_label, automation_tone)}</div>'
@@ -1721,9 +1748,9 @@ class LocalWebApplication:
         )
         add_form = (
             '<form method="post" action="/test-suites/' + str(suite_id) + '/members/add" class="inline-form" data-inline-validation novalidate>'
-            '<label for="suite-member">Add TestCase</label><select id="suite-member" name="test_case_id" required>'
+            '<div class="field"><label for="suite-member">Add TestCase</label><select id="suite-member" name="test_case_id" required>'
             '<option value="">Choose a TestCase</option>' + options
-            + '</select><button class="button" type="submit">Add</button></form>'
+            + '</select></div><button class="button" type="submit">Add</button></form>'
             if available else '<p class="muted">All available TestCases are already in this suite.</p>'
         )
         content = (
@@ -1739,7 +1766,7 @@ class LocalWebApplication:
             f'<form method="post" action="/test-suites/{suite_id}/update" class="suite-form" data-inline-validation novalidate>'
             f'<div class="field"><label for="suite-name">Name</label><input id="suite-name" name="name" maxlength="120" required value="{escape_html(suite.name)}"></div>'
             f'<div class="field"><label for="suite-description">Description</label><textarea id="suite-description" name="description" maxlength="1000" rows="3">{escape_html(suite.description)}</textarea></div>'
-            '<button class="button" type="submit">Save changes</button></form></section>'
+            '<button class="button primary" type="submit">Save changes</button></form></section>'
             '<section class="panel"><h2>Suite TestCases</h2>' + add_form
             + (f'<ol class="suite-members">{"".join(member_rows)}</ol>' if member_rows else self._empty_state("This suite is empty.", "Add saved TestCases above."))
             + '</section>'
@@ -2995,7 +3022,10 @@ def _suite_export_blocker_content(suite_id: UUID, blockers) -> str:
     for blocker in unique.values():
         identity = blocker.public_id or blocker.test_case_name
         step = (
-            f'<p>Step {blocker.step_order}</p>'
+            '<p class="suite-export-step"><strong>'
+            f'Step {blocker.step_order}'
+            + (f' — {escape_html(blocker.step_name)}' if blocker.step_name else "")
+            + '</strong></p>'
             if blocker.step_order is not None else ""
         )
         rows.append(
@@ -3036,10 +3066,11 @@ def _suite_member_form(
     disabled: bool = False,
 ) -> str:
     disabled_attr = " disabled" if disabled else ""
+    button_class = "button danger-button" if operation == "remove" else "button"
     return (
         f'<form method="post" action="/test-suites/{suite_id}/members/{operation}">'
         f'<input type="hidden" name="test_case_id" value="{case_id}">'
-        f'<button class="button" type="submit" aria-label="{escape_html(accessible_label)}"'
+        f'<button class="{button_class}" type="submit" aria-label="{escape_html(accessible_label)}"'
         f' title="{escape_html(accessible_label)}"{disabled_attr}>{escape_html(label)}</button></form>'
     )
 

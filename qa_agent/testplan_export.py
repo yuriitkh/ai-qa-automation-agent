@@ -33,6 +33,7 @@ class ExportBlocker:
     test_case_name: str
     step_order: int | None
     reason: str
+    step_name: str | None = None
 
 
 class TestPlanExportError(ValueError):
@@ -75,6 +76,7 @@ def _plans_for_case(test_case: TestCase, plan_store: PlanStore) -> ExportableTes
                     test_case_name=test_case.name,
                     step_order=step.order + 1,
                     reason="No executable plan is saved.",
+                    step_name=step.name,
                 )
                 raise TestPlanExportError(
                     f"Automation required before export: {test_case.public_id or test_case.name}, "
