@@ -1,3 +1,4 @@
+from threading import RLock
 from typing import Protocol
 from copy import deepcopy
 from uuid import UUID
@@ -51,6 +52,8 @@ class PlanStore(Protocol):
 
     def find_test_plan(self, test_step_id: UUID) -> TestPlan | None: ...
 
+    def list_versions(self, test_step_id: UUID) -> tuple[TestPlanVersion, ...]: ...
+
 
 class InMemoryPlanStore:
     """Process-local store keyed by stable ``TestStep.id`` values."""
@@ -59,8 +62,19 @@ class InMemoryPlanStore:
         self._versions: dict[UUID, TestPlanVersion] = {}
         self._version_history: dict[UUID, TestPlanVersion] = {}
         self._test_plans: dict[UUID, TestPlan] = {}
+        self._lock = RLock()
 
     def save(
+        self,
+        test_step_id: UUID,
+        plan_version: TestPlanVersion,
+        *,
+        test_plan: TestPlan,
+    ) -> None:
+        with self._lock:
+            self._save_unlocked(test_step_id, plan_version, test_plan=test_plan)
+
+    def _save_unlocked(
         self,
         test_step_id: UUID,
         plan_version: TestPlanVersion,
@@ -95,12 +109,27 @@ class InMemoryPlanStore:
         self._version_history[plan_version.id] = stored_version
 
     def find(self, test_step_id: UUID) -> TestPlanVersion | None:
-        version = self._versions.get(test_step_id)
-        return deepcopy(version) if version is not None else None
+        with self._lock:
+            version = self._versions.get(test_step_id)
+            return deepcopy(version) if version is not None else None
 
     def get_version(self, version_id: UUID) -> TestPlanVersion | None:
-        version = self._version_history.get(version_id)
-        return deepcopy(version) if version is not None else None
+        with self._lock:
+            version = self._version_history.get(version_id)
+            return deepcopy(version) if version is not None else None
 
     def find_test_plan(self, test_step_id: UUID) -> TestPlan | None:
-        return self._test_plans.get(test_step_id)
+        with self._lock:
+            return self._test_plans.get(test_step_id)
+
+    def list_versions(self, test_step_id: UUID) -> tuple[TestPlanVersion, ...]:
+        with self._lock:
+            test_plan = self._test_plans.get(test_step_id)
+            if test_plan is None:
+                return ()
+            versions = [
+                version for version in self._version_history.values()
+                if version.test_plan_id == test_plan.id
+            ]
+            versions.sort(key=lambda version: (version.version, version.created_at), reverse=True)
+            return tuple(deepcopy(version) for version in versions)

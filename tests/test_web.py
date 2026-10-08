@@ -378,7 +378,7 @@ class LocalWebApplicationTests(unittest.TestCase):
 
         summary_start = body.index("<summary>v4")
         summary_end = body.index("</summary>", summary_start)
-        self.assertIn("Repaired", body[summary_start:summary_end])
+        self.assertIn("Updated automatically", body[summary_start:summary_end])
         self.assertNotIn(str(version.id), body[summary_start:summary_end])
         self.assertIn("Created: 1 May 2026, 00:00 UTC", body)
         self.assertIn("Previous version: v3", body)

@@ -375,6 +375,15 @@ class SQLitePlanStore(_SQLiteStorage):
             name=row["test_plan_name"],
         )
 
+    def list_versions(self, test_step_id: UUID) -> tuple[TestPlanVersion, ...]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM test_plan_versions WHERE test_step_id = ? "
+                "ORDER BY version_number DESC, created_at DESC",
+                (str(test_step_id),),
+            ).fetchall()
+        return tuple(self._to_version(row) for row in rows)
+
     @staticmethod
     def _to_version(row: sqlite3.Row) -> TestPlanVersion:
         return TestPlanVersion(

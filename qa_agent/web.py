@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlencode, urlsplit
+from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urlsplit
 from uuid import UUID, uuid4
 
 from qa_agent.presentation import (
@@ -35,6 +35,7 @@ from qa_agent.automation_lifecycle import (
     AutomationLifecycleService,
     AutomationStatus,
     InMemoryAutomationLifecycleRepository,
+    has_complete_plans,
 )
 from qa_agent.drafts import Draft, DraftRepository, InMemoryDraftRepository
 from qa_agent.test_case_execution import (
@@ -61,7 +62,14 @@ from qa_agent.execution_progress import (
     AuthoringEventType,
     ExecutionProgressStore,
 )
-from qa_agent.models import PlanVersionOrigin, TestCase
+from qa_agent.models import PlanVersionOrigin, QATestStep, TestCase, TestPlan, TestPlanVersion
+from qa_agent.automation_editor import (
+    ACTION_EDITOR_FIELDS,
+    ACTION_LABELS,
+    FIELD_LABELS,
+    AutomationEditorError,
+    plan_from_form,
+)
 from qa_agent.plan_store import InMemoryPlanStore, PlanStore
 from qa_agent.testplan_export import (
     TestPlanExportError,
@@ -303,6 +311,20 @@ class LocalWebApplication:
         if len(parts) == 3 and parts[0] == "test-cases" and parts[2] == "plans":
             test_case_id = _parse_uuid(parts[1])
             return self._test_plan_view(test_case_id) if test_case_id else self._not_found("TestCase not found")
+        if len(parts) == 4 and parts[0] == "test-cases" and parts[2:] == ["automation", "edit"]:
+            test_case_id = _parse_uuid(parts[1])
+            return self._automation_editor_page(test_case_id, query) if test_case_id else self._not_found("TestCase not found")
+        if (
+            len(parts) == 7 and parts[0] == "test-cases"
+            and parts[2:4] == ["automation", "steps"]
+            and parts[5] == "versions"
+        ):
+            test_case_id = _parse_uuid(parts[1])
+            step_id = _parse_uuid(parts[4])
+            version_id = _parse_uuid(parts[6])
+            if test_case_id is None or step_id is None or version_id is None:
+                return self._not_found("Automation version not found")
+            return self._automation_version_view(test_case_id, step_id, version_id)
         if len(parts) == 4 and parts[0] == "test-cases" and parts[2] == "export":
             test_case_id = _parse_uuid(parts[1])
             if test_case_id is None:
@@ -344,6 +366,11 @@ class LocalWebApplication:
             ))
         if len(parts) == 3 and parts[0] == "test-cases" and parts[2] == "edit":
             return self._handle_test_case_edit(parts[1], body)
+        if (
+            len(parts) == 6 and parts[0] == "test-cases"
+            and parts[2:4] == ["automation", "steps"] and parts[5] == "save"
+        ):
+            return self._handle_automation_step_save(parts[1], parts[4], body)
         if (
             len(parts) == 4
             and parts[:2] == ["test-cases", "authoring-progress"]
@@ -1027,20 +1054,278 @@ class LocalWebApplication:
                 continue
             actions = "".join(
                 '<li><code>' + escape_html(action.action) + '</code><pre>'
-                + escape_html(redact_secrets(json.dumps(action.parameters, ensure_ascii=False, sort_keys=True, indent=2)))
+                + escape_html(_safe_parameter_json(action.parameters))
                 + '</pre></li>' for action in version.qa_test_plan.steps
             )
             rows.append(
                 f'<section class="panel"><h2>Step {step.order + 1}: {escape_html(step.name)}</h2>'
                 f'<p>Plan v{version.version} · {_plan_origin_label(version.origin)}</p>'
-                f'<p>URL: {escape_html(redact_secrets(version.qa_test_plan.url))}</p><ol>{actions}</ol></section>'
+                f'<p>URL: {escape_html(_safe_automation_url_display(version.qa_test_plan.url))}</p><ol>{actions}</ol></section>'
             )
         content = (
             f'<header class="page-heading"><h1>View TestPlan: {escape_html(test_case.name)}</h1>'
-            '<p class="lead">Read-only view of the current saved plans. Editing structured automation is planned for a later Automation Editor milestone.</p></header>'
+            '<p class="lead">Read-only view of current saved plans. Edit supported actions in the Automation Editor.</p></header>'
             + "".join(rows)
         )
         return WebResponse.html(200, self._page("View TestPlan", content, current="Test Cases", breadcrumbs=[("Dashboard", "/"), ("Test Cases", "/test-cases"), (test_case.name, f"/test-cases/{test_case.id}")]))
+
+    def _automation_editor_page(
+        self,
+        test_case_id: UUID,
+        query: dict[str, list[str]] | None = None,
+        *,
+        submitted_step_id: UUID | None = None,
+        submitted_values: dict[str, str] | None = None,
+        field_errors: dict[str, str] | None = None,
+        error_message: str | None = None,
+        status: int = 200,
+    ) -> WebResponse:
+        test_case = self._test_cases.get(test_case_id) if self._test_cases is not None else None
+        if test_case is None:
+            return self._not_found("TestCase not found")
+        if self._plan_store is None:
+            return WebResponse.html(503, self._page(
+                "Automation editor unavailable",
+                self._empty_state("Automation editor unavailable", "No saved plan store is configured."),
+            ))
+
+        query = query or {}
+        submitted_values = submitted_values or {}
+        field_errors = field_errors or {}
+        complete = has_complete_plans(test_case, self._plan_store)
+        notice = ""
+        if query.get("saved") == ["1"]:
+            detail = (
+                "Validation required before this TestCase is Automation ready."
+                if complete else "Automation for the remaining steps is required before Validation can run."
+            )
+            validation_button = (
+                f'<form method="post" action="/test-cases/{test_case.id}/run" class="inline-form">'
+                '<input type="hidden" name="workflow" value="VALIDATION">'
+                '<button class="button primary" type="submit">Run Validation</button></form>'
+                if self._background_runs is not None and complete else ""
+            )
+            notice = (
+                '<div class="success-state" role="status"><strong>Automation saved.</strong> '
+                + detail
+                + validation_button
+                + f' <a href="/test-cases/{test_case.id}">Back to TestCase</a></div>'
+            )
+        if error_message:
+            notice = f'<div class="error-state" role="alert">{escape_html(error_message)}</div>'
+
+        sections: list[str] = []
+        for step in test_case.steps:
+            version = self._plan_store.find(step.id)
+            test_plan = self._plan_store.find_test_plan(step.id)
+            if version is not None and (test_plan is None or test_plan.id != version.test_plan_id):
+                sections.append(
+                    f'<section class="panel"><h2>Step {step.order + 1}: {escape_html(step.name)}</h2>'
+                    '<p class="error-state">The saved plan relationship is invalid. This step is read-only.</p></section>'
+                )
+                continue
+
+            active_form = submitted_step_id == step.id and bool(submitted_values)
+            if active_form:
+                state_url = submitted_values.get("plan_url", "")
+                expected_version = submitted_values.get("expected_version", "0")
+                actions = _automation_submitted_actions(submitted_values)
+            elif version is not None:
+                state_url = version.qa_test_plan.url
+                expected_version = str(version.version)
+                actions = [
+                    {"type": action.action, "parameters": action.parameters}
+                    for action in version.qa_test_plan.steps
+                ]
+            else:
+                segment = next((item for item in test_case.segments if step in item.steps), None)
+                state_url = (segment.base_url if segment else None) or test_case.base_url or ""
+                expected_version = "0"
+                actions = []
+
+            title = f"Step {step.order + 1}: {escape_html(step.name)}"
+            state = (
+                '<p class="muted">Not automated. Create automation manually with supported actions.</p>'
+                if version is None else
+                f'<p>Current plan: <strong>v{version.version}</strong> · '
+                f'{escape_html(_plan_origin_label(version.origin))} · '
+                f'{escape_html(format_timestamp(version.created_at))}</p>'
+            )
+            form_errors = "".join(
+                f'<p class="field-error" role="alert">{escape_html(message)}</p>'
+                for key, message in field_errors.items()
+                if key in {"actions", "expected_version"}
+            ) if active_form else ""
+            action_html = "".join(
+                _automation_action_card(
+                    index, str(action.get("type", "")), action.get("parameters", {}),
+                    field_errors if active_form else {},
+                )
+                for index, action in enumerate(actions)
+            )
+            url_error = field_errors.get("plan_url", "") if active_form else ""
+            if _url_contains_credentials(state_url) or redact_secrets(state_url) != state_url:
+                state_url = ""
+                url_error = url_error or "This saved URL contains credentials. Replace it before saving."
+            url_error_html = (
+                f'<span class="field-error" role="alert">{escape_html(url_error)}</span>'
+                if url_error else ""
+            )
+            form = (
+                f'<form method="post" class="panel automation-editor-form" '
+                f'action="/test-cases/{test_case.id}/automation/steps/{step.id}/save" data-automation-form>'
+                f'<input type="hidden" name="expected_version" value="{escape_html(expected_version)}">'
+                + form_errors
+                + '<label class="field"><span>Plan URL</span>'
+                f'<input name="plan_url" type="url" required value="{escape_html(state_url)}" data-automation-url></label>'
+                + url_error_html
+                + '<div class="automation-actions" data-automation-actions>' + action_html + '</div>'
+                + '<div class="actions"><button class="button" type="button" data-action-add>Add action</button>'
+                + '<button class="button primary" type="submit">Save automation</button>'
+                + f'<a class="button" href="/test-cases/{test_case.id}">Cancel</a></div></form>'
+            )
+            history = self._plan_store.list_versions(step.id)
+            history_html = _automation_history_html(test_case, step.id, version, history)
+            sections.append(
+                f'<section class="panel automation-step"><h2>{title}</h2>{state}{form}{history_html}</section>'
+            )
+
+        content = (
+            f'<header class="page-heading"><h1>Edit Automation: {escape_html(test_case.name)}</h1>'
+            '<p class="lead">Edit saved browser actions by TestStep. Each save creates a new version, and current automation must pass Validation before it is ready.</p></header>'
+            + notice
+            + f'<div class="actions"><a class="button" href="/test-cases/{test_case.id}/plans">View TestPlan</a>'
+            + f'<a class="button" href="/test-cases/{test_case.id}">Back to TestCase</a></div>'
+            + ''.join(sections)
+        )
+        return WebResponse.html(status, self._page(
+            "Edit Automation", content, current="Test Cases",
+            breadcrumbs=[("Dashboard", "/"), ("Test Cases", "/test-cases"),
+                         (test_case.name, f"/test-cases/{test_case.id}")],
+        ))
+
+    def _automation_version_view(self, test_case_id: UUID, step_id: UUID, version_id: UUID) -> WebResponse:
+        test_case = self._test_cases.get(test_case_id) if self._test_cases is not None else None
+        step = next((item for item in test_case.steps if item.id == step_id), None) if test_case else None
+        version = self._plan_store.get_version(version_id) if self._plan_store is not None else None
+        test_plan = self._plan_store.find_test_plan(step_id) if self._plan_store is not None else None
+        if (
+            test_case is None or step is None or version is None or test_plan is None
+            or version.test_plan_id != test_plan.id
+        ):
+            return self._not_found("Automation version not found")
+        current = self._plan_store.find(step_id)
+        actions = ''.join(
+            '<li><strong>' + escape_html(ACTION_LABELS.get(action.action, action.action)) + '</strong><dl>'
+            + ''.join(
+                f'<dt>{escape_html(FIELD_LABELS.get(key, key))}</dt>'
+                f'<dd><code>{escape_html(_safe_automation_url_display(str(value)) if key == "url" else redact_secrets(str(value)))}</code></dd>'
+                for key, value in sorted(action.parameters.items())
+            )
+            + '</dl></li>' for action in version.qa_test_plan.steps
+        )
+        content = (
+            f'<header class="page-heading"><h1>Automation version v{version.version}</h1>'
+            f'<p class="lead">{escape_html(step.name)} · {_plan_origin_label(version.origin)} · '
+            f'{escape_html(format_timestamp(version.created_at))}</p></header>'
+            + f'<section class="panel"><p>Plan URL: <code>{escape_html(_safe_automation_url_display(version.qa_test_plan.url))}</code></p>'
+            + f'<ol>{actions}</ol></section>'
+            + (f'<p class="muted">This is the current version.</p>' if current and current.id == version.id else '<p class="muted">Read-only historical version.</p>')
+            + f'<div class="actions"><a class="button" href="/test-cases/{test_case.id}/automation/edit">Back to Automation Editor</a>'
+            + f'<a class="button" href="/test-cases/{test_case.id}/plans">View TestPlan</a></div>'
+        )
+        return WebResponse.html(200, self._page(
+            f"Automation v{version.version}", content, current="Test Cases",
+            breadcrumbs=[("Dashboard", "/"), ("Test Cases", "/test-cases"),
+                         (test_case.name, f"/test-cases/{test_case.id}")],
+        ))
+
+    def _handle_automation_step_save(
+        self, test_case_id_text: str, step_id_text: str, body: bytes | str | None
+    ) -> WebResponse:
+        test_case_id = _parse_uuid(test_case_id_text)
+        step_id = _parse_uuid(step_id_text)
+        test_case = self._test_cases.get(test_case_id) if test_case_id and self._test_cases is not None else None
+        if test_case is None or step_id is None:
+            return self._not_found("TestCase or TestStep not found")
+        step = next((item for item in test_case.steps if item.id == step_id), None)
+        if step is None:
+            return self._not_found("TestStep not found")
+        if self._plan_store is None:
+            return WebResponse.html(503, self._page(
+                "Automation editor unavailable",
+                self._empty_state("Automation editor unavailable", "No saved plan store is configured."),
+            ))
+        form, parse_error = _parse_form_body(body, max_bytes=_MAX_MANUAL_FORM_BODY_BYTES)
+        values = {key: items[0] for key, items in form.items()}
+        if parse_error:
+            return self._automation_editor_page(
+                test_case.id, submitted_step_id=step.id, submitted_values=values,
+                error_message=parse_error, status=400,
+            )
+        try:
+            expected_version = int(values.get("expected_version", ""))
+            if expected_version < 0:
+                raise ValueError
+        except ValueError:
+            return self._automation_editor_page(
+                test_case.id, submitted_step_id=step.id, submitted_values=values,
+                field_errors={"expected_version": "Reload the editor before saving this plan."},
+                status=400,
+            )
+
+        current = self._plan_store.find(step.id)
+        current_number = current.version if current is not None else 0
+        if current_number != expected_version:
+            return self._automation_editor_page(
+                test_case.id, submitted_step_id=step.id, submitted_values=values,
+                error_message="This automation changed since you opened the editor. Reload and review the latest version.",
+                status=409,
+            )
+        try:
+            edited_plan = plan_from_form(values)
+        except AutomationEditorError as error:
+            return self._automation_editor_page(
+                test_case.id, submitted_step_id=step.id, submitted_values=values,
+                field_errors=error.field_errors, status=400,
+            )
+
+        test_plan = self._plan_store.find_test_plan(step.id)
+        if current is not None and (test_plan is None or test_plan.id != current.test_plan_id):
+            return self._automation_editor_page(
+                test_case.id, submitted_step_id=step.id, submitted_values=values,
+                error_message="The saved plan relationship changed. Reload and review the latest version.",
+                status=409,
+            )
+        if test_plan is None:
+            test_plan = TestPlan(test_step_id=step.id, name=step.name)
+        version = TestPlanVersion(
+            test_plan_id=test_plan.id,
+            version=current_number + 1,
+            origin=PlanVersionOrigin.HUMAN_EDITED,
+            qa_test_plan=edited_plan,
+        )
+        try:
+            self._plan_store.save(step.id, version, test_plan=test_plan)
+        except ValueError:
+            latest = self._plan_store.find(step.id)
+            if (latest.version if latest is not None else 0) != expected_version:
+                return self._automation_editor_page(
+                    test_case.id, submitted_step_id=step.id, submitted_values=values,
+                    error_message="This automation changed since you opened the editor. Reload and review the latest version.",
+                    status=409,
+                )
+            return self._automation_editor_page(
+                test_case.id, submitted_step_id=step.id, submitted_values=values,
+                error_message="The automation could not be saved. Review the form and try again.",
+                status=400,
+            )
+
+        if has_complete_plans(test_case, self._plan_store):
+            self._automation_lifecycle.mark_automation_completed(test_case)
+        return WebResponse.redirect(
+            f"/test-cases/{test_case.id}/automation/edit?saved=1&step={step.id}"
+        )
 
     def _handle_generate_test_case(self, body: bytes | str | None) -> WebResponse:
         form, form_error = _parse_form_body(body, max_bytes=_MAX_AUTHORING_FORM_BODY_BYTES)
@@ -2570,6 +2855,13 @@ class LocalWebApplication:
             f'<a class="button" href="/test-cases/{test_case_id}/plans">View TestPlan</a></div>'
             if test_case is not None else ""
         )
+        if test_case is not None and self._plan_store is not None and any(
+            self._plan_store.find(step.id) is not None for step in test_case.steps
+        ):
+            edit_links = edit_links.replace(
+                '</div>',
+                f'<a class="button primary" href="/test-cases/{test_case_id}/automation/edit">Edit Automation</a></div>',
+            )
         export_panel = ""
         if test_case is not None and self._testplan_exports is not None:
             export_panel = (
@@ -3446,6 +3738,38 @@ def _parse_uuid(value: str) -> UUID | None:
         return None
 
 
+def _url_contains_credentials(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+        if parsed.username or parsed.password:
+            return True
+        secret_query_keys = {
+            "api_key", "api-key", "apikey", "access_token", "access-token",
+            "token", "password", "secret", "authorization", "credential",
+        }
+        return any(
+            key.casefold() in secret_query_keys
+            for key, _ in parse_qsl(parsed.query, keep_blank_values=True)
+        )
+    except ValueError:
+        return False
+
+
+def _safe_automation_url_display(value: str) -> str:
+    if _url_contains_credentials(value):
+        return "[credential-bearing URL redacted]"
+    return redact_secrets(value)
+
+
+def _safe_parameter_json(parameters: dict[str, object]) -> str:
+    safe_values = dict(parameters)
+    if isinstance(safe_values.get("url"), str):
+        safe_values["url"] = _safe_automation_url_display(safe_values["url"])
+    return redact_secrets(json.dumps(
+        safe_values, ensure_ascii=False, sort_keys=True, indent=2
+    ))
+
+
 def should_suppress_successful_progress_log(method: str, target: str, status: int | None) -> bool:
     if method.upper() != "GET" or status is None or not 200 <= status < 300:
         return False
@@ -3486,6 +3810,96 @@ def _parse_form_body(
     if any(len(items) != 1 and key not in allowed_repeated for key, items in values.items()):
         return {}, "The request contained ambiguous form fields."
     return values, None
+
+
+def _automation_submitted_actions(values: dict[str, str]) -> list[dict[str, object]]:
+    actions: dict[int, dict[str, object]] = {}
+    for name, value in values.items():
+        parts = name.split(".")
+        if len(parts) < 3 or parts[0] != "action" or not parts[1].isdigit():
+            continue
+        index = int(parts[1])
+        action = actions.setdefault(index, {"type": "", "parameters": {}})
+        if parts[2] == "type":
+            action["type"] = value
+        elif len(parts) == 4 and parts[2] == "param":
+            parameters = action["parameters"]
+            if isinstance(parameters, dict):
+                parameters[parts[3]] = value
+    return [actions[index] for index in sorted(actions)]
+
+
+def _automation_action_card(
+    index: int,
+    action_type: str,
+    parameters: dict[str, object],
+    field_errors: dict[str, str],
+) -> str:
+    action_options = ['<option value="">Choose action type</option>']
+    for value, label in ACTION_LABELS.items():
+        selected = ' selected' if value == action_type else ''
+        action_options.append(
+            f'<option value="{value}"{selected}>{escape_html(label)}</option>'
+        )
+    type_error = field_errors.get(f"action.{index}.type", "")
+    type_error_html = (
+        f'<span class="field-error" role="alert">{escape_html(type_error)}</span>'
+        if type_error else ""
+    )
+    rendered_fields: list[str] = []
+    supported = ACTION_EDITOR_FIELDS.get(action_type, ())
+    required = QATestStep.ACTION_PARAMETER_FIELDS.get(action_type, ())
+    for field in supported:
+        field_name = f"action.{index}.param.{field}"
+        value = parameters.get(field, "")
+        error = field_errors.get(field_name, "")
+        if field == "url" and isinstance(value, str) and (
+            _url_contains_credentials(value) or redact_secrets(value) != value
+        ):
+            value = ""
+            error = error or "This saved URL contains credentials. Replace it before saving."
+        rendered_fields.append(
+            '<label class="field"><span>' + escape_html(FIELD_LABELS.get(field, field)) + '</span>'
+            + f'<input name="{field_name}" value="{escape_html(str(value))}"'
+            + (' required' if field in required else '')
+            + f' data-action-param="{field}" autocomplete="off"></label>'
+            + (f'<span class="field-error" role="alert">{escape_html(error)}</span>' if error else '')
+        )
+    unsupported_errors = ''.join(
+        f'<span class="field-error" role="alert">{escape_html(message)}</span>'
+        for name, message in field_errors.items()
+        if name.startswith(f"action.{index}.param.")
+        and name.rsplit(".", 1)[-1] not in supported
+    )
+    return (
+        f'<fieldset class="automation-action" data-action-card><legend>Action {index + 1}</legend>'
+        + '<div class="automation-action-controls">'
+        + '<button class="button" type="button" data-action-move="up" aria-label="Move action up">↑</button>'
+        + '<button class="button" type="button" data-action-move="down" aria-label="Move action down">↓</button>'
+        + '<button class="button" type="button" data-action-duplicate>Duplicate</button>'
+        + '<button class="button" type="button" data-action-remove>Delete</button></div>'
+        + f'<label class="field"><span>Action type</span><select name="action.{index}.type" data-action-type>'
+        + ''.join(action_options) + '</select></label>' + type_error_html
+        + '<div class="automation-action-fields" data-action-fields>'
+        + ''.join(rendered_fields) + unsupported_errors + '</div></fieldset>'
+    )
+
+
+def _automation_history_html(test_case, step_id, current_version, versions) -> str:
+    if not versions:
+        return '<section class="automation-history"><h4>Version history</h4><p class="muted">No saved versions yet.</p></section>'
+    current_id = current_version.id if current_version is not None else None
+    rows = []
+    for version in versions:
+        current = version.id == current_id
+        label = (
+            f'v{version.version} · {_plan_origin_label(version.origin)}'
+            + (' · current' if current else '')
+            + f' · {format_timestamp(version.created_at)}'
+        )
+        href = f'/test-cases/{test_case.id}/automation/steps/{step_id}/versions/{version.id}'
+        rows.append(f'<li><a href="{href}">{escape_html(label)}</a></li>')
+    return '<section class="automation-history"><h4>Version history</h4><ol>' + ''.join(rows) + '</ol></section>'
 
 
 def _download_response(content: bytes, filename: str, content_type: str) -> WebResponse:
@@ -3638,8 +4052,8 @@ def _plan_origin_label(origin: PlanVersionOrigin | None) -> str:
     return {
         PlanVersionOrigin.AI_GENERATED: "Generated by AI",
         PlanVersionOrigin.HUMAN_EDITED: "Edited locally",
-        PlanVersionOrigin.REGENERATED: "Updated automatically",
-        PlanVersionOrigin.REPAIRED: "Repaired automatically",
+        PlanVersionOrigin.REGENERATED: "Regenerated by AI",
+        PlanVersionOrigin.REPAIRED: "Updated automatically",
     }.get(origin, "Unknown origin")
 
 
@@ -3783,6 +4197,124 @@ def _inline_invalid_attrs(error_id: str, error: str | None) -> str:
 
 _UI_JAVASCRIPT = r"""
 (() => {
+  const actionFields = {
+    navigate: ['url'],
+    assert_page_loaded: [],
+    assert_title: ['expected'],
+    assert_visible: ['selector', 'expected_text'],
+    click: ['selector'],
+    fill: ['selector', 'value'],
+    assert_hidden: ['selector'],
+    assert_url: ['expected'],
+    select_option: ['selector', 'option_label'],
+    assert_text_contains: ['expected_text', 'selector'],
+    assert_checked: ['selector'],
+    assert_selected: ['selector', 'expected'],
+    assert_enabled: ['selector'],
+    assert_disabled: ['selector']
+  };
+  const requiredActionFields = {
+    navigate: ['url'], assert_page_loaded: [], assert_title: ['expected'],
+    assert_visible: ['selector'], click: ['selector'], fill: ['selector', 'value'],
+    assert_hidden: ['selector'], assert_url: ['expected'],
+    select_option: ['selector', 'option_label'],
+    assert_text_contains: ['expected_text'], assert_checked: ['selector'],
+    assert_selected: ['selector'], assert_enabled: ['selector'], assert_disabled: ['selector']
+  };
+  const actionLabels = {
+    navigate: 'Navigate to URL', assert_page_loaded: 'Assert page loaded',
+    assert_title: 'Assert page title', assert_visible: 'Assert visible', click: 'Click',
+    fill: 'Fill field', assert_hidden: 'Assert hidden', assert_url: 'Assert URL',
+    select_option: 'Select option', assert_text_contains: 'Assert text contains',
+    assert_checked: 'Assert checked', assert_selected: 'Assert selected',
+    assert_enabled: 'Assert enabled', assert_disabled: 'Assert disabled'
+  };
+  const fieldLabels = {
+    url: 'URL', selector: 'Selector', value: 'Value', expected: 'Expected value',
+    expected_text: 'Expected text', option_label: 'Option label'
+  };
+  document.querySelectorAll('[data-automation-form]').forEach((form) => {
+    const actions = form.querySelector('[data-automation-actions]');
+    const makeButton = (label, attribute, value) => {
+      const button = document.createElement('button');
+      button.type = 'button'; button.className = 'button'; button.textContent = label;
+      button.dataset[attribute] = value || '';
+      return button;
+    };
+    const readParameters = (card) => Object.fromEntries(
+      [...card.querySelectorAll('[data-action-param]')].map((field) => [field.dataset.actionParam, field.value])
+    );
+    const renderFields = (card, values = {}) => {
+      const fields = card.querySelector('[data-action-fields]');
+      const type = card.querySelector('[data-action-type]').value;
+      fields.replaceChildren();
+      (actionFields[type] || []).forEach((name) => {
+        const label = document.createElement('label'); label.className = 'field';
+        const caption = document.createElement('span'); caption.textContent = fieldLabels[name] || name;
+        const input = document.createElement('input');
+        input.name = ''; input.value = values[name] || ''; input.autocomplete = 'off';
+        input.dataset.actionParam = name;
+        if ((requiredActionFields[type] || []).includes(name)) input.required = true;
+        label.append(caption, input); fields.append(label);
+      });
+    };
+    const makeCard = (type = 'assert_page_loaded', values = {}) => {
+      const card = document.createElement('fieldset'); card.className = 'automation-action'; card.dataset.actionCard = '';
+      const legend = document.createElement('legend'); legend.textContent = 'Action'; card.append(legend);
+      const controls = document.createElement('div'); controls.className = 'automation-action-controls';
+      controls.append(
+        makeButton('↑', 'actionMove', 'up'), makeButton('↓', 'actionMove', 'down'),
+        makeButton('Duplicate', 'actionDuplicate'), makeButton('Delete', 'actionRemove')
+      ); card.append(controls);
+      const typeLabel = document.createElement('label'); typeLabel.className = 'field';
+      const typeCaption = document.createElement('span'); typeCaption.textContent = 'Action type';
+      const select = document.createElement('select'); select.dataset.actionType = '';
+      const placeholder = document.createElement('option'); placeholder.value = ''; placeholder.textContent = 'Choose action type';
+      select.append(placeholder);
+      Object.keys(actionFields).forEach((key) => {
+        const option = document.createElement('option'); option.value = key;
+        option.textContent = actionLabels[key]; select.append(option);
+      });
+      select.value = type; select.addEventListener('change', () => renderFields(card, readParameters(card)));
+      typeLabel.append(typeCaption, select); card.append(typeLabel);
+      const container = document.createElement('div'); container.className = 'automation-action-fields';
+      container.dataset.actionFields = ''; card.append(container); renderFields(card, values);
+      return card;
+    };
+    const renumber = () => {
+      [...actions.querySelectorAll('[data-action-card]')].forEach((card, index) => {
+        card.querySelector('legend').textContent = `Action ${index + 1}`;
+        card.querySelector('[data-action-type]').name = `action.${index}.type`;
+        card.querySelectorAll('[data-action-param]').forEach((field) => {
+          field.name = `action.${index}.param.${field.dataset.actionParam}`;
+        });
+        const controls = card.querySelector('.automation-action-controls');
+        controls.querySelector('[data-action-move="up"]').disabled = index === 0;
+        controls.querySelector('[data-action-move="down"]').disabled = index === actions.children.length - 1;
+      });
+    };
+    form.addEventListener('click', (event) => {
+      const target = event.target.closest('button');
+      if (!target) return;
+      if (target.matches('[data-action-add]')) {
+        actions.append(makeCard()); renumber(); return;
+      }
+      const card = target.closest('[data-action-card]');
+      if (!card) return;
+      if (target.matches('[data-action-remove]')) card.remove();
+      else if (target.matches('[data-action-duplicate]')) {
+        const clone = makeCard(card.querySelector('[data-action-type]').value, readParameters(card));
+        card.after(clone);
+      } else if (target.matches('[data-action-move="up"]') && card.previousElementSibling) {
+        actions.insertBefore(card, card.previousElementSibling);
+      } else if (target.matches('[data-action-move="down"]') && card.nextElementSibling) {
+        actions.insertBefore(card.nextElementSibling, card);
+      }
+      renumber();
+    });
+    renumber();
+  });
+
   document.querySelectorAll('[data-select-all]').forEach((master) => {
     master.addEventListener('change', () => {
       const form = master.closest('form');

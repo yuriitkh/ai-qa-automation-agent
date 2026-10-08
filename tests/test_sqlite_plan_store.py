@@ -84,6 +84,7 @@ class SQLitePlanStoreTests(unittest.TestCase):
         self.assertEqual(restored.test_plan_id, self.plan.id)
         self.assertEqual(reopened.get_version(version_one.id), version_one)
         self.assertEqual(reopened.get_version(version_two.id), version_two)
+        self.assertEqual(reopened.list_versions(self.step.id), (version_two, version_one))
 
     def test_rejects_rewriting_an_existing_version_id(self) -> None:
         store = SQLitePlanStore(self.db_path)
