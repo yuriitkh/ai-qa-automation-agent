@@ -188,6 +188,30 @@ class AutomationEditorTests(unittest.TestCase):
         self.assertEqual(self.plans.find(self.step.id), self.version_one)
         self.assertEqual(self.lifecycle.status(self.case), AutomationStatus.AUTOMATION_READY)
 
+    def test_checkbox_state_actions_are_editable_and_create_human_versions(self) -> None:
+        editor_js = self.app.handle("GET", "/assets/ui.js").body.decode()
+        for action in ("check", "uncheck", "assert_unchecked"):
+            self.assertIn(action, editor_js)
+
+        unchecked = self.save_form(action="uncheck", **{"action.0.param.selector": "#terms"})
+        self.assertEqual(unchecked.status, 303)
+        second = self.plans.find(self.step.id)
+        self.assertEqual(second.version, 2)
+        self.assertEqual(second.origin, PlanVersionOrigin.HUMAN_EDITED)
+        self.assertEqual(second.qa_test_plan.steps[0].action, "uncheck")
+
+        verified = self.save_form(
+            expected_version="2",
+            action="assert_unchecked",
+            **{"action.0.param.selector": "#terms"},
+        )
+        self.assertEqual(verified.status, 303)
+        third = self.plans.find(self.step.id)
+        self.assertEqual(third.version, 3)
+        self.assertEqual(third.origin, PlanVersionOrigin.HUMAN_EDITED)
+        self.assertEqual(third.qa_test_plan.steps[0].action, "assert_unchecked")
+        self.assertEqual(self.plans.get_version(second.id), second)
+
     def test_unsupported_action_parameter_and_unsafe_urls_are_rejected(self) -> None:
         unsupported = self.save_form(
             **{

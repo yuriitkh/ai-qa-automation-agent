@@ -56,17 +56,31 @@ def recover_locator(
     disagreement vetoes a candidate, including one still found by the old CSS
     selector. Entered values are never considered.
     """
-    if planned_interaction.action not in {"click", "fill"}:
-        raise ValueError("Locator recovery supports click and fill interactions only.")
+    if planned_interaction.action not in {"click", "check", "uncheck", "fill"}:
+        raise ValueError("Locator recovery supports click, checkbox state, and fill interactions only.")
 
     params = planned_interaction.parameters
     selector = params.get("selector", "")
     if not isinstance(selector, str):
         selector = ""
     expected = _expected_identity(params, original_identity, planned_interaction.action)
+    dialog_scope = _dialog_scope_prefix(selector)
+    expected_dialog = expected.get("dialog_identity")
     candidates = [
         element for element in discovery_result.interactive_elements
         if _compatible(planned_interaction.action, element)
+        and (
+            expected_dialog is None
+            or (
+                element.selector == selector
+                if expected_dialog == "unidentified-dialog"
+                else element.dialog_identity == expected_dialog
+            )
+        )
+        and (
+            dialog_scope is None
+            or dialog_scope.casefold() in element.selector.casefold()
+        )
     ]
 
     exact_selector = [element for element in candidates if selector and element.selector == selector]
@@ -142,6 +156,7 @@ def identity_for_element(step_index: int, element: InteractiveElement, action: s
         element_id=_clean(element.id),
         name=_clean(element.name),
         href=_clean(element.href) if action == "click" else None,
+        dialog_identity=_clean(element.dialog_identity),
         tag=_clean(element.tag),
         role=_clean(element.role),
     )
@@ -156,7 +171,7 @@ def _expected_identity(
     if original is not None:
         for key in (
             "accessible_name", "label", "placeholder", "test_id",
-            "element_id", "name", "href", "tag", "role", "visible_text",
+            "element_id", "name", "href", "dialog_identity", "tag", "role", "visible_text",
         ):
             value = getattr(original, key)
             if isinstance(value, str) and value.strip():
@@ -171,6 +186,7 @@ def _expected_identity(
         "element_id": ("id",),
         "name": ("name",),
         "href": ("href",),
+        "dialog_identity": ("dialog_identity",),
         "tag": ("tag",),
         "role": ("role",),
         "visible_text": ("text", "expected_text"),
@@ -196,6 +212,7 @@ def _candidate_values(element: InteractiveElement) -> dict[str, str]:
         "element_id": element.id,
         "name": element.name,
         "href": element.href,
+        "dialog_identity": element.dialog_identity,
         "tag": element.tag,
         "role": element.role,
     }
@@ -297,9 +314,29 @@ def _compatible(action: str, element: InteractiveElement) -> bool:
         return tag in {"input", "textarea", "select"} or kind in {
             "input", "textarea", "select", "textbox", "searchbox", "combobox"
         } or role in {"textbox", "searchbox", "combobox"}
+    if action in {"check", "uncheck"}:
+        return kind == "checkbox" or role == "checkbox"
     return tag in {"a", "button", "input"} or kind in {
         "a", "link", "button", "submit", "checkbox", "radio", "menuitem", "tab"
     } or role in {"link", "button", "menuitem", "tab", "checkbox", "radio"}
+
+
+def _dialog_scope_prefix(selector: str) -> str | None:
+    """Return a dialog ancestor token that a recovered selector must retain."""
+    if not isinstance(selector, str):
+        return None
+    match = re.search(
+        r'''(?:\[role\s*=\s*["']?dialog["']?\]|\[aria-modal\s*=\s*["']?true["']?\]|#[\w-]*(?:dialog|modal)[\w-]*|\.[\w-]*(?:dialog|modal)[\w-]*|(?:^|\s)dialog(?=\s|[>+~]))''',
+        selector,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    tail = selector[match.end():]
+    if not re.match(r"(?:\s+|\s*[>+~]\s*)\S", tail):
+        return None
+    token = match.group(0).strip()
+    return token or None
 
 
 def _clean(value: str | None) -> str | None:

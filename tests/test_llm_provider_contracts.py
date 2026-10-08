@@ -30,11 +30,14 @@ class LLMProviderContractTests(unittest.TestCase):
                     "parameters": {"selector": "h1", "expected_text": "Example"},
                 },
                 {"action": "click", "parameters": {"selector": "#submit"}},
+                {"action": "check", "parameters": {"selector": "#terms"}},
+                {"action": "uncheck", "parameters": {"selector": "#terms"}},
                 {
                     "action": "fill",
                     "parameters": {"selector": "#name", "value": "Ada"},
                 },
                 {"action": "assert_hidden", "parameters": {"selector": "#notice"}},
+                {"action": "assert_unchecked", "parameters": {"selector": "#terms"}},
                 {"action": "assert_url", "parameters": {"expected": "https://example.com/lan"}},
                 {"action": "assert_disabled", "parameters": {"selector": "input"}},
                 {"action": "select_option", "parameters": {
@@ -50,6 +53,8 @@ class LLMProviderContractTests(unittest.TestCase):
             "assert_title",
             "assert_visible",
             "click",
+            "check",
+            "uncheck",
             "fill",
             "assert_hidden",
             "assert_url",
@@ -68,8 +73,11 @@ class LLMProviderContractTests(unittest.TestCase):
             self.assertIn(parameter_contract, prompt)
 
         self.assertIn("Never invent, rename, normalize, or silently correct", prompt)
+        self.assertIn("check and uncheck", prompt)
+        self.assertIn("assert_checked", prompt)
+        self.assertIn("assert_unchecked", prompt)
         self.assertIn(
-            "For every selector parameter in click, fill, assert_hidden, or assert_visible",
+            "For every selector parameter in click, check, uncheck, fill, assert_hidden, or assert_visible",
             prompt,
         )
         self.assertIn("Do not use text instead of expected_text", prompt)

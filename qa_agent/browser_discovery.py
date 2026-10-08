@@ -213,6 +213,17 @@ _SNAPSHOT_SCRIPT = r"""() => {
             // Keep placeholder separate so recovery can treat it as weaker
             // evidence than an accessible name or an explicit label.
             item.accessible_name = (element.getAttribute('aria-label') || item.label || item.text || '').trim().slice(0, 120);
+            const dialog = element.closest('dialog, [role="dialog"], [aria-modal="true"]');
+            if (dialog) {
+                const dialogId = (dialog.getAttribute('id') || '').trim();
+                const dialogLabel = (dialog.getAttribute('aria-label') || '').trim();
+                const labelledBy = (dialog.getAttribute('aria-labelledby') || '').trim();
+                item.dialog_identity = dialogId ? `id:${dialogId}`
+                    : dialogLabel ? `label:${dialogLabel}`
+                    : labelledBy ? `labelledby:${labelledBy}`
+                    : 'unidentified-dialog';
+                item.dialog_identity = item.dialog_identity.slice(0, 120);
+            }
             item.visible = true;
             item.enabled = !element.disabled && element.getAttribute('aria-disabled') !== 'true';
             return item;
@@ -1036,7 +1047,7 @@ def _normalize_interactive_elements(value: Any) -> list[dict[str, Any]]:
         return []
     fields = (
         "kind", "selector", "text", "accessible_name", "label", "placeholder",
-        "test_id", "tag", "role", "id", "name", "href",
+        "test_id", "tag", "role", "id", "name", "href", "dialog_identity",
     )
     result: list[dict[str, Any]] = []
     for entry in value[:32]:
@@ -1047,6 +1058,7 @@ def _normalize_interactive_elements(value: Any) -> list[dict[str, Any]]:
                 entry.get(key),
                 500 if key == "href" else 180 if key in {"id", "name", "test_id"}
                 else MAX_TEXT_CHARS if key in {"text", "accessible_name", "label", "placeholder"}
+                else 120 if key == "dialog_identity"
                 else MAX_SELECTOR_CHARS,
             )
             for key in fields if entry.get(key)

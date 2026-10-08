@@ -286,6 +286,8 @@ class LocalWebApplication:
             return WebResponse.html(200, self._usage_analytics_page(query))
         if path == "/demo-target/registration":
             return WebResponse.html(200, _local_demo_page())
+        if path == "/demo-target/registration/help":
+            return WebResponse.html(200, _local_demo_help_page())
         if path == "/test-cases":
             return WebResponse.html(200, self._test_case_list())
         if path == "/export":
@@ -4034,12 +4036,92 @@ def main(argv: list[str] | None = None) -> int:
 def _local_demo_page() -> str:
     return """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Local registration demo</title></head>
-<body><main><h1>Registration demo</h1>
-<p>Local-only registration page for exercising saved browser plans.</p>
-<form><label>Email <input id="email" type="email" autocomplete="off"></label>
-<button type="button">Create account</button></form>
-<p>The account confirmation appears after the registration action is connected.</p>
-</main></body></html>"""
+<body><main>
+<h1>Registration demo</h1>
+<p>Local-only page for exercising common browser interactions.</p>
+<nav aria-label="Demo navigation">
+  <a id="help-link" href="/demo-target/registration/help">Help</a>
+  <a id="details-link" href="#interaction-controls">Interaction controls</a>
+</nav>
+<p id="page-status" role="status">Ready</p>
+<button id="change-status" type="button">Change page state</button>
+<button id="reset-demo" type="button">Reset demo</button>
+<form id="registration-form" novalidate>
+  <h2 id="registration-fields">Registration</h2>
+  <label>Email <input id="email" name="email" type="email" autocomplete="off"></label>
+  <label>Password <input id="password" name="password" type="password" autocomplete="new-password"></label>
+  <label><input id="terms" name="terms" type="checkbox"> Accept terms</label>
+  <fieldset><legend>Plan</legend>
+    <label><input id="plan-basic" name="plan" type="radio" value="basic"> Basic</label>
+    <label><input id="plan-pro" name="plan" type="radio" value="pro"> Pro</label>
+  </fieldset>
+  <label>Region <select id="region" name="region">
+    <option value="">Choose a region</option>
+    <option value="north">North</option>
+    <option value="south">South</option>
+  </select></label>
+  <p id="form-error" role="alert" hidden></p>
+  <p id="registration-success" role="status" hidden>Registration submitted.</p>
+  <button id="create-account" type="submit">Create account</button>
+  <button id="reset-form" type="reset">Reset form</button>
+</form>
+<section id="interaction-controls">
+  <h2>Dialog controls</h2>
+  <button id="open-details" type="button">Open details</button>
+  <dialog id="details-dialog" aria-label="Account details">
+    <p>Review account details.</p>
+    <button id="confirm-details" type="button">Confirm details</button>
+    <button id="close-details" type="button">Close dialog</button>
+  </dialog>
+  <p id="dialog-result" role="status" hidden>Details confirmed.</p>
+</section>
+<section id="cookie-consent" role="dialog" aria-label="Cookie preferences">
+  <p>This local demo uses cookies for preferences.</p>
+  <button id="accept-cookies" type="button">Accept all cookies</button>
+</section>
+</main>
+<script>
+const form = document.querySelector('#registration-form');
+const error = document.querySelector('#form-error');
+const success = document.querySelector('#registration-success');
+form.addEventListener('submit', event => {
+  event.preventDefault(); error.hidden = true; success.hidden = true;
+  const email = document.querySelector('#email');
+  if (!email.value.includes('@')) {
+    error.textContent = 'Enter a valid email address.';
+    error.hidden = false; email.setAttribute('aria-invalid', 'true'); return;
+  }
+  email.removeAttribute('aria-invalid'); success.hidden = false;
+});
+form.addEventListener('reset', () => {
+  error.hidden = true; success.hidden = true;
+  document.querySelector('#email').removeAttribute('aria-invalid');
+});
+document.querySelector('#change-status').addEventListener('click', () => {
+  document.querySelector('#page-status').textContent = 'Page state changed.';
+});
+document.querySelector('#reset-demo').addEventListener('click', () => window.location.reload());
+document.querySelector('#open-details').addEventListener('click', () => {
+  document.querySelector('#details-dialog').showModal();
+});
+document.querySelector('#confirm-details').addEventListener('click', () => {
+  document.querySelector('#details-dialog').close();
+  document.querySelector('#dialog-result').hidden = false;
+});
+document.querySelector('#close-details').addEventListener('click', () => {
+  document.querySelector('#details-dialog').close();
+});
+document.querySelector('#accept-cookies').addEventListener('click', () => {
+  document.querySelector('#cookie-consent').hidden = true;
+});
+</script></body></html>"""
+
+
+def _local_demo_help_page() -> str:
+    return """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Registration help</title></head>
+<body><main><h1>Registration help</h1><p>Use a valid email address to continue.</p>
+<a href="/demo-target/registration">Back to registration</a></main></body></html>"""
 
 
 def _parse_uuid(value: str) -> UUID | None:
@@ -4584,30 +4666,36 @@ _UI_JAVASCRIPT = r"""
     assert_title: ['expected'],
     assert_visible: ['selector', 'expected_text'],
     click: ['selector'],
+    check: ['selector'],
+    uncheck: ['selector'],
     fill: ['selector', 'value'],
     assert_hidden: ['selector'],
     assert_url: ['expected'],
     select_option: ['selector', 'option_label'],
     assert_text_contains: ['expected_text', 'selector'],
-    assert_checked: ['selector'],
+    assert_checked: ['selector'], assert_unchecked: ['selector'],
     assert_selected: ['selector', 'expected'],
     assert_enabled: ['selector'],
     assert_disabled: ['selector']
   };
   const requiredActionFields = {
     navigate: ['url'], assert_page_loaded: [], assert_title: ['expected'],
-    assert_visible: ['selector'], click: ['selector'], fill: ['selector', 'value'],
+    assert_visible: ['selector'], click: ['selector'], check: ['selector'],
+    uncheck: ['selector'], fill: ['selector', 'value'],
     assert_hidden: ['selector'], assert_url: ['expected'],
     select_option: ['selector', 'option_label'],
     assert_text_contains: ['expected_text'], assert_checked: ['selector'],
+    assert_unchecked: ['selector'],
     assert_selected: ['selector'], assert_enabled: ['selector'], assert_disabled: ['selector']
   };
   const actionLabels = {
     navigate: 'Navigate to URL', assert_page_loaded: 'Assert page loaded',
     assert_title: 'Assert page title', assert_visible: 'Assert visible', click: 'Click',
+    check: 'Check checkbox', uncheck: 'Uncheck checkbox',
     fill: 'Fill field', assert_hidden: 'Assert hidden', assert_url: 'Assert URL',
     select_option: 'Select option', assert_text_contains: 'Assert text contains',
-    assert_checked: 'Assert checked', assert_selected: 'Assert selected',
+    assert_checked: 'Assert checked', assert_unchecked: 'Assert unchecked',
+    assert_selected: 'Assert selected',
     assert_enabled: 'Assert enabled', assert_disabled: 'Assert disabled'
   };
   const fieldLabels = {

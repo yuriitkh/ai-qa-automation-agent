@@ -1,4 +1,5 @@
 import json
+import re
 from dataclasses import dataclass
 
 from qa_agent.llm.router import LLMRouter
@@ -239,7 +240,9 @@ class LLMTestPlanGenerator(TestPlanGenerator):
             "Treat deterministic interactive_elements "
             "as authoritative: when a requested control matches an accessible_name, "
             "use its exact selector unchanged. Use select_option for selects, "
-            "assert_checked for checkbox/radio, assert_selected for select state, "
+            "check or uncheck to set checkbox state, assert_checked or "
+            "assert_unchecked to verify checkbox state, click to select a radio, "
+            "assert_selected for radio/select state, "
             "assert_enabled/assert_disabled for enabled state, and "
             "assert_text_contains for substring requirements. Do not invent exact "
             "text, statuses, values, IDs, labels, URLs, or counts that are not "
@@ -298,7 +301,7 @@ class LLMTestPlanGenerator(TestPlanGenerator):
             selector = step.parameters.get("selector")
             element = elements.get(selector) if isinstance(selector, str) else None
             relevant_actions = {
-                "checkbox": {"click", "assert_checked"},
+                "checkbox": {"click", "check", "uncheck", "assert_checked", "assert_unchecked"},
                 "radio": {"click", "assert_selected"},
                 "select": {"select_option", "assert_selected"},
                 "input": {"assert_enabled", "assert_disabled"},
@@ -307,7 +310,12 @@ class LLMTestPlanGenerator(TestPlanGenerator):
                 label = discovered.accessible_name.casefold()
                 actions = next((allowed for kind, allowed in relevant_actions.items()
                                 if kind in (discovered.kind + " " + discovered.tag + " " + discovered.role).casefold()), set())
-                if label and label in intent and step.action in actions and selector != discovered.selector:
+                if (
+                    label
+                    and _intent_mentions_label(intent, label)
+                    and step.action in actions
+                    and selector != discovered.selector
+                ):
                     raise PlanValidationError([PlanValidationIssue(
                         code="DISCOVERY_SELECTOR_MISMATCH",
                         path=path,
@@ -343,9 +351,18 @@ class LLMTestPlanGenerator(TestPlanGenerator):
                         path=path,
                         message="ASSERT_SELECTED does not target a radio or select control supported by Discovery.",
                     )])
-            if step.action == "assert_checked" and "checkbox" not in kind:
+            if step.action in {"check", "uncheck", "assert_checked", "assert_unchecked"} and "checkbox" not in kind:
                 raise PlanValidationError([PlanValidationIssue(
                     code="ACTION_TARGET_MISMATCH",
                     path=path,
-                    message="ASSERT_CHECKED must target a discovered checkbox control.",
+                    message=f"{step.action.upper()} must target a discovered checkbox control.",
                 )])
+
+
+def _intent_mentions_label(intent: str, label: str) -> bool:
+    """Match a control name as a phrase, not as a substring of another word."""
+    words = [word for word in label.split() if word]
+    if not words:
+        return False
+    phrase = r"\s+".join(re.escape(word) for word in words)
+    return re.search(rf"(?<!\w){phrase}(?!\w)", intent, re.IGNORECASE) is not None

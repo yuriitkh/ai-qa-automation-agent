@@ -433,12 +433,14 @@ def _is_stale_ui_failure(runner_result: dict[str, Any] | None) -> bool:
                 "element is not visible",
                 "waiting for element to be visible",
             )
-        ) and action in {"click", "fill", "select_option"}
+        ) and action in {"click", "check", "uncheck", "fill", "select_option"}
         locator_actionability_timeout = (
             "timeout" in error
             and "waiting for locator" in error
             and (
                 "could not click element matching selector" in error
+                or "could not check checkbox matching selector" in error
+                or "could not uncheck checkbox matching selector" in error
                 or "could not fill element matching selector" in error
                 or action == "select_option"
             )
@@ -449,7 +451,7 @@ def _is_stale_ui_failure(runner_result: dict[str, Any] | None) -> bool:
             "option label was not found",
         ))
         if (
-            (selector_missing and action in {"click", "fill", "select_option"})
+            (selector_missing and action in {"click", "check", "uncheck", "fill", "select_option"})
             or element_unavailable
             or locator_actionability_timeout
             or option_missing
@@ -483,6 +485,7 @@ def _is_assertion_target_unavailable(runner_result: dict[str, Any] | None) -> bo
             and action in {
                 "assert_visible",
                 "assert_checked",
+                "assert_unchecked",
                 "assert_selected",
                 "assert_enabled",
                 "assert_disabled",

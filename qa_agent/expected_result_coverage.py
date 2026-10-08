@@ -60,7 +60,7 @@ class _Expectation:
 
 _ASSERTION_ACTIONS = frozenset({
     "assert_page_loaded", "assert_title", "assert_visible", "assert_hidden",
-    "assert_url", "assert_text_contains", "assert_checked", "assert_selected",
+    "assert_url", "assert_text_contains", "assert_checked", "assert_unchecked", "assert_selected",
     "assert_enabled", "assert_disabled",
 })
 
@@ -79,7 +79,7 @@ _ACTION_EXPECTATION = re.compile(
 _OUTPUT_STATE = re.compile(
     r"\b(?:displayed|visible|shown|appears?|present|hidden|disappears?|"
     r"redirected|redirection|title|url|contains?|includes?|checked|selected|"
-    r"disabled|enabled|loaded|exists?|created|saved|submitted|updated|deleted|"
+    r"unchecked|not\s+(?:be\s+)?(?:checked|ticked)|disabled|enabled|loaded|exists?|created|saved|submitted|updated|deleted|"
     r"removed|added|accepted|rejected|authenticated|logged\s+in|signed\s+in|"
     r"error|success|confirmation|notification|alert|warning|message|notice|"
     r"available|unavailable|empty|cleared|expanded|collapsed|selected|"
@@ -98,6 +98,7 @@ _URL = re.compile(r"\b(?:url|address|path|route)\b|https?://", re.I)
 _TITLE = re.compile(r"\b(?:page\s+)?title\b", re.I)
 _DISABLED = re.compile(r"\bdisabled\b", re.I)
 _ENABLED = re.compile(r"\benabled\b", re.I)
+_UNCHECKED = re.compile(r"\b(?:unchecked|not\s+(?:be\s+)?(?:checked|ticked))\b", re.I)
 _CHECKED = re.compile(r"\b(?:checked|ticked)\b", re.I)
 _SELECTED = re.compile(r"\b(?:selected|chosen)\b", re.I)
 _VISIBLE = re.compile(r"\b(?:displayed|visible|shown|appears?|present|exists?)\b", re.I)
@@ -299,6 +300,8 @@ def _expectation_kind(clause: str) -> str | None:
         return "disabled"
     if _ENABLED.search(clause):
         return "enabled"
+    if _UNCHECKED.search(clause):
+        return "unchecked"
     if _CHECKED.search(clause):
         return "checked"
     if _SELECTED.search(clause):
@@ -331,6 +334,7 @@ def _action_covers(
         "disabled": {"assert_disabled"},
         "enabled": {"assert_enabled"},
         "checked": {"assert_checked"},
+        "unchecked": {"assert_unchecked"},
         "selected": {"assert_selected"},
         "redirect": {"assert_url", "assert_page_loaded"},
         "url": {"assert_url"},

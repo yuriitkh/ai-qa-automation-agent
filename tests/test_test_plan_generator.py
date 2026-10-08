@@ -8,6 +8,7 @@ from qa_agent.llm.base import LLMProvider
 from qa_agent.llm.errors import RetryableLLMError
 from qa_agent.llm.router import LLMRouter
 from qa_agent.models import (
+    AssertionGrounding,
     DiscoveryResult,
     PlanVersionOrigin,
     DiscoveryStatus,
@@ -315,6 +316,40 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
         self.assertEqual(generated.test_plan_version.qa_test_plan.steps[-1].action, "assert_visible")
         self.assertIn("EXPECTED_RESULT_NOT_COVERED", router.calls[1]["task"])
 
+    def test_checkbox_generation_uses_state_actions_and_keeps_label_grounded(self) -> None:
+        target_url = "http://127.0.0.1:43123/registration"
+        step = DomainTestStep(
+            name="Leave the marketing checkbox unchecked",
+            description="Verify the marketing checkbox is unchecked.",
+            expected="The marketing checkbox is unchecked.",
+            order=0,
+        )
+        discovery = DiscoveryResult(
+            status=DiscoveryStatus.SUCCESS,
+            url=target_url,
+            interactive_elements=[InteractiveElement(
+                kind="checkbox", tag="input", role="checkbox",
+                selector="#marketing", accessible_name="Marketing emails",
+            )],
+        )
+        plan = QATestPlan(url=target_url, steps=[
+            QATestStep(action="uncheck", parameters={"selector": "#marketing"}),
+            QATestStep(action="assert_unchecked", parameters={"selector": "#marketing"}),
+        ])
+        router = _SequencedRouter([plan])
+
+        generated = LLMTestPlanGenerator(router).generate_with_plan(step, discovery)
+
+        self.assertEqual(
+            [action.action for action in generated.test_plan_version.qa_test_plan.steps],
+            ["uncheck", "assert_unchecked"],
+        )
+        self.assertEqual(
+            generated.test_plan_version.assertion_grounding[0].category,
+            AssertionGrounding.REQUIREMENT_GROUNDED,
+        )
+        self.assertIn("check or uncheck to set checkbox state", router.calls[0]["task"])
+
     def test_repair_with_grounded_but_irrelevant_assertion_is_rejected_without_saving(self) -> None:
         target_url = "http://127.0.0.1:43123/register"
         step = DomainTestStep(
@@ -597,6 +632,46 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
         plan.steps[1].parameters["selector"] = "input[type=radio]"
         with self.assertRaisesRegex(PlanValidationError, "deterministic Discovery selector"):
             LLMTestPlanGenerator(_StubRouter(plan)).generate(test_step, discovery)
+
+    def test_discovery_label_matching_does_not_match_inside_other_words(self) -> None:
+        discovery = DiscoveryResult(
+            status=DiscoveryStatus.SUCCESS,
+            url="http://127.0.0.1/registration",
+            interactive_elements=[
+                InteractiveElement(
+                    kind="radio", tag="input", selector="#plan-pro",
+                    accessible_name="Pro", role="radio",
+                ),
+                InteractiveElement(
+                    kind="button", tag="button", selector="#submit",
+                    accessible_name="Submit", role="button",
+                ),
+            ],
+        )
+        submit_plan = QATestPlan(url=discovery.url, steps=[
+            QATestStep(action="click", parameters={"selector": "#submit"}),
+        ])
+        submit_step = DomainTestStep(
+            name="Submit registration",
+            description="Click the submit button.",
+            expected="The registration action is processed.",
+            order=0,
+        )
+
+        LLMTestPlanGenerator._validate_discovery_capabilities(
+            submit_plan, discovery, submit_step
+        )
+
+        pro_step = DomainTestStep(
+            name="Select Pro",
+            description="Select the Pro plan.",
+            expected="The Pro option is selected.",
+            order=0,
+        )
+        with self.assertRaisesRegex(PlanValidationError, "deterministic Discovery selector"):
+            LLMTestPlanGenerator._validate_discovery_capabilities(
+                submit_plan, discovery, pro_step
+            )
 
 
 class _StubRouter:

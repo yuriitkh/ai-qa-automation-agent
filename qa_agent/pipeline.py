@@ -588,7 +588,7 @@ class QATestPipeline:
 
             failed_interaction = execution.planned_interaction(plan_version)
             recovery = None
-            if failed_interaction is not None and failed_interaction.action in {"click", "fill"}:
+            if failed_interaction is not None and failed_interaction.action in {"click", "check", "uncheck", "fill"}:
                 original_identity = next((
                     item for item in (plan_version.locator_identity or ())
                     if item.step_index == execution.planned_step_index
@@ -757,7 +757,7 @@ def _with_discovered_locator_identity(
 
     entries = {item.step_index: item for item in (version.locator_identity or ())}
     for index, interaction in enumerate(version.qa_test_plan.steps):
-        if interaction.action not in {"click", "fill"}:
+        if interaction.action not in {"click", "check", "uncheck", "fill"}:
             continue
         selector = interaction.parameters.get("selector")
         matches = candidates_by_selector.get(selector, []) if isinstance(selector, str) else []
@@ -917,7 +917,7 @@ def _replace_interaction_selector(
         raise ValueError("Failed execution does not identify a planned interaction.")
     steps = list(plan.steps)
     interaction = steps[step_index]
-    if interaction.action not in {"click", "fill"}:
+    if interaction.action not in {"click", "check", "uncheck", "fill"}:
         raise ValueError("Failed planned interaction is not locator-recoverable.")
     parameters = dict(interaction.parameters)
     parameters["selector"] = selector

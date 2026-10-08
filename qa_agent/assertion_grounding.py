@@ -28,6 +28,7 @@ _ASSERTION_ACTIONS = frozenset({
     "assert_url",
     "assert_text_contains",
     "assert_checked",
+    "assert_unchecked",
     "assert_selected",
     "assert_enabled",
     "assert_disabled",
@@ -51,6 +52,7 @@ _STRUCTURAL_TERMS: dict[str, tuple[str, ...]] = {
     "assert_visible": ("visible", "display", "displayed", "displays", "shown", "present", "appear", "appears", "state", "status"),
     "assert_hidden": ("hidden", "not visible", "disappear", "not displayed"),
     "assert_checked": ("checked", "ticked"),
+    "assert_unchecked": ("unchecked", "not checked", "not be checked", "not ticked", "not be ticked"),
     "assert_selected": ("selected", "chosen"),
     "assert_enabled": ("enabled",),
     "assert_disabled": ("disabled",),
@@ -320,6 +322,10 @@ def _structural_assertion_is_required(
     terms = _STRUCTURAL_TERMS.get(action, ())
     for requirement in requirements:
         text = _EXAMPLE_TAIL.sub(" ", requirement).casefold()
+        if action == "assert_checked" and re.search(
+            r"\b(?:unchecked|not\s+(?:be\s+)?(?:checked|ticked))\b", text
+        ):
+            continue
         if any(_contains_phrase(text, term) for term in terms):
             return True
     return False

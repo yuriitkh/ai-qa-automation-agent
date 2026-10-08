@@ -161,6 +161,22 @@ class DemoSeedTests(unittest.TestCase):
             "User-edited definition.",
         )
 
+    def test_local_registration_fixture_exposes_common_interaction_controls(self) -> None:
+        response = self.application.handle("GET", "/demo-target/registration")
+        body = response.body.decode("utf-8")
+
+        self.assertEqual(response.status, 200)
+        for selector in (
+            'id="email"', 'id="password"', 'id="terms"', 'type="radio"',
+            'id="region"', 'id="form-error"', 'id="details-dialog"',
+            'id="cookie-consent"', 'id="accept-cookies"',
+        ):
+            self.assertIn(selector, body)
+        self.assertEqual(
+            self.application.handle("GET", "/demo-target/registration/help").status,
+            200,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

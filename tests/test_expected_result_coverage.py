@@ -130,6 +130,36 @@ class ExpectedResultCoverageTests(unittest.TestCase):
         self.assertEqual(entries[0].category.value, "REQUIREMENT_GROUNDED")
         self.assertEqual(result.status, ExpectedResultCoverageStatus.COVERED)
 
+    def test_unchecked_expectation_requires_matching_state_assertion(self) -> None:
+        step = self.step.model_copy(update={
+            "name": "Verify the terms checkbox",
+            "description": "The checkbox must remain clear.",
+            "expected": "The terms checkbox is unchecked.",
+        })
+        unchecked = self.plan(QATestStep(
+            action="assert_unchecked", parameters={"selector": "#terms"}
+        ))
+        checked = self.plan(QATestStep(
+            action="assert_checked", parameters={"selector": "#terms"}
+        ))
+        action_only = self.plan(
+            QATestStep(action="check", parameters={"selector": "#terms"}),
+            QATestStep(action="uncheck", parameters={"selector": "#terms"}),
+        )
+
+        self.assertEqual(
+            expected_result_coverage(step, unchecked).status,
+            ExpectedResultCoverageStatus.COVERED,
+        )
+        self.assertEqual(
+            expected_result_coverage(step, checked).status,
+            ExpectedResultCoverageStatus.NOT_COVERED,
+        )
+        self.assertEqual(
+            expected_result_coverage(step, action_only).status,
+            ExpectedResultCoverageStatus.NOT_COVERED,
+        )
+
     def test_two_expected_results_report_partial_coverage(self) -> None:
         step = self.step.model_copy(update={
             "expected": "An error message is displayed and the submit button is disabled."

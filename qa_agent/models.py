@@ -16,12 +16,15 @@ class QATestStep(BaseModel):
         "assert_title": ("expected",),
         "assert_visible": ("selector",),
         "click": ("selector",),
+        "check": ("selector",),
+        "uncheck": ("selector",),
         "fill": ("selector", "value"),
         "assert_hidden": ("selector",),
         "assert_url": ("expected",),
         "select_option": ("selector", "option_label"),
         "assert_text_contains": ("expected_text",),
         "assert_checked": ("selector",),
+        "assert_unchecked": ("selector",),
         "assert_selected": ("selector",),
         "assert_enabled": ("selector",),
         "assert_disabled": ("selector",),
@@ -33,12 +36,15 @@ class QATestStep(BaseModel):
         "assert_title",
         "assert_visible",
         "click",
+        "check",
+        "uncheck",
         "fill",
         "assert_hidden",
         "assert_url",
         "select_option",
         "assert_text_contains",
         "assert_checked",
+        "assert_unchecked",
         "assert_selected",
         "assert_enabled",
         "assert_disabled",
@@ -48,7 +54,10 @@ class QATestStep(BaseModel):
     @model_validator(mode="after")
     def validate_capability_parameters(self) -> "QATestStep":
         selector = self.parameters.get("selector")
-        if self.action in {"select_option", "assert_selected", "assert_checked", "assert_enabled", "assert_disabled"}:
+        if self.action in {
+            "select_option", "assert_selected", "assert_checked", "assert_unchecked",
+            "check", "uncheck", "assert_enabled", "assert_disabled",
+        }:
             if not isinstance(selector, str) or not selector.strip():
                 raise ValueError(f"{self.action} requires a selector.")
         if self.action == "select_option" and not isinstance(self.parameters.get("option_label"), str):
@@ -123,6 +132,7 @@ class InteractiveElement(BaseModel):
     id: str = ""
     name: str = ""
     href: str = ""
+    dialog_identity: str = ""
     visible: bool = True
     enabled: bool = True
 
@@ -141,6 +151,7 @@ class LocatorIdentityEntry(BaseModel):
     element_id: str | None = Field(default=None, max_length=180)
     name: str | None = Field(default=None, max_length=180)
     href: str | None = Field(default=None, max_length=500)
+    dialog_identity: str | None = Field(default=None, max_length=120)
     tag: str | None = Field(default=None, max_length=40)
     role: str | None = Field(default=None, max_length=60)
 
@@ -406,8 +417,8 @@ class TestPlanVersion(BaseModel):
         for index in indexes:
             if index >= len(self.qa_test_plan.steps):
                 raise ValueError("Locator identity index is outside the saved plan.")
-            if self.qa_test_plan.steps[index].action not in {"click", "fill"}:
-                raise ValueError("Locator identity metadata must refer to click or fill actions.")
+            if self.qa_test_plan.steps[index].action not in {"click", "check", "uncheck", "fill"}:
+                raise ValueError("Locator identity metadata must refer to supported interactions.")
         return self
 
 

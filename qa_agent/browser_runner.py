@@ -266,18 +266,39 @@ def _run_plan_on_page(
                         f"Could not click element matching selector "
                         f"{selector!r}: {error}"
                     ) from error
+            elif step.action in {"check", "uncheck"}:
+                selector = step.parameters["selector"]
+                operation = step.action
+                try:
+                    element = page.locator(selector)
+                    getattr(element, operation)(timeout=ACTION_TIMEOUT_MS)
+                except AssertionError:
+                    raise
+                except Exception as error:
+                    raise AssertionError(
+                        f"Could not {operation} checkbox matching selector "
+                        f"{selector!r}: {error}"
+                    ) from error
             elif step.action == "fill":
                 selector = step.parameters["selector"]
                 value = step.parameters["value"]
                 element = page.locator(selector)
                 try:
                     element.fill(value, timeout=ACTION_TIMEOUT_MS)
-                except AssertionError:
+                except AssertionError as error:
+                    safe_error = str(error)
+                    if value:
+                        safe_error = safe_error.replace(value, "[REDACTED]")
+                    if safe_error != str(error):
+                        raise AssertionError(safe_error) from error
                     raise
                 except Exception as error:
+                    safe_error = str(error)
+                    if value:
+                        safe_error = safe_error.replace(value, "[REDACTED]")
                     raise AssertionError(
                         f"Could not fill element matching selector "
-                        f"{selector!r}: {error}"
+                        f"{selector!r}: {safe_error}"
                     ) from error
             elif step.action == "select_option":
                 selector = step.parameters["selector"]
@@ -337,6 +358,10 @@ def _run_plan_on_page(
                 selector = step.parameters["selector"]
                 element = page.locator(selector)
                 expect(element).to_be_checked(timeout=ASSERTION_TIMEOUT_MS)
+            elif step.action == "assert_unchecked":
+                selector = step.parameters["selector"]
+                element = page.locator(selector)
+                expect(element).not_to_be_checked(timeout=ASSERTION_TIMEOUT_MS)
             elif step.action == "assert_selected":
                 selector = step.parameters["selector"]
                 element = page.locator(selector)

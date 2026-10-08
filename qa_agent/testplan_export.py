@@ -304,6 +304,9 @@ def _emit_python(action: str, p: dict, i: int) -> list[str]:
         return [f"page.goto({_python_string(p['url'])}, wait_until={_python_string(NAVIGATION_LOAD_STATE)}, timeout={NAVIGATION_TIMEOUT_MS})"]
     if action == "click":
         return [f"page.locator({_python_string(p['selector'])}).click(timeout={ACTION_TIMEOUT_MS})"]
+    if action in {"check", "uncheck"}:
+        method = action
+        return [f"page.locator({_python_string(p['selector'])}).{method}(timeout={ACTION_TIMEOUT_MS})"]
     if action == "fill":
         return [f"page.locator({_python_string(p['selector'])}).fill({_python_string(p['value'])}, timeout={ACTION_TIMEOUT_MS})"]
     if action == "select_option":
@@ -328,6 +331,8 @@ def _emit_python(action: str, p: dict, i: int) -> list[str]:
         return [f"target_{i} = {target}", f"expect(target_{i}.get_by_text({expected}, exact=False)).to_be_visible(timeout={ASSERTION_TIMEOUT_MS})", f"expect(target_{i}).to_have_text(re.compile({pattern}, re.DOTALL), use_inner_text=True, timeout={ASSERTION_TIMEOUT_MS})"]
     if action == "assert_checked":
         return [f"expect(page.locator({_python_string(p['selector'])})).to_be_checked(timeout={ASSERTION_TIMEOUT_MS})"]
+    if action == "assert_unchecked":
+        return [f"expect(page.locator({_python_string(p['selector'])})).not_to_be_checked(timeout={ASSERTION_TIMEOUT_MS})"]
     if action == "assert_selected":
         lines = [
             f"element_{i} = page.locator({_python_string(p['selector'])})",
@@ -375,6 +380,9 @@ def _emit_typescript(action: str, p: dict, i: int) -> list[str]:
         return [f"await page.goto({_js_string(p['url'])}, {{ waitUntil: {_js_string(NAVIGATION_LOAD_STATE)}, timeout: {NAVIGATION_TIMEOUT_MS} }});"]
     if action == "click":
         return [f"await page.locator({_js_string(p['selector'])}).click({{ timeout: {ACTION_TIMEOUT_MS} }});"]
+    if action in {"check", "uncheck"}:
+        method = "check" if action == "check" else "uncheck"
+        return [f"await page.locator({_js_string(p['selector'])}).{method}({{ timeout: {ACTION_TIMEOUT_MS} }});"]
     if action == "fill":
         return [f"await page.locator({_js_string(p['selector'])}).fill({_js_string(p['value'])}, {{ timeout: {ACTION_TIMEOUT_MS} }});"]
     if action == "select_option":
@@ -399,6 +407,8 @@ def _emit_typescript(action: str, p: dict, i: int) -> list[str]:
         return [f"const target_{i} = {target};", f"await expect(target_{i}.getByText({expected}, {{ exact: false }})).toBeVisible({{ timeout: {ASSERTION_TIMEOUT_MS} }});", f"await expect(target_{i}).toHaveText(new RegExp({pattern}, 's'), {{ useInnerText: true, timeout: {ASSERTION_TIMEOUT_MS} }});"]
     if action == "assert_checked":
         return [f"await expect(page.locator({_js_string(p['selector'])})).toBeChecked({{ timeout: {ASSERTION_TIMEOUT_MS} }});"]
+    if action == "assert_unchecked":
+        return [f"await expect(page.locator({_js_string(p['selector'])})).not.toBeChecked({{ timeout: {ASSERTION_TIMEOUT_MS} }});"]
     if action == "assert_selected":
         lines = [f"const element_{i} = page.locator({_js_string(p['selector'])});", f"await expect(element_{i}).toBeVisible({{ timeout: {ASSERTION_TIMEOUT_MS} }});", f"const kind_{i} = await element_{i}.evaluate(node => ({{ tag: node.tagName.toLowerCase(), type: (node as HTMLInputElement | HTMLSelectElement).type }}));"]
         lines.extend(_typescript_selected_assertion(p, i))
@@ -442,6 +452,9 @@ def _emit_csharp(action: str, p: dict, i: int) -> list[str]:
         return [f"await page.GotoAsync({_csharp_string(p['url'])}, new() {{ WaitUntil = WaitUntilState.{NAVIGATION_LOAD_STATE.title()}, Timeout = {NAVIGATION_TIMEOUT_MS} }});"]
     if action == "click":
         return [f"await page.Locator({_csharp_string(p['selector'])}).ClickAsync(new() {{ Timeout = {ACTION_TIMEOUT_MS} }});"]
+    if action in {"check", "uncheck"}:
+        method = "CheckAsync" if action == "check" else "UncheckAsync"
+        return [f"await page.Locator({_csharp_string(p['selector'])}).{method}(new() {{ Timeout = {ACTION_TIMEOUT_MS} }});"]
     if action == "fill":
         return [f"await page.Locator({_csharp_string(p['selector'])}).FillAsync({_csharp_string(p['value'])}, new() {{ Timeout = {ACTION_TIMEOUT_MS} }});"]
     if action == "select_option":
@@ -466,6 +479,8 @@ def _emit_csharp(action: str, p: dict, i: int) -> list[str]:
         return [f"var target_{i} = {target};", f"await Expect(target_{i}.GetByText({expected}, new() {{ Exact = false }})).ToBeVisibleAsync(new() {{ Timeout = {ASSERTION_TIMEOUT_MS} }});", f"await Expect(target_{i}).ToHaveTextAsync(new Regex({pattern}, RegexOptions.Singleline), new() {{ UseInnerText = true, Timeout = {ASSERTION_TIMEOUT_MS} }});"]
     if action == "assert_checked":
         return [f"await Expect(page.Locator({_csharp_string(p['selector'])})).ToBeCheckedAsync(new() {{ Timeout = {ASSERTION_TIMEOUT_MS} }});"]
+    if action == "assert_unchecked":
+        return [f"await Expect(page.Locator({_csharp_string(p['selector'])})).Not.ToBeCheckedAsync(new() {{ Timeout = {ASSERTION_TIMEOUT_MS} }});"]
     if action == "assert_selected":
         lines = [f"var element_{i} = page.Locator({_csharp_string(p['selector'])});", f"await Expect(element_{i}).ToBeVisibleAsync(new() {{ Timeout = {ASSERTION_TIMEOUT_MS} }});", f"var tag_{i} = await element_{i}.EvaluateAsync<string>(\"element => element.tagName.toLowerCase()\");", f"var type_{i} = await element_{i}.EvaluateAsync<string>(\"element => element.type\");", f"if (tag_{i} == \"input\" && type_{i} == \"radio\") {{"]
         expected = p.get("expected")
@@ -508,12 +523,15 @@ ACTION_EXPORT_HANDLERS: dict[str, tuple[Callable, Callable, Callable]] = {
     "assert_title": (_emit_python, _emit_typescript, _emit_csharp),
     "assert_visible": (_emit_python, _emit_typescript, _emit_csharp),
     "click": (_emit_python, _emit_typescript, _emit_csharp),
+    "check": (_emit_python, _emit_typescript, _emit_csharp),
+    "uncheck": (_emit_python, _emit_typescript, _emit_csharp),
     "fill": (_emit_python, _emit_typescript, _emit_csharp),
     "assert_hidden": (_emit_python, _emit_typescript, _emit_csharp),
     "assert_url": (_emit_python, _emit_typescript, _emit_csharp),
     "select_option": (_emit_python, _emit_typescript, _emit_csharp),
     "assert_text_contains": (_emit_python, _emit_typescript, _emit_csharp),
     "assert_checked": (_emit_python, _emit_typescript, _emit_csharp),
+    "assert_unchecked": (_emit_python, _emit_typescript, _emit_csharp),
     "assert_selected": (_emit_python, _emit_typescript, _emit_csharp),
     "assert_enabled": (_emit_python, _emit_typescript, _emit_csharp),
     "assert_disabled": (_emit_python, _emit_typescript, _emit_csharp),
@@ -522,9 +540,11 @@ ACTION_EXPORT_HANDLERS: dict[str, tuple[Callable, Callable, Callable]] = {
 _ALLOWED_EXPORT_PARAMETERS = {
     "navigate": {"url"}, "assert_page_loaded": set(), "assert_title": {"expected"},
     "assert_visible": {"selector", "expected_text"}, "click": {"selector"},
+    "check": {"selector"}, "uncheck": {"selector"},
     "fill": {"selector", "value"}, "assert_hidden": {"selector"},
     "assert_url": {"expected"}, "select_option": {"selector", "option_label"},
     "assert_text_contains": {"selector", "expected_text"}, "assert_checked": {"selector"},
+    "assert_unchecked": {"selector"},
     "assert_selected": {"selector", "expected"}, "assert_enabled": {"selector"},
     "assert_disabled": {"selector"},
 }

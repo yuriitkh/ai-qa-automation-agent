@@ -24,6 +24,9 @@ class AssertionGroundingTests(unittest.TestCase):
             expected="The confirmation state is displayed.",
             order=0,
         )
+        self.discovery = DiscoveryResult(
+            status=DiscoveryStatus.SUCCESS, url="https://example.test/"
+        )
 
     @staticmethod
     def plan(action: QATestStep) -> QATestPlan:
@@ -179,6 +182,37 @@ class AssertionGroundingTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.issues[0].code, "UNGROUNDED_ASSERTION")
         self.assertNotIn("Pending", str(raised.exception))
+
+    def test_checkbox_unchecked_is_grounded_structurally_without_invented_label(self) -> None:
+        step = DomainTestStep(
+            name="Verify the terms checkbox",
+            description="The terms checkbox remains unchecked.",
+            expected="The terms checkbox is not checked.",
+            order=0,
+        )
+        plan = self.plan(QATestStep(
+            action="assert_unchecked", parameters={"selector": "#terms"}
+        ))
+        entries = validate_assertion_grounding(plan, step, self.discovery)
+
+        self.assertEqual(entries[0].category, AssertionGrounding.REQUIREMENT_GROUNDED)
+        self.assertEqual(set(plan.steps[0].parameters), {"selector"})
+
+    def test_positive_checkbox_assertion_is_not_grounded_by_a_negative_requirement(self) -> None:
+        step = DomainTestStep(
+            name="Verify the checkbox",
+            description="The checkbox must not be checked.",
+            expected="The checkbox is unchecked.",
+            order=0,
+        )
+        plan = self.plan(QATestStep(
+            action="assert_checked", parameters={"selector": "#terms"}
+        ))
+
+        self.assertEqual(
+            classify_assertions(plan, step, self.discovery)[0].category,
+            AssertionGrounding.UNKNOWN,
+        )
 
     def test_negated_requirement_does_not_ground_a_forbidden_exact_value(self) -> None:
         plan = self.plan(QATestStep(

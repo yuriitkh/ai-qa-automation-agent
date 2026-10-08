@@ -34,7 +34,13 @@ from qa_agent.locator_recovery import RecoveryStatus
 from qa_agent.llm.base import LLMProvider
 from qa_agent.llm.errors import RetryableLLMError
 from qa_agent.llm.router import LLMRouter
-from qa_agent.pipeline import PipelineResult, PipelineStageError, QATestPipeline, _automation_run_outcome
+from qa_agent.pipeline import (
+    PipelineResult,
+    PipelineStageError,
+    QATestPipeline,
+    _with_discovered_locator_identity,
+    _automation_run_outcome,
+)
 from qa_agent.plan_store import InMemoryPlanStore
 from qa_agent.run_history import InMemoryRunHistoryRepository, RunHistoryService, WorkflowType
 from qa_agent.test_case_decomposer import TestCaseDecomposer
@@ -42,6 +48,45 @@ from qa_agent.test_plan_generator import GeneratedTestPlan, LLMTestPlanGenerator
 
 
 class QATestPipelineTests(unittest.TestCase):
+    def test_checkbox_actions_attach_only_discovered_value_free_identity(self) -> None:
+        step = self.make_step(0)
+        plan = DomainTestPlan(test_step_id=step.id, name=step.name)
+        generated = GeneratedTestPlan(
+            test_plan=plan,
+            test_plan_version=DomainTestPlanVersion(
+                test_plan_id=plan.id,
+                version=1,
+                qa_test_plan=QATestPlan(url="http://127.0.0.1/", steps=[
+                    QATestStep(action="check", parameters={"selector": "#marketing"}),
+                    QATestStep(action="click", parameters={"selector": "#confirm-details"}),
+                ]),
+            ),
+        )
+        discovery = DiscoveryResult(
+            status=DiscoveryStatus.SUCCESS,
+            url="http://127.0.0.1/",
+            interactive_elements=[InteractiveElement(
+                kind="checkbox", selector="#marketing", tag="input", role="checkbox",
+                label="Marketing emails", accessible_name="Marketing emails",
+            ), InteractiveElement(
+                kind="button", selector="#confirm-details", tag="button", role="button",
+                label="Confirm details", accessible_name="Confirm details",
+                dialog_identity="id:details-dialog",
+            )],
+        )
+
+        attached = _with_discovered_locator_identity(generated, discovery)
+
+        identity = attached.test_plan_version.locator_identity[0]
+        self.assertEqual(identity.step_index, 0)
+        self.assertEqual(identity.label, "Marketing emails")
+        self.assertEqual(identity.accessible_name, "Marketing emails")
+        self.assertIsNone(identity.visible_text)
+        self.assertEqual(
+            attached.test_plan_version.locator_identity[1].dialog_identity,
+            "id:details-dialog",
+        )
+
     def test_custom_generator_missing_expected_coverage_is_rejected_before_save(self) -> None:
         step = self.make_step(0).model_copy(update={
             "name": "Verify the error message is displayed",

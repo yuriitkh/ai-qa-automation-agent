@@ -57,6 +57,11 @@ class OpenAICompatibleSchemaTests(unittest.TestCase):
         self.assertFalse(visible["additionalProperties"])
         click = by_action["click"]["properties"]["parameters"]
         self.assertEqual(click["properties"]["selector"]["type"], "string")
+        for action in ("check", "uncheck", "assert_unchecked"):
+            with self.subTest(action=action):
+                parameters = by_action[action]["properties"]["parameters"]
+                self.assertIn("selector", parameters["required"])
+                self.assertEqual(parameters["properties"]["selector"]["type"], "string")
         fill = by_action["fill"]["properties"]["parameters"]
         self.assertEqual(fill["properties"]["selector"]["type"], "string")
         self.assertEqual(fill["properties"]["value"]["type"], "string")

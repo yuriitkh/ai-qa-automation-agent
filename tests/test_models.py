@@ -31,18 +31,21 @@ class QATestStepTests(unittest.TestCase):
             "assert_page_loaded",
             "assert_title",
             "assert_visible",
-            "click",
+            "click", "check", "uncheck",
             "fill",
             "assert_hidden",
             "assert_url",
-            "select_option", "assert_text_contains", "assert_checked",
+            "select_option", "assert_text_contains", "assert_checked", "assert_unchecked",
             "assert_selected", "assert_enabled", "assert_disabled",
         )
 
         parameters_by_action = {
+            "check": {"selector": "#choice"},
+            "uncheck": {"selector": "#choice"},
             "select_option": {"selector": "select", "option_label": "Two"},
             "assert_text_contains": {"expected_text": "required phrase"},
             "assert_checked": {"selector": "#choice"},
+            "assert_unchecked": {"selector": "#choice"},
             "assert_selected": {"selector": "select", "expected": "Two"},
             "assert_enabled": {"selector": "#control"},
             "assert_disabled": {"selector": "#control"},
@@ -70,6 +73,11 @@ class QATestStepTests(unittest.TestCase):
             action="assert_selected", parameters={"selector": "#default-radio"}
         )
         self.assertEqual(step.parameters, {"selector": "#default-radio"})
+
+    def test_checkbox_state_actions_require_a_selector(self) -> None:
+        for action in ("check", "uncheck", "assert_unchecked"):
+            with self.subTest(action=action), self.assertRaises(ValidationError):
+                QATestStep(action=action)
 
     def test_option_label_is_rejected_for_non_select_actions(self) -> None:
         for action, parameters in (

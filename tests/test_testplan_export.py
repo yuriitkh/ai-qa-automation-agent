@@ -45,12 +45,15 @@ def _all_actions() -> list[QATestStep]:
         QATestStep(action="assert_title", parameters={"expected": 'Title "quoted" ☃'}),
         QATestStep(action="assert_visible", parameters={"selector": "main > h1", "expected_text": "Ready\\nNow"}),
         QATestStep(action="click", parameters={"selector": "button[type='submit']"}),
+        QATestStep(action="check", parameters={"selector": "input#accepted"}),
+        QATestStep(action="uncheck", parameters={"selector": "input#accepted"}),
         QATestStep(action="fill", parameters={"selector": "input[name='query']", "value": "line 1\nline 2 \"quoted\" ☃"}),
         QATestStep(action="assert_hidden", parameters={"selector": "#hidden"}),
         QATestStep(action="assert_url", parameters={"expected": "http://127.0.0.1:8000/result"}),
         QATestStep(action="select_option", parameters={"selector": "select#kind", "option_label": "Web"}),
         QATestStep(action="assert_text_contains", parameters={"selector": "main", "expected_text": "text\\npart"}),
         QATestStep(action="assert_checked", parameters={"selector": "input#accepted"}),
+        QATestStep(action="assert_unchecked", parameters={"selector": "input#accepted"}),
         QATestStep(action="assert_selected", parameters={"selector": "select#kind", "expected": "Web"}),
         QATestStep(action="assert_selected", parameters={"selector": "input[type=radio]"}),
         QATestStep(action="assert_enabled", parameters={"selector": "button#save"}),
@@ -165,7 +168,8 @@ class TestPlanExportTests(unittest.TestCase):
             "page.goto(", "page.wait_for_load_state(", "to_have_title(",
             "to_have_text(re.compile(", f".click(timeout={ACTION_TIMEOUT_MS})", ".fill(", "to_be_hidden(",
             "to_have_url(", "select_option(label=",
-            "to_be_checked(", "option:checked", "to_be_enabled(", "to_be_disabled(",
+            "to_be_checked(", "not_to_be_checked(", "option:checked",
+            ".check(timeout=", ".uncheck(timeout=", "to_be_enabled(", "to_be_disabled(",
         ):
             self.assertIn(fragment, source)
         self.assertIn("page.locator(\"button[type='submit']\")", source)
@@ -178,7 +182,8 @@ class TestPlanExportTests(unittest.TestCase):
             "import { test, expect }", "await page.goto(", "waitForLoadState(",
             "toHaveTitle(", "toHaveText(", f".click({{ timeout: {ACTION_TIMEOUT_MS} }})", ".fill(",
             "toBeHidden(", "toHaveURL(", "selectOption(", "toHaveText(new RegExp(",
-            "toBeChecked(", "option:checked", "toBeEnabled(", "toBeDisabled(",
+            "toBeChecked(", "not.toBeChecked(", "option:checked",
+            ".check({ timeout:", ".uncheck({ timeout:", "toBeEnabled(", "toBeDisabled(",
         ):
             self.assertIn(fragment, source)
         self.assertNotIn("qa_agent", source)
@@ -190,7 +195,8 @@ class TestPlanExportTests(unittest.TestCase):
             "WaitForLoadStateAsync(", "ToHaveTitleAsync(", "InnerTextAsync()",
             ".ClickAsync(", ".FillAsync(", "ToBeHiddenAsync(", "ToHaveURLAsync(",
             "SelectOptionAsync(", "GetByText(", "option:checked",
-            "ToBeCheckedAsync(", "ToBeEnabledAsync(",
+            "ToBeCheckedAsync(", ".Not.ToBeCheckedAsync(",
+            ".CheckAsync(", ".UncheckAsync(", "ToBeEnabledAsync(",
         ):
             self.assertIn(fragment, source)
         self.assertNotIn("qa_agent", source)

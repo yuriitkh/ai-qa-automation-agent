@@ -1,6 +1,6 @@
 import unittest
 
-from qa_agent.locator_recovery import RecoveryStatus, recover_locator
+from qa_agent.locator_recovery import RecoveryStatus, identity_for_element, recover_locator
 from qa_agent.models import (
     DiscoveryResult,
     DiscoveryStatus,
@@ -25,6 +25,12 @@ class LocatorRecoveryIdentityTests(unittest.TestCase):
         return InteractiveElement(
             kind="input", selector=selector, tag="input", role="textbox",
             label=label, accessible_name=label, **values,
+        )
+
+    def checkbox_control(self, selector, label):
+        return InteractiveElement(
+            kind="checkbox", selector=selector, tag="input", role="checkbox",
+            label=label, accessible_name=label,
         )
 
     def test_label_and_accessible_name_are_sufficient_with_compatible_type(self):
@@ -148,6 +154,59 @@ class LocatorRecoveryIdentityTests(unittest.TestCase):
         result = recover_locator(plan, self.discover(candidate))
 
         self.assertEqual(result.status, RecoveryStatus.NO_MATCH)
+
+    def test_checkbox_recovery_preserves_checkbox_label_identity(self):
+        plan = QATestStep(action="check", parameters={"selector": "#old"})
+        original = self.original(
+            accessible_name="Marketing emails", label="Marketing emails",
+            tag="input", role="checkbox",
+        )
+
+        result = recover_locator(
+            plan,
+            self.discover(self.checkbox_control("#newsletter", "Product updates")),
+            original,
+        )
+
+        self.assertEqual(result.status, RecoveryStatus.REJECTED_CONFLICT)
+        self.assertIsNone(result.candidate)
+        self.assertNotIn("Marketing emails", result.reason)
+        self.assertNotIn("Product updates", result.reason)
+
+    def test_checkbox_identity_metadata_contains_label_but_no_entered_value(self):
+        checkbox = self.checkbox_control("#marketing", "Marketing emails")
+
+        identity = identity_for_element(0, checkbox, "check")
+
+        self.assertEqual(identity.accessible_name, "Marketing emails")
+        self.assertEqual(identity.label, "Marketing emails")
+        self.assertIsNone(identity.visible_text)
+
+    def test_modal_control_does_not_recover_to_a_similar_page_control(self):
+        plan = QATestStep(action="click", parameters={"selector": "#old-confirm"})
+        original = self.original(
+            accessible_name="Confirm", visible_text="Confirm",
+            tag="button", role="button", dialog_identity="id:details-dialog",
+        )
+        page_control = InteractiveElement(
+            kind="button", selector="button.confirm", tag="button", role="button",
+            accessible_name="Confirm", text="Confirm",
+        )
+
+        result = recover_locator(plan, self.discover(page_control), original)
+        same_dialog_control = InteractiveElement(
+            kind="button", selector="#new-confirm", tag="button", role="button",
+            accessible_name="Confirm", text="Confirm",
+            dialog_identity="id:details-dialog",
+        )
+        same_dialog_result = recover_locator(
+            plan, self.discover(same_dialog_control), original
+        )
+
+        self.assertEqual(result.status, RecoveryStatus.NO_MATCH)
+        self.assertIsNone(result.candidate)
+        self.assertEqual(same_dialog_result.status, RecoveryStatus.MATCHED_HIGH_CONFIDENCE)
+        self.assertIs(same_dialog_result.candidate, same_dialog_control)
 
 
 if __name__ == "__main__":

@@ -536,6 +536,25 @@ class BrowserDiscoveryTests(unittest.TestCase):
         self.assertNotIn("element.value", _SNAPSHOT_SCRIPT)
         self.assertNotIn("|| item.placeholder", _SNAPSHOT_SCRIPT)
 
+    def test_modal_control_snapshot_records_its_dialog_identity(self) -> None:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.set_content(
+                    '<dialog open id="details-dialog" aria-label="Account details">'
+                    '<button id="confirm-details">Confirm</button></dialog>'
+                )
+                snapshot = page.evaluate(_SNAPSHOT_SCRIPT)
+                button = next(
+                    item for item in snapshot["interactive_elements"]
+                    if item.get("id") == "confirm-details"
+                )
+            finally:
+                browser.close()
+
+        self.assertEqual(button["dialog_identity"], "id:details-dialog")
+
     def test_snapshot_is_bounded_and_truncates_large_page_data(self) -> None:
         large_entry = {
             "tag": "a",

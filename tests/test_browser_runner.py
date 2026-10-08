@@ -87,6 +87,11 @@ class _FakeAssertions:
         if not self.actual.is_checked():
             raise AssertionError("Expected checkbox/radio to be checked.")
 
+    def not_to_be_checked(self, *, timeout):
+        self._record("not_to_be_checked", timeout=timeout)
+        if self.actual.is_checked():
+            raise AssertionError("Expected checkbox/radio to be unchecked.")
+
     def to_be_enabled(self, *, timeout):
         self._record("to_be_enabled", timeout=timeout)
         if not self.actual.is_enabled():
@@ -371,6 +376,22 @@ class BrowserRunnerActionTests(unittest.TestCase):
         self.page.locator.assert_called_once_with("#name")
         self.locator.fill.assert_called_once_with("Ada", timeout=ACTION_TIMEOUT_MS)
 
+    def test_fill_error_redacts_entered_sensitive_value(self) -> None:
+        secret = "private-password-value"
+        for exception in (RuntimeError, AssertionError):
+            with self.subTest(exception=exception.__name__):
+                self.locator.fill.side_effect = exception(f"rejected value {secret}")
+                result = self.run_steps({
+                    "action": "fill",
+                    "parameters": {"selector": "#password", "value": secret},
+                })
+                self.locator.fill.side_effect = None
+
+                self.assertEqual(result["status"], "failed")
+                serialized = str(result)
+                self.assertNotIn(secret, serialized)
+                self.assertIn("[REDACTED]", serialized)
+
     def test_assert_url_passes_for_exact_match(self) -> None:
         result = self.run_steps(
             {
@@ -454,6 +475,23 @@ class BrowserRunnerActionTests(unittest.TestCase):
                 )
                 self.assertEqual(result["status"], "passed")
                 self.locator.is_checked.assert_called()
+
+    def test_check_and_uncheck_are_state_aware_checkbox_actions(self) -> None:
+        self.locator.is_checked.side_effect = [True, False]
+        result = self.run_steps(
+            {"action": "check", "parameters": {"selector": "#terms"}},
+            {"action": "assert_checked", "parameters": {"selector": "#terms"}},
+            {"action": "uncheck", "parameters": {"selector": "#terms"}},
+            {"action": "assert_unchecked", "parameters": {"selector": "#terms"}},
+        )
+
+        self.assertEqual(result["status"], "passed")
+        self.locator.check.assert_called_once_with(timeout=ACTION_TIMEOUT_MS)
+        self.locator.uncheck.assert_called_once_with(timeout=ACTION_TIMEOUT_MS)
+        self.assertEqual(
+            [call[0] for call in self.expect_calls],
+            ["to_be_checked", "not_to_be_checked"],
+        )
 
     def test_select_option_and_assert_selected(self) -> None:
         self.locator.evaluate.return_value = {"tag": "select", "type": "select-one"}
@@ -758,6 +796,24 @@ class BrowserRunnerActionTests(unittest.TestCase):
         self.assertEqual(result["evidence"][0]["scope"], "ELEMENT")
         self.locator.screenshot.assert_called_once()
         self.page.screenshot.assert_not_called()
+
+    def test_unchecked_verification_captures_its_element_evidence(self) -> None:
+        self.locator.is_checked.return_value = False
+        with tempfile.TemporaryDirectory() as directory:
+            self.locator.screenshot.side_effect = lambda *, path, **_: Path(path).write_bytes(b"png")
+            result = self.run_with_evidence_policy(
+                EvidencePolicy(
+                    mode=EvidenceMode.EVERY_VERIFICATION,
+                    screenshot_mode=ScreenshotMode.ELEMENT,
+                ),
+                [{"action": "assert_unchecked", "parameters": {"selector": "#terms"}}],
+                directory,
+            )
+
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(len(result["evidence"]), 1)
+        self.assertEqual(result["evidence"][0]["scope"], "ELEMENT")
+        self.locator.screenshot.assert_called_once()
 
     def test_element_scope_without_locator_skips_safely(self) -> None:
         self.page.title.return_value = "Expected"
