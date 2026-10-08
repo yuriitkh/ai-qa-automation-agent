@@ -5,6 +5,7 @@ import json
 import logging
 import mimetypes
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
@@ -80,6 +81,7 @@ from qa_agent.workflows import AutomationWorkflow
 
 
 _PAGE_LIMIT = 500
+_EXPORT_PAGE_SIZE = 100
 logger = logging.getLogger(__name__)
 _MAX_FORM_BODY_BYTES = 8192
 _MAX_AUTHORING_FORM_BODY_BYTES = 80_000
@@ -241,6 +243,8 @@ class LocalWebApplication:
             return WebResponse.html(200, _local_demo_page())
         if path == "/test-cases":
             return WebResponse.html(200, self._test_case_list())
+        if path == "/export":
+            return WebResponse.html(200, self._export_workspace(query))
         if path == "/test-suites":
             return WebResponse.html(200, self._test_suites_page())
         if path == "/test-cases/new":
@@ -350,6 +354,8 @@ class LocalWebApplication:
             return self._handle_provider_settings_post(body)
         if parts == ["test-cases", "export"]:
             return self._handle_bulk_export(body)
+        if parts == ["export"]:
+            return self._handle_export_workspace(body)
         if parts == ["test-suites"]:
             return self._handle_test_suite_create(body)
         if len(parts) == 3 and parts[0] == "test-suites" and parts[2] == "update":
@@ -1552,11 +1558,6 @@ class LocalWebApplication:
                 run_count = f'{len(history)} {"run" if len(history) == 1 else "runs"}'
                 rows.append(
                     "<tr>"
-                    + (
-                        f'<td class="test-case-select-cell"><input type="checkbox" name="test_case_id" value="{test_case_id}" '
-                        f'aria-label="Select {escape_html(test_case.public_id or test_case.name)}"></td>'
-                        if self._testplan_exports is not None else ""
-                    )
                     + f'<td class="test-case-main-cell"><div class="status-line"><span class="id-code">{escape_html(test_case.public_id or "")}</span>'
                     f'<a href="/test-cases/{test_case_id}">{escape_html(test_case.name)}</a></div>'
                     f'<details><summary>Technical ID</summary><code>{escape_html(test_case_id)}</code></details></td>'
@@ -1568,7 +1569,10 @@ class LocalWebApplication:
                     '<td class="test-case-actions-cell"><div class="test-case-actions">'
                     + f'<a class="button" href="/test-cases/{test_case_id}">Open</a>'
                     + f'<a class="button" href="/test-cases/{test_case_id}/edit">Edit</a>'
-                    + (f'<a class="button" href="/test-cases/{test_case_id}/export/portable">Export</a>' if self._testplan_exports is not None else "")
+                    + (
+                        f'<a class="button" href="/export?mode=testcases&amp;case={quote(test_case.public_id or "")}">Export</a>'
+                        if self._testplan_exports is not None else ""
+                    )
                     + '</div></td></tr>'
                 )
         else:
@@ -1588,36 +1592,550 @@ class LocalWebApplication:
                     f'<td class="test-case-actions-cell"><div class="test-case-actions"><a class="button" href="/test-cases/{test_case_id}">Open</a></div></td>'
                     "</tr>"
                 )
-        selection_column = '<th scope="col"><label><input type="checkbox" data-select-all> Select visible</label></th>' if self._testplan_exports is not None else ""
         table = (
-            '<div class="table-wrap"><table class="test-case-list"><thead><tr>' + selection_column + '<th scope="col">TestCase</th>'
+            '<div class="table-wrap"><table class="test-case-list"><thead><tr><th scope="col">TestCase</th>'
             '<th scope="col">Automation and run history</th><th scope="col">Actions</th></tr></thead><tbody>'
             + "".join(rows)
             + "</tbody></table></div>"
-        )
-        bulk_form = (
-            '<form method="post" action="/test-cases/export" class="export-selection">'
-            '<div class="export-selection-controls"><div class="field">'
-            '<label for="bulk-export-format">Export selected as</label><select id="bulk-export-format" name="target">'
-            '<option value="portable">Portable JSON bundle</option>'
-            '<option value="python">Python Playwright project</option>'
-            '<option value="typescript">TypeScript Playwright project</option>'
-            '<option value="csharp">C# Playwright project</option>'
-            '</select></div><button class="button" type="submit">Export selected</button></div>'
-            + table + '</form>'
-            if rows and self._testplan_exports is not None else ""
         )
         content = (
             '<header class="page-heading section-heading"><div><h1>Test Cases</h1>'
             '<p class="lead">Saved TestCase definitions and their run history.</p></div>'
             '<a class="button primary" href="/test-cases/new">+ New Test Case</a></header>'
             '<section class="panel"><h2>TestCases</h2>'
-            + (bulk_form if self._testplan_exports is not None and rows else table if rows else self._empty_state(
+            + (table if rows else self._empty_state(
                 "No TestCases found.", "Create a TestCase from a natural-language scenario to get started."
             ))
             + "</section>"
         )
         return self._page("Test Cases", content, current="Test Cases", breadcrumbs=[("Dashboard", "/")])
+
+    def _export_workspace(self, query: dict[str, list[str]], *, notice: str | None = None) -> str:
+        mode = query.get("mode", ["testcases"])[0].casefold()
+        mode = mode if mode in {"testcases", "suites"} else "testcases"
+        search = query.get("q", [""])[0].strip()[:160]
+        page_raw = query.get("page", ["1"])[0]
+        page = int(page_raw) if page_raw.isdigit() else 1
+        page = min(max(page, 1), 100_000)
+
+        selected_case_keys = []
+        if self._test_cases is not None:
+            for key in query.get("case", []):
+                key = key.strip().upper()
+                if key.startswith("TC-") and len(key) >= 7 and key[3:].isdigit():
+                    if self._test_cases.get_by_public_id(key) is not None and key not in selected_case_keys:
+                        selected_case_keys.append(key)
+        selected_suites = []
+        for raw_suite_id in query.get("suite", []):
+            suite_id = _parse_uuid(raw_suite_id)
+            if suite_id is not None and self._test_suites.get(suite_id) is not None and suite_id not in selected_suites:
+                selected_suites.append(suite_id)
+
+        extra_messages = [notice] if notice else []
+        if self._testplan_exports is None:
+            extra_messages.append("Export is unavailable because saved TestCase and plan storage is not configured.")
+
+        date_values: dict[str, str] = {}
+        date_bounds: dict[str, str] = {}
+        for key in ("created_from", "created_to", "updated_from", "updated_to"):
+            raw = query.get(key, [""])[0]
+            date_values[key] = raw
+            if raw:
+                try:
+                    parsed_date = date.fromisoformat(raw)
+                    date_bounds[key] = (
+                        (parsed_date + timedelta(days=1)).isoformat()
+                        if key.endswith("_to") else parsed_date.isoformat()
+                    )
+                except ValueError:
+                    extra_messages.append(f"{key.replace('_', ' ').capitalize()} must be a valid date.")
+                    date_values[key] = ""
+                    date_bounds[key] = ""
+        for lower_key, upper_key in (("created_from", "created_to"), ("updated_from", "updated_to")):
+            if date_values[lower_key] and date_values[upper_key] and date_values[lower_key] > date_values[upper_key]:
+                extra_messages.append(f"{lower_key.split('_')[0].capitalize()} date range is reversed.")
+                date_bounds[lower_key] = date_bounds[upper_key] = ""
+                date_values[lower_key] = date_values[upper_key] = ""
+
+        selected_test_suite = query.get("test_suite", [""])[0]
+        suite_filter_id = _parse_uuid(selected_test_suite) if selected_test_suite else None
+        if suite_filter_id is not None and self._test_suites.get(suite_filter_id) is None:
+            suite_filter_id = None
+            selected_test_suite = ""
+        lifecycle_filter = query.get("lifecycle", ["ALL"])[0].upper()
+        if lifecycle_filter not in {"ALL", *(status.value for status in AutomationStatus)}:
+            lifecycle_filter = "ALL"
+        suite_readiness_filter = query.get("readiness", ["ALL"])[0].upper()
+        if suite_readiness_filter not in {"ALL", "READY", "BLOCKED"}:
+            suite_readiness_filter = "ALL"
+
+        case_mode_current = ' aria-current="page"' if mode == "testcases" else ""
+        suite_mode_current = ' aria-current="page"' if mode == "suites" else ""
+        tabs = (
+            '<nav class="export-mode-tabs" aria-label="Export source">'
+            f'<a href="{escape_html(self._export_mode_url("testcases", selected_case_keys, selected_suites))}"'
+            f'{case_mode_current}>TestCases</a>'
+            f'<a href="{escape_html(self._export_mode_url("suites", selected_case_keys, selected_suites))}"'
+            f'{suite_mode_current}>Test Suites</a>'
+            '</nav>'
+        )
+
+        selected_cases_by_id: dict[UUID, TestCase] = {}
+        for public_id in selected_case_keys:
+            case = self._test_cases.get_by_public_id(public_id) if self._test_cases is not None else None
+            if case is not None:
+                selected_cases_by_id[case.id] = case
+        selected_suite_names = []
+        for suite_id in selected_suites:
+            suite = self._test_suites.get(suite_id)
+            if suite is None:
+                continue
+            selected_suite_names.append(suite.name)
+            for case in self._test_suites.members(suite_id):
+                selected_cases_by_id.setdefault(case.id, case)
+
+        selected_panel = self._export_selection_panel(
+            selected_case_keys, selected_suites, selected_suite_names,
+            list(selected_cases_by_id.values()),
+        )
+        main_list = ""
+        page_links = ""
+
+        if mode == "testcases":
+            suite_options = ['<option value="">All Test Suites</option>']
+            for suite in self._test_suites.list():
+                selected = " selected" if suite_filter_id == suite.id else ""
+                suite_options.append(
+                    f'<option value="{suite.id}"{selected}>{escape_html(suite.name)}</option>'
+                )
+            status_options = ['<option value="ALL">All lifecycle statuses</option>']
+            for status in AutomationStatus:
+                selected = " selected" if lifecycle_filter == status.value else ""
+                status_options.append(
+                    f'<option value="{status.value}"{selected}>{escape_html(_automation_status_label(status))}</option>'
+                )
+            form_hidden = [f'<input type="hidden" name="mode" value="testcases">']
+            visible_case_keys: set[str] = set()
+            entries: list = []
+            total = 0
+            has_next = False
+            if self._test_cases is not None:
+                member_ids = (
+                    self._test_suites.member_ids(suite_filter_id)
+                    if suite_filter_id is not None else None
+                )
+                catalog_options = dict(
+                    search=search,
+                    created_from=date_bounds.get("created_from", ""),
+                    created_before=date_bounds.get("created_to", ""),
+                    updated_from=date_bounds.get("updated_from", ""),
+                    updated_before=date_bounds.get("updated_to", ""),
+                    test_case_ids=member_ids,
+                )
+                if lifecycle_filter == "ALL":
+                    entries, total = self._test_cases.list_export_catalog(
+                        **catalog_options,
+                        offset=(page - 1) * _EXPORT_PAGE_SIZE,
+                        limit=_EXPORT_PAGE_SIZE,
+                    )
+                    has_next = page * _EXPORT_PAGE_SIZE < total
+                else:
+                    wanted_start = (page - 1) * _EXPORT_PAGE_SIZE
+                    matched = 0
+                    source_offset = 0
+                    source_total = None
+                    while source_total is None or source_offset < source_total:
+                        batch, source_total = self._test_cases.list_export_catalog(
+                            **catalog_options, offset=source_offset, limit=500,
+                        )
+                        if not batch:
+                            break
+                        for entry in batch:
+                            if self._automation_lifecycle.status(entry.test_case).value != lifecycle_filter:
+                                continue
+                            if wanted_start <= matched < wanted_start + _EXPORT_PAGE_SIZE:
+                                entries.append(entry)
+                            elif matched >= wanted_start + _EXPORT_PAGE_SIZE:
+                                has_next = True
+                                break
+                            matched += 1
+                        if has_next:
+                            break
+                        source_offset += len(batch)
+                    total = matched
+            visible_case_keys = {entry.test_case.public_id or "" for entry in entries}
+            for key in selected_case_keys:
+                if key not in visible_case_keys:
+                    form_hidden.append(f'<input type="hidden" name="case" value="{escape_html(key)}">')
+            form_hidden.extend(
+                f'<input type="hidden" name="suite" value="{suite_id}">'
+                for suite_id in selected_suites
+            )
+            rows = []
+            for entry in entries:
+                case = entry.test_case
+                public_id = case.public_id or ""
+                visible_case_keys.add(public_id)
+                lifecycle_status, exportable, reason = self._export_case_readiness(case)
+                readiness = (
+                    '<span class="badge success">Exportable</span>'
+                    if exportable else '<span class="badge warning">Blocked</span>'
+                )
+                if reason:
+                    readiness += f'<p class="muted export-reason">{escape_html(reason)}</p>'
+                selection = " checked" if public_id in selected_case_keys else ""
+                rows.append(
+                    '<tr><td><label class="export-select-label">'
+                    f'<input type="checkbox" name="case" value="{escape_html(public_id)}" aria-label="Select {escape_html(public_id)} {escape_html(case.name)}"{selection}>'
+                    f'<span><span class="id-code">{escape_html(public_id)}</span> '
+                    f'<a href="/test-cases/{case.id}">{escape_html(case.name)}</a></span></label></td>'
+                    f'<td>{badge(_automation_status_label(lifecycle_status), "workflow")}</td>'
+                    f'<td>{readiness}</td>'
+                    f'<td><time datetime="{escape_html(entry.created_at.isoformat())}">{escape_html(format_timestamp(entry.created_at))}</time></td>'
+                    f'<td><time datetime="{escape_html(entry.updated_at.isoformat())}">{escape_html(format_timestamp(entry.updated_at))}</time></td></tr>'
+                )
+            filter_form = (
+                '<form class="export-filter-form" method="get" action="/export">'
+                + "".join(form_hidden)
+                + '<input type="hidden" name="page" value="1">'
+                + '<div class="filters export-filters">'
+                + f'<div class="field"><label for="export-search">Search TestCases</label><input id="export-search" name="q" type="search" value="{escape_html(search)}" placeholder="Public ID or name"></div>'
+                + '<div class="field"><label for="export-suite-filter">Test Suite</label><select id="export-suite-filter" name="test_suite">'
+                + "".join(suite_options) + '</select></div>'
+                + '<div class="field"><label for="export-lifecycle-filter">Automation lifecycle</label><select id="export-lifecycle-filter" name="lifecycle">'
+                + "".join(status_options) + '</select></div>'
+                + "".join(
+                    f'<div class="field"><label for="filter-{key}">{label}</label><input id="filter-{key}" type="date" name="{key}" value="{escape_html(date_values[key])}"></div>'
+                    for key, label in (("created_from", "Created from"), ("created_to", "Created to"), ("updated_from", "Updated from"), ("updated_to", "Updated to"))
+                )
+                + '<button class="button" type="submit">Apply filters and selection</button></div></form>'
+            )
+            table = (
+                '<div class="table-wrap"><table class="export-case-table"><thead><tr>'
+                '<th scope="col">TestCase</th><th scope="col">Automation lifecycle</th>'
+                '<th scope="col">Export readiness</th><th scope="col">Created</th><th scope="col">Updated</th>'
+                '</tr></thead><tbody>' + "".join(rows) + '</tbody></table></div>'
+                if rows else self._empty_state("No TestCases match these filters.", "Change the search or filters and try again.")
+            )
+            if page > 1 or has_next:
+                nav_params = [(key, value) for key, values in query.items() for value in values if key != "page"]
+                links = []
+                if page > 1:
+                    links.append(f'<a class="button" href="/export?{escape_html(urlencode(nav_params + [("page", str(page - 1))]))}">Previous</a>')
+                if has_next:
+                    links.append(f'<a class="button" href="/export?{escape_html(urlencode(nav_params + [("page", str(page + 1))]))}">Next</a>')
+                page_links = '<nav class="export-pagination" aria-label="TestCase pages">' + "".join(links) + '</nav>'
+            main_list = (
+                '<section class="panel"><h2>Choose TestCases</h2>'
+                f'<p class="muted">Showing {len(entries)} on this page' + (f' of {total} matching TestCases.' if lifecycle_filter == "ALL" else ' matching the selected filters.') + '</p>'
+                + filter_form + table + page_links + '</section>'
+            )
+        else:
+            suite_search = search
+            form_hidden = ['<input type="hidden" name="mode" value="suites">']
+            form_hidden.extend(f'<input type="hidden" name="case" value="{escape_html(key)}">' for key in selected_case_keys)
+            suite_rows = []
+            visible_suite_ids: set[UUID] = set()
+            page_suites: list = []
+            total_suites = 0
+            has_next = False
+            if suite_readiness_filter == "ALL":
+                page_suites, total_suites = self._test_suites.list_page(
+                    search=suite_search, offset=(page - 1) * _EXPORT_PAGE_SIZE, limit=_EXPORT_PAGE_SIZE,
+                )
+                has_next = page * _EXPORT_PAGE_SIZE < total_suites
+            else:
+                matched = 0
+                source_offset = 0
+                source_total = 0
+                while source_offset < source_total or source_offset == 0:
+                    batch, source_total = self._test_suites.list_page(
+                        search=suite_search, offset=source_offset, limit=500,
+                    )
+                    if not batch:
+                        break
+                    for suite in batch:
+                        summary = self._suite_export_counts(suite.id)
+                        is_match = summary["ready"] > 0 if suite_readiness_filter == "READY" else summary["blocked"] > 0
+                        if not is_match:
+                            continue
+                        if (page - 1) * _EXPORT_PAGE_SIZE <= matched < page * _EXPORT_PAGE_SIZE:
+                            page_suites.append(suite)
+                        elif matched >= page * _EXPORT_PAGE_SIZE:
+                            has_next = True
+                            break
+                        matched += 1
+                    if has_next:
+                        break
+                    source_offset += len(batch)
+                total_suites = matched
+            for suite in page_suites:
+                visible_suite_ids.add(suite.id)
+                summary = self._suite_export_counts(suite.id)
+                selected = " checked" if suite.id in selected_suites else ""
+                suite_rows.append(
+                    '<tr><td><label class="export-select-label">'
+                    f'<input type="checkbox" name="suite" value="{suite.id}" aria-label="Select Test Suite {escape_html(suite.name)}"{selected}>'
+                    f'<span><a href="/test-suites/{suite.id}">{escape_html(suite.name)}</a>'
+                    + (f'<span class="muted export-suite-description">{escape_html(suite.description)}</span>' if suite.description else '')
+                    + '</span></label></td>'
+                    + f'<td>{summary["members"]} TestCases</td>'
+                    + f'<td>{summary["ready"]} Automation ready</td>'
+                    + f'<td>{summary["blocked"]} blocked</td></tr>'
+                )
+            form_hidden.extend(
+                f'<input type="hidden" name="suite" value="{suite_id}">'
+                for suite_id in selected_suites if suite_id not in visible_suite_ids
+            )
+            readiness_options = (
+                '<option value="ALL">Any readiness</option>'
+                f'<option value="READY"{" selected" if suite_readiness_filter == "READY" else ""}>Has Automation Ready tests</option>'
+                f'<option value="BLOCKED"{" selected" if suite_readiness_filter == "BLOCKED" else ""}>Has blocked tests</option>'
+            )
+            filter_form = (
+                '<form class="export-filter-form" method="get" action="/export">'
+                + "".join(form_hidden)
+                + '<input type="hidden" name="page" value="1">'
+                + '<div class="filters export-filters">'
+                + f'<div class="field"><label for="export-search">Search Test Suites</label><input id="export-search" name="q" type="search" value="{escape_html(suite_search)}" placeholder="Suite name"></div>'
+                + '<div class="field"><label for="export-readiness-filter">Readiness</label><select id="export-readiness-filter" name="readiness">'
+                + readiness_options + '</select></div><button class="button" type="submit">Apply filters and selection</button></div></form>'
+            )
+            table = (
+                '<div class="table-wrap"><table class="export-suite-table"><thead><tr>'
+                '<th scope="col">Test Suite</th><th scope="col">Members</th><th scope="col">Automation Ready</th><th scope="col">Blocked</th>'
+                '</tr></thead><tbody>' + "".join(suite_rows) + '</tbody></table></div>'
+                if suite_rows else self._empty_state("No Test Suites match these filters.", "Change the search or readiness filter and try again.")
+            )
+            if page > 1 or has_next:
+                nav_params = [(key, value) for key, values in query.items() for value in values if key != "page"]
+                links = []
+                if page > 1:
+                    links.append(f'<a class="button" href="/export?{escape_html(urlencode(nav_params + [("page", str(page - 1))]))}">Previous</a>')
+                if has_next:
+                    links.append(f'<a class="button" href="/export?{escape_html(urlencode(nav_params + [("page", str(page + 1))]))}">Next</a>')
+                page_links = '<nav class="export-pagination" aria-label="Test Suite pages">' + "".join(links) + '</nav>'
+            main_list = (
+                '<section class="panel"><h2>Choose Test Suites</h2>'
+                f'<p class="muted">Showing {len(page_suites)} on this page' + (f' of {total_suites} matching Test Suites.' if suite_readiness_filter == "ALL" else ' matching the selected filters.') + '</p>'
+                + filter_form + table + page_links + '</section>'
+            )
+
+        notices = "".join(
+            f'<div class="notice warning">{escape_html(message)}</div>'
+            for message in extra_messages
+        )
+        body = (
+            '<header class="page-heading"><h1>Export</h1>'
+            '<p class="lead">Select TestCases or suites, review readiness, then export saved automation.</p></header>'
+            + tabs + notices + selected_panel + main_list
+        )
+        return self._page("Export", body, current="Export", breadcrumbs=[("Dashboard", "/")])
+
+    def _export_mode_url(self, mode: str, case_keys: list[str], suite_ids: list[UUID]) -> str:
+        params = [("mode", mode)]
+        params.extend(("case", key) for key in case_keys)
+        params.extend(("suite", str(suite_id)) for suite_id in suite_ids)
+        return "/export?" + urlencode(params)
+
+    def _export_case_readiness(self, test_case: TestCase) -> tuple[AutomationStatus, bool, str]:
+        try:
+            status = self._automation_lifecycle.status(test_case)
+        except Exception as error:
+            logger.warning("Export readiness check failed safely (%s)", type(error).__name__)
+            return AutomationStatus.AUTOMATION_FAILED, False, "Automation readiness could not be verified safely."
+        blocked_reasons = {
+            AutomationStatus.NOT_AUTOMATED: "Automation is not complete.",
+            AutomationStatus.NEEDS_VALIDATION: "Saved automation needs Validation before export.",
+            AutomationStatus.NEEDS_UPDATE: "Saved automation is stale and needs an update.",
+            AutomationStatus.AUTOMATION_FAILED: "Automation needs attention before export.",
+        }
+        if status != AutomationStatus.AUTOMATION_READY:
+            return status, False, blocked_reasons.get(status, "Automation is not ready for export.")
+        if self._testplan_exports is None:
+            return status, False, "The saved automation exporter is unavailable."
+        try:
+            self._testplan_exports.get(test_case.id)
+        except TestPlanExportError as error:
+            reason = "; ".join(dict.fromkeys(blocker.reason for blocker in error.blockers)) or str(error)
+            return status, False, reason
+        except Exception as error:
+            logger.warning("Export plan check failed safely (%s)", type(error).__name__)
+            return status, False, "Saved automation could not be verified safely."
+        return status, True, ""
+
+    def _suite_export_counts(self, suite_id: UUID) -> dict[str, int]:
+        members = self._test_suites.members(suite_id)
+        ready = 0
+        blocked = 0
+        for case in members:
+            status, exportable, _reason = self._export_case_readiness(case)
+            if status == AutomationStatus.AUTOMATION_READY:
+                ready += 1
+            if not exportable:
+                blocked += 1
+        return {"members": len(members), "ready": ready, "blocked": blocked}
+
+    def _export_selection_panel(
+        self,
+        case_keys: list[str],
+        suite_ids: list[UUID],
+        suite_names: list[str],
+        test_cases: list[TestCase],
+    ) -> str:
+        rows = []
+        for case in sorted(test_cases, key=lambda item: (item.public_id or "", item.name.casefold())):
+            status, exportable, reason = self._export_case_readiness(case)
+            readiness = '<span class="badge success">Exportable</span>' if exportable else '<span class="badge warning">Blocked</span>'
+            if reason:
+                readiness += f'<span class="muted export-reason">{escape_html(reason)}</span>'
+            rows.append(
+                '<tr><td><span class="id-code">' + escape_html(case.public_id or "") + '</span> '
+                + f'<a href="/test-cases/{case.id}">{escape_html(case.name)}</a></td>'
+                + f'<td>{badge(_automation_status_label(status), "workflow")}</td><td>{readiness}</td></tr>'
+            )
+        source_labels = []
+        source_labels.extend(escape_html(key) for key in case_keys)
+        source_labels.extend(escape_html(name) for name in suite_names)
+        selected_label = (
+            f'{len(case_keys)} direct TestCases and {len(suite_ids)} Test Suites; '
+            f'{len(test_cases)} unique TestCases after suite membership is resolved.'
+        )
+        if not case_keys and not suite_ids:
+            selected_label = "No items selected yet. Select TestCases or Test Suites below."
+        source_html = (
+            '<p class="muted">Selected sources: ' + (", ".join(source_labels) if source_labels else "none") + '</p>'
+        )
+        clear_selection = (
+            '<a class="button" href="/export">Clear selection</a>'
+            if case_keys or suite_ids else ""
+        )
+        export_form = ""
+        if self._testplan_exports is not None and test_cases:
+            hidden = ''.join(
+                f'<input type="hidden" name="case" value="{escape_html(key)}">' for key in case_keys
+            ) + ''.join(
+                f'<input type="hidden" name="suite" value="{suite_id}">' for suite_id in suite_ids
+            )
+            export_form = (
+                '<form method="post" action="/export" class="export-download-form">'
+                + hidden
+                + '<div class="filters"><div class="field"><label for="export-target">Format</label><select id="export-target" name="target">'
+                + '<option value="portable">Portable JSON</option><option value="python">Python Playwright</option>'
+                + '<option value="typescript">TypeScript Playwright</option><option value="csharp">C# Playwright</option>'
+                + '</select></div>'
+                + '<div class="export-policies"><button class="button primary" type="submit" name="policy" value="require_all">Export all selected (require all exportable)</button>'
+                + '<button class="button" type="submit" name="policy" value="ready_only">Export ready items only</button></div></div>'
+                + '<p class="muted">Ready-only export excludes blocked cases listed above. Review the reasons before choosing that option.</p></form>'
+            )
+        return (
+            '<section class="panel export-selected"><div class="section-heading"><h2>Selected items and readiness</h2>'
+            + clear_selection + '</div>'
+            + f'<p>{escape_html(selected_label)}</p>' + source_html
+            + ('<div class="table-wrap"><table class="export-selected-table"><thead><tr><th scope="col">TestCase</th>'
+               '<th scope="col">Automation lifecycle</th><th scope="col">Export readiness</th></tr></thead><tbody>'
+               + "".join(rows) + '</tbody></table></div>' if rows else '')
+            + export_form + '</section>'
+        )
+
+    def _handle_export_workspace(self, body: bytes | str | None) -> WebResponse:
+        if self._testplan_exports is None or self._test_cases is None:
+            return WebResponse.html(503, self._page(
+                "Export unavailable", '<section class="panel error-state"><h1>Export unavailable</h1>'
+                '<p>Saved TestCase and plan storage is not configured.</p></section>', current="Export",
+            ))
+        form, error = _parse_form_body(
+            body, max_bytes=64 * 1024, allow_repeated_fields={"case", "suite"},
+        )
+        if error:
+            return self._export_post_error(error, 400)
+        raw_case_keys = list(dict.fromkeys(value.strip().upper() for value in form.get("case", []) if value.strip()))
+        raw_suite_ids = list(dict.fromkeys(value.strip() for value in form.get("suite", []) if value.strip()))
+        if not raw_case_keys and not raw_suite_ids:
+            return self._export_post_error("Select one or more TestCases or Test Suites.", 400)
+        test_cases: dict[UUID, TestCase] = {}
+        for public_id in raw_case_keys:
+            if not public_id.startswith("TC-") or len(public_id) < 7 or not public_id[3:].isdigit():
+                return self._export_post_error("A selected TestCase ID is invalid.", 400)
+            case = self._test_cases.get_by_public_id(public_id)
+            if case is None:
+                return self._export_post_error("A selected TestCase is no longer available.", 404)
+            test_cases[case.id] = case
+        selected_suite_uuids = []
+        for raw_suite_id in raw_suite_ids:
+            suite_id = _parse_uuid(raw_suite_id)
+            if suite_id is None:
+                return self._export_post_error("A selected Test Suite is invalid.", 400)
+            suite = self._test_suites.get(suite_id)
+            if suite is None:
+                return self._export_post_error("A selected Test Suite is no longer available.", 404)
+            selected_suite_uuids.append(suite_id)
+            for case in self._test_suites.members(suite_id):
+                test_cases.setdefault(case.id, case)
+        if not test_cases:
+            return self._export_post_error("The selected sources do not contain any TestCases.", 400)
+
+        target = form.get("target", [""])[0].casefold()
+        if target not in {"portable", "python", "typescript", "csharp"}:
+            return self._export_post_error("Choose Portable JSON, Python, TypeScript, or C# export.", 400)
+        policy = form.get("policy", [""])[0]
+        if policy not in {"require_all", "ready_only"}:
+            return self._export_post_error("Choose whether all selected items must be exportable or only ready items should be exported.", 400)
+
+        exportable_ids = []
+        blocked = []
+        for case in test_cases.values():
+            _status, ready, reason = self._export_case_readiness(case)
+            if ready:
+                exportable_ids.append(case.id)
+            else:
+                blocked.append((case, reason))
+        if blocked and policy == "require_all":
+            return self._export_blocked_response(blocked, raw_case_keys, selected_suite_uuids)
+        if not exportable_ids:
+            return self._export_post_error("No selected TestCases are exportable yet.", 409)
+        try:
+            if target == "portable" and len(exportable_ids) == 1:
+                content, filename = self._testplan_exports.portable_json(exportable_ids[0])
+                return _download_response(content.encode("utf-8"), filename, "application/json; charset=utf-8")
+            content, filename = self._testplan_exports.bulk_zip(exportable_ids, target)
+            return _download_response(content, filename, "application/zip")
+        except TestPlanExportError as export_error:
+            return self._export_post_error(str(export_error), 409)
+        except Exception as export_error:
+            logger.warning("Central export failed safely (%s)", type(export_error).__name__)
+            return self._export_post_error("The selected saved automation could not be exported.", 500)
+
+    def _export_post_error(self, message: str, status: int) -> WebResponse:
+        content = (
+            '<section class="panel error-state"><h1>Export unavailable</h1>'
+            f'<p>{escape_html(message)}</p><a class="button" href="/export">Back to Export</a></section>'
+        )
+        return WebResponse.html(status, self._page("Export unavailable", content, current="Export"))
+
+    def _export_blocked_response(
+        self,
+        blocked: list[tuple[TestCase, str]],
+        case_keys: list[str],
+        suite_ids: list[UUID],
+    ) -> WebResponse:
+        rows = []
+        for case, reason in blocked:
+            rows.append(
+                '<li><strong>' + escape_html(case.public_id or case.name) + '</strong> '
+                + f'<a href="/test-cases/{case.id}">{escape_html(case.name)}</a>: {escape_html(reason)}</li>'
+            )
+        query = [("mode", "testcases")]
+        query.extend(("case", key) for key in case_keys)
+        query.extend(("suite", str(suite_id)) for suite_id in suite_ids)
+        review_href = escape_html("/export?" + urlencode(query))
+        content = (
+            '<section class="panel error-state"><h1>Some selected items are blocked</h1>'
+            '<p>Require-all export stopped before creating a file. Make every selected TestCase exportable or choose ready-only in the workspace.</p>'
+            '<ul class="export-blocked-list">' + "".join(rows) + '</ul>'
+            f'<a class="button" href="{review_href}">Review selection</a></section>'
+        )
+        return WebResponse.html(409, self._page("Export needs attention", content, current="Export"))
 
     def _test_case_export(self, test_case_id: UUID, target: str) -> WebResponse:
         if self._testplan_exports is None:
@@ -1694,7 +2212,7 @@ class LocalWebApplication:
                 + f'<td><time datetime="{escape_html(suite.updated_at.isoformat())}">{escape_html(format_timestamp(suite.updated_at))}</time></td>'
                 + '<td><div class="suite-list-actions">'
                 + f'<a class="button" href="/test-suites/{suite.id}">Open</a>'
-                + f'<a class="button" href="/test-suites/{suite.id}/export?format=portable">Export</a>'
+                + f'<a class="button" href="/export?mode=suites&amp;suite={suite.id}">Export</a>'
                 + '</div></td></tr>'
             )
         rows = "".join(suite_rows)
@@ -1756,12 +2274,10 @@ class LocalWebApplication:
         content = (
             '<header class="page-heading"><p class="eyebrow">Test Suite</p>'
             f'<h1>{escape_html(suite.name)}</h1><p class="lead">{escape_html(suite.description)}</p></header>'
-            '<section class="panel"><div class="section-heading"><h2>Export suite</h2><div class="button-row">'
-            f'<a class="button" href="/test-suites/{suite_id}/export?format=portable">Portable JSON ZIP</a>'
-            f'<a class="button" href="/test-suites/{suite_id}/export?format=python">Python ZIP</a>'
-            f'<a class="button" href="/test-suites/{suite_id}/export?format=typescript">TypeScript ZIP</a>'
-            f'<a class="button" href="/test-suites/{suite_id}/export?format=csharp">C# ZIP</a>'
-            '</div></div></section>'
+            '<section class="panel"><div class="section-heading"><div><h2>Export suite</h2>'
+            '<p class="muted">Review member readiness and choose a format in the Export workspace.</p></div>'
+            f'<a class="button primary" href="/export?mode=suites&amp;suite={suite_id}">Export suite &rarr;</a>'
+            '</div></section>'
             '<section class="panel"><h2>Edit suite</h2>'
             f'<form method="post" action="/test-suites/{suite_id}/update" class="suite-form" data-inline-validation novalidate>'
             f'<div class="field"><label for="suite-name">Name</label><input id="suite-name" name="name" maxlength="120" required value="{escape_html(suite.name)}"></div>'
@@ -2056,36 +2572,13 @@ class LocalWebApplication:
         )
         export_panel = ""
         if test_case is not None and self._testplan_exports is not None:
-            try:
-                exportable = self._testplan_exports.get(test_case_id)
-            except TestPlanExportError as error:
-                unavailable_message = (
-                    "Automation required before code export. Generate and save a complete set of automation plans first."
-                    if str(error).startswith("Automation required")
-                    else str(error)
-                )
-                export_panel = (
-                    '<section class="panel"><h2>Export</h2>'
-                    f'<p class="muted">{escape_html(unavailable_message)}</p></section>'
-                )
-            else:
-                version_summary = ", ".join(
-                    f"Step {item.step_order + 1}: v{item.version.version} · "
-                    f"{_plan_origin_label(item.version.origin)}"
-                    for item in exportable.plans
-                )
-                export_panel = (
-                    '<section class="panel export-panel"><div class="section-heading"><div>'
-                    '<h2>Export</h2><p class="muted">Saved automation, ready to use outside AI QA Agent.</p>'
-                    '</div><details><summary>Plan versions</summary>'
-                    f'<p class="muted">{escape_html(version_summary)}</p></details></div>'
-                    '<div class="button-row">'
-                    f'<a class="button" href="/test-cases/{test_case_id}/export/portable">Portable JSON</a>'
-                    f'<a class="button" href="/test-cases/{test_case_id}/export/python">Python Playwright</a>'
-                    f'<a class="button" href="/test-cases/{test_case_id}/export/typescript">TypeScript Playwright</a>'
-                    f'<a class="button" href="/test-cases/{test_case_id}/export/csharp">C# Playwright</a>'
-                    '</div></section>'
-                )
+            export_panel = (
+                '<section class="panel export-panel"><div class="section-heading"><div>'
+                '<h2>Export</h2><p class="muted">Review automation readiness and choose a format in the Export workspace.</p>'
+                '</div>'
+                f'<a class="button primary" href="/export?mode=testcases&amp;case={quote(test_case.public_id or "")}">Export &rarr;</a>'
+                '</div></section>'
+            )
         content = (
             '<header class="page-heading">'
             + (f'<p class="eyebrow">{escape_html(case_public_id)}</p>' if case_public_id else '')
@@ -2739,7 +3232,7 @@ class LocalWebApplication:
         breadcrumbs: list[tuple[str, str]] | None = None,
     ) -> str:
         nav_items = []
-        links = [("Dashboard", "/"), ("Test Cases", "/test-cases"), ("Drafts", "/drafts"), ("Runs", "/runs")]
+        links = [("Dashboard", "/"), ("Test Cases", "/test-cases"), ("Export", "/export"), ("Drafts", "/drafts"), ("Runs", "/runs")]
         if self._test_suites is not None:
             links.append(("Test Suites", "/test-suites"))
         if self._llm_usage is not None:

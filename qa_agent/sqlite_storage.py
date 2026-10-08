@@ -1,5 +1,7 @@
 """File-backed SQLite implementations of plan and execution storage contracts."""
 
+from __future__ import annotations
+
 import json
 import sqlite3
 from contextlib import contextmanager
@@ -32,6 +34,7 @@ from qa_agent.public_ids import (
     parse_run_public_id,
     parse_test_case_public_id,
 )
+from qa_agent.test_case_repository import TestCaseCatalogEntry
 
 
 def _format_public_id(prefix: str, sequence: int) -> str:
@@ -530,6 +533,64 @@ class SQLiteTestCaseRepository(_SQLiteStorage):
                 "ORDER BY name COLLATE NOCASE, test_case_id"
             ).fetchall()
         return [TestCase.model_validate_json(row["definition_json"]) for row in rows]
+
+    def list_export_catalog(
+        self,
+        *,
+        search: str = "",
+        created_from: str = "",
+        created_before: str = "",
+        updated_from: str = "",
+        updated_before: str = "",
+        test_case_ids: list[UUID] | None = None,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> tuple[list[TestCaseCatalogEntry], int]:
+        if test_case_ids is not None and not test_case_ids:
+            return [], 0
+        conditions = []
+        parameters: list[object] = []
+        if search.strip():
+            conditions.append(
+                "(instr(lower(name), lower(?)) > 0 "
+                "OR instr(upper(COALESCE(public_id, '')), upper(?)) > 0)"
+            )
+            parameters.extend([search.strip(), search.strip()])
+        for column, lower, upper in (
+            ("created_at", created_from, created_before),
+            ("updated_at", updated_from, updated_before),
+        ):
+            if lower:
+                conditions.append(f"{column} >= ?")
+                parameters.append(lower)
+            if upper:
+                conditions.append(f"{column} < ?")
+                parameters.append(upper)
+        if test_case_ids is not None:
+            conditions.append("test_case_id IN (" + ",".join("?" for _ in test_case_ids) + ")")
+            parameters.extend(str(item) for item in test_case_ids)
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        safe_limit = min(max(int(limit), 1), 500)
+        safe_offset = max(int(offset), 0)
+        with self._connection() as connection:
+            total = int(connection.execute(
+                "SELECT COUNT(*) FROM test_cases" + where, parameters
+            ).fetchone()[0])
+            rows = connection.execute(
+                "SELECT definition_json, created_at, updated_at FROM test_cases"
+                + where
+                + " ORDER BY name COLLATE NOCASE, test_case_id LIMIT ? OFFSET ?",
+                [*parameters, safe_limit, safe_offset],
+            ).fetchall()
+        entries = [
+            TestCaseCatalogEntry(
+                TestCase.model_validate_json(row["definition_json"]),
+                datetime.fromisoformat(row["created_at"]),
+                datetime.fromisoformat(row["updated_at"]),
+            )
+            for row in rows
+        ]
+        return entries, total
 
     def find_test_plan(self, test_step_id: UUID) -> TestPlan | None:
         with self._connection() as connection:

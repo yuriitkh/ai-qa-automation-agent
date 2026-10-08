@@ -110,6 +110,16 @@ class TestSuiteRepositoryTests(unittest.TestCase):
         with self.assertRaisesRegex(KeyError, "not in this Test Suite"):
             repository.move_member(suite.id, uuid4(), 1)
 
+    def test_suite_search_page_is_bounded_and_uses_name_filter(self):
+        repository = InMemoryTestSuiteRepository()
+        for name in ("Checkout smoke", "Checkout regression", "Settings"):
+            repository.create(name, "")
+        page, total = repository.list_page(search="checkout", offset=1, limit=1)
+
+        self.assertEqual(total, 2)
+        self.assertEqual(len(page), 1)
+        self.assertEqual(page[0].name, "Checkout smoke")
+
 
 class TestSuiteWebTests(unittest.TestCase):
     def setUp(self):
@@ -141,27 +151,26 @@ class TestSuiteWebTests(unittest.TestCase):
             test_suites=self.suites,
         )
 
-    def test_suite_list_and_testcase_export_controls_render(self):
+    def test_suite_list_and_central_testcase_export_shortcuts_render(self):
         list_html = self.app.handle("GET", "/test-cases").body.decode("utf-8")
-        self.assertIn('name="test_case_id"', list_html)
-        self.assertIn("Select visible", list_html)
-        self.assertIn("Export selected", list_html)
+        self.assertNotIn('name="test_case_id"', list_html)
+        self.assertNotIn("Select visible", list_html)
+        self.assertNotIn("Export selected", list_html)
         self.assertIn("Needs validation", list_html)
         self.assertIn("Latest status:", list_html)
         self.assertIn(f'href="/test-cases/{self.case.id}/edit"', list_html)
-        self.assertIn(f'href="/test-cases/{self.case.id}/export/portable"', list_html)
+        self.assertIn(f'href="/export?mode=testcases&amp;case={self.case.public_id}"', list_html)
         self.assertIn(f'href="/test-cases/{self.case.id}"', list_html)
-        self.assertIn('class="export-selection-controls"', list_html)
+        self.assertNotIn('class="export-selection-controls"', list_html)
         self.assertIn(".field{display:grid;gap:.42rem}", list_html)
         self.assertIn(".test-case-list{min-width:700px", list_html)
         case_html = self.app.handle("GET", f"/test-cases/{self.case.id}").body.decode("utf-8")
-        self.assertIn("Portable JSON", case_html)
-        self.assertIn("Python Playwright", case_html)
-        self.assertIn("TypeScript Playwright", case_html)
-        self.assertIn("C# Playwright", case_html)
+        self.assertIn("Export &rarr;", case_html)
+        self.assertIn(f"/export?mode=testcases&amp;case={self.case.public_id}", case_html)
+        self.assertNotIn("Python Playwright</a>", case_html)
         suites_html = self.app.handle("GET", "/test-suites").body.decode("utf-8")
         self.assertIn("Create Test Suite", suites_html)
-        self.assertIn("Export", list_html)
+        self.assertIn("/export?mode=testcases&amp;case=", list_html)
 
     def test_suite_list_shows_description_counts_readiness_and_open_action(self):
         suite = self.suites.create("Smoke <suite>", "Short <description> for local checks.")
@@ -174,7 +183,7 @@ class TestSuiteWebTests(unittest.TestCase):
         self.assertIn("1 TestCase", html)
         self.assertIn("0 of 1 Automation ready", html)
         self.assertIn(f'>Open</a>', html)
-        self.assertIn(f'href="/test-suites/{suite.id}/export?format=portable"', html)
+        self.assertIn(f'href="/export?mode=suites&amp;suite={suite.id}"', html)
         self.assertIn('class="button primary" type="submit">Create suite</button>', html)
 
     def test_suite_members_render_as_compact_accessible_rows_with_lifecycle(self):
@@ -186,6 +195,8 @@ class TestSuiteWebTests(unittest.TestCase):
         self.assertIn('class="suite-members"', html)
         self.assertIn('class="suite-member-main"', html)
         self.assertIn('class="suite-member-actions"', html)
+        self.assertIn("Export suite &rarr;", html)
+        self.assertNotIn("Python ZIP", html)
         self.assertIn('class="suite-form"', html)
         self.assertIn("Needs validation", html)
         self.assertIn("1.", html)

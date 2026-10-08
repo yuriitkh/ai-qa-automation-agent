@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from datetime import timedelta
 from pathlib import Path
 
 from qa_agent.models import (
@@ -77,6 +78,30 @@ class TestCaseRepositoryTests(unittest.TestCase):
         loaded.segments[0].steps[0].name = "Changed in caller"
 
         self.assertEqual(repository.get(original.id).steps[0].name, "Open registration")
+
+    def test_export_catalog_searches_and_pages_using_existing_sqlite_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = SQLiteTestCaseRepository(Path(directory) / "catalog.sqlite3")
+            first = _case()
+            repository.save(first)
+            second = _case().model_copy(update={"name": "Profile update"})
+            repository.save(second)
+            created_at = repository.list_export_catalog(limit=10)[0][0].created_at
+            created_day = created_at.date()
+
+            entries, total = repository.list_export_catalog(
+                search=first.public_id,
+                created_from=created_day.isoformat(),
+                created_before=(created_day + timedelta(days=1)).isoformat(),
+                offset=0,
+                limit=1,
+            )
+
+            self.assertEqual(total, 1)
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0].test_case.id, first.id)
+            self.assertEqual(entries[0].created_at.date(), created_day)
+            self.assertGreaterEqual(entries[0].updated_at, entries[0].created_at)
 
 
 if __name__ == "__main__":

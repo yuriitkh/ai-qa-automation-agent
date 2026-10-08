@@ -27,6 +27,7 @@ class TestSuiteRepository(Protocol):
     def create(self, name: str, description: str) -> TestSuite: ...
     def get(self, suite_id: UUID) -> TestSuite | None: ...
     def list(self) -> list[TestSuite]: ...
+    def list_page(self, *, search: str = "", offset: int = 0, limit: int = 100) -> tuple[list[TestSuite], int]: ...
     def update(self, suite_id: UUID, name: str, description: str) -> TestSuite | None: ...
     def members(self, suite_id: UUID) -> list[UUID]: ...
     def add_member(self, suite_id: UUID, test_case_id: UUID) -> None: ...
@@ -103,6 +104,24 @@ class SQLiteTestSuiteRepository:
         with self._connection() as connection:
             rows = connection.execute("SELECT * FROM test_suites ORDER BY name COLLATE NOCASE, suite_id").fetchall()
         return [self._to_suite(row) for row in rows]
+
+    def list_page(
+        self, *, search: str = "", offset: int = 0, limit: int = 100
+    ) -> tuple[list[TestSuite], int]:
+        conditions = " WHERE instr(lower(name), lower(?)) > 0" if search.strip() else ""
+        parameters: list[object] = [search.strip()] if conditions else []
+        safe_limit = min(max(int(limit), 1), 500)
+        safe_offset = max(int(offset), 0)
+        with self._connection() as connection:
+            total = int(connection.execute(
+                "SELECT COUNT(*) FROM test_suites" + conditions, parameters
+            ).fetchone()[0])
+            rows = connection.execute(
+                "SELECT * FROM test_suites" + conditions
+                + " ORDER BY name COLLATE NOCASE, suite_id LIMIT ? OFFSET ?",
+                [*parameters, safe_limit, safe_offset],
+            ).fetchall()
+        return [self._to_suite(row) for row in rows], total
 
     def update(self, suite_id: UUID, name: str, description: str) -> TestSuite | None:
         now = datetime.now(timezone.utc)
@@ -218,6 +237,16 @@ class InMemoryTestSuiteRepository:
     def list(self) -> list[TestSuite]:
         return sorted(self._suites.values(), key=lambda item: (item.name.casefold(), str(item.id)))
 
+    def list_page(
+        self, *, search: str = "", offset: int = 0, limit: int = 100
+    ) -> tuple[list[TestSuite], int]:
+        needle = search.casefold().strip()
+        suites = [
+            suite for suite in self.list()
+            if not needle or needle in suite.name.casefold()
+        ]
+        return suites[offset:offset + limit], len(suites)
+
     def update(self, suite_id: UUID, name: str, description: str) -> TestSuite | None:
         old = self._suites.get(suite_id)
         if old is None:
@@ -269,6 +298,16 @@ class TestSuiteService:
 
     def list(self) -> list[TestSuite]:
         return self._repository.list()
+
+    def list_page(
+        self, *, search: str = "", offset: int = 0, limit: int = 100
+    ) -> tuple[list[TestSuite], int]:
+        list_page = getattr(self._repository, "list_page", None)
+        if list_page is not None:
+            return list_page(search=search, offset=offset, limit=limit)
+        needle = search.casefold().strip()
+        suites = [suite for suite in self._repository.list() if not needle or needle in suite.name.casefold()]
+        return suites[offset:offset + limit], len(suites)
 
     def member_ids(self, suite_id: UUID) -> list[UUID]:
         if self._test_cases is None:
