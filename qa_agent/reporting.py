@@ -8,6 +8,13 @@ from collections.abc import Callable, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from qa_agent.evidence_policy import (
+    DEFAULT_EVIDENCE_POLICY,
+    EvidencePolicy,
+    EvidenceScope,
+    evidence_mode_label,
+    screenshot_mode_label,
+)
 from qa_agent.models import (
     Evidence,
     EvidenceType,
@@ -42,6 +49,8 @@ class EvidenceReport(BaseModel):
     path: str
     description: str | None = None
     timestamp: datetime | None = None
+    scope: EvidenceScope | None = None
+    event: str | None = None
 
     @classmethod
     def from_evidence(cls, evidence: Evidence) -> "EvidenceReport":
@@ -52,6 +61,8 @@ class EvidenceReport(BaseModel):
             path=evidence.path,
             description=evidence.description,
             timestamp=evidence.timestamp,
+            scope=evidence.scope,
+            event=evidence.event,
         )
 
 
@@ -166,6 +177,8 @@ class RunEvidenceReport(BaseModel):
     type: str
     name: str
     description: str | None = None
+    scope: EvidenceScope | None = None
+    event: str | None = None
 
 
 class RunAttemptReport(BaseModel):
@@ -203,6 +216,7 @@ class RunReport(BaseModel):
     test_case_name: str
     test_case_description: str
     workflow_type: WorkflowType
+    evidence_policy: EvidencePolicy | None = None
     outcome: str
     status: ExecutionStatus
     started_at: datetime
@@ -294,6 +308,7 @@ class RunReportGenerator:
             test_case_name=record.test_case_name,
             test_case_description=record.test_case_description,
             workflow_type=record.workflow_type,
+            evidence_policy=record.evidence_policy,
             outcome=record.outcome,
             status=record.status,
             started_at=record.started_at,
@@ -330,6 +345,8 @@ class RunReportGenerator:
                 type=item.type,
                 name=item.name,
                 description=item.description,
+                scope=item.scope,
+                event=item.event,
             )
             for item in reference.evidence
         ]
@@ -416,21 +433,22 @@ class RunReportGenerator:
                     evidence_items = []
                     for evidence_index, evidence in enumerate(attempt.evidence):
                         name = esc(evidence.name)
+                        label = esc(_evidence_label(evidence))
                         url = evidence_url(step, attempt, evidence, evidence_index) if evidence_url else None
                         if url:
                             safe_url = esc(url)
                             evidence_items.append(
                                 f'<a href="{safe_url}" target="_blank" rel="noopener">'
-                                f'<img class="evidence-preview" src="{safe_url}" alt="Screenshot: {name}">'
-                                f"Open {name}</a>"
+                                f'<img class="evidence-preview" src="{safe_url}" alt="{label}: {name}">'
+                                f"{label}: Open {name}</a>"
                             )
                             evidence_available = True
                         elif evidence_url is None:
                             evidence_items.append(
-                                f'<span>{name} (local image link unavailable in exported file)</span>'
+                                f'<span>{label}: {name} (local image link unavailable in exported file)</span>'
                             )
                         else:
-                            evidence_items.append(f'<span class="muted">{name} — unavailable</span>')
+                            evidence_items.append(f'<span class="muted">{label}: {name} — unavailable</span>')
                     details.append(
                         '<div class="detail-box"><h4>Evidence</h4>'
                         + "<br>".join(evidence_items)
@@ -542,6 +560,18 @@ class RunReportGenerator:
             + _report_meta("Run", report.run_public_id or "Unknown")
             + _report_meta("Base URL", report.base_url or "Unavailable")
             + _report_meta("TestCase", report.test_case_public_id or "Unknown")
+            + _report_meta(
+                "Evidence mode",
+                evidence_mode_label(
+                    (report.evidence_policy or DEFAULT_EVIDENCE_POLICY).mode
+                ),
+            )
+            + _report_meta(
+                "Screenshot scope",
+                screenshot_mode_label(
+                    (report.evidence_policy or DEFAULT_EVIDENCE_POLICY).screenshot_mode
+                ),
+            )
             + "</div></section>"
         )
         technical_ids = (
@@ -621,6 +651,21 @@ def _report_meta(label: str, value: object, *, raw: bool = False) -> str:
         f'<div class="meta-item"><span class="meta-label">{escape_html(label)}</span>'
         f'<span class="meta-value">{shown}</span></div>'
     )
+
+
+def _evidence_label(evidence: RunEvidenceReport) -> str:
+    scope = {
+        EvidenceScope.ELEMENT: "Element",
+        EvidenceScope.PAGE: "Page",
+    }.get(evidence.scope, "Screenshot")
+    event = (evidence.event or "").split(":", 1)[0]
+    if event == "FAILURE":
+        return f"Failure · {scope} screenshot"
+    if event == "VERIFICATION":
+        return f"Verification · {scope} screenshot"
+    if event == "TEST_STEP":
+        return f"TestStep · {scope} screenshot"
+    return f"{scope} screenshot"
 
 
 def _safe_report_value(value: Any, test_run: TestRun) -> Any:

@@ -7,6 +7,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from qa_agent.evidence_policy import EvidencePolicy, EvidenceScope, current_evidence_policy
 from qa_agent.execution_repository import ExecutionRepository
 from qa_agent.models import (
     Execution,
@@ -68,6 +69,8 @@ class HistoryEvidenceReference(BaseModel):
     type: str
     name: str
     description: str | None = None
+    scope: EvidenceScope | None = None
+    event: str | None = None
 
 
 class HistoryExecutionReference(BaseModel):
@@ -107,6 +110,8 @@ class RunHistoryRecord(BaseModel):
     test_case_description: str
     base_url: str | None = None
     workflow_type: WorkflowType
+    # None marks a historical record created before evidence policies existed.
+    evidence_policy: EvidencePolicy | None = None
     outcome: str
     status: ExecutionStatus
     started_at: datetime
@@ -209,6 +214,7 @@ class RunHistoryRecord(BaseModel):
             test_case_description=_safe_text(test_case.description, run_context),
             base_url=_safe_text(test_case.base_url, run_context) if test_case.base_url else None,
             workflow_type=workflow_type,
+            evidence_policy=current_evidence_policy(),
             outcome=str(raw_outcome),
             status=test_run.status,
             started_at=actual_start,
@@ -263,6 +269,8 @@ class RunHistoryRecord(BaseModel):
                             type=item.type.value,
                             name=_safe_text(item.path.replace("\\", "/").rsplit("/", 1)[-1], run_context) or "evidence",
                             description=_safe_text(item.description, run_context),
+                            scope=item.scope,
+                            event=item.event,
                         )
                         for item in execution.evidence
                     ],

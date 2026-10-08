@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
+from qa_agent.evidence_policy import EvidenceScope
 from qa_agent.run_context import RunContext
 
 
@@ -438,6 +439,8 @@ class Evidence(BaseModel):
     path: str = Field(min_length=1)
     description: str | None = None
     timestamp: datetime | None = None
+    scope: EvidenceScope | None = None
+    event: str | None = None
 
 
 class Execution(BaseModel):

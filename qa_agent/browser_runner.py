@@ -12,7 +12,14 @@ from .execution_semantics import (
     NAVIGATION_LOAD_STATE,
     NAVIGATION_TIMEOUT_MS,
 )
-from .models import QATestPlan, TestCase
+from .evidence_policy import (
+    EvidenceMode,
+    EvidenceScope,
+    ScreenshotMode,
+    current_evidence_execution,
+    current_evidence_policy,
+)
+from .models import QATestPlan, QATestStep, TestCase
 
 
 class BrowserSession:
@@ -193,7 +200,13 @@ def _run_plan_on_page(
         "evidence": [],
     }
 
-    for step in plan.steps:
+    verification_actions = frozenset(
+        action
+        for action in QATestStep.ACTION_PARAMETER_FIELDS
+        if action.startswith("assert_")
+    )
+
+    for step_index, step in enumerate(plan.steps):
         step_result = {
             "action": step.action,
             "status": "passed",
@@ -359,21 +372,107 @@ def _run_plan_on_page(
             step_result["status"] = "failed"
             step_result["error"] = str(error)
             result["status"] = "failed"
-            if evidence_directory is not None:
-                try:
-                    directory = Path(evidence_directory)
-                    directory.mkdir(parents=True, exist_ok=True)
-                    screenshot_path = directory / f"execution-{uuid4().hex}.png"
-                    page.screenshot(path=str(screenshot_path))
-                    result["evidence"].append({
-                        "type": "SCREENSHOT",
-                        "path": str(screenshot_path),
-                        "description": f"Browser state after failed {step.action} step.",
-                    })
-                except Exception as capture_error:
-                    result["evidence_capture_error"] = str(capture_error)
+            _capture_screenshots(
+                page,
+                evidence_directory,
+                result,
+                action=step,
+                action_index=step_index,
+                event_kind="FAILURE",
+            )
             result["steps"].append(step_result)
             break
 
+        if (
+            current_evidence_policy().mode == EvidenceMode.EVERY_VERIFICATION
+            and step.action in verification_actions
+        ):
+            _capture_screenshots(
+                page,
+                evidence_directory,
+                result,
+                action=step,
+                action_index=step_index,
+                event_kind="VERIFICATION",
+            )
         result["steps"].append(step_result)
+
+    if (
+        result["status"] == "passed"
+        and current_evidence_policy().mode == EvidenceMode.EVERY_STEP
+        and plan.steps
+    ):
+        _capture_screenshots(
+            page,
+            evidence_directory,
+            result,
+            action=plan.steps[-1],
+            action_index=len(plan.steps),
+            event_kind="TEST_STEP",
+        )
     return result
+
+
+def _capture_screenshots(
+    page: Any,
+    evidence_directory: str | Path | None,
+    result: dict[str, Any],
+    *,
+    action: QATestStep,
+    action_index: int,
+    event_kind: str,
+) -> None:
+    """Capture configured scopes without changing the browser action result."""
+    if evidence_directory is None:
+        return
+    policy = current_evidence_policy()
+    selector = action.parameters.get("selector")
+    has_locator = isinstance(selector, str) and bool(selector.strip())
+    scopes = (
+        (EvidenceScope.ELEMENT, EvidenceScope.PAGE)
+        if policy.screenshot_mode == ScreenshotMode.ELEMENT_AND_PAGE
+        else (EvidenceScope.ELEMENT,)
+        if policy.screenshot_mode == ScreenshotMode.ELEMENT
+        else (EvidenceScope.PAGE,)
+    )
+    identity = current_evidence_execution()
+    run_execution_id = identity.execution_id if identity is not None else uuid4()
+    test_step_id = identity.test_step_id if identity is not None else None
+    directory = Path(evidence_directory)
+
+    for scope in scopes:
+        if scope == EvidenceScope.ELEMENT and not has_locator:
+            continue
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            step_part = test_step_id.hex if test_step_id is not None else "unbound"
+            screenshot_path = directory / (
+                f"execution-{run_execution_id.hex}-step-{step_part}-"
+                f"event-{action_index}-{scope.value.casefold()}.png"
+            )
+            if scope == EvidenceScope.ELEMENT:
+                page.locator(selector).screenshot(
+                    path=str(screenshot_path),
+                    timeout=ACTION_TIMEOUT_MS,
+                )
+            else:
+                page.screenshot(path=str(screenshot_path))
+            if event_kind == "FAILURE":
+                description = f"Failure screenshot after {action.action} action."
+            elif event_kind == "VERIFICATION":
+                description = f"Verification screenshot after {action.action}."
+            else:
+                description = "Screenshot after the TestStep completed."
+            result.setdefault("evidence", []).append({
+                "type": "SCREENSHOT",
+                "path": str(screenshot_path),
+                "description": description,
+                "scope": scope.value,
+                "event": f"{event_kind}:{action.action}:{action_index}",
+            })
+        except Exception as capture_error:
+            warning = f"Screenshot capture failed ({type(capture_error).__name__})."
+            result.setdefault("evidence_capture_warnings", []).append(warning)
+            # Keep the legacy warning key for callers that inspect it, without
+            # exposing exception text, selectors, URLs, or entered values.
+            result["evidence_capture_error"] = warning

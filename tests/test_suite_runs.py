@@ -4,12 +4,14 @@ import json
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event
 from urllib.parse import urlencode
 from uuid import uuid4
 
 from qa_agent.execution_repository import InMemoryExecutionRepository
+from qa_agent.evidence_policy import EvidenceMode, EvidencePolicy, ScreenshotMode
 from qa_agent.models import (
     AssertionGrounding,
     AssertionGroundingEntry,
@@ -138,6 +140,30 @@ class _UnexpectedAIWorkflow:
 
 
 class SuiteRunExecutionTests(SuiteRunTestHarness, unittest.TestCase):
+    def test_evidence_policy_is_stored_and_propagated_to_each_child_run(self):
+        policy = EvidencePolicy(
+            mode=EvidenceMode.EVERY_VERIFICATION,
+            screenshot_mode=ScreenshotMode.ELEMENT,
+        )
+        service = self.make_service(lambda _plan: {
+            "status": "passed",
+            "steps": [{"action": "assert_title", "status": "passed"}],
+        })
+        try:
+            started = service.start(
+                self.suite.id,
+                ai_policy=AIPolicy.DISABLED,
+                evidence_policy=policy,
+            )
+            finished = self.wait_for_terminal(service, started.run.public_id)
+        finally:
+            service.close()
+
+        self.assertEqual(finished.config.evidence_policy, policy)
+        history = self.history.list_for_test_case(self.case.id)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0].evidence_policy, policy)
+
     def test_retry_is_fresh_run_and_keeps_the_exact_start_time_pin(self):
         entered_runner = Event()
         release_runner = Event()
@@ -151,8 +177,21 @@ class SuiteRunExecutionTests(SuiteRunTestHarness, unittest.TestCase):
                 return {
                     "status": "failed",
                     "steps": [{"action": "assert_title", "status": "failed", "error": "title differs"}],
+                    "evidence": [{
+                        "type": "SCREENSHOT", "path": "artifacts/attempt-one.png",
+                        "description": "First attempt failure.", "scope": "PAGE",
+                        "event": "FAILURE:assert_title:0",
+                    }],
                 }
-            return {"status": "passed", "steps": [{"action": "assert_title", "status": "passed"}]}
+            return {
+                "status": "passed",
+                "steps": [{"action": "assert_title", "status": "passed"}],
+                "evidence": [{
+                    "type": "SCREENSHOT", "path": "artifacts/attempt-two.png",
+                    "description": "Retry verification.", "scope": "PAGE",
+                    "event": "VERIFICATION:assert_title:0",
+                }],
+            }
 
         service = self.make_service(runner)
         try:
@@ -187,6 +226,18 @@ class SuiteRunExecutionTests(SuiteRunTestHarness, unittest.TestCase):
         self.assertEqual(
             [record.executions[0].test_plan_version_id for record in self.history.list_for_test_case(self.case.id)],
             [original_pin, original_pin],
+        )
+        run_records = {
+            record.run_id: record
+            for record in self.history.list_for_test_case(self.case.id)
+        }
+        first_record = run_records[item.attempts[0].run_id]
+        second_record = run_records[item.attempts[1].run_id]
+        self.assertEqual(first_record.executions[0].evidence[0].name, "attempt-one.png")
+        self.assertEqual(second_record.executions[0].evidence[0].name, "attempt-two.png")
+        self.assertNotEqual(
+            first_record.executions[0].execution_id,
+            second_record.executions[0].execution_id,
         )
 
     def test_failure_isolation_continues_to_next_member_and_ai_policy_does_not_call_ai(self):
@@ -289,6 +340,68 @@ class SuiteRunStorageTests(unittest.TestCase):
             report = json.loads(suite_run_report_json(interrupted))
             self.assertNotIn("test_case_snapshot", report["items"][0])
 
+    def test_suite_page_links_each_retry_to_its_own_run_without_evidence_gallery(self):
+        harness = _WebSuiteHarness()
+        try:
+            first_run_id, second_run_id = uuid4(), uuid4()
+            started_at = datetime.now(timezone.utc)
+            run = SuiteRun(
+                suite_id=harness.suite.id,
+                suite_name=harness.suite.name,
+                config=SuiteRunConfig(retry_count=1),
+                status=SuiteRunStatus.COMPLETED,
+                items=[SuiteRunItem(
+                    order_index=0,
+                    test_case_id=harness.case.id,
+                    test_case_public_id=harness.case.public_id,
+                    test_case_name=harness.case.name,
+                    status=SuiteRunItemStatus.PASSED_AFTER_RETRY,
+                    classification="PASSED",
+                    duration_ms=2400,
+                    attempts=[
+                        SuiteRunAttempt(
+                            attempt_number=1,
+                            run_id=first_run_id,
+                            run_public_id="RUN-000101",
+                            run_status="FAILED",
+                            outcome="PRODUCT_FAILURE",
+                            started_at=started_at,
+                            finished_at=started_at,
+                            duration_ms=1100,
+                            failure_classifications=["PRODUCT_FAILURE"],
+                        ),
+                        SuiteRunAttempt(
+                            attempt_number=2,
+                            run_id=second_run_id,
+                            run_public_id="RUN-000102",
+                            run_status="PASSED",
+                            outcome="PASSED",
+                            started_at=started_at,
+                            finished_at=started_at,
+                            duration_ms=1200,
+                        ),
+                    ],
+                )],
+            )
+            stored = harness.suite_run_service._repository.save(run)
+
+            response = harness.app.handle("GET", f"/suite-runs/{stored.public_id}")
+            html = response.body.decode("utf-8")
+
+            self.assertEqual(response.status, 200)
+            self.assertIn("TC-0001", html)
+            self.assertIn("PASSED AFTER RETRY", html)
+            self.assertIn("2.4 s", html)
+            self.assertIn("PRODUCT_FAILURE", html)
+            self.assertIn("Attempt 1", html)
+            self.assertIn("Attempt 2", html)
+            self.assertIn(f'href="/runs/{first_run_id}"', html)
+            self.assertIn(f'href="/runs/{second_run_id}"', html)
+            self.assertNotIn("<img", html)
+            self.assertNotIn("Evidence</h4>", html)
+        finally:
+            harness.app.close()
+
     def test_web_preflight_lists_blockers_and_suite_run_is_reloadable(self):
         harness = _WebSuiteHarness()
         try:
@@ -298,6 +411,8 @@ class SuiteRunStorageTests(unittest.TestCase):
             self.assertIn("Pinned plan versions at start", config_html)
             self.assertIn("Sequential", config_html)
             self.assertIn("AI policy", config_html)
+            self.assertIn("Every verification", config_html)
+            self.assertIn("Element + Page", config_html)
 
             invalid = harness.app.handle("POST", f"/test-suites/{harness.suite.id}/run", urlencode({
                 "workflow": "REGRESSION",
@@ -312,19 +427,40 @@ class SuiteRunStorageTests(unittest.TestCase):
                 "execution_type": "SEQUENTIAL",
                 "ai_policy": "DISABLED",
                 "retry_count": "0",
+                "evidence_mode": "EVERY_VERIFICATION",
+                "screenshot_mode": "ELEMENT_AND_PAGE",
             }))
             self.assertEqual(valid.status, 303)
             public_id = valid.headers["Location"].rsplit("/", 1)[1]
+            harness.wait_for_terminal(harness.suite_run_service, public_id)
             page = harness.app.handle("GET", valid.headers["Location"])
             self.assertEqual(page.status, 200)
             self.assertIn("Download JSON report", page.body.decode("utf-8"))
+            page_html = page.body.decode("utf-8")
+            self.assertIn("Every verification", page_html)
+            self.assertNotIn("<img", page_html)
             progress = harness.app.handle("GET", f"/api/suite-runs/{public_id}")
             payload = json.loads(progress.body)
             self.assertEqual(payload["public_id"], public_id)
+            self.assertEqual(payload["evidence_policy"], {
+                "mode": "EVERY_VERIFICATION",
+                "screenshot_mode": "ELEMENT_AND_PAGE",
+            })
             self.assertNotIn("test_case_snapshot", progress.body.decode("utf-8"))
             report = harness.app.handle("GET", f"/suite-runs/{public_id}/report.json")
             self.assertEqual(report.content_type, "application/json; charset=utf-8")
             self.assertNotIn(b"test_case_snapshot", report.body)
+            suite_payload = json.loads(report.body)
+            self.assertEqual(suite_payload["config"]["evidence_policy"]["mode"], "EVERY_VERIFICATION")
+            self.assertEqual(
+                suite_payload["items"][0]["attempts"][0]["run_id"],
+                str(harness.history.list_for_test_case(harness.case.id)[0].run_id),
+            )
+            self.assertNotIn("SCREENSHOT", report.body.decode("utf-8"))
+            self.assertIn(
+                f'href="/runs/{suite_payload["items"][0]["attempts"][0]["run_id"]}"',
+                page_html,
+            )
         finally:
             harness.app.close()
 

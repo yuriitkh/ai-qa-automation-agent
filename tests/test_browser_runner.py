@@ -5,6 +5,14 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from qa_agent.browser_runner import BrowserRunner, run_test_plan
+from qa_agent.evidence_policy import (
+    DEFAULT_EVIDENCE_POLICY,
+    EvidenceMode,
+    EvidencePolicy,
+    EvidenceScope,
+    ScreenshotMode,
+    evidence_policy_scope,
+)
 from qa_agent.execution_semantics import (
     ACTION_TIMEOUT_MS,
     ASSERTION_TIMEOUT_MS,
@@ -664,7 +672,7 @@ class BrowserRunnerActionTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertIn("Expected title", result["steps"][0]["error"])
         self.assertEqual(result["evidence"], [])
-        self.assertEqual(result["evidence_capture_error"], "capture failed")
+        self.assertEqual(result["evidence_capture_error"], "Screenshot capture failed (RuntimeError).")
 
     def test_passed_execution_does_not_capture_screenshot(self) -> None:
         self.page.title.return_value = "Expected"
@@ -678,6 +686,141 @@ class BrowserRunnerActionTests(unittest.TestCase):
             self.assertEqual(result["evidence"], [])
             self.assertEqual(list(Path(directory).iterdir()), [])
             self.page.screenshot.assert_not_called()
+
+    def run_with_evidence_policy(self, policy, steps, directory):
+        plan = QATestPlan(url="https://example.com", steps=steps)
+        with evidence_policy_scope(policy):
+            with patch("qa_agent.browser_runner.sync_playwright", return_value=self.manager):
+                return run_test_plan(plan, evidence_directory=directory)
+
+    def test_every_verification_captures_only_successful_assertions(self) -> None:
+        self.page.title.return_value = "Expected"
+        with tempfile.TemporaryDirectory() as directory:
+            self.page.screenshot.side_effect = lambda *, path: Path(path).write_bytes(b"png")
+            result = self.run_with_evidence_policy(
+                EvidencePolicy(mode=EvidenceMode.EVERY_VERIFICATION),
+                [
+                    {"action": "navigate", "parameters": {"url": "https://example.com"}},
+                    {"action": "assert_title", "parameters": {"expected": "Expected"}},
+                    {"action": "assert_page_loaded", "parameters": {}},
+                ],
+                directory,
+            )
+
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(len(result["evidence"]), 2)
+        self.assertEqual([item["scope"] for item in result["evidence"]], ["PAGE", "PAGE"])
+        self.assertTrue(all(item["event"].startswith("VERIFICATION:") for item in result["evidence"]))
+
+    def test_every_step_captures_once_after_success_with_selected_scope(self) -> None:
+        self.page.title.return_value = "Expected"
+        with tempfile.TemporaryDirectory() as directory:
+            def save(*, path, **_kwargs):
+                Path(path).write_bytes(b"png")
+
+            self.page.screenshot.side_effect = save
+            self.locator.screenshot.side_effect = save
+            result = self.run_with_evidence_policy(
+                EvidencePolicy(
+                    mode=EvidenceMode.EVERY_STEP,
+                    screenshot_mode=ScreenshotMode.ELEMENT_AND_PAGE,
+                ),
+                [
+                    {"action": "assert_title", "parameters": {"expected": "Expected"}},
+                    {"action": "assert_visible", "parameters": {"selector": "h1"}},
+                ],
+                directory,
+            )
+
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual([item["scope"] for item in result["evidence"]], ["ELEMENT", "PAGE"])
+        self.assertTrue(all(item["event"].startswith("TEST_STEP:") for item in result["evidence"]))
+        self.locator.screenshot.assert_called_once()
+        self.page.screenshot.assert_called_once()
+
+    def test_default_policy_is_failures_only_and_element_mode_uses_locator(self) -> None:
+        self.assertEqual(DEFAULT_EVIDENCE_POLICY.mode, EvidenceMode.FAILURES_ONLY)
+        self.assertEqual(DEFAULT_EVIDENCE_POLICY.screenshot_mode, ScreenshotMode.PAGE)
+        self.page.title.return_value = "Expected"
+        with tempfile.TemporaryDirectory() as directory:
+            self.locator.screenshot.side_effect = lambda *, path, **_: Path(path).write_bytes(b"png")
+            result = self.run_with_evidence_policy(
+                EvidencePolicy(
+                    mode=EvidenceMode.EVERY_VERIFICATION,
+                    screenshot_mode=ScreenshotMode.ELEMENT,
+                ),
+                [{"action": "assert_visible", "parameters": {"selector": "h1"}}],
+                directory,
+            )
+
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(len(result["evidence"]), 1)
+        self.assertEqual(result["evidence"][0]["scope"], "ELEMENT")
+        self.locator.screenshot.assert_called_once()
+        self.page.screenshot.assert_not_called()
+
+    def test_element_scope_without_locator_skips_safely(self) -> None:
+        self.page.title.return_value = "Expected"
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_with_evidence_policy(
+                EvidencePolicy(
+                    mode=EvidenceMode.EVERY_VERIFICATION,
+                    screenshot_mode=ScreenshotMode.ELEMENT,
+                ),
+                [{"action": "assert_title", "parameters": {"expected": "Expected"}}],
+                directory,
+            )
+
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["evidence"], [])
+        self.assertNotIn("evidence_capture_error", result)
+        self.page.screenshot.assert_not_called()
+        self.page.locator.assert_not_called()
+
+    def test_every_step_failure_is_captured_once_as_failure_evidence(self) -> None:
+        self.page.title.return_value = "Wrong"
+        with tempfile.TemporaryDirectory() as directory:
+            self.page.screenshot.side_effect = lambda *, path: Path(path).write_bytes(b"png")
+            result = self.run_with_evidence_policy(
+                EvidencePolicy(mode=EvidenceMode.EVERY_STEP),
+                [{"action": "assert_title", "parameters": {"expected": "Expected"}}],
+                directory,
+            )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(len(result["evidence"]), 1)
+        self.assertTrue(result["evidence"][0]["event"].startswith("FAILURE:"))
+
+    def test_every_step_capture_error_does_not_change_passed_result_or_leak_error(self) -> None:
+        self.page.title.return_value = "Expected"
+        self.page.screenshot.side_effect = RuntimeError("secret URL and form value")
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_with_evidence_policy(
+                EvidencePolicy(mode=EvidenceMode.EVERY_STEP),
+                [{"action": "assert_title", "parameters": {"expected": "Expected"}}],
+                directory,
+            )
+
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["evidence"], [])
+        self.assertEqual(result["evidence_capture_warnings"], [
+            "Screenshot capture failed (RuntimeError)."
+        ])
+        self.assertNotIn("secret", str(result))
+
+    def test_failures_only_is_default_and_keeps_page_scope(self) -> None:
+        self.page.title.return_value = "Wrong"
+        with tempfile.TemporaryDirectory() as directory:
+            self.page.screenshot.side_effect = lambda *, path: Path(path).write_bytes(b"png")
+            plan = QATestPlan(url="https://example.com", steps=[{
+                "action": "assert_title", "parameters": {"expected": "Expected"}
+            }])
+            with patch("qa_agent.browser_runner.sync_playwright", return_value=self.manager):
+                result = run_test_plan(plan, evidence_directory=directory)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["evidence"][0]["scope"], EvidenceScope.PAGE.value)
+        self.assertTrue(result["evidence"][0]["event"].startswith("FAILURE:"))
 
 
 if __name__ == "__main__":

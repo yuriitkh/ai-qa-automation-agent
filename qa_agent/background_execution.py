@@ -13,6 +13,7 @@ from qa_agent.execution_progress import (
     ExecutionProgressStore,
     active_execution_progress,
 )
+from qa_agent.evidence_policy import DEFAULT_EVIDENCE_POLICY, EvidencePolicy, evidence_policy_scope
 from qa_agent.pipeline import PipelineStageError
 from qa_agent.run_history import RunHistoryService, WorkflowType
 from qa_agent.run_context import RunContext
@@ -50,7 +51,13 @@ class BackgroundRunService:
         self._lock = Lock()
         self._closed = False
 
-    def start(self, test_case_id: UUID, workflow_type: WorkflowType) -> str:
+    def start(
+        self,
+        test_case_id: UUID,
+        workflow_type: WorkflowType,
+        *,
+        evidence_policy: EvidencePolicy | None = None,
+    ) -> str:
         progress_id = self.progress_store.create(test_case_id, workflow_type)
         reporter = ExecutionProgressReporter(self.progress_store, progress_id)
         reporter.emit(
@@ -73,6 +80,7 @@ class BackgroundRunService:
                     progress_id,
                     test_case_id,
                     workflow_type,
+                    evidence_policy or DEFAULT_EVIDENCE_POLICY,
                 )
         except Exception:
             self._capacity.release()
@@ -89,9 +97,10 @@ class BackgroundRunService:
         progress_id: str,
         test_case_id: UUID,
         workflow_type: WorkflowType,
+        evidence_policy: EvidencePolicy,
     ) -> None:
         try:
-            self._execute(progress_id, test_case_id, workflow_type)
+            self._execute(progress_id, test_case_id, workflow_type, evidence_policy)
         finally:
             self._capacity.release()
 
@@ -107,6 +116,7 @@ class BackgroundRunService:
         progress_id: str,
         test_case_id: UUID,
         workflow_type: WorkflowType,
+        evidence_policy: EvidencePolicy = DEFAULT_EVIDENCE_POLICY,
     ) -> None:
         reporter = ExecutionProgressReporter(
             self.progress_store,
@@ -119,11 +129,12 @@ class BackgroundRunService:
                 message="Run started.",
             )
             try:
-                with llm_usage_scope(
-                    related_test_case_id=test_case_id,
-                    related_workflow_id=progress_id,
-                ):
-                    result = self._run_service.run(test_case_id, workflow_type)
+                with evidence_policy_scope(evidence_policy):
+                    with llm_usage_scope(
+                        related_test_case_id=test_case_id,
+                        related_workflow_id=progress_id,
+                    ):
+                        result = self._run_service.run(test_case_id, workflow_type)
             except RunUnavailableError as error:
                 category = getattr(error, "category", "MISSING_AUTOMATION")
                 logger.info("TestCase run was not available (%s)", category)

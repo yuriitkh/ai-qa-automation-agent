@@ -6,10 +6,11 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from urllib.parse import urlencode
 from uuid import uuid4
 
+from qa_agent.evidence_policy import EvidenceMode, EvidencePolicy, ScreenshotMode
 from qa_agent.execution_repository import InMemoryExecutionRepository
 from qa_agent.models import (
     Evidence,
@@ -596,6 +597,32 @@ class PersistedTestCaseRunUiTests(unittest.TestCase):
         self.assertIn(b"Start run", detail.body)
         self.assertIn(b'method="post"', detail.body)
         self.run_service.run.assert_not_called()
+
+    def test_run_page_exposes_compact_evidence_controls_and_post_propagates_choice(self) -> None:
+        page = self.app.handle("GET", f"/test-cases/{self.case.id}").body.decode("utf-8")
+        self.assertIn("Evidence settings", page)
+        self.assertIn('value="FAILURES_ONLY" selected>Failures only', page)
+        self.assertIn('value="EVERY_VERIFICATION">Every verification', page)
+        self.assertIn('value="EVERY_STEP">Every step', page)
+        self.assertIn('value="ELEMENT">Element', page)
+        self.assertIn('value="PAGE" selected>Page', page)
+        self.assertIn('value="ELEMENT_AND_PAGE">Element + Page', page)
+
+        with patch.object(self.app._background_runs, "start", return_value="progress-id") as start:
+            response = self.app.handle(
+                "POST",
+                f"/test-cases/{self.case.id}/run",
+                b"workflow=REGRESSION&evidence_mode=EVERY_VERIFICATION&screenshot_mode=ELEMENT_AND_PAGE",
+            )
+
+        self.assertEqual(response.status, 303)
+        self.assertEqual(
+            start.call_args.kwargs["evidence_policy"],
+            EvidencePolicy(
+                mode=EvidenceMode.EVERY_VERIFICATION,
+                screenshot_mode=ScreenshotMode.ELEMENT_AND_PAGE,
+            ),
+        )
 
     def test_post_returns_progress_url_and_runs_selected_workflow_in_background(self) -> None:
         started_at = time.monotonic()

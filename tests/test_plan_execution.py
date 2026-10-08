@@ -60,6 +60,25 @@ class PlanExecutionServiceTests(unittest.TestCase):
         saved = self.repository.list_for_test_step(self.test_step.id)
         self.assertEqual(saved, [outcome.execution])
 
+    def test_successful_runner_evidence_is_attached_to_its_execution(self) -> None:
+        outcome = self.execute(lambda _: {
+            "status": "passed",
+            "steps": [{"action": "assert_title", "status": "passed"}],
+            "evidence": [{
+                "type": "SCREENSHOT",
+                "path": "artifacts/verification.png",
+                "description": "Verification screenshot.",
+                "scope": "PAGE",
+                "event": "VERIFICATION:assert_title:0",
+            }],
+        })
+
+        self.assertEqual(len(outcome.execution.evidence), 1)
+        evidence = outcome.execution.evidence[0]
+        self.assertEqual(evidence.execution_id, outcome.execution.id)
+        self.assertEqual(evidence.scope.value, "PAGE")
+        self.assertEqual(evidence.event, "VERIFICATION:assert_title:0")
+
     def test_assertion_failure_is_product_failure_not_automation_drift(self) -> None:
         outcome = self.execute(lambda _: {
             "status": "failed",

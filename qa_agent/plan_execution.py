@@ -8,6 +8,7 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from qa_agent.execution_repository import ExecutionRepository
+from qa_agent.evidence_policy import EvidenceExecutionIdentity, EvidenceScope, evidence_execution_scope
 from qa_agent.execution_progress import (
     ExecutionEventType,
     emit_progress_event,
@@ -140,9 +141,11 @@ class PlanExecutionService:
         )
         runner_result: dict[str, Any] | None = None
         execution_error: Exception | None = None
+        execution_id = uuid4()
         try:
             active_runner = runner if runner is not None else self._runner
-            runner_output = active_runner(plan_version.qa_test_plan)
+            with evidence_execution_scope(EvidenceExecutionIdentity(execution_id, test_step.id)):
+                runner_output = active_runner(plan_version.qa_test_plan)
             if not isinstance(runner_output, dict):
                 raise TypeError("Browser runner must return a result dictionary.")
             runner_result = runner_output
@@ -160,7 +163,6 @@ class PlanExecutionService:
             if runner_status == "passed"
             else ExecutionStatus.FAILED
         )
-        execution_id = uuid4()
         execution = Execution(
             id=execution_id,
             test_step_id=test_step.id,
@@ -182,7 +184,7 @@ class PlanExecutionService:
                 else None
             ),
             runner_result=runner_result,
-            evidence=self._runner_evidence(runner_result, status, execution_id),
+            evidence=self._runner_evidence(runner_result, execution_id),
         )
         classification = self._classify(execution, execution_error, plan_version)
         grounding_reason = self._grounding_failure_reason(
@@ -331,10 +333,9 @@ class PlanExecutionService:
     @staticmethod
     def _runner_evidence(
         runner_result: dict[str, Any] | None,
-        status: ExecutionStatus,
         execution_id,
     ) -> tuple[Evidence, ...]:
-        if status != ExecutionStatus.FAILED or not isinstance(runner_result, dict):
+        if not isinstance(runner_result, dict):
             return ()
         items = runner_result.get("evidence", [])
         if not isinstance(items, list):
@@ -348,12 +349,18 @@ class PlanExecutionService:
                 continue
             evidence_id = uuid4()
             item["evidence_id"] = str(evidence_id)
+            try:
+                scope = EvidenceScope(item["scope"]) if isinstance(item.get("scope"), str) else None
+            except ValueError:
+                scope = None
             evidence.append(Evidence(
                 id=evidence_id,
                 execution_id=execution_id,
                 type=EvidenceType.SCREENSHOT,
                 path=path,
                 description=item.get("description"),
+                scope=scope,
+                event=item.get("event") if isinstance(item.get("event"), str) else None,
             ))
         return tuple(evidence)
 

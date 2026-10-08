@@ -3,6 +3,13 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
+from qa_agent.evidence_policy import (
+    EvidenceMode,
+    EvidencePolicy,
+    EvidenceScope,
+    ScreenshotMode,
+    evidence_policy_scope,
+)
 from qa_agent.models import (
     Evidence,
     EvidenceType,
@@ -48,6 +55,8 @@ class RunReportTests(unittest.TestCase):
             type=EvidenceType.SCREENSHOT,
             path="artifacts/failure-view.png",
             description="Page after failed assertion.",
+            scope=EvidenceScope.PAGE,
+            event="FAILURE:assert_title:1",
         ),)
         self.run = DomainTestRun.from_test_case(
             self.case,
@@ -102,6 +111,8 @@ class RunReportTests(unittest.TestCase):
             str(self.run.executions[1].test_plan_version_id),
         )
         self.assertEqual(failed_attempt["evidence"][0]["name"], "failure-view.png")
+        self.assertEqual(failed_attempt["evidence"][0]["scope"], "PAGE")
+        self.assertEqual(failed_attempt["evidence"][0]["event"], "FAILURE:assert_title:1")
         self.assertEqual(failed_attempt["error"], "Expected welcome; token=[REDACTED]")
         self.assertEqual(failed_attempt["actual_result"], "Actual value [REDACTED]")
         self.assertNotIn(self.secret, report.to_json())
@@ -227,6 +238,85 @@ class RunReportTests(unittest.TestCase):
             f"/runs/{report.run_id}/evidence/{self.run.executions[1].id}/0",
             html,
         )
+
+    def test_reports_include_effective_evidence_policy_and_capture_label(self) -> None:
+        policy = EvidencePolicy(
+            mode=EvidenceMode.EVERY_VERIFICATION,
+            screenshot_mode=ScreenshotMode.ELEMENT_AND_PAGE,
+        )
+        with evidence_policy_scope(policy):
+            report = self.generator.generate_current(
+                self.case, self.run, workflow_type=WorkflowType.AUTOMATION
+            )
+
+        payload = json.loads(report.to_json())
+        capture = payload["steps"][1]["attempts"][0]["evidence"][0]
+        html = self.generator.to_html(
+            report,
+            evidence_url=lambda _step, _attempt, _evidence, _index: "/local-evidence.png",
+        )
+        self.assertEqual(payload["evidence_policy"], {
+            "mode": "EVERY_VERIFICATION",
+            "screenshot_mode": "ELEMENT_AND_PAGE",
+        })
+        self.assertEqual(capture["scope"], "PAGE")
+        self.assertIn("Failure · Page screenshot", html)
+        self.assertIn("Evidence mode", html)
+        self.assertIn("Every verification", html)
+        self.assertIn("Element + Page", html)
+
+    def test_pre_policy_history_defaults_to_legacy_evidence_display(self) -> None:
+        record = RunHistoryRecord.from_completed_run(
+            self.case, self.run, workflow_type=WorkflowType.REGRESSION
+        ).model_copy(update={"evidence_policy": None})
+
+        report = self.generator.generate_history(record)
+        html = self.generator.to_html(report)
+
+        self.assertIsNone(report.evidence_policy)
+        self.assertIn("Failures only", html)
+        self.assertIn("Page</span>", html)
+
+    def test_run_json_includes_success_evidence_and_html_escapes_its_name(self) -> None:
+        passed_execution = self.run.executions[0].model_copy(update={
+            "evidence": (Evidence(
+                execution_id=self.run.executions[0].id,
+                type=EvidenceType.SCREENSHOT,
+                path="artifacts/success.png",
+                description="After a passing assertion.",
+                scope=EvidenceScope.ELEMENT,
+                event="VERIFICATION:assert_visible:0",
+            ),),
+        })
+        run = self.run.model_copy(update={
+            "executions": (passed_execution, *self.run.executions[1:]),
+        })
+        record = RunHistoryRecord.from_completed_run(
+            self.case, run, workflow_type=WorkflowType.REGRESSION
+        )
+        evidence_refs = [
+            item.model_copy(update={"name": "<script>alert(1)</script>.png"})
+            if item.name == "success.png" else item
+            for execution in record.executions
+            for item in execution.evidence
+        ]
+        first_reference, *other_references = record.executions
+        record = record.model_copy(update={
+            "executions": [
+                first_reference.model_copy(update={"evidence": evidence_refs[:1]}),
+                *other_references,
+            ],
+        })
+
+        report = self.generator.generate_history(record)
+        payload = json.loads(report.to_json())
+        html = self.generator.to_html(report)
+
+        evidence = payload["steps"][0]["attempts"][0]["evidence"][0]
+        self.assertEqual(evidence["scope"], "ELEMENT")
+        self.assertEqual(evidence["event"], "VERIFICATION:assert_visible:0")
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;.png", html)
+        self.assertNotIn("<script>alert(1)</script>.png", html)
 
 
 if __name__ == "__main__":

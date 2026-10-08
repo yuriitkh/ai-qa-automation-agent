@@ -23,6 +23,13 @@ from qa_agent.presentation import (
 )
 from qa_agent.reporting import RunAttemptReport, RunEvidenceReport, RunReportGenerator, RunStepReport
 from qa_agent.browser_runner import BrowserRunner
+from qa_agent.evidence_policy import (
+    EvidenceMode,
+    EvidencePolicy,
+    ScreenshotMode,
+    evidence_mode_label,
+    screenshot_mode_label,
+)
 from qa_agent.provider_settings import (
     ProviderSettingsRepository,
     ProviderSettingsService,
@@ -458,13 +465,22 @@ class LocalWebApplication:
             return self._run_error(test_case_id, "Choose Automation, Validation, or Regression before starting a run.", 400)
         if workflow not in {WorkflowType.AUTOMATION, WorkflowType.VALIDATION, WorkflowType.REGRESSION}:
             return self._run_error(test_case_id, "Choose Automation, Validation, or Regression before starting a run.", 400)
+        try:
+            evidence_policy = EvidencePolicy(
+                mode=EvidenceMode(form.get("evidence_mode", [EvidenceMode.FAILURES_ONLY.value])[0]),
+                screenshot_mode=ScreenshotMode(form.get("screenshot_mode", [ScreenshotMode.PAGE.value])[0]),
+            )
+        except ValueError:
+            return self._run_error(test_case_id, "Choose a valid evidence mode and screenshot scope.", 400)
         if self._background_runs is None:
             return self._run_error(
                 test_case_id,
                 "Execution is not available for this application.",
                 503,
             )
-        progress_id = self._background_runs.start(test_case_id, workflow)
+        progress_id = self._background_runs.start(
+            test_case_id, workflow, evidence_policy=evidence_policy
+        )
         return WebResponse.redirect(f"/runs/progress/{progress_id}")
 
     def _progress_json(self, progress_id: str) -> WebResponse:
@@ -2673,6 +2689,7 @@ class LocalWebApplication:
             '<div class="field"><label for="suite-retries">Retry count</label><select id="suite-retries" name="retry_count">'
             '<option value="0" selected>0 retries</option><option value="1">1 retry</option><option value="2">2 retries</option></select>'
             '<small>Each retry is a fresh TestCase Run against the same pinned plan versions.</small></div>'
+            + self._evidence_controls(f"suite-{suite_id}")
             + f'<button class="button primary" type="submit"{("" if can_start else " disabled aria-disabled=\"true\"")}>Start Suite Run</button>'
             + '</form>'
         )
@@ -2705,11 +2722,22 @@ class LocalWebApplication:
         try:
             ai_policy = AIPolicy(form.get("ai_policy", [AIPolicy.DISABLED.value])[0])
             retry_count = int(form.get("retry_count", ["0"])[0])
-            config = SuiteRunConfig(ai_policy=ai_policy, retry_count=retry_count)
+            evidence_policy = EvidencePolicy(
+                mode=EvidenceMode(form.get("evidence_mode", [EvidenceMode.FAILURES_ONLY.value])[0]),
+                screenshot_mode=ScreenshotMode(form.get("screenshot_mode", [ScreenshotMode.PAGE.value])[0]),
+            )
+            config = SuiteRunConfig(
+                ai_policy=ai_policy,
+                retry_count=retry_count,
+                evidence_policy=evidence_policy,
+            )
         except (ValueError, TypeError):
-            return self._suite_run_config_page(suite_id, error="Choose a valid AI policy and retry count from 0 to 2.", status=400)
+            return self._suite_run_config_page(suite_id, error="Choose a valid AI policy, evidence mode, screenshot scope, and retry count from 0 to 2.", status=400)
         result = self._suite_run_service.start(
-            suite_id, ai_policy=config.ai_policy, retry_count=config.retry_count
+            suite_id,
+            ai_policy=config.ai_policy,
+            retry_count=config.retry_count,
+            evidence_policy=config.evidence_policy,
         )
         if result.run is None:
             message = result.suite_error or "Resolve every blocked member before starting this Suite Run."
@@ -2728,17 +2756,27 @@ class LocalWebApplication:
             return self._not_found("Suite Run not found.")
         item_rows = []
         for item in run.items:
-            attempts = "".join(
-                f'<li>Attempt {attempt.attempt_number}: '
-                + (f'<a href="/runs/{attempt.run_id}">{escape_html(attempt.run_public_id or "Open TestCase Run")}</a> '
-                   if attempt.run_id else "No Run History record ")
-                + f'— {escape_html(attempt.outcome)} ({escape_html(attempt.run_status)})</li>'
-                for attempt in item.attempts
-            )
+            attempt_rows = []
+            for attempt in item.attempts:
+                classification = ", ".join(attempt.failure_classifications) or attempt.outcome
+                duration = escape_html(format_duration(attempt.duration_ms))
+                run_link = (
+                    f'<a href="/runs/{attempt.run_id}">'
+                    f'{escape_html(attempt.run_public_id or "Open TestCase Run")}</a>'
+                    if attempt.run_id else "No Run History record"
+                )
+                attempt_rows.append(
+                    f'<li>Attempt {attempt.attempt_number} — {escape_html(attempt.run_status)}'
+                    f' · {escape_html(classification)} · {duration} → {run_link}</li>'
+                )
+            attempts = "".join(attempt_rows)
             item_rows.append(
                 f'<li class="suite-run-item" data-suite-item="{item.order_index}">'
-                f'<div><strong>{item.order_index + 1}. {escape_html(item.test_case_public_id or "")} '
-                f'{escape_html(item.test_case_name)}</strong> {badge(item.status.value)}</div>'
+                f'<div><strong>{escape_html(item.test_case_public_id or "")} — '
+                f'{escape_html(item.test_case_name)}</strong> {badge(item.status.value)}'
+                f'<span class="muted">{escape_html(format_duration(item.duration_ms))}'
+                + (f' · {escape_html(item.classification)}' if item.classification else '')
+                + '</span></div>'
                 + (f'<ul>{attempts}</ul>' if attempts else '<p class="muted">Waiting to start</p>')
                 + '</li>'
             )
@@ -2749,7 +2787,9 @@ class LocalWebApplication:
             f'<h1>{escape_html(run.public_id or public_id)} — {escape_html(run.suite_name)}</h1>'
             f'<p class="lead">{badge(run.status.value)} Workflow: Regression · Execution: Sequential · '
             f'AI policy: {escape_html(run.config.ai_policy.value)} · Retries: {run.config.retry_count}</p></header>'
-            f'<section class="panel" data-suite-run-progress="/api/suite-runs/{escape_html(run.public_id or public_id)}">'
+            + f'<p class="muted">Evidence: {escape_html(evidence_mode_label(run.config.evidence_policy.mode))} · '
+            f'{escape_html(screenshot_mode_label(run.config.evidence_policy.screenshot_mode))}</p>'
+            + f'<section class="panel" data-suite-run-progress="/api/suite-runs/{escape_html(run.public_id or public_id)}">'
             '<h2>Progress</h2>'
             f'<p data-suite-run-summary>{run.passed_count} passed · {run.failed_count} failed · {run.flaky_count} flaky · {len(run.items)} total</p>'
             + ('<p data-suite-run-live>Refreshing saved progress…</p>' if live else '<p data-suite-run-live>Run finished.</p>')
@@ -3282,8 +3322,31 @@ class LocalWebApplication:
             '<option value="" disabled selected>Choose a workflow</option>'
             '<option value="VALIDATION">Validation</option>'
             '<option value="REGRESSION">Regression</option>'
-            '</select></div><button class="button primary" type="submit">Start run</button></form>'
+            '</select></div>'
+            + LocalWebApplication._evidence_controls(f"run-{test_case_id}")
+            + '<button class="button primary" type="submit">Start run</button></form>'
             '</section>'
+        )
+
+    @staticmethod
+    def _evidence_controls(prefix: str) -> str:
+        mode_id = f"{prefix}-evidence-mode"
+        scope_id = f"{prefix}-screenshot-mode"
+        return (
+            '<details class="run-evidence-options"><summary>Evidence settings</summary>'
+            '<div class="run-evidence-fields">'
+            f'<div class="field"><label for="{mode_id}">Evidence</label>'
+            f'<select id="{mode_id}" name="evidence_mode">'
+            f'<option value="{EvidenceMode.FAILURES_ONLY.value}" selected>Failures only</option>'
+            f'<option value="{EvidenceMode.EVERY_VERIFICATION.value}">Every verification</option>'
+            f'<option value="{EvidenceMode.EVERY_STEP.value}">Every step</option></select></div>'
+            f'<div class="field"><label for="{scope_id}">Screenshot</label>'
+            f'<select id="{scope_id}" name="screenshot_mode">'
+            f'<option value="{ScreenshotMode.ELEMENT.value}">Element</option>'
+            f'<option value="{ScreenshotMode.PAGE.value}" selected>Page</option>'
+            f'<option value="{ScreenshotMode.ELEMENT_AND_PAGE.value}">Element + Page</option></select></div>'
+            '</div><p class="muted">Screenshots may include sensitive values visible on the page. Review them before sharing.</p>'
+            '</details>'
         )
 
     def _workflow_availability(self, test_case_id: UUID) -> WorkflowAvailability | None:
@@ -3307,7 +3370,8 @@ class LocalWebApplication:
             forms.append(
                 f'<form method="post" action="/test-cases/{test_case_id}/run" data-run-form>'
                 '<input type="hidden" name="workflow" value="AUTOMATION">'
-                '<button class="button primary" type="submit">Generate &amp; Run Automation</button></form>'
+                + self._evidence_controls(f"automation-{test_case_id}")
+                + '<button class="button primary" type="submit">Generate &amp; Run Automation</button></form>'
             )
         plan_by_step = {
             step_id: (version, version_id)
@@ -3350,7 +3414,8 @@ class LocalWebApplication:
                 forms.append(
                     f'<form method="post" action="/test-cases/{test_case_id}/run" data-run-form>'
                     f'<input type="hidden" name="workflow" value="{workflow.value}">'
-                    f'<button class="button" type="submit">Run {label}</button></form>'
+                    + self._evidence_controls(f"{workflow.value.casefold()}-{test_case_id}")
+                    + f'<button class="button" type="submit">Run {label}</button></form>'
                 )
         status_rows = (
             '<li>Automation <strong>'
@@ -3953,6 +4018,10 @@ def _suite_run_public_dict(run: SuiteRun) -> dict:
         "execution_type": run.config.execution_type,
         "ai_policy": run.config.ai_policy.value,
         "retry_count": run.config.retry_count,
+        "evidence_policy": {
+            "mode": run.config.evidence_policy.mode.value,
+            "screenshot_mode": run.config.evidence_policy.screenshot_mode.value,
+        },
         "counts": {
             "passed": run.passed_count,
             "failed": run.failed_count,
@@ -3966,6 +4035,8 @@ def _suite_run_public_dict(run: SuiteRun) -> dict:
                 "test_case_public_id": item.test_case_public_id,
                 "test_case_name": item.test_case_name,
                 "status": item.status.value,
+                "classification": item.classification,
+                "duration_ms": item.duration_ms,
                 "error_category": item.error_category,
                 "attempts": [
                     {
@@ -3974,6 +4045,8 @@ def _suite_run_public_dict(run: SuiteRun) -> dict:
                         "run_public_id": attempt.run_public_id,
                         "run_status": attempt.run_status,
                         "outcome": attempt.outcome,
+                        "duration_ms": attempt.duration_ms,
+                        "failure_classifications": attempt.failure_classifications,
                         "error_category": attempt.error_category,
                     }
                     for attempt in item.attempts
@@ -5190,17 +5263,20 @@ _UI_JAVASCRIPT = r"""
     run.items.forEach((item) => {
       const row = document.createElement('li'); row.className = 'suite-run-item';
       const heading = document.createElement('strong');
-      heading.textContent = `${item.order_index + 1}. ${item.test_case_public_id || ''} ${item.test_case_name} — ${item.status}`;
+      const itemDuration = item.duration_ms == null ? '' : ` · ${(item.duration_ms / 1000).toFixed(1)} s`;
+      const itemClassification = item.classification ? ` · ${item.classification}` : '';
+      heading.textContent = `${item.order_index + 1}. ${item.test_case_public_id || ''} — ${item.test_case_name} — ${item.status}${itemDuration}${itemClassification}`;
       row.append(heading);
       if (item.attempts.length) {
         const attempts = document.createElement('ul');
         item.attempts.forEach((attempt) => {
           const line = document.createElement('li');
-          line.append(document.createTextNode(`Attempt ${attempt.attempt_number}: `));
+          const attemptClassifications = (attempt.failure_classifications || []).join(', ') || attempt.outcome;
+          const attemptDuration = attempt.duration_ms == null ? '' : ` · ${(attempt.duration_ms / 1000).toFixed(1)} s`;
+          line.append(document.createTextNode(`Attempt ${attempt.attempt_number} — ${attempt.run_status} · ${attemptClassifications}${attemptDuration} → `));
           if (attempt.run_id) {
             const link = document.createElement('a'); link.href = `/runs/${encodeURIComponent(attempt.run_id)}`;
             link.textContent = attempt.run_public_id || 'Open TestCase Run'; line.append(link);
-            line.append(document.createTextNode(` — ${attempt.outcome} (${attempt.run_status})`));
           } else {
             line.append(document.createTextNode(`${attempt.outcome} (${attempt.error_category || 'no Run History record'})`));
           }

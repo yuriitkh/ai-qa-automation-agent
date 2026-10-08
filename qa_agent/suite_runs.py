@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from qa_agent.evidence_policy import DEFAULT_EVIDENCE_POLICY, EvidencePolicy, evidence_policy_scope
 from qa_agent.models import TestCase
 from qa_agent.pinned_execution import PlanVersionSet, StepPlanSelection
 from qa_agent.run_history import RunHistoryService, WorkflowType
@@ -57,6 +58,7 @@ class SuiteRunConfig(BaseModel):
     execution_type: Literal["SEQUENTIAL"] = "SEQUENTIAL"
     ai_policy: AIPolicy = AIPolicy.DISABLED
     retry_count: int = Field(default=0, ge=0, le=2)
+    evidence_policy: EvidencePolicy = DEFAULT_EVIDENCE_POLICY
 
 
 class PinnedSuitePlan(BaseModel):
@@ -90,12 +92,14 @@ class SuiteRunItem(BaseModel):
     test_case_public_id: str | None = None
     test_case_name: str
     status: SuiteRunItemStatus = SuiteRunItemStatus.QUEUED
+    classification: str | None = None
     blocking_reasons: list[str] = Field(default_factory=list)
     pinned_plans: list[PinnedSuitePlan] = Field(default_factory=list)
     test_case_snapshot: dict[str, Any] = Field(default_factory=dict, repr=False)
     attempts: list[SuiteRunAttempt] = Field(default_factory=list)
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    duration_ms: int | None = None
     error_category: str | None = None
 
 
@@ -300,11 +304,16 @@ class SuiteRunService:
         *,
         ai_policy: AIPolicy = AIPolicy.DISABLED,
         retry_count: int = 0,
+        evidence_policy: EvidencePolicy = DEFAULT_EVIDENCE_POLICY,
     ) -> SuiteStartResult:
         preview = self.preview(suite_id)
         if preview.suite is None or preview.suite_error or not preview.can_start:
             return preview
-        config = SuiteRunConfig(ai_policy=ai_policy, retry_count=retry_count)
+        config = SuiteRunConfig(
+            ai_policy=ai_policy,
+            retry_count=retry_count,
+            evidence_policy=evidence_policy,
+        )
         items = [
             SuiteRunItem(
                 order_index=item.order_index,
@@ -416,7 +425,8 @@ class SuiteRunService:
                     StepPlanSelection(plan.test_step_id, plan.test_plan_version_id)
                     for plan in item.pinned_plans
                 ))
-                result = self._execution.run_pinned_regression(test_case, selected)
+                with evidence_policy_scope(run.config.evidence_policy):
+                    result = self._execution.run_pinned_regression(test_case, selected)
                 run_id = result.test_run.id
                 record = self._history.get(run_id)
                 if record is None:
@@ -451,6 +461,8 @@ class SuiteRunService:
             if attempt_number < max_attempts:
                 item = item.model_copy(update={"status": SuiteRunItemStatus.RETRYING, "attempts": attempts})
                 run = self._replace_item(run, index, item)
+        item_finished_at = datetime.now(timezone.utc)
+        last_attempt = attempts[-1]
         final = item.model_copy(update={
             "status": (
                 SuiteRunItemStatus.PASSED_AFTER_RETRY
@@ -460,7 +472,13 @@ class SuiteRunService:
                 else SuiteRunItemStatus.FAILED
             ),
             "attempts": attempts,
-            "finished_at": datetime.now(timezone.utc),
+            "classification": (
+                last_attempt.failure_classifications[-1]
+                if last_attempt.failure_classifications
+                else last_attempt.outcome
+            ),
+            "finished_at": item_finished_at,
+            "duration_ms": max(0, int((item_finished_at - started_at).total_seconds() * 1000)),
             "error_category": None if succeeded else (attempts[-1].error_category or attempts[-1].outcome),
         })
         return self._replace_item(run, index, final)

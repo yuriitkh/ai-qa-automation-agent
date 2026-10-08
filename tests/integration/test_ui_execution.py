@@ -109,7 +109,10 @@ class PersistedTestCaseBrowserFlowTests(unittest.TestCase):
                 evidence_path = Path(execution.evidence[0].path).resolve()
                 self.assertTrue(evidence_path.is_relative_to(evidence_root.resolve()))
                 self.assertTrue(evidence_path.is_file())
-                self.assertRegex(evidence_path.name, r"^execution-[0-9a-f]{32}\.png$")
+                self.assertRegex(
+                    evidence_path.name,
+                    r"^execution-[0-9a-f]{32}-step-[0-9a-f]{32}-event-\d+-page\.png$",
+                )
 
                 connection.request("GET", run_location)
                 detail_response = connection.getresponse()
