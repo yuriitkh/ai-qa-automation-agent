@@ -518,6 +518,16 @@ class QATestPipeline:
             execution = execution_outcome.execution
             executions.append(execution)
 
+            if (
+                isinstance(execution.runner_result, dict)
+                and execution.runner_result.get("cookie_consent_requires_attention") is True
+            ):
+                blocked_step_ids = [
+                    step.id for step in ordered_steps[step_index + 1:]
+                ]
+                _emit_blocked_steps(ordered_steps[step_index + 1:])
+                break
+
             if execution_outcome.classification != PlanExecutionClassification.AUTOMATION_DRIFT:
                 # Explicit failure policy: a step whose final outcome is
                 # FAILED may still continue the TestCase (CONTINUE) or stop

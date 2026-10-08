@@ -138,6 +138,38 @@ class PinnedWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(result.test_run.status, ExecutionStatus.PASSED)
 
+    def test_cookie_consent_attention_blocks_rest_even_when_failure_policy_continues(self) -> None:
+        first = self.first.model_copy(update={"failure_policy": FailurePolicy.CONTINUE})
+        case = DomainTestCase(
+            name="Consent flow",
+            description="Stop safely when cookie consent needs attention.",
+            steps=[first, self.second],
+        )
+        selection = PlanVersionSet(tuple(
+            StepPlanSelection(step.id, self.versions[step.id][0].id)
+            for step in (first, self.second)
+        ))
+        calls = []
+
+        def runner(_plan):
+            calls.append("consent")
+            return {
+                "status": "failed",
+                "cookie_consent_requires_attention": True,
+                "steps": [{
+                    "action": "cookie_consent_precondition",
+                    "status": "failed",
+                    "error": "Cookie consent requires attention.",
+                }],
+            }
+
+        result = ValidationWorkflow(self.make_executor(runner)).run(case, selection)
+
+        self.assertEqual(result.outcome, WorkflowOutcome.AUTOMATION_EXECUTION_ERROR)
+        self.assertEqual(calls, ["consent"])
+        self.assertEqual(len(result.test_run.executions), 1)
+        self.assertEqual(result.test_run.blocked_step_ids, [self.second.id])
+
     def test_missing_coverage_blocks_validation_and_regression_cannot_false_pass(self) -> None:
         verification_step = self.first.model_copy(update={
             "name": "Verify the error message is displayed",

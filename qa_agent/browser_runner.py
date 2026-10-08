@@ -12,6 +12,14 @@ from .execution_semantics import (
     NAVIGATION_LOAD_STATE,
     NAVIGATION_TIMEOUT_MS,
 )
+from .cookie_consent import (
+    CookieConsentRecord,
+    CookieConsentPolicy,
+    CookieConsentReason,
+    CookieConsentStatus,
+    current_cookie_consent_policy,
+    handle_cookie_consent,
+)
 from .evidence_policy import (
     EvidenceMode,
     EvidenceScope,
@@ -198,6 +206,15 @@ def _run_plan_on_page(
         "url": plan.url,
         "steps": [],
         "evidence": [],
+        "cookie_consent": {
+            "policy": current_cookie_consent_policy().value,
+            "status": (
+                CookieConsentStatus.LEFT_UNCHANGED.value
+                if current_cookie_consent_policy() == CookieConsentPolicy.LEAVE_UNCHANGED
+                else CookieConsentStatus.NOT_EVALUATED.value
+            ),
+            "reason": None,
+        },
     }
 
     verification_actions = frozenset(
@@ -205,6 +222,15 @@ def _run_plan_on_page(
         for action in QATestStep.ACTION_PARAMETER_FIELDS
         if action.startswith("assert_")
     )
+
+    if getattr(page, "url", "") and getattr(page, "url", "") != "about:blank":
+        consent = handle_cookie_consent(page)
+        result["cookie_consent"] = _cookie_consent_public_dict(consent)
+        if consent.status == CookieConsentStatus.REQUIRES_ATTENTION:
+            _record_cookie_consent_attention(
+                result, page, evidence_directory, consent.reason
+            )
+            return result
 
     for step_index, step in enumerate(plan.steps):
         step_result = {
@@ -220,6 +246,14 @@ def _run_plan_on_page(
                     wait_until=NAVIGATION_LOAD_STATE,
                     timeout=NAVIGATION_TIMEOUT_MS,
                 )
+                consent = handle_cookie_consent(page)
+                result["cookie_consent"] = _cookie_consent_public_dict(consent)
+                if consent.status == CookieConsentStatus.REQUIRES_ATTENTION:
+                    result["steps"].append(step_result)
+                    _record_cookie_consent_attention(
+                        result, page, evidence_directory, consent.reason
+                    )
+                    return result
             elif step.action == "click":
                 selector = step.parameters["selector"]
                 try:
@@ -411,6 +445,57 @@ def _run_plan_on_page(
             event_kind="TEST_STEP",
         )
     return result
+
+
+def _record_cookie_consent_attention(
+    result: dict[str, Any],
+    page: Any,
+    evidence_directory: str | Path | None,
+    reason: CookieConsentReason | None,
+) -> None:
+    """Stop safely when consent is ambiguous, without treating it as a product assertion."""
+    result["status"] = "failed"
+    result["cookie_consent_requires_attention"] = True
+    result["cookie_consent"] = _cookie_consent_public_dict(CookieConsentRecord(
+        policy=current_cookie_consent_policy(),
+        status=CookieConsentStatus.REQUIRES_ATTENTION,
+        reason=reason,
+    ))
+    result["steps"].append({
+        "action": "cookie_consent_precondition",
+        "status": "failed",
+        "error": "Cookie consent requires attention.",
+    })
+    if evidence_directory is None:
+        return
+    identity = current_evidence_execution()
+    execution_id = identity.execution_id if identity is not None else uuid4()
+    test_step_id = identity.test_step_id if identity is not None else None
+    step_part = test_step_id.hex if test_step_id is not None else "unbound"
+    directory = Path(evidence_directory)
+    screenshot_path = directory / (
+        f"execution-{execution_id.hex}-step-{step_part}-cookie-consent-page.png"
+    )
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        page.screenshot(path=str(screenshot_path))
+    except Exception:
+        return
+    result.setdefault("evidence", []).append({
+        "type": "SCREENSHOT",
+        "path": str(screenshot_path),
+        "description": "Page screenshot captured because cookie consent requires attention.",
+        "scope": EvidenceScope.PAGE.value,
+        "event": "COOKIE_CONSENT_FAILURE",
+    })
+
+
+def _cookie_consent_public_dict(record: CookieConsentRecord) -> dict[str, str | None]:
+    return {
+        "policy": record.policy.value,
+        "status": record.status.value,
+        "reason": record.reason.value if record.reason is not None else None,
+    }
 
 
 def _capture_screenshots(

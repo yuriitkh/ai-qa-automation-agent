@@ -21,6 +21,11 @@ from qa_agent.presentation import (
     outcome_label,
     outcome_tone,
 )
+from qa_agent.cookie_consent import (
+    DEFAULT_COOKIE_CONSENT_POLICY,
+    CookieConsentPolicy,
+    cookie_consent_policy_label,
+)
 from qa_agent.reporting import RunAttemptReport, RunEvidenceReport, RunReportGenerator, RunStepReport
 from qa_agent.browser_runner import BrowserRunner
 from qa_agent.evidence_policy import (
@@ -472,6 +477,12 @@ class LocalWebApplication:
             )
         except ValueError:
             return self._run_error(test_case_id, "Choose a valid evidence mode and screenshot scope.", 400)
+        try:
+            cookie_policy = CookieConsentPolicy(
+                form.get("cookie_policy", [DEFAULT_COOKIE_CONSENT_POLICY.value])[0]
+            )
+        except ValueError:
+            return self._run_error(test_case_id, "Choose a valid cookie consent policy.", 400)
         if self._background_runs is None:
             return self._run_error(
                 test_case_id,
@@ -479,7 +490,10 @@ class LocalWebApplication:
                 503,
             )
         progress_id = self._background_runs.start(
-            test_case_id, workflow, evidence_policy=evidence_policy
+            test_case_id,
+            workflow,
+            evidence_policy=evidence_policy,
+            cookie_policy=cookie_policy,
         )
         return WebResponse.redirect(f"/runs/progress/{progress_id}")
 
@@ -2690,6 +2704,7 @@ class LocalWebApplication:
             '<option value="0" selected>0 retries</option><option value="1">1 retry</option><option value="2">2 retries</option></select>'
             '<small>Each retry is a fresh TestCase Run against the same pinned plan versions.</small></div>'
             + self._evidence_controls(f"suite-{suite_id}")
+            + self._cookie_consent_controls(f"suite-{suite_id}")
             + f'<button class="button primary" type="submit"{("" if can_start else " disabled aria-disabled=\"true\"")}>Start Suite Run</button>'
             + '</form>'
         )
@@ -2726,18 +2741,23 @@ class LocalWebApplication:
                 mode=EvidenceMode(form.get("evidence_mode", [EvidenceMode.FAILURES_ONLY.value])[0]),
                 screenshot_mode=ScreenshotMode(form.get("screenshot_mode", [ScreenshotMode.PAGE.value])[0]),
             )
+            cookie_policy = CookieConsentPolicy(
+                form.get("cookie_policy", [DEFAULT_COOKIE_CONSENT_POLICY.value])[0]
+            )
             config = SuiteRunConfig(
                 ai_policy=ai_policy,
                 retry_count=retry_count,
                 evidence_policy=evidence_policy,
+                cookie_policy=cookie_policy,
             )
         except (ValueError, TypeError):
-            return self._suite_run_config_page(suite_id, error="Choose a valid AI policy, evidence mode, screenshot scope, and retry count from 0 to 2.", status=400)
+            return self._suite_run_config_page(suite_id, error="Choose a valid AI policy, cookie consent policy, evidence mode, screenshot scope, and retry count from 0 to 2.", status=400)
         result = self._suite_run_service.start(
             suite_id,
             ai_policy=config.ai_policy,
             retry_count=config.retry_count,
             evidence_policy=config.evidence_policy,
+            cookie_policy=config.cookie_policy,
         )
         if result.run is None:
             message = result.suite_error or "Resolve every blocked member before starting this Suite Run."
@@ -2787,6 +2807,7 @@ class LocalWebApplication:
             f'<h1>{escape_html(run.public_id or public_id)} — {escape_html(run.suite_name)}</h1>'
             f'<p class="lead">{badge(run.status.value)} Workflow: Regression · Execution: Sequential · '
             f'AI policy: {escape_html(run.config.ai_policy.value)} · Retries: {run.config.retry_count}</p></header>'
+            + f'<p class="muted">Cookie consent: {escape_html(cookie_consent_policy_label(run.config.cookie_policy))}</p>'
             + f'<p class="muted">Evidence: {escape_html(evidence_mode_label(run.config.evidence_policy.mode))} · '
             f'{escape_html(screenshot_mode_label(run.config.evidence_policy.screenshot_mode))}</p>'
             + f'<section class="panel" data-suite-run-progress="/api/suite-runs/{escape_html(run.public_id or public_id)}">'
@@ -3324,6 +3345,7 @@ class LocalWebApplication:
             '<option value="REGRESSION">Regression</option>'
             '</select></div>'
             + LocalWebApplication._evidence_controls(f"run-{test_case_id}")
+            + LocalWebApplication._cookie_consent_controls(f"run-{test_case_id}")
             + '<button class="button primary" type="submit">Start run</button></form>'
             '</section>'
         )
@@ -3349,6 +3371,21 @@ class LocalWebApplication:
             '</details>'
         )
 
+    @staticmethod
+    def _cookie_consent_controls(prefix: str) -> str:
+        policy_id = f"{prefix}-cookie-policy"
+        return (
+            '<details class="run-cookie-options"><summary>Cookie consent</summary>'
+            '<div class="field"><label for="' + escape_html(policy_id) + '">Policy</label>'
+            '<select id="' + escape_html(policy_id) + '" name="cookie_policy">'
+            f'<option value="{CookieConsentPolicy.AUTO_HANDLE.value}" selected>'
+            f'{escape_html(cookie_consent_policy_label(CookieConsentPolicy.AUTO_HANDLE))}</option>'
+            f'<option value="{CookieConsentPolicy.LEAVE_UNCHANGED.value}">'
+            f'{escape_html(cookie_consent_policy_label(CookieConsentPolicy.LEAVE_UNCHANGED))}</option>'
+            '</select></div><p class="muted">Choose Leave unchanged when this TestCase checks cookie behavior.</p>'
+            '</details>'
+        )
+
     def _workflow_availability(self, test_case_id: UUID) -> WorkflowAvailability | None:
         method = getattr(self._run_service, "workflow_availability", None)
         if not callable(method):
@@ -3371,6 +3408,7 @@ class LocalWebApplication:
                 f'<form method="post" action="/test-cases/{test_case_id}/run" data-run-form>'
                 '<input type="hidden" name="workflow" value="AUTOMATION">'
                 + self._evidence_controls(f"automation-{test_case_id}")
+                + self._cookie_consent_controls(f"automation-{test_case_id}")
                 + '<button class="button primary" type="submit">Generate &amp; Run Automation</button></form>'
             )
         plan_by_step = {
@@ -3415,6 +3453,7 @@ class LocalWebApplication:
                     f'<form method="post" action="/test-cases/{test_case_id}/run" data-run-form>'
                     f'<input type="hidden" name="workflow" value="{workflow.value}">'
                     + self._evidence_controls(f"{workflow.value.casefold()}-{test_case_id}")
+                    + self._cookie_consent_controls(f"{workflow.value.casefold()}-{test_case_id}")
                     + f'<button class="button" type="submit">Run {label}</button></form>'
                 )
         status_rows = (
@@ -4018,6 +4057,7 @@ def _suite_run_public_dict(run: SuiteRun) -> dict:
         "execution_type": run.config.execution_type,
         "ai_policy": run.config.ai_policy.value,
         "retry_count": run.config.retry_count,
+        "cookie_policy": run.config.cookie_policy.value,
         "evidence_policy": {
             "mode": run.config.evidence_policy.mode.value,
             "screenshot_mode": run.config.evidence_policy.screenshot_mode.value,

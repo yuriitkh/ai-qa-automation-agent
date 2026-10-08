@@ -12,6 +12,11 @@ from uuid import uuid4
 
 from qa_agent.execution_repository import InMemoryExecutionRepository
 from qa_agent.evidence_policy import EvidenceMode, EvidencePolicy, ScreenshotMode
+from qa_agent.cookie_consent import (
+    CookieConsentPolicy,
+    CookieConsentStatus,
+    current_cookie_consent_policy,
+)
 from qa_agent.models import (
     AssertionGrounding,
     AssertionGroundingEntry,
@@ -163,6 +168,30 @@ class SuiteRunExecutionTests(SuiteRunTestHarness, unittest.TestCase):
         history = self.history.list_for_test_case(self.case.id)
         self.assertEqual(len(history), 1)
         self.assertEqual(history[0].evidence_policy, policy)
+
+    def test_cookie_policy_is_persisted_and_propagated_without_ai(self):
+        observed = []
+
+        def runner(_plan):
+            observed.append(current_cookie_consent_policy())
+            return {"status": "passed", "steps": [{"action": "assert_title", "status": "passed"}]}
+
+        service = self.make_service(runner)
+        try:
+            started = service.start(
+                self.suite.id,
+                ai_policy=AIPolicy.ALLOWED,
+                cookie_policy=CookieConsentPolicy.LEAVE_UNCHANGED,
+            )
+            finished = self.wait_for_terminal(service, started.run.public_id)
+        finally:
+            service.close()
+
+        self.assertEqual(finished.config.cookie_policy, CookieConsentPolicy.LEAVE_UNCHANGED)
+        self.assertEqual(observed, [CookieConsentPolicy.LEAVE_UNCHANGED])
+        history = self.history.list_for_test_case(self.case.id)
+        self.assertEqual(history[0].cookie_consent.policy, CookieConsentPolicy.LEAVE_UNCHANGED)
+        self.assertEqual(history[0].cookie_consent.status, CookieConsentStatus.LEFT_UNCHANGED)
 
     def test_retry_is_fresh_run_and_keeps_the_exact_start_time_pin(self):
         entered_runner = Event()
@@ -411,6 +440,8 @@ class SuiteRunStorageTests(unittest.TestCase):
             self.assertIn("Pinned plan versions at start", config_html)
             self.assertIn("Sequential", config_html)
             self.assertIn("AI policy", config_html)
+            self.assertIn("Auto handle cookie consent", config_html)
+            self.assertIn("Leave cookie consent unchanged", config_html)
             self.assertIn("Every verification", config_html)
             self.assertIn("Element + Page", config_html)
 
@@ -429,6 +460,7 @@ class SuiteRunStorageTests(unittest.TestCase):
                 "retry_count": "0",
                 "evidence_mode": "EVERY_VERIFICATION",
                 "screenshot_mode": "ELEMENT_AND_PAGE",
+                "cookie_policy": CookieConsentPolicy.LEAVE_UNCHANGED.value,
             }))
             self.assertEqual(valid.status, 303)
             public_id = valid.headers["Location"].rsplit("/", 1)[1]
@@ -446,12 +478,21 @@ class SuiteRunStorageTests(unittest.TestCase):
                 "mode": "EVERY_VERIFICATION",
                 "screenshot_mode": "ELEMENT_AND_PAGE",
             })
+            self.assertEqual(payload["cookie_policy"], CookieConsentPolicy.LEAVE_UNCHANGED.value)
+            self.assertEqual(
+                harness.history.list_for_test_case(harness.case.id)[0].cookie_consent.status,
+                CookieConsentStatus.LEFT_UNCHANGED,
+            )
             self.assertNotIn("test_case_snapshot", progress.body.decode("utf-8"))
             report = harness.app.handle("GET", f"/suite-runs/{public_id}/report.json")
             self.assertEqual(report.content_type, "application/json; charset=utf-8")
             self.assertNotIn(b"test_case_snapshot", report.body)
             suite_payload = json.loads(report.body)
             self.assertEqual(suite_payload["config"]["evidence_policy"]["mode"], "EVERY_VERIFICATION")
+            self.assertEqual(
+                suite_payload["config"]["cookie_policy"],
+                CookieConsentPolicy.LEAVE_UNCHANGED.value,
+            )
             self.assertEqual(
                 suite_payload["items"][0]["attempts"][0]["run_id"],
                 str(harness.history.list_for_test_case(harness.case.id)[0].run_id),

@@ -7,6 +7,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from qa_agent.cookie_consent import CookieConsentRecord, current_cookie_consent_record
 from qa_agent.evidence_policy import EvidencePolicy, EvidenceScope, current_evidence_policy
 from qa_agent.execution_repository import ExecutionRepository
 from qa_agent.models import (
@@ -112,6 +113,7 @@ class RunHistoryRecord(BaseModel):
     workflow_type: WorkflowType
     # None marks a historical record created before evidence policies existed.
     evidence_policy: EvidencePolicy | None = None
+    cookie_consent: CookieConsentRecord | None = None
     outcome: str
     status: ExecutionStatus
     started_at: datetime
@@ -215,6 +217,7 @@ class RunHistoryRecord(BaseModel):
             base_url=_safe_text(test_case.base_url, run_context) if test_case.base_url else None,
             workflow_type=workflow_type,
             evidence_policy=current_evidence_policy(),
+            cookie_consent=current_cookie_consent_record(),
             outcome=str(raw_outcome),
             status=test_run.status,
             started_at=actual_start,

@@ -13,6 +13,11 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from qa_agent.cookie_consent import (
+    DEFAULT_COOKIE_CONSENT_POLICY,
+    CookieConsentPolicy,
+    cookie_consent_scope,
+)
 from qa_agent.evidence_policy import DEFAULT_EVIDENCE_POLICY, EvidencePolicy, evidence_policy_scope
 from qa_agent.models import TestCase
 from qa_agent.pinned_execution import PlanVersionSet, StepPlanSelection
@@ -59,6 +64,7 @@ class SuiteRunConfig(BaseModel):
     ai_policy: AIPolicy = AIPolicy.DISABLED
     retry_count: int = Field(default=0, ge=0, le=2)
     evidence_policy: EvidencePolicy = DEFAULT_EVIDENCE_POLICY
+    cookie_policy: CookieConsentPolicy = DEFAULT_COOKIE_CONSENT_POLICY
 
 
 class PinnedSuitePlan(BaseModel):
@@ -305,6 +311,7 @@ class SuiteRunService:
         ai_policy: AIPolicy = AIPolicy.DISABLED,
         retry_count: int = 0,
         evidence_policy: EvidencePolicy = DEFAULT_EVIDENCE_POLICY,
+        cookie_policy: CookieConsentPolicy = DEFAULT_COOKIE_CONSENT_POLICY,
     ) -> SuiteStartResult:
         preview = self.preview(suite_id)
         if preview.suite is None or preview.suite_error or not preview.can_start:
@@ -313,6 +320,7 @@ class SuiteRunService:
             ai_policy=ai_policy,
             retry_count=retry_count,
             evidence_policy=evidence_policy,
+            cookie_policy=cookie_policy,
         )
         items = [
             SuiteRunItem(
@@ -425,8 +433,9 @@ class SuiteRunService:
                     StepPlanSelection(plan.test_step_id, plan.test_plan_version_id)
                     for plan in item.pinned_plans
                 ))
-                with evidence_policy_scope(run.config.evidence_policy):
-                    result = self._execution.run_pinned_regression(test_case, selected)
+                with cookie_consent_scope(run.config.cookie_policy):
+                    with evidence_policy_scope(run.config.evidence_policy):
+                        result = self._execution.run_pinned_regression(test_case, selected)
                 run_id = result.test_run.id
                 record = self._history.get(run_id)
                 if record is None:

@@ -11,6 +11,7 @@ from urllib.parse import urlencode
 from uuid import uuid4
 
 from qa_agent.evidence_policy import EvidenceMode, EvidencePolicy, ScreenshotMode
+from qa_agent.cookie_consent import CookieConsentPolicy
 from qa_agent.execution_repository import InMemoryExecutionRepository
 from qa_agent.models import (
     Evidence,
@@ -359,8 +360,8 @@ class LocalWebApplicationTests(unittest.TestCase):
         run_service = Mock()
         run_service.workflow_availability.return_value = WorkflowAvailability(
             automation_available=True,
-            validation_available=False,
-            regression_available=False,
+            validation_available=True,
+            regression_available=True,
             usable_plan_count=1,
             total_step_count=len(self.case.steps),
             plan_versions=((step.id, version.version, version.id),),
@@ -384,6 +385,9 @@ class LocalWebApplicationTests(unittest.TestCase):
         self.assertIn("Created: 1 May 2026, 00:00 UTC", body)
         self.assertIn("Previous version: v3", body)
         self.assertIn(f"Internal ID: <code>{version.id}</code>", body)
+        self.assertIn("Auto handle cookie consent", body)
+        self.assertIn("Leave cookie consent unchanged", body)
+        self.assertEqual(body.count('name="cookie_policy"'), 3)
 
     def test_setup_failure_and_cleanup_failure_are_presented_separately(self) -> None:
         setup_run = RunHistoryRecord(
@@ -607,12 +611,14 @@ class PersistedTestCaseRunUiTests(unittest.TestCase):
         self.assertIn('value="ELEMENT">Element', page)
         self.assertIn('value="PAGE" selected>Page', page)
         self.assertIn('value="ELEMENT_AND_PAGE">Element + Page', page)
+        self.assertIn("Auto handle cookie consent", page)
+        self.assertIn("Leave cookie consent unchanged", page)
 
         with patch.object(self.app._background_runs, "start", return_value="progress-id") as start:
             response = self.app.handle(
                 "POST",
                 f"/test-cases/{self.case.id}/run",
-                b"workflow=REGRESSION&evidence_mode=EVERY_VERIFICATION&screenshot_mode=ELEMENT_AND_PAGE",
+                b"workflow=REGRESSION&evidence_mode=EVERY_VERIFICATION&screenshot_mode=ELEMENT_AND_PAGE&cookie_policy=LEAVE_UNCHANGED",
             )
 
         self.assertEqual(response.status, 303)
@@ -622,6 +628,10 @@ class PersistedTestCaseRunUiTests(unittest.TestCase):
                 mode=EvidenceMode.EVERY_VERIFICATION,
                 screenshot_mode=ScreenshotMode.ELEMENT_AND_PAGE,
             ),
+        )
+        self.assertEqual(
+            start.call_args.kwargs["cookie_policy"],
+            CookieConsentPolicy.LEAVE_UNCHANGED,
         )
 
     def test_post_returns_progress_url_and_runs_selected_workflow_in_background(self) -> None:

@@ -240,6 +240,23 @@ class PinnedExecutionService:
                 break
 
             if (
+                isinstance(execution.runner_result, dict)
+                and execution.runner_result.get("cookie_consent_requires_attention") is True
+            ):
+                blocked_step_ids = [
+                    following.test_step.id
+                    for following in resolved.steps[index + 1:]
+                ]
+                for following in resolved.steps[index + 1:]:
+                    emit_progress_event(
+                        ExecutionEventType.STEP_BLOCKED,
+                        step=following.test_step,
+                        status=ExecutionStatus.BLOCKED.value,
+                        message="Blocked because cookie consent requires attention.",
+                    )
+                break
+
+            if (
                 execution.status == ExecutionStatus.FAILED
                 and selected.test_step.failure_policy == FailurePolicy.BLOCK_REST
             ):

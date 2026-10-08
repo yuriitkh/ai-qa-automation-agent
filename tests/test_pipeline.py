@@ -34,7 +34,7 @@ from qa_agent.locator_recovery import RecoveryStatus
 from qa_agent.llm.base import LLMProvider
 from qa_agent.llm.errors import RetryableLLMError
 from qa_agent.llm.router import LLMRouter
-from qa_agent.pipeline import PipelineResult, PipelineStageError, QATestPipeline
+from qa_agent.pipeline import PipelineResult, PipelineStageError, QATestPipeline, _automation_run_outcome
 from qa_agent.plan_store import InMemoryPlanStore
 from qa_agent.run_history import InMemoryRunHistoryRepository, RunHistoryService, WorkflowType
 from qa_agent.test_case_decomposer import TestCaseDecomposer
@@ -430,6 +430,34 @@ class QATestPipelineTests(unittest.TestCase):
         self.assertEqual(result.test_run.test_case_id, self.test_case.id)
         self.assertEqual(result.test_run.executions, executions)
         self.assertEqual(result.test_run.status, ExecutionStatus.PASSED)
+
+    def test_automation_stops_after_cookie_consent_attention(self) -> None:
+        runner_calls = []
+
+        def runner(plan):
+            runner_calls.append(plan)
+            return {
+                "status": "failed",
+                "cookie_consent_requires_attention": True,
+                "steps": [{
+                    "action": "cookie_consent_precondition",
+                    "status": "failed",
+                    "error": "Cookie consent requires attention.",
+                }],
+            }
+
+        pipeline = QATestPipeline(
+            decomposer=self.decomposer,
+            discovery=self.discover,
+            plan_generator=self.generator,
+            runner=runner,
+        )
+        result = pipeline.run("Open the example homepage.")
+
+        self.assertEqual(len(runner_calls), 1)
+        self.assertEqual(len(result.executions), 1)
+        self.assertEqual(result.blocked_step_ids, [self.steps[0].id])
+        self.assertEqual(_automation_run_outcome(result.test_run), "AUTOMATION_EXECUTION_ERROR")
 
     def test_pipeline_preserves_supplied_run_context(self) -> None:
         context = RunContext()

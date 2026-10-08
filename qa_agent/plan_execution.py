@@ -246,6 +246,11 @@ class PlanExecutionService:
             return PlanExecutionClassification.INFRASTRUCTURE_ERROR
         if execution.status == ExecutionStatus.PASSED:
             return PlanExecutionClassification.PASSED
+        if (
+            isinstance(execution.runner_result, dict)
+            and execution.runner_result.get("cookie_consent_requires_attention") is True
+        ):
+            return PlanExecutionClassification.AUTOMATION_EXECUTION_ERROR
         if _is_infrastructure_failure(execution.runner_result):
             return PlanExecutionClassification.INFRASTRUCTURE_ERROR
         if _is_stale_ui_failure(execution.runner_result):
@@ -324,6 +329,8 @@ class PlanExecutionService:
         runner_result: dict[str, Any] | None,
     ) -> int | None:
         if not isinstance(runner_result, dict):
+            return None
+        if runner_result.get("cookie_consent_requires_attention") is True:
             return None
         for index, step_result in enumerate(runner_result.get("steps", [])):
             if isinstance(step_result, dict) and step_result.get("status") == "failed":

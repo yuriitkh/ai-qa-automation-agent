@@ -8,6 +8,12 @@ from collections.abc import Callable, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from qa_agent.cookie_consent import (
+    CookieConsentRecord,
+    cookie_consent_label,
+    cookie_consent_policy_label,
+    cookie_consent_reason_label,
+)
 from qa_agent.evidence_policy import (
     DEFAULT_EVIDENCE_POLICY,
     EvidencePolicy,
@@ -217,6 +223,7 @@ class RunReport(BaseModel):
     test_case_description: str
     workflow_type: WorkflowType
     evidence_policy: EvidencePolicy | None = None
+    cookie_consent: CookieConsentRecord | None = None
     outcome: str
     status: ExecutionStatus
     started_at: datetime
@@ -309,6 +316,7 @@ class RunReportGenerator:
             test_case_description=record.test_case_description,
             workflow_type=record.workflow_type,
             evidence_policy=record.evidence_policy,
+            cookie_consent=record.cookie_consent,
             outcome=record.outcome,
             status=record.status,
             started_at=record.started_at,
@@ -487,7 +495,7 @@ class RunReportGenerator:
             )
 
         setup_html = ""
-        if report.preconditions or report.setup_status is not None:
+        if report.preconditions or report.setup_status is not None or report.cookie_consent is not None:
             rows = []
             for condition in report.preconditions:
                 rows.append(
@@ -495,6 +503,16 @@ class RunReportGenerator:
                     + (presentation_badge(condition.status) + " " if condition.status else "")
                     + esc(condition.description)
                     + (f'<p class="muted">{esc(condition.error)}</p>' if condition.error else "")
+                    + "</li>"
+                )
+            if report.cookie_consent is not None:
+                consent = report.cookie_consent
+                detail = cookie_consent_reason_label(consent.reason)
+                rows.append(
+                    "<li><strong>Cookie consent:</strong> "
+                    + esc(cookie_consent_policy_label(consent.policy))
+                    + " · " + esc(cookie_consent_label(consent))
+                    + (" · " + esc(detail) if detail else "")
                     + "</li>"
                 )
             status = report.setup_status
