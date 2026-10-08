@@ -37,6 +37,7 @@ from qa_agent.automation_lifecycle import (
     InMemoryAutomationLifecycleRepository,
     has_complete_plans,
 )
+from qa_agent.expected_result_coverage import expected_result_coverage
 from qa_agent.drafts import Draft, DraftRepository, InMemoryDraftRepository
 from qa_agent.test_case_execution import (
     RunUnavailableError,
@@ -1049,8 +1050,13 @@ class LocalWebApplication:
         rows = []
         for step in test_case.steps:
             version = self._plan_store.find(step.id)
+            coverage_html = _expected_result_coverage_html(
+                expected_result_coverage(
+                    step, version.qa_test_plan if version is not None else None
+                )
+            )
             if version is None:
-                rows.append(f'<section class="panel"><h2>Step {step.order + 1}: {escape_html(step.name)}</h2><p class="muted">No saved TestPlan for this step.</p></section>')
+                rows.append(f'<section class="panel"><h2>Step {step.order + 1}: {escape_html(step.name)}</h2>{coverage_html}<p class="muted">No saved TestPlan for this step.</p></section>')
                 continue
             actions = "".join(
                 '<li><code>' + escape_html(action.action) + '</code><pre>'
@@ -1060,6 +1066,7 @@ class LocalWebApplication:
             rows.append(
                 f'<section class="panel"><h2>Step {step.order + 1}: {escape_html(step.name)}</h2>'
                 f'<p>Plan v{version.version} · {_plan_origin_label(version.origin)}</p>'
+                f'{coverage_html}'
                 f'<p>URL: {escape_html(_safe_automation_url_display(version.qa_test_plan.url))}</p><ol>{actions}</ol></section>'
             )
         content = (
@@ -1151,6 +1158,11 @@ class LocalWebApplication:
                 f'{escape_html(_plan_origin_label(version.origin))} · '
                 f'{escape_html(format_timestamp(version.created_at))}</p>'
             )
+            coverage_html = _expected_result_coverage_html(
+                expected_result_coverage(
+                    step, version.qa_test_plan if version is not None else None
+                )
+            )
             form_errors = "".join(
                 f'<p class="field-error" role="alert">{escape_html(message)}</p>'
                 for key, message in field_errors.items()
@@ -1187,7 +1199,7 @@ class LocalWebApplication:
             history = self._plan_store.list_versions(step.id)
             history_html = _automation_history_html(test_case, step.id, version, history)
             sections.append(
-                f'<section class="panel automation-step"><h2>{title}</h2>{state}{form}{history_html}</section>'
+                f'<section class="panel automation-step"><h2>{title}</h2>{state}{coverage_html}{form}{history_html}</section>'
             )
 
         content = (
@@ -1228,6 +1240,9 @@ class LocalWebApplication:
             f'<header class="page-heading"><h1>Automation version v{version.version}</h1>'
             f'<p class="lead">{escape_html(step.name)} · {_plan_origin_label(version.origin)} · '
             f'{escape_html(format_timestamp(version.created_at))}</p></header>'
+            + _expected_result_coverage_html(
+                expected_result_coverage(step, version.qa_test_plan)
+            )
             + f'<section class="panel"><p>Plan URL: <code>{escape_html(_safe_automation_url_display(version.qa_test_plan.url))}</code></p>'
             + f'<ol>{actions}</ol></section>'
             + (f'<p class="muted">This is the current version.</p>' if current and current.id == version.id else '<p class="muted">Read-only historical version.</p>')
@@ -2845,6 +2860,19 @@ class LocalWebApplication:
             AutomationStatus.NEEDS_VALIDATION: "Executable automation exists and must pass Validation before it is marked ready.",
             AutomationStatus.AUTOMATION_FAILED: "Automation could not be prepared completely. Review the TestCase and try Automation again.",
         }[automation_status]
+        if (
+            automation_status == AutomationStatus.NEEDS_VALIDATION
+            and test_case is not None
+            and self._plan_store is not None
+            and any(
+                not expected_result_coverage(
+                    step,
+                    (version.qa_test_plan if (version := self._plan_store.find(step.id)) else None),
+                ).is_sufficient
+                for step in test_case.steps
+            )
+        ):
+            lifecycle_note = "Automation does not verify the TestStep expected result."
         lifecycle_panel = (
             '<section class="panel"><h2>Automation status</h2>'
             f'<p>{badge(lifecycle_label, "workflow")}</p><p class="muted">{escape_html(lifecycle_note)}</p></section>'
@@ -4046,6 +4074,28 @@ def _operation_label(operation: str) -> str:
         "DISCOVERY": "Discovery",
         "OTHER": "Other",
     }.get(operation, "Other")
+
+
+def _expected_result_coverage_html(coverage) -> str:
+    labels = {
+        "NO_VERIFICATION_REQUIRED": "Not required",
+        "COVERED": "Covered",
+        "PARTIALLY_COVERED": "Partially covered",
+        "NOT_COVERED": "Missing verification",
+        "UNKNOWN": "Unknown",
+    }
+    value = coverage.status.value
+    label = labels.get(value, "Unknown")
+    tone = "success" if coverage.is_sufficient else "warning"
+    message = (
+        ""
+        if coverage.is_sufficient
+        else f'<p class="muted coverage-warning">{escape_html(coverage.safe_message)}</p>'
+    )
+    return (
+        f'<p class="coverage-status">Expected result coverage: '
+        f'<strong class="{tone}">{escape_html(label)}</strong></p>{message}'
+    )
 
 
 def _plan_origin_label(origin: PlanVersionOrigin | None) -> str:

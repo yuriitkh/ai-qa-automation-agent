@@ -29,6 +29,7 @@ class PlanValidationIssue(BaseModel):
         "DISCOVERY_SELECTOR_MISMATCH",
         "ACTION_TARGET_MISMATCH",
         "UNGROUNDED_ASSERTION",
+        "EXPECTED_RESULT_NOT_COVERED",
     ]
     path: str
     message: str

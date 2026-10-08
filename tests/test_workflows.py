@@ -25,6 +25,7 @@ from qa_agent.pinned_execution import (
 )
 from qa_agent.plan_execution import PlanExecutionService
 from qa_agent.plan_store import InMemoryPlanStore
+from qa_agent.reporting import RunReportGenerator
 from qa_agent.run_history import (
     InMemoryRunHistoryRepository,
     RunHistoryService,
@@ -77,8 +78,8 @@ class PinnedWorkflowTests(unittest.TestCase):
     def make_step(name, order, failure_policy=FailurePolicy.CONTINUE):
         return DomainTestStep(
             name=name,
-            description=f"Check {name}.",
-            expected=f"{name} is correct.",
+            description=f"Perform action {name}.",
+            expected=f"Action {name} is completed.",
             order=order,
             failure_policy=failure_policy,
         )
@@ -136,6 +137,48 @@ class PinnedWorkflowTests(unittest.TestCase):
             [self.versions[self.first.id][0].id, self.versions[self.second.id][0].id],
         )
         self.assertEqual(result.test_run.status, ExecutionStatus.PASSED)
+
+    def test_missing_coverage_blocks_validation_and_regression_cannot_false_pass(self) -> None:
+        verification_step = self.first.model_copy(update={
+            "name": "Verify the error message is displayed",
+            "description": "Submit invalid data and inspect the response.",
+            "expected": "An error message is displayed.",
+        })
+        updated_steps = [
+            verification_step if step.id == self.first.id else step
+            for step in self.test_case.steps
+        ]
+        case_segment = self.test_case.segments[0].model_copy(update={"steps": updated_steps})
+        case = self.test_case.model_copy(update={"segments": [case_segment]})
+        validation_runner_calls = []
+        with self.assertRaisesRegex(ValueError, "does not verify the TestStep expected result"):
+            ValidationWorkflow(self.make_executor(
+                lambda plan: validation_runner_calls.append(plan) or {"status": "passed", "steps": []}
+            )).run(case, self.full_selection())
+        self.assertEqual(validation_runner_calls, [])
+
+        regression_runner_calls = []
+        history_repository = InMemoryRunHistoryRepository()
+        history = RunHistoryService(history_repository, self.repository, self.plan_store)
+        regression = RegressionWorkflow(self.make_executor(
+            lambda plan: regression_runner_calls.append(plan) or {"status": "passed", "steps": []}
+        ), run_history=history).run(case, self.full_selection())
+        self.assertEqual(len(regression_runner_calls), 2)
+        self.assertEqual(regression.outcome, WorkflowOutcome.AUTOMATION_EXECUTION_ERROR)
+        self.assertIn("does not verify the TestStep expected result", str(regression.execution.error))
+        self.assertEqual(regression.test_run.status, ExecutionStatus.FAILED)
+        failed_step = regression.test_run.final_execution_for_step(verification_step.id)
+        self.assertEqual(failed_step.status, ExecutionStatus.FAILED)
+        self.assertIn("does not verify the TestStep expected result", failed_step.error)
+        report = RunReportGenerator().generate_history(
+            history.get_detail(regression.test_run.id)
+        )
+        self.assertEqual(report.outcome, WorkflowOutcome.AUTOMATION_EXECUTION_ERROR.value)
+        self.assertEqual(report.status, ExecutionStatus.FAILED)
+        self.assertIn(
+            "does not verify the TestStep expected result",
+            report.steps[0].attempts[0].error,
+        )
 
     def test_regression_does_not_substitute_newer_cached_versions(self) -> None:
         workflow = RegressionWorkflow(self.executor)

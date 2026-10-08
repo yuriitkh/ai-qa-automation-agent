@@ -45,8 +45,8 @@ def _make_step(
 ) -> DomainTestStep:
     return DomainTestStep(
         name=f"Step {order}",
-        description=f"Perform check {order}",
-        expected=f"Check {order} passes",
+        description=f"Perform action {order}",
+        expected=f"Action {order} is completed.",
         order=order,
         failure_policy=failure_policy,
     )
@@ -54,9 +54,9 @@ def _make_step(
 
 def _test_step() -> DomainTestStep:
     return DomainTestStep(
-        name="Check",
-        description="Perform check",
-        expected="Check passes",
+        name="Open the example homepage",
+        description="Open the example homepage.",
+        expected="The example homepage is opened.",
         order=0,
     )
 

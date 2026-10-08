@@ -87,6 +87,13 @@ class TestPlanGeneratorTests(unittest.TestCase):
 
 
 class LLMTestPlanGeneratorTests(unittest.TestCase):
+    def heading_assertion(self) -> QATestStep:
+        heading = self.make_test_step().name.removeprefix("Verify ").removesuffix(" page")
+        return QATestStep(action="assert_visible", parameters={
+            "selector": f'h1:has-text("{heading}")',
+            "expected_text": heading,
+        })
+
     def make_test_step(self) -> DomainTestStep:
         return DomainTestStep(
             name="Verify Boliglån page",
@@ -174,7 +181,7 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
         step = self.make_test_step()
         executable = QATestPlan(
             url="https://www.dnb.no/",
-            steps=[QATestStep(action="assert_page_loaded")],
+            steps=[self.heading_assertion()],
         )
 
         generated = LLMTestPlanGenerator(_StubRouter(executable)).generate_with_plan(
@@ -190,7 +197,7 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
         step = self.make_test_step()
         generator = LLMTestPlanGenerator(_StubRouter(QATestPlan(
             url="https://www.dnb.no/",
-            steps=[QATestStep(action="assert_page_loaded")],
+            steps=[self.heading_assertion()],
         )))
         first = generator.generate_with_plan(step, self.make_discovery_result())
         second = generator.generate_with_plan(
@@ -267,6 +274,87 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
         self.assertIn("MISSING_INPUT_VALUE", router.calls[1]["task"])
         self.assertIn("Enter registration details", router.calls[1]["task"])
 
+    def test_missing_expected_result_coverage_is_repaired_before_plan_creation(self) -> None:
+        target_url = "http://127.0.0.1:43123/register"
+        step = DomainTestStep(
+            name="Enter invalid email and verify an error message is displayed",
+            description="Submit the registration form with an invalid email.",
+            expected="An error message is displayed.",
+            order=0,
+        )
+        discovery = DiscoveryResult(
+            status=DiscoveryStatus.SUCCESS,
+            url=target_url,
+            snapshot={"visible_text_elements": [{
+                "selector": "#error-message",
+                "tag": "p",
+                "text": "Invalid email address.",
+            }]},
+            interactive_elements=[
+                InteractiveElement(kind="input", tag="input", selector="#email", accessible_name="Email"),
+                InteractiveElement(kind="button", tag="button", role="button", selector="#submit", accessible_name="Submit"),
+            ],
+        )
+        missing = QATestPlan(url=target_url, steps=[
+            QATestStep(action="fill", parameters={"selector": "#email", "value": "invalid"}),
+            QATestStep(action="click", parameters={"selector": "#submit"}),
+        ])
+        covered = QATestPlan(url=target_url, steps=[
+            *missing.steps,
+            QATestStep(action="assert_visible", parameters={
+                "selector": "#error-message",
+                "expected_text": "Invalid email address.",
+            }),
+        ])
+        router = _SequencedRouter([missing, covered])
+
+        generated = LLMTestPlanGenerator(router).generate_with_plan(step, discovery)
+
+        self.assertEqual(len(router.calls), 2)
+        self.assertEqual(generated.test_plan_version.origin, PlanVersionOrigin.REPAIRED)
+        self.assertEqual(generated.test_plan_version.qa_test_plan.steps[-1].action, "assert_visible")
+        self.assertIn("EXPECTED_RESULT_NOT_COVERED", router.calls[1]["task"])
+
+    def test_repair_with_grounded_but_irrelevant_assertion_is_rejected_without_saving(self) -> None:
+        target_url = "http://127.0.0.1:43123/register"
+        step = DomainTestStep(
+            name="Enter invalid email and verify an error message is displayed",
+            description="Submit the registration form with an invalid email.",
+            expected="An error message is displayed.",
+            order=0,
+        )
+        discovery = DiscoveryResult(
+            status=DiscoveryStatus.SUCCESS,
+            url=target_url,
+            title="Registration",
+            snapshot={"visible_text_elements": [{
+                "selector": "#error-message",
+                "tag": "p",
+                "text": "Invalid email address.",
+            }]},
+            interactive_elements=[
+                InteractiveElement(kind="input", tag="input", selector="#email", accessible_name="Email"),
+                InteractiveElement(kind="button", tag="button", role="button", selector="#submit", accessible_name="Submit"),
+            ],
+        )
+        missing = QATestPlan(url=target_url, steps=[
+            QATestStep(action="fill", parameters={"selector": "#email", "value": "invalid"}),
+            QATestStep(action="click", parameters={"selector": "#submit"}),
+        ])
+        irrelevant = QATestPlan(url=target_url, steps=[
+            *missing.steps,
+            QATestStep(action="assert_title", parameters={"expected": "Registration"}),
+        ])
+        router = _SequencedRouter([missing, irrelevant])
+
+        with patch("qa_agent.test_plan_generator.TestPlan") as plan_factory:
+            with self.assertRaises(PlanValidationError) as raised:
+                LLMTestPlanGenerator(router).generate_with_plan(step, discovery)
+
+        self.assertEqual(len(router.calls), 2)
+        self.assertEqual(raised.exception.issues[0].code, "EXPECTED_RESULT_NOT_COVERED")
+        plan_factory.assert_not_called()
+
     def test_generic_state_assertion_cannot_gain_an_invented_exact_value_during_repair(self) -> None:
         step = DomainTestStep(
             name="Verify confirmation",
@@ -321,7 +409,7 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
             QATestStep(action="click", parameters={}),
         ])
         valid = QATestPlan(url="https://www.dnb.no/", steps=[
-            QATestStep(action="assert_page_loaded"),
+            self.heading_assertion(),
         ])
         router = _SequencedRouter([invalid, valid])
         store = ExecutionProgressStore()
@@ -368,7 +456,10 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
 
             def create_test_plan(self, task, target_url, page_snapshot):
                 self.calls += 1
-                return QATestPlan(url=target_url, steps=[{"action": "assert_page_loaded", "parameters": {}}])
+                return QATestPlan(url=target_url, steps=[{
+                    "action": "assert_visible",
+                    "parameters": LLMTestPlanGeneratorTests().heading_assertion().parameters,
+                }])
 
         first = FirstProvider()
         fallback = FallbackProvider()
@@ -386,7 +477,7 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
     def test_discovery_context_and_single_step_task_are_passed_to_router(self) -> None:
         router = _StubRouter(QATestPlan(
             url="https://www.dnb.no/",
-            steps=[QATestStep(action="assert_page_loaded")],
+            steps=[self.heading_assertion()],
         ))
         step = self.make_test_step()
         result = self.make_discovery_result()
@@ -414,7 +505,7 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
     def test_only_the_supplied_test_step_is_used_for_one_router_request(self) -> None:
         router = _StubRouter(QATestPlan(
             url="https://www.dnb.no/",
-            steps=[QATestStep(action="assert_page_loaded")],
+            steps=[self.heading_assertion()],
         ))
         step = self.make_test_step()
 
@@ -443,12 +534,15 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
             ],
         )
 
-        for action in ("assert_disabled", "assert_enabled"):
+        for action, expected_name, selector, assertion_selector in (
+            ("assert_disabled", "Disabled input", selector, selector),
+            ("assert_enabled", "Text input", 'input[name="my-text"]', 'input[name="my-text"]'),
+        ):
             with self.subTest(action=action):
                 step = DomainTestStep(
-                    name="Check Disabled input",
-                    description="Verify the input labeled Disabled input",
-                    expected="Disabled input is disabled",
+                    name=f"Check {expected_name}",
+                    description=f"Verify the input labeled {expected_name}",
+                    expected=f"{expected_name} is {'disabled' if action == 'assert_disabled' else 'enabled'}",
                     order=0,
                 )
                 plan = QATestPlan(
@@ -459,11 +553,13 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
                 with self.assertRaisesRegex(PlanValidationError, "deterministic Discovery selector"):
                     LLMTestPlanGenerator(_StubRouter(plan)).generate(step, discovery)
 
-                plan.steps[0].parameters["selector"] = "#my-disabled"
+                plan.steps[0].parameters["selector"] = (
+                    "#my-disabled" if action == "assert_disabled" else "#my-text"
+                )
                 with self.assertRaisesRegex(PlanValidationError, "deterministic Discovery selector"):
                     LLMTestPlanGenerator(_StubRouter(plan)).generate(step, discovery)
 
-                plan.steps[0].parameters["selector"] = selector
+                plan.steps[0].parameters["selector"] = assertion_selector
                 LLMTestPlanGenerator(_StubRouter(plan)).generate(step, discovery)
 
     def test_radio_assert_selected_requires_concrete_discovered_selector(self) -> None:

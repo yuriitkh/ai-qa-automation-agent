@@ -12,6 +12,10 @@ from qa_agent.automation_lifecycle import (
     AutomationLifecycleService,
     plan_fingerprint_for_versions,
 )
+from qa_agent.expected_result_coverage import (
+    has_sufficient_test_case_coverage,
+    ExpectedResultCoverageError,
+)
 from qa_agent.execution_repository import ExecutionRepository
 from qa_agent.execution_progress import get_active_execution_progress
 from qa_agent.models import QATestPlan
@@ -121,10 +125,28 @@ class TestCaseExecutionService:
                     continue
                 versions.append((step.id, version.version, version.id))
         complete = bool(steps) and len(versions) == len(steps)
-        ready_reason = None if complete else "No complete automation version has been generated yet."
+        coverage_sufficient = (
+            complete and has_sufficient_test_case_coverage(test_case, self._plan_store)
+        )
+        has_saved_plan = any(
+            self._plan_store.find(step.id) is not None for step in steps
+        )
+        ready_reason = (
+            None
+            if coverage_sufficient
+            else (
+                "Automation does not verify the TestStep expected result."
+                if complete
+                else (
+                    "One or more saved plans are not usable."
+                    if has_saved_plan
+                    else "No complete automation version has been generated yet."
+                )
+            )
+        )
         return WorkflowAvailability(
             automation_available=self._automation_workflow is not None,
-            validation_available=complete,
+            validation_available=complete and coverage_sufficient,
             regression_available=complete,
             usable_plan_count=len(versions),
             total_step_count=len(steps),
@@ -194,9 +216,15 @@ class TestCaseExecutionService:
                 category="MISSING_AUTOMATION",
             )
         availability = self.workflow_availability(test_case_id)
-        if not availability.validation_available:
+        workflow_available = (
+            availability.validation_available
+            if workflow_type == WorkflowType.VALIDATION
+            else availability.regression_available
+        )
+        if not workflow_available:
             raise RunUnavailableError(
-                "This TestCase is not ready to run because one or more saved plans are not usable.",
+                availability.reason
+                or "This TestCase is not ready to run because one or more saved plans are not usable.",
                 category="MISSING_AUTOMATION",
             )
 
@@ -231,6 +259,10 @@ class TestCaseExecutionService:
                     validated_plan_fingerprint=selected_plan_fingerprint,
                 )
             return result
+        except ExpectedResultCoverageError as error:
+            raise RunUnavailableError(
+                str(error), category="MISSING_AUTOMATION"
+            ) from error
         except PlanSelectionError as error:
             raise RunUnavailableError(
                 "Saved plans changed before this run started. Reload the TestCase and try again.",

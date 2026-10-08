@@ -23,6 +23,7 @@ from qa_agent.llm_usage import (
     llm_usage_scope,
 )
 from qa_agent.assertion_grounding import validate_assertion_grounding
+from qa_agent.expected_result_coverage import validate_expected_result_coverage
 
 
 @dataclass(frozen=True)
@@ -187,6 +188,7 @@ class LLMTestPlanGenerator(TestPlanGenerator):
             discovery_result,
             requirement_context=requirement_context,
         )
+        validate_expected_result_coverage(test_step, executable_plan)
         return executable_plan, grounding
 
     @staticmethod
@@ -202,7 +204,10 @@ class LLMTestPlanGenerator(TestPlanGenerator):
             f"{original_task}\n\n"
             "The previous plan failed executable-plan validation. Regenerate a "
             "corrected plan for the same TestStep, preserving every requested "
-            "action and verification. Fix each listed issue. A human TestStep "
+            "action and verification. Every verification-oriented TestStep must "
+            "include a semantically relevant assertion for its expected result; "
+            "an unrelated assertion does not count. Do not add artificial "
+            "assertions for action-only steps. Fix each listed issue. A human TestStep "
             "may require multiple ordered executable actions. Use only actions "
             "and selectors supported by the supplied schema and page snapshot. "
             "Do not add exact text, status, value, label, ID, URL, or count unless "
@@ -225,6 +230,12 @@ class LLMTestPlanGenerator(TestPlanGenerator):
             "checks. A human TestStep may require multiple ordered executable "
             "actions, such as filling several fields before submitting a form. "
             "Preserve every requested action and verification from the TestStep. "
+            "Every verification-oriented TestStep must include at least one "
+            "assertion that checks the expected result itself; an unrelated page "
+            "assertion does not count. Action-only steps do not need artificial "
+            "assertions. Keep assertions relevant to the expected behavior and "
+            "ground exact assertion values in the requirement or deterministic "
+            "page evidence. "
             "Treat deterministic interactive_elements "
             "as authoritative: when a requested control matches an accessible_name, "
             "use its exact selector unchanged. Use select_option for selects, "

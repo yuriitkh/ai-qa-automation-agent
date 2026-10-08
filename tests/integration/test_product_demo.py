@@ -360,16 +360,16 @@ class ProductDemoSliceTests(unittest.TestCase):
             steps = [
                 DomainTestStep(
                     name="Open registration", description="Open the form.",
-                    expected="Registration form is loaded.", order=0,
+                    expected='The page title is "step-0".', order=0,
                 ),
                 DomainTestStep(
                     name="Verify welcome", description="Check the result.",
-                    expected="Welcome is visible.", order=1,
+                    expected='The page title is "step-1".', order=1,
                     failure_policy=FailurePolicy.BLOCK_REST,
                 ),
                 DomainTestStep(
                     name="Continue flow", description="Continue after welcome.",
-                    expected="Next page is visible.", order=2,
+                    expected='The page title is "step-2".', order=2,
                 ),
             ]
             test_case = DomainTestCase(
@@ -551,7 +551,7 @@ class ProductDemoSliceTests(unittest.TestCase):
                         "value": "local-test@example.test",
                     }),
                     QATestStep(action="assert_visible", parameters={
-                        "selector": "main p",
+                        "selector": "main p#registration-page",
                     }),
                 ])
                 version = DomainTestPlanVersion(
@@ -577,7 +577,7 @@ class ProductDemoSliceTests(unittest.TestCase):
                         "<script>window.addEventListener('load', () => window.setTimeout(() => {"
                         "const input = document.createElement('input'); input.id = 'delayed-email';"
                         "document.body.append(input); }, 150));</script></head>"
-                        "<body><main><p>Local-only registration page</p></main></body></html>"
+                        "<body><main><p id='registration-page'>Local-only registration page</p></main></body></html>"
                     ).encode("utf-8")
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -928,7 +928,7 @@ class ProductDemoSliceTests(unittest.TestCase):
                         {
                             "name": "Enter user details",
                             "description": "Populate the email field.",
-                            "expected": "The email field contains the demo address.",
+                            "expected": "The demo email address is entered.",
                         },
                         {
                             "name": "Submit registration",

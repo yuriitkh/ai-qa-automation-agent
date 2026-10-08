@@ -15,6 +15,7 @@ from typing import Protocol
 from uuid import UUID
 
 from qa_agent.models import TestCase
+from qa_agent.expected_result_coverage import has_sufficient_test_case_coverage
 from qa_agent.plan_store import PlanStore
 from qa_agent.test_plan_validation import validate_executable_plan
 
@@ -129,6 +130,9 @@ class AutomationLifecycleService:
         current_definition = definition_fingerprint(test_case)
         current_plans = plan_fingerprint(test_case, self._plan_store)
         complete = has_complete_plans(test_case, self._plan_store)
+        coverage_sufficient = (
+            complete and has_sufficient_test_case_coverage(test_case, self._plan_store)
+        )
         if record is None:
             return AutomationStatus.NEEDS_VALIDATION if complete else AutomationStatus.NOT_AUTOMATED
         if record.state == AutomationStatus.NOT_AUTOMATED:
@@ -140,6 +144,8 @@ class AutomationLifecycleService:
         if record.state == AutomationStatus.AUTOMATION_READY:
             if not complete:
                 return AutomationStatus.NEEDS_UPDATE
+            if not coverage_sufficient:
+                return AutomationStatus.NEEDS_VALIDATION
             if current_plans != record.plan_fingerprint:
                 return AutomationStatus.NEEDS_VALIDATION
         if record.state == AutomationStatus.NEEDS_VALIDATION and not complete:
@@ -173,12 +179,16 @@ class AutomationLifecycleService:
         current = self.status(test_case)
         if not has_complete_plans(test_case, self._plan_store):
             return AutomationStatus.NEEDS_UPDATE if current != AutomationStatus.NOT_AUTOMATED else current
+        coverage_sufficient = has_sufficient_test_case_coverage(
+            test_case, self._plan_store
+        )
         current_plan_fingerprint = plan_fingerprint(test_case, self._plan_store)
         expected_fingerprint = validated_plan_fingerprint or current_plan_fingerprint
         still_current = current_plan_fingerprint == expected_fingerprint
         status = (
             AutomationStatus.AUTOMATION_READY
-            if passed and still_current else AutomationStatus.NEEDS_VALIDATION
+            if passed and still_current and coverage_sufficient
+            else AutomationStatus.NEEDS_VALIDATION
         )
         # Store the exact pinned versions that Validation exercised. If a plan
         # changes concurrently, status() observes the fingerprint mismatch.

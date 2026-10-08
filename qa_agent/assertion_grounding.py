@@ -48,7 +48,7 @@ _EXAMPLE_TAIL = re.compile(
 
 _STRUCTURAL_TERMS: dict[str, tuple[str, ...]] = {
     "assert_page_loaded": ("load", "opened", "open", "available"),
-    "assert_visible": ("visible", "display", "shown", "present", "appear", "state", "status"),
+    "assert_visible": ("visible", "display", "displayed", "displays", "shown", "present", "appear", "appears", "state", "status"),
     "assert_hidden": ("hidden", "not visible", "disappear", "not displayed"),
     "assert_checked": ("checked", "ticked"),
     "assert_selected": ("selected", "chosen"),

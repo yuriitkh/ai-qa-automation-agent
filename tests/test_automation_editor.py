@@ -33,7 +33,7 @@ class AutomationEditorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.step = DomainTestStep(
             name="Fill registration email", description="Enter an email.",
-            expected="The email is accepted.", order=0,
+            expected="The email is entered.", order=0,
         )
         self.case = DomainTestCase(
             name="Registration flow", description="Register a user.",
@@ -293,6 +293,46 @@ class AutomationEditorTests(unittest.TestCase):
         exported = json.loads(portable)
         exported_value = exported["test_case"]["segments"][0]["steps"][0]["testplan_version"]["plan"]["steps"][0]["parameters"]["value"]
         self.assertEqual(exported_value, "export-current@example.test")
+
+    def test_incomplete_human_plan_is_saved_but_shows_missing_coverage_and_stays_unready(self) -> None:
+        verification_step = DomainTestStep(
+            name="Verify an error message is displayed",
+            description="Submit invalid registration data.",
+            expected="An error message is displayed.",
+            order=0,
+        )
+        case = DomainTestCase(
+            name="Manual coverage review",
+            description="A local registration validation check.",
+            base_url="https://example.test/register",
+            steps=[verification_step],
+        )
+        self.cases.save(case)
+
+        response = self.app.handle(
+            "POST",
+            f"/test-cases/{case.id}/automation/steps/{verification_step.id}/save",
+            urlencode({
+                "expected_version": "0",
+                "plan_url": "https://example.test/register",
+                "action.0.type": "click",
+                "action.0.param.selector": "#submit",
+            }),
+        )
+
+        self.assertEqual(response.status, 303)
+        self.assertEqual(self.plans.find(verification_step.id).origin, PlanVersionOrigin.HUMAN_EDITED)
+        self.assertEqual(self.lifecycle.status(case), AutomationStatus.NEEDS_VALIDATION)
+        self.assertEqual(
+            self.lifecycle.mark_validation_completed(case, passed=True),
+            AutomationStatus.NEEDS_VALIDATION,
+        )
+        editor = self.app.handle("GET", f"/test-cases/{case.id}/automation/edit").body.decode()
+        test_plan = self.app.handle("GET", f"/test-cases/{case.id}/plans").body.decode()
+        for page in (editor, test_plan):
+            self.assertIn("Expected result coverage:", page)
+            self.assertIn("Missing verification", page)
+            self.assertIn("Automation does not verify the TestStep expected result.", page)
 
     def test_no_saved_plans_hides_editor_entry_but_existing_route_can_render_creation(self) -> None:
         empty_store = InMemoryPlanStore()

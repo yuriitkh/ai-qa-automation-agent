@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from qa_agent.browser_discovery import capture_discovery_result, extract_target_url
 from qa_agent.assertion_grounding import validate_assertion_grounding
+from qa_agent.expected_result_coverage import validate_expected_result_coverage
 from qa_agent.browser_runner import BrowserRunner
 from qa_agent.execution_repository import ExecutionRepository, InMemoryExecutionRepository
 from qa_agent.execution_trace import (
@@ -832,6 +833,7 @@ def _validate_generated_plan(
         discovery_result,
         requirement_context=requirement_context,
     )
+    validate_expected_result_coverage(test_step, executable_plan)
     return GeneratedTestPlan(
         test_plan=generated_plan.test_plan,
         test_plan_version=version.model_copy(update={

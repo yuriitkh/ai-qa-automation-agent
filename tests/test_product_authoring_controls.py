@@ -303,7 +303,7 @@ class ProductAuthoringControlsTests(unittest.TestCase):
         plan = self.storage.plan_store.find_test_plan(step.id)
         self.storage.plan_store.save(step.id, DomainTestPlanVersion(
             test_plan_id=plan.id, version=2, origin=PlanVersionOrigin.HUMAN_EDITED,
-            qa_test_plan=QATestPlan(url="http://127.0.0.1/local", steps=[QATestStep(action="assert_page_loaded")]),
+            qa_test_plan=QATestPlan(url="http://127.0.0.1/local", steps=[QATestStep(action="assert_title", parameters={"expected": "Local page"})]),
         ), test_plan=plan)
         self.assertEqual(self.lifecycle.status(case), AutomationStatus.NEEDS_VALIDATION)
         self.assertEqual(self.lifecycle.mark_validation_completed(case, passed=True), AutomationStatus.AUTOMATION_READY)
@@ -320,6 +320,57 @@ class ProductAuthoringControlsTests(unittest.TestCase):
         self.storage.test_case_repository.save(removed)
         self.assertEqual(self.lifecycle.status(removed), AutomationStatus.NEEDS_UPDATE)
         self.assertIsNotNone(self.storage.plan_store.get_version(removed_step_version))
+
+    def test_removing_required_assertion_downgrades_ready_and_validation_cannot_restore_it(self):
+        step = DomainTestStep(
+            name="Verify an error message is displayed",
+            description="Submit invalid registration data.",
+            expected="An error message is displayed.",
+            order=0,
+        )
+        case = DomainTestCase(
+            name="Coverage lifecycle",
+            description="Verify the invalid registration response.",
+            base_url="http://127.0.0.1/local",
+            steps=[step],
+        )
+        self.storage.test_case_repository.save(case)
+        plan = DomainTestPlan(test_step_id=step.id, name=step.name)
+        covered = DomainTestPlanVersion(
+            test_plan_id=plan.id,
+            version=1,
+            origin=PlanVersionOrigin.AI_GENERATED,
+            qa_test_plan=QATestPlan(
+                url=case.base_url,
+                steps=[QATestStep(
+                    action="assert_text_contains",
+                    parameters={"expected_text": "Error message"},
+                )],
+            ),
+        )
+        self.storage.plan_store.save(step.id, covered, test_plan=plan)
+        self.assertEqual(
+            self.lifecycle.mark_validation_completed(case, passed=True),
+            AutomationStatus.AUTOMATION_READY,
+        )
+
+        edited = DomainTestPlanVersion(
+            test_plan_id=plan.id,
+            version=2,
+            origin=PlanVersionOrigin.HUMAN_EDITED,
+            qa_test_plan=QATestPlan(
+                url=case.base_url,
+                steps=[QATestStep(action="click", parameters={"selector": "#submit"})],
+            ),
+        )
+        self.storage.plan_store.save(step.id, edited, test_plan=plan)
+
+        self.assertEqual(self.lifecycle.status(case), AutomationStatus.NEEDS_VALIDATION)
+        self.assertEqual(
+            self.lifecycle.mark_validation_completed(case, passed=True),
+            AutomationStatus.NEEDS_VALIDATION,
+        )
+        self.assertEqual(self.storage.plan_store.get_version(covered.id), covered)
 
     def test_product_failure_does_not_invalidate_automation_ready(self):
         case = self.case_with_steps(["Find existing account"])
@@ -373,7 +424,7 @@ class ProductAuthoringControlsTests(unittest.TestCase):
         def runner(_plan):
             self.storage.plan_store.save(step.id, DomainTestPlanVersion(
                 test_plan_id=plan.id, version=2, origin=PlanVersionOrigin.HUMAN_EDITED,
-                qa_test_plan=QATestPlan(url=case.base_url, steps=[QATestStep(action="assert_page_loaded")]),
+                qa_test_plan=QATestPlan(url=case.base_url, steps=[QATestStep(action="assert_title", parameters={"expected": "Local page"})]),
             ), test_plan=plan)
             return {"status": "passed", "url": case.base_url, "steps": [], "evidence": []}
 
@@ -435,7 +486,12 @@ class ProductAuthoringControlsTests(unittest.TestCase):
 
     @staticmethod
     def step(name, order):
-        return DomainTestStep(name=name, description=f"Perform {name.lower()}.", expected="The expected result is shown.", order=order)
+        return DomainTestStep(
+            name=name,
+            description=f"Perform {name.lower()}.",
+            expected='The page title is "Local page".',
+            order=order,
+        )
 
     def save_plans(self, case):
         version_ids = []

@@ -36,6 +36,38 @@ from qa_agent.test_plan_generator import GeneratedTestPlan, LLMTestPlanGenerator
 
 
 class QATestPipelineTests(unittest.TestCase):
+    def test_custom_generator_missing_expected_coverage_is_rejected_before_save(self) -> None:
+        step = self.make_step(0).model_copy(update={
+            "name": "Verify the error message is displayed",
+            "description": "Submit invalid data and inspect the response.",
+            "expected": "An error message is displayed.",
+        })
+        case = DomainTestCase(
+            name="Coverage boundary",
+            description="Submit invalid data and verify its error message.",
+            base_url="https://example.test/",
+            steps=[step],
+        )
+        store = InMemoryPlanStore()
+        runner_calls = []
+        pipeline = QATestPipeline(
+            decomposer=_FakeDecomposer(case),
+            plan_generator=_FakeGenerator([]),
+            discovery=lambda url: DiscoveryResult(
+                status=DiscoveryStatus.SUCCESS,
+                url=url,
+            ),
+            runner=lambda plan: runner_calls.append(plan) or {"status": "passed", "steps": []},
+            plan_store=store,
+        )
+
+        with self.assertRaises(PipelineStageError) as raised:
+            pipeline.run_test_case(case)
+
+        self.assertIn("plan generation", raised.exception.stage)
+        self.assertIsNone(store.find(step.id))
+        self.assertEqual(runner_calls, [])
+
     def test_plan_missing_required_browser_parameter_is_not_persisted_or_executed(self) -> None:
         step = self.make_step(0)
         case = DomainTestCase(
@@ -343,8 +375,8 @@ class QATestPipelineTests(unittest.TestCase):
     def make_step(order: int) -> DomainTestStep:
         return DomainTestStep(
             name=f"Step {order}",
-            description=f"Perform check {order}",
-            expected=f"Check {order} passes",
+            description=f"Perform action {order}",
+            expected=f"Action {order} is completed",
             order=order,
         )
 
@@ -1827,8 +1859,8 @@ class QATestPipelineTests(unittest.TestCase):
         steps = [
             DomainTestStep(
                 name="Step 0",
-                description="Perform check 0",
-                expected="Check 0 passes",
+                description="Perform action 0",
+                expected="Action 0 is completed",
                 order=0,
                 failure_policy=FailurePolicy.CONTINUE,
             ),
@@ -1894,8 +1926,8 @@ class QATestPipelineTests(unittest.TestCase):
         steps = [
             DomainTestStep(
                 name="Step 0",
-                description="Perform check 0",
-                expected="Check 0 passes",
+                description="Perform action 0",
+                expected="Action 0 is completed",
                 order=0,
                 failure_policy=FailurePolicy.BLOCK_REST,
             ),
@@ -1962,8 +1994,8 @@ class QATestPipelineTests(unittest.TestCase):
         steps = [
             DomainTestStep(
                 name="Step 0",
-                description="Perform check 0",
-                expected="Check 0 passes",
+                description="Perform action 0",
+                expected="Action 0 is completed",
                 order=0,
                 failure_policy=FailurePolicy.BLOCK_REST,
             ),
@@ -2585,7 +2617,14 @@ class _FakeGenerator:
             version=version_number,
             qa_test_plan=QATestPlan(
                 url=discovery_result.url,
-                steps=[QATestStep(action="assert_page_loaded")],
+                steps=[
+                    QATestStep(
+                        action="assert_url",
+                        parameters={"expected": discovery_result.url},
+                    )
+                    if "url" in test_step.expected.casefold()
+                    else QATestStep(action="assert_page_loaded")
+                ],
             ),
         )
         self.versions.append(version)

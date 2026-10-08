@@ -1,9 +1,14 @@
 """Thin automation, validation, and regression workflow entry points."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
-from qa_agent.models import TestCase, TestRun
+from qa_agent.models import ExecutionStatus, TestCase, TestRun
+from qa_agent.expected_result_coverage import (
+    ExpectedResultCoverageError,
+    expected_result_coverage,
+)
+from qa_agent.plan_execution import PlanExecutionClassification
 from qa_agent.pipeline import PipelineResult, QATestPipeline
 from qa_agent.pinned_execution import (
     PinnedExecutionResult,
@@ -79,6 +84,17 @@ class _PinnedTestCaseWorkflow:
         # Reject bad pins before provisioning resources. Resolution is exact and
         # never consults the store's current/latest version for execution.
         resolved = self._executor.resolve(test_case, selected_versions)
+        uncovered_step_ids = tuple(
+            item.test_step.id
+            for item in resolved.steps
+            if not expected_result_coverage(
+                item.test_step,
+                item.plan_version.qa_test_plan,
+            ).is_sufficient
+        )
+        coverage_sufficient = not uncovered_step_ids
+        if self.workflow_type == WorkflowType.VALIDATION and not coverage_sufficient:
+            raise ExpectedResultCoverageError()
         started_at = datetime.now(timezone.utc)
         execution_result: PinnedExecutionResult | None = None
 
@@ -91,6 +107,54 @@ class _PinnedTestCaseWorkflow:
 
         lifecycle = self._setup_cleanup.run(test_case, context, execute_pinned)
         finished_at = datetime.now(timezone.utc)
+        if (
+            self.workflow_type == WorkflowType.REGRESSION
+            and uncovered_step_ids
+            and execution_result is not None
+            and execution_result.outcome == WorkflowOutcome.PASSED
+        ):
+            coverage_error = ExpectedResultCoverageError()
+            uncovered_step_id = uncovered_step_ids[0]
+            failed_execution = next(
+                (
+                    execution
+                    for execution in execution_result.test_run.executions
+                    if execution.test_step_id == uncovered_step_id
+                    and execution.status == ExecutionStatus.PASSED
+                ),
+                None,
+            )
+            if failed_execution is not None:
+                failed_execution = failed_execution.model_copy(update={
+                    "status": ExecutionStatus.FAILED,
+                    "error": str(coverage_error),
+                })
+                test_run = execution_result.test_run.model_copy(update={
+                    "executions": [
+                        failed_execution if execution.id == failed_execution.id else execution
+                        for execution in execution_result.test_run.executions
+                    ],
+                })
+                step_executions = tuple(
+                    replace(
+                        item,
+                        classification=PlanExecutionClassification.AUTOMATION_EXECUTION_ERROR,
+                        execution=failed_execution,
+                    )
+                    if item.execution.id == failed_execution.id
+                    else item
+                    for item in execution_result.step_executions
+                )
+            else:
+                test_run = execution_result.test_run
+                step_executions = execution_result.step_executions
+            execution_result = replace(
+                execution_result,
+                outcome=WorkflowOutcome.AUTOMATION_EXECUTION_ERROR,
+                error=coverage_error,
+                test_run=test_run,
+                step_executions=step_executions,
+            )
         if not lifecycle.setup.succeeded:
             outcome = WorkflowOutcome.SETUP_FAILURE
         elif lifecycle.product_error_type is not None:
