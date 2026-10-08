@@ -305,6 +305,8 @@ def _print_execution_section(trace: ExecutionTrace | None) -> None:
                 f"      locator recovery: {recovery.status.value} "
                 f"({recovery.original_selector} -> {candidate})"
             )
+            if recovery.reason:
+                print(f"      recovery detail: {recovery.reason}")
         regeneration = step.regeneration
         if regeneration is not None:
             print(

@@ -50,12 +50,12 @@ class LocatorRecoveryTests(unittest.TestCase):
         self.assertEqual(result.status, RecoveryStatus.MATCHED)
         self.assertEqual(result.signals, ("exact_href",))
 
-    def test_no_candidate_returns_not_found(self) -> None:
+    def test_wrong_semantic_candidate_is_rejected_as_conflict(self) -> None:
         result = recover_locator(
             QATestStep(action="click", parameters={"selector": "#gone", "expected_text": "Apply"}),
             self.discover(self.element("#other", text="Cancel")),
         )
-        self.assertEqual(result.status, RecoveryStatus.NOT_FOUND)
+        self.assertEqual(result.status, RecoveryStatus.REJECTED_CONFLICT)
         self.assertEqual(result.original_selector, "#gone")
 
     def test_multiple_exact_text_candidates_are_ambiguous(self) -> None:
@@ -76,7 +76,7 @@ class LocatorRecoveryTests(unittest.TestCase):
     def test_boliglan_never_matches_billan(self) -> None:
         plan = QATestStep(action="click", parameters={"selector": "#old", "expected_text": "Boliglån"})
         result = recover_locator(plan, self.discover(self.element("#car-loan", text="Billån")))
-        self.assertEqual(result.status, RecoveryStatus.NOT_FOUND)
+        self.assertEqual(result.status, RecoveryStatus.REJECTED_CONFLICT)
 
     def test_email_input_does_not_match_phone_input(self) -> None:
         plan = QATestStep(action="fill", parameters={"selector": "#old", "expected_text": "Email"})

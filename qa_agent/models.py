@@ -114,6 +114,9 @@ class InteractiveElement(BaseModel):
     selector: str
     text: str = ""
     accessible_name: str = ""
+    label: str = ""
+    placeholder: str = ""
+    test_id: str = ""
     tag: str = ""
     role: str = ""
     id: str = ""
@@ -121,6 +124,24 @@ class InteractiveElement(BaseModel):
     href: str = ""
     visible: bool = True
     enabled: bool = True
+
+
+class LocatorIdentityEntry(BaseModel):
+    """Value-free identity evidence captured for one planned interaction."""
+
+    model_config = ConfigDict(frozen=True)
+
+    step_index: int = Field(ge=0)
+    accessible_name: str | None = Field(default=None, max_length=120)
+    label: str | None = Field(default=None, max_length=120)
+    placeholder: str | None = Field(default=None, max_length=120)
+    visible_text: str | None = Field(default=None, max_length=120)
+    test_id: str | None = Field(default=None, max_length=180)
+    element_id: str | None = Field(default=None, max_length=180)
+    name: str | None = Field(default=None, max_length=180)
+    href: str | None = Field(default=None, max_length=500)
+    tag: str | None = Field(default=None, max_length=40)
+    role: str | None = Field(default=None, max_length=60)
 
 
 class NavigationAction(BaseModel):
@@ -355,6 +376,10 @@ class TestPlanVersion(BaseModel):
     # Optional for compatibility with saved plans created before grounding.
     # Metadata records only categories and indexes; it never stores page text.
     assertion_grounding: tuple[AssertionGroundingEntry, ...] | None = None
+    # Locator identity contains control labels/attributes, never entered values.
+    # It is separate from QATestPlan so the canonical executable/export format
+    # remains unchanged. Missing metadata is valid for legacy and edited plans.
+    locator_identity: tuple[LocatorIdentityEntry, ...] | None = None
 
     @model_validator(mode="after")
     def validate_assertion_grounding_indexes(self) -> "TestPlanVersion":
@@ -368,6 +393,20 @@ class TestPlanVersion(BaseModel):
                 raise ValueError("Assertion grounding index is outside the saved plan.")
             if not self.qa_test_plan.steps[index].action.startswith("assert_"):
                 raise ValueError("Assertion grounding metadata must refer to assertion actions.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_locator_identity_indexes(self) -> "TestPlanVersion":
+        if self.locator_identity is None:
+            return self
+        indexes = [entry.step_index for entry in self.locator_identity]
+        if len(indexes) != len(set(indexes)):
+            raise ValueError("Locator identity indexes must be unique.")
+        for index in indexes:
+            if index >= len(self.qa_test_plan.steps):
+                raise ValueError("Locator identity index is outside the saved plan.")
+            if self.qa_test_plan.steps[index].action not in {"click", "fill"}:
+                raise ValueError("Locator identity metadata must refer to click or fill actions.")
         return self
 
 

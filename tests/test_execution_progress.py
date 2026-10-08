@@ -150,6 +150,39 @@ class ExecutionProgressStoreTests(unittest.TestCase):
         self.assertEqual(timestamps, sorted(timestamps))
         self.assertEqual(len({event.id for event in finished.events}), len(finished.events))
 
+    def test_locator_recovery_refusal_is_visible_as_needs_attention(self) -> None:
+        test_case = DomainTestCase(
+            id=self.test_case_id,
+            name="Update profile",
+            description="Update an existing profile.",
+            steps=[DomainTestStep(
+                name="Fill profile name",
+                description="Enter the profile name.",
+                expected="The profile is updated.",
+                order=0,
+            )],
+        )
+        step = test_case.steps[0]
+        self.reporter.test_case_loaded(test_case)
+        self.reporter.emit(ExecutionEventType.STEP_STARTED, step=step)
+        self.reporter.emit(
+            ExecutionEventType.STEP_FAILED,
+            step=step,
+            classification="AUTOMATION_DRIFT",
+            message="The saved automation no longer matches the current UI.",
+        )
+        self.reporter.emit(
+            ExecutionEventType.PLAN_REPAIR_FAILED,
+            step=step,
+            message="Similar controls were found, but their identity conflicts with the saved target. Manual attention is required.",
+        )
+
+        snapshot = self.store.get(self.progress_id)
+        self.assertEqual(snapshot.steps[0].state, ProgressStepState.FAILED)
+        self.assertEqual(snapshot.steps[0].failure_classification, "AUTOMATION_DRIFT")
+        self.assertEqual(snapshot.steps[0].automation_state, "Needs attention")
+        self.assertIn("Manual attention is required", snapshot.steps[0].message)
+
     def test_terminal_generation_failure_preserves_step_details_and_marks_remaining_steps(self) -> None:
         test_case = DomainTestCase(
             id=self.test_case_id,

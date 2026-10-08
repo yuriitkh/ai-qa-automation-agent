@@ -746,6 +746,11 @@ class ExecutionProgressStore:
             )
         elif event.event_type == ExecutionEventType.PLAN_REPAIR_FAILED:
             record.phase = "Preparing automation"
+            self._update_step(
+                record, event.step_id,
+                automation_state="Needs attention",
+                message=event.message,
+            )
         elif event.event_type == ExecutionEventType.PLAN_REUSED:
             self._update_step(
                 record, event.step_id,

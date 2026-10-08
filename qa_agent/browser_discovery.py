@@ -77,6 +77,10 @@ _SNAPSHOT_SCRIPT = r"""() => {
     const name = element.getAttribute("name") || "";
     const role = element.getAttribute("role") || "";
     const ariaLabel = element.getAttribute("aria-label") || "";
+    const labelText = element.labels?.[0]?.innerText || "";
+    const placeholder = element.getAttribute("placeholder") || "";
+    const testId = element.getAttribute("data-testid") ||
+        element.getAttribute("data-test") || element.getAttribute("data-qa") || "";
         let selector = id ? `#${CSS.escape(id)}` : tag;
         if (!id && /^H[1-6]$/.test(element.tagName)) {
             const normalizedText = (element.innerText || "").replace(/\s+/g, " ").trim();
@@ -97,12 +101,16 @@ _SNAPSHOT_SCRIPT = r"""() => {
     const item = {
       tag,
       selector,
-      text: (element.innerText || element.value || ariaLabel).trim().slice(0, 120),
+      // Never include a control's current value in discovery or recovery data.
+      text: (element.innerText || "").trim().slice(0, 120),
     };
     if (id) item.id = id;
     if (name) item.name = name;
     if (role) item.role = role;
     if (ariaLabel) item.aria_label = ariaLabel;
+    if (labelText) item.label = labelText.trim().slice(0, 120);
+    if (placeholder) item.placeholder = placeholder.trim().slice(0, 120);
+    if (testId) item.test_id = testId.trim().slice(0, 180);
     if (tag === "a" && element.href) item.href = element.href;
     return item;
   };
@@ -201,9 +209,10 @@ _SNAPSHOT_SCRIPT = r"""() => {
             const role = element.getAttribute('role') || '';
             const type = (element.getAttribute('type') || '').toLowerCase();
             const kind = role || (tag === 'input' && ['checkbox', 'radio'].includes(type) ? type : tag);
-            const label = element.labels?.[0]?.innerText || '';
             item.kind = kind;
-            item.accessible_name = (element.getAttribute('aria-label') || label || item.text || element.getAttribute('placeholder') || '').trim().slice(0, 120);
+            // Keep placeholder separate so recovery can treat it as weaker
+            // evidence than an accessible name or an explicit label.
+            item.accessible_name = (element.getAttribute('aria-label') || item.label || item.text || '').trim().slice(0, 120);
             item.visible = true;
             item.enabled = !element.disabled && element.getAttribute('aria-disabled') !== 'true';
             return item;
@@ -1025,13 +1034,21 @@ def _normalize_interactive_elements(value: Any) -> list[dict[str, Any]]:
     """Keep only bounded, replay-relevant identity and state information."""
     if not isinstance(value, list):
         return []
-    fields = ("kind", "selector", "text", "accessible_name", "tag", "role", "id", "name", "href")
+    fields = (
+        "kind", "selector", "text", "accessible_name", "label", "placeholder",
+        "test_id", "tag", "role", "id", "name", "href",
+    )
     result: list[dict[str, Any]] = []
     for entry in value[:32]:
         if not isinstance(entry, dict) or not entry.get("selector"):
             continue
         item = {
-            key: _bounded_text(entry.get(key), 500 if key == "href" else MAX_SELECTOR_CHARS)
+            key: _bounded_text(
+                entry.get(key),
+                500 if key == "href" else 180 if key in {"id", "name", "test_id"}
+                else MAX_TEXT_CHARS if key in {"text", "accessible_name", "label", "placeholder"}
+                else MAX_SELECTOR_CHARS,
+            )
             for key in fields if entry.get(key)
         }
         item["visible"] = entry.get("visible") is True

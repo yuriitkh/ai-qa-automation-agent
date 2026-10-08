@@ -7,12 +7,18 @@ import unittest.mock
 from contextlib import redirect_stdout
 from typing import Any
 
+from qa_agent.automation_lifecycle import (
+    AutomationLifecycleService,
+    AutomationStatus,
+    InMemoryAutomationLifecycleRepository,
+)
 from qa_agent.models import (
     DiscoveryResult,
     DiscoveryStatus,
     ExecutionStatus,
     FailurePolicy,
     InteractiveElement,
+    LocatorIdentityEntry,
     PlanVersionOrigin,
     QATestPlan,
     QATestStep,
@@ -152,7 +158,12 @@ class QATestPipelineTests(unittest.TestCase):
                     self.assertEqual(generator.calls[0][1].navigation_paths[0].menu_item_text, "Account")
 
     def test_matched_stale_locator_is_repaired_deterministically_and_preserves_history(self) -> None:
-        step = self.make_step(0)
+        step = DomainTestStep(
+            name="Click Continue",
+            description="Click Continue to proceed.",
+            expected="Continue is clicked.",
+            order=0,
+        )
         test_case = DomainTestCase(name="Flow", description="Check", base_url="https://example.com/", steps=[step])
         plan_store = InMemoryPlanStore()
         plan = DomainTestPlan(test_step_id=step.id, name=step.name)
@@ -161,8 +172,22 @@ class QATestPipelineTests(unittest.TestCase):
             qa_test_plan=QATestPlan(url="https://example.com/", steps=[
                 QATestStep(action="click", parameters={"selector": "#old", "text": "Continue"})
             ]),
+            locator_identity=(LocatorIdentityEntry(
+                step_index=0,
+                accessible_name="Continue",
+                visible_text="Continue",
+                tag="button",
+                role="button",
+            ),),
         )
         plan_store.save(step.id, version_one, test_plan=plan)
+        lifecycle = AutomationLifecycleService(
+            InMemoryAutomationLifecycleRepository(), plan_store
+        )
+        self.assertEqual(
+            lifecycle.mark_validation_completed(test_case, passed=True),
+            AutomationStatus.AUTOMATION_READY,
+        )
         discovery_result = DiscoveryResult(
             status=DiscoveryStatus.SUCCESS, url="https://example.com/",
             interactive_elements=[InteractiveElement(
@@ -197,9 +222,16 @@ class QATestPipelineTests(unittest.TestCase):
         self.assertEqual([e.test_plan_version_id for e in repository.list_for_test_step(step.id)],
                          [version_one.id, result.test_plans[-1].test_plan_version.id])
         self.assertEqual(result.test_run.status, ExecutionStatus.PASSED)
+        repaired_version = result.test_plans[-1].test_plan_version
+        self.assertEqual(repaired_version.version, 2)
+        self.assertEqual(repaired_version.origin, PlanVersionOrigin.REPAIRED)
+        self.assertEqual(repaired_version.locator_identity[0].visible_text, "Continue")
+        self.assertEqual(plan_store.get_version(version_one.id), version_one)
+        self.assertEqual(plan_store.list_versions(step.id), (repaired_version, version_one))
+        self.assertEqual(lifecycle.status(test_case), AutomationStatus.NEEDS_VALIDATION)
         self.assertEqual(generator.calls, [])
 
-    def test_ambiguous_and_not_found_recovery_fall_back_to_llm(self) -> None:
+    def test_ambiguous_and_not_found_recovery_stop_without_llm_or_plan_change(self) -> None:
         for elements in ([], [
             InteractiveElement(kind="button", tag="button", role="button", text="Continue", selector="#a"),
             InteractiveElement(kind="button", tag="button", role="button", text="Continue", selector="#b"),
@@ -223,14 +255,17 @@ class QATestPipelineTests(unittest.TestCase):
                 discovery_result = DiscoveryResult(status=DiscoveryStatus.SUCCESS, url="https://example.com/", interactive_elements=elements)
                 result = QATestPipeline(decomposer=_FakeDecomposer(case), discovery=lambda _: discovery_result,
                     plan_generator=generator, runner=runner, plan_store=store).run("Check")
-                self.assertEqual(len(generator.calls), 1)
-                self.assertEqual([p.test_plan_version.version for p in result.test_plans], [1, 2])
+                self.assertEqual(generator.calls, [])
+                self.assertEqual(run_count, 1)
+                self.assertEqual([p.test_plan_version.version for p in result.test_plans], [1])
+                self.assertEqual(result.test_run.status, ExecutionStatus.FAILED)
                 self.assertEqual(
-                    result.test_plans[-1].test_plan_version.origin,
-                    PlanVersionOrigin.REGENERATED,
+                    result.trace.steps[0].locator_recovery.status,
+                    RecoveryStatus.AMBIGUOUS if elements else RecoveryStatus.NO_MATCH,
                 )
+                self.assertEqual(store.find(step.id).id, v1.id)
 
-    def test_regeneration_failure_raises_stage_error_and_keeps_version_one(
+    def test_unsafe_recovery_refusal_keeps_version_one_without_llm_call(
         self,
     ) -> None:
         step = self.make_step(0)
@@ -250,8 +285,8 @@ class QATestPipelineTests(unittest.TestCase):
         store = InMemoryPlanStore()
         store.save(step.id, version_one, test_plan=cached_plan)
 
-        # Deterministic rediscovery finds no candidate, so recovery is NOT_FOUND
-        # and the pipeline proceeds to LLM regeneration.
+        # Deterministic rediscovery finds no candidate. The failure remains
+        # Automation Drift and the pipeline does not ask an LLM to choose.
         discovery_result = DiscoveryResult(
             status=DiscoveryStatus.SUCCESS,
             url="https://example.com/",
@@ -259,9 +294,7 @@ class QATestPipelineTests(unittest.TestCase):
         )
         repository = InMemoryExecutionRepository()
         events: list[tuple[Any, ...]] = []
-        generator = _FakeGenerator(
-            events, error=RuntimeError("LLM regeneration failed")
-        )
+        generator = _FakeGenerator(events)
 
         def stale_runner(plan: QATestPlan) -> dict[str, Any]:
             return {"status": "failed", "steps": [{
@@ -277,30 +310,26 @@ class QATestPipelineTests(unittest.TestCase):
             execution_repository=repository,
         )
 
-        with self.assertRaises(PipelineStageError) as raised:
-            pipeline.run("Check")
+        result = pipeline.run("Check")
 
-        error = raised.exception
-        self.assertIn("regeneration", error.stage)
-
-        # The run's trace is finalized as ERROR and attached to the error.
-        trace = error.trace
+        # The run is a completed failed execution, not a generation error.
+        trace = result.trace
         self.assertIsNotNone(trace)
-        self.assertEqual(trace.status, TraceStatus.ERROR)
-        self.assertIn("regeneration", trace.error_stage or "")
-        self.assertIsNotNone(trace.error)
+        self.assertEqual(trace.status, TraceStatus.FAILED)
+        self.assertIsNone(trace.error_stage)
+        self.assertIsNone(trace.error)
 
         # Recovery ran, but no successful regeneration was recorded.
         step_trace = trace.steps[0]
         self.assertEqual(
-            step_trace.locator_recovery.status, RecoveryStatus.NOT_FOUND
+            step_trace.locator_recovery.status, RecoveryStatus.NO_MATCH
         )
         self.assertIsNone(step_trace.regeneration)
         self.assertIsNone(step_trace.plan_generation)
         self.assertEqual(trace.totals.regenerations, 0)
 
-        # Exactly one regeneration attempt: the failure never retries.
-        self.assertEqual(len(generator.calls), 1)
+        # No regeneration attempt is made.
+        self.assertEqual(generator.calls, [])
 
         # No v2 was saved; the plan store still points at v1.
         current = store.find(step.id)
@@ -1112,59 +1141,47 @@ class QATestPipelineTests(unittest.TestCase):
 
         result = pipeline.run("Check")
 
-        # v1 (stale) and v2 (assertion) both FAILED and both persisted.
+        # Unsafe rediscovery leaves v1 failed and does not create or run v2.
         self.assertEqual(
             [execution.status for execution in result.executions],
-            [ExecutionStatus.FAILED, ExecutionStatus.FAILED],
+            [ExecutionStatus.FAILED],
         )
         self.assertEqual(result.test_run.status, ExecutionStatus.FAILED)
         persisted = repository.list_for_test_step(step.id)
-        self.assertEqual(len(persisted), 2)
+        self.assertEqual(len(persisted), 1)
         self.assertEqual(
             [
                 execution.test_plan_version_id
                 for execution in result.executions
             ],
-            [
-                result.test_plans[0].test_plan_version.id,
-                result.test_plans[1].test_plan_version.id,
-            ],
+            [version_one.id],
         )
-        self.assertEqual(
-            [plan.test_plan_version.version for plan in result.test_plans],
-            [1, 2],
-        )
+        self.assertEqual([plan.test_plan_version.version for plan in result.test_plans], [1])
         current = store.find(step.id)
         self.assertIsNotNone(current)
-        self.assertEqual(current.version, 2)
+        self.assertEqual(current.id, version_one.id)
+        self.assertEqual(current.version, 1)
 
-        # Exactly one regeneration, one recovery, one rediscovery, two runs:
-        # the assertion failure triggers no further cascade (no v3).
-        self.assertEqual(len(generator.calls), 1)
+        # Only rediscovery ran. No LLM or retry followed the stale failure.
+        self.assertEqual(generator.calls, [])
         self.assertEqual(len(discovery_calls), 1)
-        self.assertEqual(len(runner_calls), 2)
+        self.assertEqual(len(runner_calls), 1)
 
         trace = result.trace
         self.assertIsNotNone(trace)
         self.assertEqual(trace.status, TraceStatus.FAILED)
         step_trace = trace.steps[0]
-        self.assertEqual(len(step_trace.execution_attempts), 2)
-
-        self.assertIsNotNone(step_trace.regeneration)
-        self.assertEqual(step_trace.regeneration.from_version, 1)
-        self.assertEqual(step_trace.regeneration.to_version, 2)
-        self.assertEqual(step_trace.regeneration.reason, "stale_ui_failure")
-        self.assertEqual(trace.totals.regenerations, 1)
+        self.assertEqual(len(step_trace.execution_attempts), 1)
+        self.assertIsNone(step_trace.regeneration)
+        self.assertEqual(trace.totals.regenerations, 0)
 
         self.assertIsNotNone(step_trace.locator_recovery)
         self.assertEqual(
-            step_trace.locator_recovery.status, RecoveryStatus.NOT_FOUND
+            step_trace.locator_recovery.status, RecoveryStatus.NO_MATCH
         )
         self.assertEqual(trace.totals.locator_recoveries, 1)
 
-        # The regeneration itself was recorded as plan generation (v2).
-        self.assertIsNotNone(step_trace.plan_generation)
-        self.assertEqual(step_trace.plan_generation.version_number, 2)
+        self.assertIsNone(step_trace.plan_generation)
 
     def test_generator_error_does_not_call_runner(self) -> None:
         generator_error = RuntimeError("LLM unavailable")
@@ -1717,12 +1734,11 @@ class QATestPipelineTests(unittest.TestCase):
         self.assertEqual(current.version, 2)
         self.assertEqual(persisted[1].test_plan_version_id, current.id)
 
-    def test_runner_exception_on_regenerated_execution_records_both_trace_attempts(
+    def test_unsafe_recovery_does_not_attempt_a_second_execution(
         self,
     ) -> None:
-        # P0-2 regression 2: stale v1 -> deterministic recovery NOT_FOUND ->
-        # LLM regeneration creates v2 -> regenerated v2 runner raises. Both
-        # executions must each be mirrored by exactly one trace attempt.
+        # Stale v1 with no saved identity must stop as drift without LLM
+        # regeneration or a second browser execution.
         step = self.make_step(0)
         case = DomainTestCase(
             name="Flow",
@@ -1754,12 +1770,10 @@ class QATestPipelineTests(unittest.TestCase):
 
         def stale_then_raise(plan: QATestPlan) -> dict[str, Any]:
             runner_calls.append(plan)
-            if len(runner_calls) == 1:
-                selector = plan.steps[0].parameters["selector"]
-                return {"status": "failed", "steps": [{
-                    "action": "click", "status": "failed",
-                    "error": f"Selector '{selector}' was not found on the page."}]}
-            raise RuntimeError("browser launch failed")
+            selector = plan.steps[0].parameters["selector"]
+            return {"status": "failed", "steps": [{
+                "action": "click", "status": "failed",
+                "error": f"Selector '{selector}' was not found on the page."}]}
 
         pipeline = QATestPipeline(
             decomposer=_FakeDecomposer(case, events),
@@ -1770,70 +1784,39 @@ class QATestPipelineTests(unittest.TestCase):
             execution_repository=repository,
         )
 
-        with self.assertRaises(PipelineStageError) as raised:
-            pipeline.run("Check")
-
-        # The pipeline ends with an execution-stage error for the
-        # REGENERATED v2 execution, not for v1.
-        error = raised.exception
-        self.assertIn("execution", error.stage)
-        self.assertIn("plan version 2", error.stage)
-
-        trace = error.trace
+        result = pipeline.run("Check")
+        trace = result.trace
         self.assertIsNotNone(trace)
-        self.assertEqual(trace.status, TraceStatus.ERROR)
-        self.assertIn("execution", trace.error_stage or "")
+        self.assertEqual(trace.status, TraceStatus.FAILED)
+        self.assertIsNone(trace.error_stage)
 
-        # Repository holds both FAILED executions: v1 stale failure and
-        # the persisted v2 runner exception.
+        # Only the original stale failure is persisted.
         persisted = repository.list_for_test_step(step.id)
-        self.assertEqual(len(persisted), 2)
-        self.assertEqual(
-            [execution.status for execution in persisted],
-            [ExecutionStatus.FAILED, ExecutionStatus.FAILED],
-        )
+        self.assertEqual(len(persisted), 1)
+        self.assertEqual([execution.status for execution in persisted], [ExecutionStatus.FAILED])
 
-        # Regeneration v1 -> v2 recorded exactly once; recovery NOT_FOUND
-        # triggered it; no regeneration loop followed the exception.
         step_trace = trace.steps[0]
-        self.assertIsNotNone(step_trace.regeneration)
-        self.assertEqual(step_trace.regeneration.from_version, 1)
-        self.assertEqual(step_trace.regeneration.to_version, 2)
-        self.assertEqual(step_trace.regeneration.reason, "stale_ui_failure")
-        self.assertEqual(trace.totals.regenerations, 1)
-        self.assertEqual(len(generator.calls), 1)
+        self.assertIsNone(step_trace.regeneration)
+        self.assertEqual(trace.totals.regenerations, 0)
+        self.assertEqual(generator.calls, [])
         self.assertIsNotNone(step_trace.locator_recovery)
         self.assertEqual(
-            step_trace.locator_recovery.status, RecoveryStatus.NOT_FOUND
+            step_trace.locator_recovery.status, RecoveryStatus.NO_MATCH
         )
         self.assertEqual(trace.totals.locator_recoveries, 1)
-        self.assertEqual(len(runner_calls), 2)
+        self.assertEqual(len(runner_calls), 1)
 
-        # The regenerated v2 itself was recorded as plan generation.
-        self.assertIsNotNone(step_trace.plan_generation)
-        self.assertEqual(step_trace.plan_generation.version_number, 2)
-
-        # Trace mirrors the repository exactly: v1 attempt, then v2 attempt.
         attempts = step_trace.execution_attempts
-        self.assertEqual(len(attempts), 2)
-        self.assertEqual(trace.totals.execution_attempts, 2)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(trace.totals.execution_attempts, 1)
         self.assertEqual(attempts[0].plan_version_number, 1)
         self.assertEqual(attempts[0].execution_id, persisted[0].id)
         self.assertEqual(attempts[0].status, ExecutionStatus.FAILED)
-        self.assertEqual(attempts[1].plan_version_number, 2)
-        self.assertEqual(attempts[1].execution_id, persisted[1].id)
-        self.assertEqual(
-            attempts[1].plan_version_id, persisted[1].test_plan_version_id
-        )
-        self.assertEqual(attempts[1].status, ExecutionStatus.FAILED)
-        self.assertEqual(attempts[1].error, "browser launch failed")
         self.assertEqual(len(persisted), len(attempts))
 
-        # The regenerated v2 is the version bound to the persisted execution.
         current = store.find(step.id)
         self.assertIsNotNone(current)
-        self.assertEqual(current.version, 2)
-        self.assertEqual(persisted[1].test_plan_version_id, current.id)
+        self.assertEqual(current.id, version_one.id)
 
     def test_runner_failed_result_becomes_failed_execution(self) -> None:
         def failed_runner(plan: QATestPlan) -> dict[str, Any]:
@@ -2026,7 +2009,7 @@ class QATestPipelineTests(unittest.TestCase):
         )
         self.assertEqual(runner.call_count, 1)
 
-    def test_stale_ui_failure_rediscovers_and_generates_version_two_once(self) -> None:
+    def test_stale_ui_failure_without_locator_identity_stays_drift(self) -> None:
         one_step_case = DomainTestCase(
             name="Example flow",
             description="Open the example homepage.",
@@ -2063,18 +2046,15 @@ class QATestPipelineTests(unittest.TestCase):
 
         result = pipeline.run("Open the example homepage.")
 
-        self.assertEqual([entry.test_plan_version.version for entry in result.test_plans], [1, 2])
-        self.assertIs(result.test_plans[0].test_plan, result.test_plans[1].test_plan)
-        self.assertEqual([run.status for run in result.executions], [
-            ExecutionStatus.FAILED, ExecutionStatus.PASSED
-        ])
-        self.assertEqual(
-            [run.test_plan_version_id for run in result.executions],
-            [entry.test_plan_version.id for entry in result.test_plans],
-        )
+        self.assertEqual([entry.test_plan_version.version for entry in result.test_plans], [1])
+        self.assertEqual([run.status for run in result.executions], [ExecutionStatus.FAILED])
+        self.assertEqual(result.test_run.status, ExecutionStatus.FAILED)
+        self.assertIsNone(result.trace.steps[0].locator_recovery)
+        self.assertIsNone(result.trace.steps[0].regeneration)
+        self.assertEqual(runner_calls, 1)
         self.assertEqual(
             [event[0] for event in self.events],
-            ["decomposer", "discovery", "generator", "discovery", "generator"],
+            ["decomposer", "discovery", "generator", "discovery"],
         )
 
     def test_assertion_failure_does_not_trigger_regeneration(self) -> None:
@@ -2267,7 +2247,7 @@ class QATestPipelineTests(unittest.TestCase):
             hit_step.execution_attempts[0].plan_version_id, stored_version.id
         )
 
-    def test_stale_v1_and_v2_attempts_are_both_saved_to_execution_repository(self) -> None:
+    def test_legacy_stale_v1_is_reported_without_regeneration(self) -> None:
         step = self.make_step(0)
         test_case = DomainTestCase(
             name="Example flow",
@@ -2322,19 +2302,10 @@ class QATestPipelineTests(unittest.TestCase):
 
         result = pipeline.run("Open the example homepage.")
 
-        self.assertEqual(len(result.executions), 2)
-        self.assertEqual(
-            [execution.status for execution in result.executions],
-            [ExecutionStatus.FAILED, ExecutionStatus.PASSED],
-        )
-        self.assertEqual(
-            [execution.test_step_id for execution in result.executions],
-            [step.id, step.id],
-        )
-        self.assertEqual(
-            [execution.test_plan_version_id for execution in result.executions],
-            [version_one.id, result.test_plans[-1].test_plan_version.id],
-        )
+        self.assertEqual(len(result.executions), 1)
+        self.assertEqual([execution.status for execution in result.executions], [ExecutionStatus.FAILED])
+        self.assertEqual([execution.test_step_id for execution in result.executions], [step.id])
+        self.assertEqual([execution.test_plan_version_id for execution in result.executions], [version_one.id])
         failed_execution = result.executions[0]
         self.assertEqual(failed_execution.test_step_id, step.id)
         self.assertEqual(failed_execution.planned_step_index, 0)
@@ -2349,12 +2320,12 @@ class QATestPipelineTests(unittest.TestCase):
         self.assertEqual(result.test_plans[0].test_plan_version.id, version_one.id)
         self.assertEqual(repository.list_for_test_step(step.id), result.executions)
         self.assertTrue(all(repository.get(item.id) is item for item in result.executions))
-        self.assertEqual(plan_store.find(step.id).version, 2)
+        self.assertEqual(plan_store.find(step.id).id, version_one.id)
+        self.assertEqual(plan_store.get_version(version_one.id), version_one)
         self.assertEqual(discovery_calls, ["https://example.com/"])
-        self.assertEqual(len(generator.calls), 1)
-        self.assertIs(generator.calls[0][0], step)
-        self.assertIs(generator.plans[0], test_plan)
-        self.assertEqual(generator.versions[0].version, 2)
+        self.assertEqual(generator.calls, [])
+        self.assertEqual(result.trace.steps[0].locator_recovery.status, RecoveryStatus.NO_MATCH)
+        self.assertIsNone(result.trace.steps[0].regeneration)
 
     def test_real_decomposer_ids_allow_cache_hit_on_repeated_pipeline_run(self) -> None:
         events: list[tuple[Any, ...]] = []
@@ -2406,7 +2377,7 @@ class QATestPipelineTests(unittest.TestCase):
             self.assertEqual(execution.test_step_id, step.id)
             self.assertEqual(execution.test_plan_version_id, pair.test_plan_version.id)
 
-    def test_cached_stale_plan_is_replaced_by_version_two_and_reused(self) -> None:
+    def test_cached_stale_plan_without_identity_stays_for_manual_review(self) -> None:
         one_step_case = DomainTestCase(
             name="Example flow",
             description="Open the example homepage.",
@@ -2449,52 +2420,20 @@ class QATestPipelineTests(unittest.TestCase):
         self.assertEqual([pair.test_plan_version.version for pair in initial.test_plans], [1])
         self.assertEqual([version.version for _, version in store.save_calls], [1])
 
-        repaired = pipeline.run("Open the example homepage.")
-        self.assertEqual([pair.test_plan_version.version for pair in repaired.test_plans], [1, 2])
-        self.assertEqual(repaired.executions[0].status, ExecutionStatus.FAILED)
-        self.assertEqual(
-            [execution.status for execution in repaired.executions],
-            [ExecutionStatus.FAILED, ExecutionStatus.PASSED],
-        )
-        self.assertEqual(
-            [execution.test_step_id for execution in repaired.executions],
-            [one_step_case.steps[0].id, one_step_case.steps[0].id],
-        )
-        self.assertEqual(
-            [execution.test_plan_version_id for execution in repaired.executions],
-            [pair.test_plan_version.id for pair in repaired.test_plans],
-        )
-        self.assertEqual(repaired.test_run.executions, repaired.executions)
-        self.assertEqual(repaired.test_run.status, ExecutionStatus.PASSED)
-        self.assertEqual(
-            repaired.test_run.final_execution_for_step(one_step_case.steps[0].id).status,
-            ExecutionStatus.PASSED,
-        )
-        self.assertEqual(store.find(one_step_case.steps[0].id), repaired.test_plans[-1].test_plan_version)
-        self.assertEqual(
-            store.get_version(repaired.executions[0].test_plan_version_id),
-            repaired.test_plans[0].test_plan_version,
-        )
-        self.assertEqual(
-            store.get_version(repaired.executions[1].test_plan_version_id),
-            repaired.test_plans[1].test_plan_version,
-        )
-        self.assertEqual([version.version for _, version in store.save_calls], [1, 2])
-
-        calls_before_cache_hit = (len(generator.calls), sum(e[0] == "discovery" for e in events))
-        reused = pipeline.run("Open the example homepage.")
-
-        self.assertEqual([pair.test_plan_version.version for pair in reused.test_plans], [2])
-        self.assertEqual(reused.test_plans[0].test_plan_version.id, store.find(one_step_case.steps[0].id).id)
-        self.assertEqual(len(generator.calls), calls_before_cache_hit[0])
-        self.assertEqual(sum(e[0] == "discovery" for e in events), calls_before_cache_hit[1])
-        self.assertEqual(len(store.save_calls), 2)
-        self.assertEqual([version.version for version in generator.versions], [1, 2])
-        self.assertEqual(reused.executions[0].test_step_id, one_step_case.steps[0].id)
-        self.assertEqual(
-            reused.executions[0].test_plan_version_id,
-            reused.test_plans[0].test_plan_version.id,
-        )
+        drifted = pipeline.run("Open the example homepage.")
+        self.assertEqual([pair.test_plan_version.version for pair in drifted.test_plans], [1])
+        self.assertEqual([execution.status for execution in drifted.executions], [ExecutionStatus.FAILED])
+        self.assertEqual(drifted.test_run.status, ExecutionStatus.FAILED)
+        self.assertIsNone(drifted.trace.steps[0].locator_recovery)
+        self.assertEqual(drifted.trace.steps[0].regeneration, None)
+        self.assertEqual(store.find(one_step_case.steps[0].id).id,
+                         initial.test_plans[0].test_plan_version.id)
+        self.assertEqual(store.get_version(initial.test_plans[0].test_plan_version.id),
+                         initial.test_plans[0].test_plan_version)
+        self.assertEqual([version.version for _, version in store.save_calls], [1])
+        self.assertEqual([version.version for version in generator.versions], [1])
+        self.assertEqual(len(generator.calls), 1)
+        self.assertEqual(len(runner_versions), 2)
 
     def test_cached_assertion_failure_does_not_discover_or_regenerate(self) -> None:
         one_step_case = DomainTestCase(

@@ -6,6 +6,9 @@ from qa_agent.models import (
     DiscoveryResult,
     DiscoveryStatus,
     ExecutionStatus,
+    InteractiveElement,
+    LocatorIdentityEntry,
+    PlanVersionOrigin,
     QATestPlan,
     QATestStep,
     TestCase as DomainTestCase,
@@ -89,7 +92,7 @@ class SQLitePipelineIntegrationTests(unittest.TestCase):
             first.executions + second.executions,
         )
 
-    def test_stale_retry_persists_both_executions_and_version_two(self) -> None:
+    def test_stale_retry_persists_repaired_identity_and_both_executions(self) -> None:
         test_plan = DomainTestPlan(test_step_id=self.step.id, name=self.step.name)
         version_one = DomainTestPlanVersion(
             test_plan_id=test_plan.id,
@@ -98,6 +101,13 @@ class SQLitePipelineIntegrationTests(unittest.TestCase):
                 url="https://example.com/",
                 steps=[QATestStep(action="click", parameters={"selector": "#old"})],
             ),
+            locator_identity=(LocatorIdentityEntry(
+                step_index=0,
+                accessible_name="Continue",
+                label="Continue",
+                tag="button",
+                role="button",
+            ),),
         )
         SQLitePlanStore(self.db_path).save(
             self.step.id,
@@ -110,7 +120,12 @@ class SQLitePipelineIntegrationTests(unittest.TestCase):
 
         def discovery(url: str) -> DiscoveryResult:
             discovery_calls.append(url)
-            return self.discovery_result
+            return self.discovery_result.model_copy(update={
+                "interactive_elements": [InteractiveElement(
+                    kind="button", selector="#new", tag="button", role="button",
+                    accessible_name="Continue", label="Continue", text="Continue",
+                )],
+            })
 
         def runner(plan: QATestPlan) -> dict:
             runner_calls.append(plan)
@@ -146,17 +161,21 @@ class SQLitePipelineIntegrationTests(unittest.TestCase):
             [version_one.id, result.test_plans[-1].test_plan_version.id],
         )
         self.assertEqual(len(discovery_calls), 1)
-        self.assertEqual(generator.calls, 1)
-        self.assertEqual(generator.last_existing_plan.id, test_plan.id)
-        self.assertEqual(generator.last_version_number, 2)
+        self.assertEqual(generator.calls, 0)
 
         reopened_plan_store = SQLitePlanStore(self.db_path)
-        self.assertEqual(reopened_plan_store.find(self.step.id).version, 2)
+        repaired_version = reopened_plan_store.find(self.step.id)
+        self.assertEqual(repaired_version.version, 2)
+        self.assertEqual(repaired_version.origin, PlanVersionOrigin.REPAIRED)
+        self.assertEqual(repaired_version.qa_test_plan.steps[0].parameters["selector"], "#new")
+        self.assertEqual(repaired_version.locator_identity[0].label, "Continue")
         self.assertEqual(reopened_plan_store.get_version(version_one.id), version_one)
         self.assertEqual(
             reopened_plan_store.get_version(result.executions[1].test_plan_version_id),
             result.test_plans[-1].test_plan_version,
         )
+        self.assertEqual(reopened_plan_store.list_versions(self.step.id),
+                         (repaired_version, version_one))
         self.assertEqual(
             [entry.status for entry in SQLiteExecutionRepository(self.db_path).list_for_test_step(self.step.id)],
             [ExecutionStatus.FAILED, ExecutionStatus.PASSED],

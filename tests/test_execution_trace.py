@@ -569,7 +569,7 @@ class ExecutionTracePipelineTests(unittest.TestCase):
         self.assertEqual(trace.totals.execution_attempts, 2)
         self.assertEqual(result.test_run.status, ExecutionStatus.PASSED)
 
-    def test_regeneration_is_recorded(self) -> None:
+    def test_rejected_locator_conflict_is_recorded_without_regeneration(self) -> None:
         step = _make_step(0)
         case = DomainTestCase(
             name="Flow",
@@ -638,26 +638,20 @@ class ExecutionTracePipelineTests(unittest.TestCase):
         step_trace = trace.steps[0]
         recovery = step_trace.locator_recovery
         self.assertIsNotNone(recovery)
-        self.assertEqual(recovery.status, RecoveryStatus.NOT_FOUND)
+        self.assertEqual(recovery.status, RecoveryStatus.REJECTED_CONFLICT)
         self.assertEqual(recovery.original_selector, "#old")
         self.assertIsNone(recovery.candidate_selector)
-        regeneration = step_trace.regeneration
-        self.assertIsNotNone(regeneration)
-        self.assertEqual(regeneration.from_version, 1)
-        self.assertEqual(regeneration.to_version, 2)
-        self.assertEqual(regeneration.reason, "stale_ui_failure")
-        self.assertIn("#old", regeneration.trigger_error or "")
+        self.assertIn("conflict", recovery.reason)
+        self.assertIsNone(step_trace.regeneration)
         self.assertEqual(
             [item.status for item in step_trace.execution_attempts],
-            [ExecutionStatus.FAILED, ExecutionStatus.PASSED],
+            [ExecutionStatus.FAILED],
         )
-        self.assertEqual([item.version for item in generator.versions], [2])
-        self.assertEqual(
-            [pair.test_plan_version.version for pair in result.test_plans], [1, 2]
-        )
+        self.assertEqual(generator.versions, [])
+        self.assertEqual([pair.test_plan_version.version for pair in result.test_plans], [1])
         self.assertEqual(trace.totals.locator_recoveries, 1)
-        self.assertEqual(trace.totals.regenerations, 1)
-        self.assertEqual(result.test_run.status, ExecutionStatus.PASSED)
+        self.assertEqual(trace.totals.regenerations, 0)
+        self.assertEqual(result.test_run.status, ExecutionStatus.FAILED)
 
     def test_discovery_fallback_is_recorded(self) -> None:
         fallback_suggestions = AIDiscoveryResult(

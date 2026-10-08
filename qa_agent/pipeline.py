@@ -31,13 +31,18 @@ from qa_agent.models import (
     FailurePolicy,
     PlanVersionOrigin,
     QATestPlan,
+    LocatorIdentityEntry,
     TestCase,
     TestPlanVersion,
     TestRun,
     TestStep,
 )
 from qa_agent.plan_store import InMemoryPlanStore, PlanStore
-from qa_agent.locator_recovery import RecoveryStatus, recover_locator
+from qa_agent.locator_recovery import (
+    RecoveryStatus,
+    identity_for_element,
+    recover_locator,
+)
 from qa_agent.test_case_decomposer import TestCaseDecomposer
 from qa_agent.test_plan_generator import GeneratedTestPlan, TestPlanGenerator
 from qa_agent.test_plan_validation import PlanValidationError, validate_executable_plan
@@ -442,6 +447,9 @@ class QATestPipeline:
                         requirement_context=test_case.description,
                         expected_version=1,
                     )
+                    generated_plan = _with_discovered_locator_identity(
+                        generated_plan, discovery_result
+                    )
                     generated_plan = _with_plan_origin(
                         generated_plan, PlanVersionOrigin.AI_GENERATED
                     )
@@ -571,15 +579,29 @@ class QATestPipeline:
             failed_interaction = execution.planned_interaction(plan_version)
             recovery = None
             if failed_interaction is not None and failed_interaction.action in {"click", "fill"}:
-                recovery = recover_locator(failed_interaction, rediscovery_result)
+                original_identity = next((
+                    item for item in (plan_version.locator_identity or ())
+                    if item.step_index == execution.planned_step_index
+                ), None)
+                recovery = recover_locator(
+                    failed_interaction, rediscovery_result, original_identity
+                )
             record_safely(trace, "record_locator_recovery", recovery)
 
-            if recovery is not None and recovery.status == RecoveryStatus.MATCHED:
+            if recovery is not None and recovery.status in {
+                RecoveryStatus.MATCHED_HIGH_CONFIDENCE,
+                RecoveryStatus.MATCHED_ACCEPTABLE,
+            }:
                 candidate = recovery.candidate
                 if candidate is None:
                     raise PipelineStageError(
                         f"locator recovery (step {test_step.order}: {test_step.name})",
                         "MATCHED result did not contain a candidate.",
+                    )
+                if execution.planned_step_index is None:
+                    raise PipelineStageError(
+                        f"locator recovery (step {test_step.order}: {test_step.name})",
+                        "Recovery did not identify the planned interaction.",
                     )
                 try:
                     repaired_plan = _replace_interaction_selector(
@@ -593,6 +615,15 @@ class QATestPipeline:
                         origin=PlanVersionOrigin.REPAIRED,
                         qa_test_plan=repaired_plan,
                         assertion_grounding=plan_version.assertion_grounding,
+                        locator_identity=_replace_locator_identity(
+                            plan_version.locator_identity,
+                            execution.planned_step_index,
+                            identity_for_element(
+                                execution.planned_step_index,
+                                candidate,
+                                failed_interaction.action,
+                            ),
+                        ),
                     )
                     repaired = GeneratedTestPlan(
                         test_plan=generated_plan.test_plan,
@@ -628,112 +659,21 @@ class QATestPipeline:
                     break
                 continue
 
-            regeneration_started = time.perf_counter()
             emit_progress_event(
-                ExecutionEventType.PLAN_GENERATION_STARTED,
+                ExecutionEventType.PLAN_REPAIR_FAILED,
                 step=test_step,
-                message="Generating updated automation for this step.",
+                message=_safe_locator_recovery_message(recovery),
             )
-            try:
-                with llm_usage_scope(
-                    related_test_case_id=test_case.id,
-                    related_test_case_public_id=test_case.public_id,
-                ):
-                    regenerated_plan = self._plan_generator.generate_with_plan(
-                        test_step,
-                        rediscovery_result,
-                        existing_test_plan=generated_plan.test_plan,
-                        version_number=plan_version.version + 1,
-                        **_requirement_context_kwargs(
-                            self._plan_generator, test_case.description
-                        ),
-                    )
-                regenerated_plan = _validate_generated_plan(
-                    regenerated_plan,
-                    test_step,
-                    discovery_result=rediscovery_result,
-                    requirement_context=test_case.description,
-                    expected_version=plan_version.version + 1,
-                )
-                if regenerated_plan.test_plan.id != generated_plan.test_plan.id:
-                    raise ValueError("Regeneration must reuse the existing TestPlan.")
-                regenerated_plan = _with_plan_origin(
-                    regenerated_plan, PlanVersionOrigin.REGENERATED
-                )
-            except Exception as error:
-                failure_code, safe_reason = _generation_failure_details(error)
-                emit_progress_event(
-                    ExecutionEventType.PLAN_GENERATION_FAILED,
-                    step=test_step,
-                    classification="AUTOMATION_GENERATION_ERROR",
-                    failure_code=failure_code,
-                    prior_plan_exists=True,
-                    new_plan_saved=False,
-                    message=safe_reason,
-                    validation_issues=(error.issues if isinstance(error, PlanValidationError) else ()),
-                )
-                raise PipelineStageError(
-                    f"regeneration (step {test_step.order}: {test_step.name})",
-                    str(error),
-                ) from error
-            record_safely(
-                trace,
-                "record_plan_generation",
-                regenerated_plan.test_plan.id,
-                regenerated_plan.test_plan_version.id,
-                regenerated_plan.test_plan_version.version,
-                len(regenerated_plan.test_plan_version.qa_test_plan.steps),
-                elapsed_ms(regeneration_started),
-            )
-            record_safely(
-                trace,
-                "record_regeneration",
-                plan_version.version,
-                regenerated_plan.test_plan_version.version,
-                "stale_ui_failure",
-                execution.error,
-            )
-
-            generated_plans.append(regenerated_plan)
-            try:
-                self._plan_store.save(
-                    test_step.id,
-                    regenerated_plan.test_plan_version,
-                    test_plan=regenerated_plan.test_plan,
-                )
-            except Exception as error:
-                emit_progress_event(
-                    ExecutionEventType.PLAN_GENERATION_FAILED,
-                    step=test_step,
-                    classification="INFRASTRUCTURE_ERROR",
-                    failure_code="PLAN_PERSISTENCE_FAILED",
-                    prior_plan_exists=True,
-                    new_plan_saved=False,
-                    message="Updated automation could not be saved.",
-                )
-                raise PipelineStageError(
-                    f"plan save (step {test_step.order}: {test_step.name})",
-                    str(error),
-                ) from error
-            emit_progress_event(
-                ExecutionEventType.PLAN_GENERATED,
-                step=test_step,
-                plan_origin=PlanVersionOrigin.REGENERATED.value,
-                plan_version=regenerated_plan.test_plan_version.version,
-                message="Updated automation generated for this step.",
-            )
-            regenerated_outcome = self._execute_plan(
-                test_step, regenerated_plan.test_plan_version, trace,
-                runner=case_runner.for_step(test_step) if case_runner is not None else None,
-            )
-            regenerated_execution = regenerated_outcome.execution
-            executions.append(regenerated_execution)
-            if _should_block_rest(test_step, regenerated_execution):
+            if _should_block_rest(test_step, execution):
                 blocked_step_ids = [
                     step.id for step in ordered_steps[step_index + 1:]
                 ]
                 _emit_blocked_steps(ordered_steps[step_index + 1:])
                 break
+            # Ambiguous, conflicting, or missing evidence is automation drift.
+            # Keep the original failed execution and leave the saved version
+            # untouched for review; do not ask an LLM to choose a replacement.
+            continue
 
         record_safely(trace, "record_blocked_steps", blocked_step_ids)
         run = TestRun.from_test_case(
@@ -793,6 +733,50 @@ class QATestPipeline:
                 str(outcome.error),
             ) from outcome.error
         return outcome
+
+
+def _with_discovered_locator_identity(
+    generated_plan: GeneratedTestPlan,
+    discovery_result: DiscoveryResult,
+) -> GeneratedTestPlan:
+    """Attach identity evidence from the exact discovered interaction target."""
+    version = generated_plan.test_plan_version
+    candidates_by_selector: dict[str, list[Any]] = {}
+    for element in discovery_result.interactive_elements:
+        candidates_by_selector.setdefault(element.selector, []).append(element)
+
+    entries = {item.step_index: item for item in (version.locator_identity or ())}
+    for index, interaction in enumerate(version.qa_test_plan.steps):
+        if interaction.action not in {"click", "fill"}:
+            continue
+        selector = interaction.parameters.get("selector")
+        matches = candidates_by_selector.get(selector, []) if isinstance(selector, str) else []
+        if len(matches) == 1:
+            entries[index] = identity_for_element(index, matches[0], interaction.action)
+
+    identity = tuple(entries[index] for index in sorted(entries)) or None
+    return GeneratedTestPlan(
+        test_plan=generated_plan.test_plan,
+        test_plan_version=version.model_copy(update={"locator_identity": identity}),
+    )
+
+
+def _replace_locator_identity(
+    current: tuple[LocatorIdentityEntry, ...] | None,
+    step_index: int,
+    replacement: LocatorIdentityEntry,
+) -> tuple[LocatorIdentityEntry, ...]:
+    entries = {item.step_index: item for item in (current or ())}
+    entries[step_index] = replacement
+    return tuple(entries[index] for index in sorted(entries))
+
+
+def _safe_locator_recovery_message(recovery) -> str:
+    if recovery is not None and recovery.status == RecoveryStatus.AMBIGUOUS:
+        return "Multiple controls match the saved identity. Manual attention is required."
+    if recovery is not None and recovery.status == RecoveryStatus.REJECTED_CONFLICT:
+        return "Similar controls were found, but their identity conflicts with the saved target. Manual attention is required."
+    return "No safe locator replacement was found. Manual attention is required."
 
 
 def _with_plan_origin(

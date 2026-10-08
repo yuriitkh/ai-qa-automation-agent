@@ -506,6 +506,36 @@ class BrowserDiscoveryTests(unittest.TestCase):
 
         browser.close.assert_called_once_with()
 
+    def test_interactive_snapshot_keeps_identity_signals_without_control_values(self) -> None:
+        serialized = _build_snapshot({
+            "url": "https://example.com/",
+            "interactive_elements": [{
+                "kind": "input",
+                "selector": "#email",
+                "tag": "input",
+                "role": "textbox",
+                "accessible_name": "Email",
+                "label": "Email",
+                "placeholder": "name@example.test",
+                "test_id": "registration-email",
+                "text": "",
+                "value": "private input",
+                "visible": True,
+                "enabled": True,
+            }],
+        })
+
+        snapshot = json.loads(serialized)
+        control = snapshot["interactive_elements"][0]
+
+        self.assertEqual(control["label"], "Email")
+        self.assertEqual(control["placeholder"], "name@example.test")
+        self.assertEqual(control["test_id"], "registration-email")
+        self.assertNotIn("value", control)
+        self.assertNotIn("private input", serialized)
+        self.assertNotIn("element.value", _SNAPSHOT_SCRIPT)
+        self.assertNotIn("|| item.placeholder", _SNAPSHOT_SCRIPT)
+
     def test_snapshot_is_bounded_and_truncates_large_page_data(self) -> None:
         large_entry = {
             "tag": "a",

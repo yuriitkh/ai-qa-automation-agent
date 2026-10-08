@@ -10,6 +10,7 @@ from qa_agent.models import (
     AssertionGroundingEntry,
     QATestPlan,
     QATestStep,
+    LocatorIdentityEntry,
     PlanVersionOrigin,
     TestPlan as DomainTestPlan,
     TestPlanVersion as DomainTestPlanVersion,
@@ -85,6 +86,32 @@ class SQLitePlanStoreTests(unittest.TestCase):
         self.assertEqual(restored.assertion_grounding, version.assertion_grounding)
         self.assertEqual(restored.qa_test_plan, version.qa_test_plan)
         self.assertEqual(set(restored.qa_test_plan.model_dump()), {"url", "steps"})
+
+    def test_locator_identity_round_trips_outside_the_canonical_plan(self) -> None:
+        plan = QATestPlan(
+            url="https://example.com/",
+            steps=[QATestStep(action="fill", parameters={
+                "selector": "#email", "value": "private input",
+            })],
+        )
+        version = self.make_version(1).model_copy(update={
+            "qa_test_plan": plan,
+            "locator_identity": (LocatorIdentityEntry(
+                step_index=0,
+                accessible_name="Email",
+                label="Email",
+                tag="input",
+                role="textbox",
+            ),),
+        })
+
+        SQLitePlanStore(self.db_path).save(self.step.id, version, test_plan=self.plan)
+        restored = SQLitePlanStore(self.db_path).get_version(version.id)
+
+        self.assertEqual(restored.locator_identity, version.locator_identity)
+        self.assertEqual(restored.qa_test_plan, plan)
+        self.assertNotIn("locator_identity", restored.qa_test_plan.model_dump())
+        self.assertNotIn("private input", restored.locator_identity[0].model_dump_json())
 
     def test_version_two_preserves_version_one_and_both_survive_reopen(self) -> None:
         store = SQLitePlanStore(self.db_path)
@@ -175,6 +202,7 @@ class SQLitePlanStoreTests(unittest.TestCase):
         current = migrated.find(self.step.id)
         self.assertEqual(current.version, 4)
         self.assertIsNone(current.origin)
+        self.assertIsNone(current.locator_identity)
         self.assertEqual(migrated.get_version(current.id), current)
 
 
