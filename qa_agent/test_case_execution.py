@@ -10,6 +10,7 @@ from uuid import UUID
 from qa_agent.browser_runner import BrowserRunner
 from qa_agent.automation_lifecycle import (
     AutomationLifecycleService,
+    AutomationStatus,
     plan_fingerprint_for_versions,
 )
 from qa_agent.expected_result_coverage import (
@@ -167,6 +168,9 @@ class TestCaseExecutionService:
         selected_versions: PlanVersionSet,
     ) -> PinnedWorkflowResult:
         """Execute a supplied TestCase snapshot against only its exact saved pins."""
+        approval_error = self.pinned_regression_approval_error(test_case, selected_versions)
+        if approval_error:
+            raise RunUnavailableError(approval_error, category="MISSING_AUTOMATION")
         runner = self._runner_factory(self._evidence_directory)
         plan_execution = PlanExecutionService(runner, self._execution_repository)
         executor = PinnedExecutionService(self._plan_store, plan_execution)
@@ -184,6 +188,38 @@ class TestCaseExecutionService:
                 "A pinned saved plan is no longer available for this Suite Run.",
                 category="MISSING_AUTOMATION",
             ) from error
+
+    def pinned_regression_approval_error(
+        self,
+        test_case: TestCase,
+        selected_versions: PlanVersionSet,
+        *,
+        check_current_automation: bool = False,
+    ) -> str | None:
+        """Check TestCase and plan approval against the exact versions a suite pins."""
+        if self._test_case_review is not None and self._test_case_review.status(test_case.id) != TestCaseReviewStatus.APPROVED:
+            return "Approve the TestCase before adding it to a Suite Run."
+        # Eligibility uses today's lifecycle; queued runs and retries retain
+        # their approved immutable pins even when the latest plans change.
+        if check_current_automation and self._automation_lifecycle is not None and self._automation_lifecycle.status(test_case) in {
+            AutomationStatus.NOT_AUTOMATED,
+            AutomationStatus.NEEDS_UPDATE,
+            AutomationStatus.AUTOMATION_FAILED,
+        }:
+            return "Generate or repair automation for the current TestCase before adding it to a Suite Run."
+        if self._test_case_review is None:
+            return None
+        record = self._test_case_review.record(test_case.id)
+        if record is None:
+            return None  # Legacy TestCases remain approved by default.
+        selected = {
+            item.test_step_id: item.test_plan_version_id
+            for item in selected_versions.selections
+        }
+        fingerprint = plan_fingerprint_for_versions(test_case, selected)
+        if record.approved_plan_fingerprint != fingerprint:
+            return "Approve the current saved automation for Validation before running the suite."
+        return None
 
     def run(
         self,

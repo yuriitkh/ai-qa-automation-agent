@@ -111,6 +111,12 @@ from qa_agent.suite_runs import (
     suite_run_report_json,
 )
 from qa_agent.suite_run_storage import SQLiteSuiteRunRepository
+from qa_agent.readiness import (
+    ReadinessCheck,
+    ReadinessReport,
+    ReadinessStatus,
+    SystemReadinessService,
+)
 from qa_agent.test_case_decomposer import TestCaseDecomposer
 from qa_agent.test_plan_generator import LLMTestPlanGenerator
 from qa_agent.test_case_editing import TestCaseEditError, create_manual_test_case, edit_test_case
@@ -177,6 +183,8 @@ class LocalWebApplication:
         automation_lifecycle_repository: AutomationLifecycleRepository | None = None,
         suite_run_service: SuiteRunService | None = None,
         test_case_review: TestCaseReviewService | None = None,
+        database_path: str | Path | None = None,
+        readiness_service: SystemReadinessService | None = None,
     ) -> None:
         self._run_history = run_history
         self._reports = reports or RunReportGenerator()
@@ -210,6 +218,27 @@ class LocalWebApplication:
             BackgroundRunService(run_service, run_history, self._progress_store)
             if run_service is not None else None
         )
+        self._readiness_service = readiness_service
+        if self._readiness_service is None and database_path is not None:
+            self._readiness_service = SystemReadinessService(
+                database_path=database_path,
+                evidence_directory=self._evidence_root,
+                application_ready=all((
+                    self._run_history is not None,
+                    self._test_cases is not None,
+                    self._run_service is not None,
+                    self._plan_store is not None,
+                    self._background_runs is not None,
+                    self._suite_run_service is not None,
+                )),
+                run_service=self._run_service,
+                background_runs=self._background_runs,
+                suite_run_service=self._suite_run_service,
+                provider_settings=self._provider_settings,
+                test_cases=self._test_cases,
+                automation_lifecycle=self._automation_lifecycle,
+                test_case_review=self._test_case_review,
+            )
         self._background_authoring = (
             BackgroundAuthoringService(
                 authoring_service,
@@ -252,6 +281,16 @@ class LocalWebApplication:
             )
         if path == "/health":
             return WebResponse.json(200, '{"status":"ok","service":"ai-qa-agent"}')
+        if path == "/system/health":
+            report = (
+                self._readiness_service.system_report()
+                if self._readiness_service is not None
+                else ReadinessReport((ReadinessCheck(
+                    "application", "Application", ReadinessStatus.NOT_APPLICABLE,
+                    "Detailed readiness checks are unavailable for this application instance.",
+                ),))
+            )
+            return self._system_health_page(report)
         if path == "/drafts":
             return WebResponse.html(200, self._drafts_page())
         if path == "/drafts/new":
@@ -410,6 +449,12 @@ class LocalWebApplication:
         return self._not_found("Page not found")
 
     def _handle_post(self, parts: list[str], body: bytes | str | None) -> WebResponse:
+        if parts == ["system", "health", "refresh"]:
+            return self._handle_system_health_refresh()
+        if len(parts) == 3 and parts[0] == "test-cases" and parts[2] == "readiness":
+            return self._handle_test_case_readiness(parts[1], body)
+        if len(parts) == 3 and parts[0] == "test-suites" and parts[2] == "readiness":
+            return self._handle_suite_readiness(parts[1], body)
         if parts == ["drafts"]:
             return self._handle_draft_create(body)
         if len(parts) == 3 and parts[0] == "drafts":
@@ -535,6 +580,19 @@ class LocalWebApplication:
                 "Review the current saved automation and approve it for Validation first.",
                 409,
             )
+        if self._readiness_service is not None:
+            report = self._readiness_service.testcase_report(
+                test_case,
+                workflow,
+                evidence_policy=evidence_policy,
+                cookie_policy=cookie_policy,
+            )
+            if not report.can_continue:
+                return self._readiness_result_page(
+                    report,
+                    title=f"Readiness blocked — {test_case.name}",
+                    return_url=f"/test-cases/{test_case.id}",
+                )
         progress_id = self._background_runs.start(
             test_case_id,
             workflow,
@@ -2914,6 +2972,7 @@ class LocalWebApplication:
             '<small>Each retry is a fresh TestCase Run against the same pinned plan versions.</small></div>'
             + self._evidence_controls(f"suite-{suite_id}")
             + self._cookie_consent_controls(f"suite-{suite_id}")
+            + f'<button class="button" type="submit" formaction="/test-suites/{suite_id}/readiness">Check readiness</button>'
             + f'<button class="button primary" type="submit"{("" if can_start else " disabled aria-disabled=\"true\"")}>Start Suite Run</button>'
             + '</form>'
         )
@@ -2928,6 +2987,168 @@ class LocalWebApplication:
         return WebResponse.html(status, self._page(
             "Configure Suite Run", content, current="Test Suites",
             breadcrumbs=[("Dashboard", "/"), ("Test Suites", "/test-suites"), (preview.suite.name, f"/test-suites/{suite_id}")],
+        ))
+
+    def _handle_system_health_refresh(self) -> WebResponse:
+        if self._readiness_service is None:
+            return WebResponse.html(503, self._page(
+                "System Health unavailable",
+                '<section class="panel error-state"><h1>System Health unavailable</h1>'
+                '<p>Detailed readiness checks are not configured for this application instance.</p></section>',
+            ))
+        report = self._readiness_service.system_report(deep_browser=True, probe_evidence=True)
+        return self._system_health_page(report, refreshed=True)
+
+    def _handle_test_case_readiness(
+        self, test_case_id_text: str, body: bytes | str | None
+    ) -> WebResponse:
+        test_case_id = _parse_uuid(test_case_id_text)
+        test_case = (
+            self._test_cases.get(test_case_id)
+            if test_case_id is not None and self._test_cases is not None else None
+        )
+        if test_case is None:
+            return self._not_found("TestCase not found.")
+        if self._readiness_service is None:
+            return self._run_error(test_case.id, "Detailed pre-run readiness is unavailable.", 503)
+        form, error = _parse_form_body(body)
+        if error:
+            return self._run_error(test_case.id, error, 400)
+        try:
+            workflow = WorkflowType(form.get("workflow", [""])[0])
+            if workflow not in {WorkflowType.AUTOMATION, WorkflowType.VALIDATION, WorkflowType.REGRESSION}:
+                raise ValueError
+            evidence_policy = EvidencePolicy(
+                mode=EvidenceMode(form.get("evidence_mode", [EvidenceMode.FAILURES_ONLY.value])[0]),
+                screenshot_mode=ScreenshotMode(form.get("screenshot_mode", [ScreenshotMode.PAGE.value])[0]),
+            )
+            cookie_policy = CookieConsentPolicy(
+                form.get("cookie_policy", [DEFAULT_COOKIE_CONSENT_POLICY.value])[0]
+            )
+        except (ValueError, TypeError):
+            return self._run_error(test_case.id, "Choose a valid workflow, evidence mode, and cookie policy.", 400)
+        report = self._readiness_service.testcase_report(
+            test_case, workflow,
+            evidence_policy=evidence_policy,
+            cookie_policy=cookie_policy,
+        )
+        fields = {
+            "workflow": workflow.value,
+            "evidence_mode": evidence_policy.mode.value,
+            "screenshot_mode": evidence_policy.screenshot_mode.value,
+            "cookie_policy": cookie_policy.value,
+        }
+        return self._readiness_result_page(
+            report,
+            title=f"Readiness — {test_case.name}",
+            return_url=f"/test-cases/{test_case.id}",
+            start_action=f"/test-cases/{test_case.id}/run",
+            fields=fields,
+        )
+
+    def _handle_suite_readiness(
+        self, suite_id_text: str, body: bytes | str | None
+    ) -> WebResponse:
+        suite_id = _parse_uuid(suite_id_text)
+        if suite_id is None or self._suite_run_service is None:
+            return self._not_found("Test Suite not found.")
+        if self._readiness_service is None:
+            return self._suite_run_config_page(suite_id, error="Detailed pre-run readiness is unavailable.", status=503)
+        form, error = _parse_form_body(body)
+        if error:
+            return self._suite_run_config_page(suite_id, error=error, status=400)
+        if form.get("workflow", [""])[0] != WorkflowType.REGRESSION.value:
+            return self._suite_run_config_page(suite_id, error="Choose the saved-plan Regression workflow.", status=400)
+        if form.get("execution_type", [""])[0] != "SEQUENTIAL":
+            return self._suite_run_config_page(suite_id, error="Choose sequential execution.", status=400)
+        try:
+            evidence_policy = EvidencePolicy(
+                mode=EvidenceMode(form.get("evidence_mode", [EvidenceMode.FAILURES_ONLY.value])[0]),
+                screenshot_mode=ScreenshotMode(form.get("screenshot_mode", [ScreenshotMode.PAGE.value])[0]),
+            )
+            cookie_policy = CookieConsentPolicy(
+                form.get("cookie_policy", [DEFAULT_COOKIE_CONSENT_POLICY.value])[0]
+            )
+            config = SuiteRunConfig(
+                ai_policy=AIPolicy(form.get("ai_policy", [AIPolicy.DISABLED.value])[0]),
+                retry_count=int(form.get("retry_count", ["0"])[0]),
+                evidence_policy=evidence_policy,
+                cookie_policy=cookie_policy,
+            )
+        except (ValueError, TypeError):
+            return self._suite_run_config_page(suite_id, error="Choose a valid AI policy, evidence mode, cookie policy, and retry count from 0 to 2.", status=400)
+        report = self._readiness_service.suite_report(
+            lambda: self._suite_run_service.preview(suite_id),
+            evidence_policy=evidence_policy,
+            cookie_policy=cookie_policy,
+        )
+        return self._readiness_result_page(
+            report,
+            title="Suite readiness",
+            return_url=f"/test-suites/{suite_id}/run",
+            start_action=f"/test-suites/{suite_id}/run",
+            fields={
+                "workflow": WorkflowType.REGRESSION.value,
+                "execution_type": "SEQUENTIAL",
+                "ai_policy": config.ai_policy.value,
+                "retry_count": str(config.retry_count),
+                "evidence_mode": evidence_policy.mode.value,
+                "screenshot_mode": evidence_policy.screenshot_mode.value,
+                "cookie_policy": cookie_policy.value,
+            },
+        )
+
+    def _readiness_result_page(
+        self,
+        report: ReadinessReport,
+        *,
+        title: str,
+        return_url: str,
+        start_action: str | None = None,
+        fields: dict[str, str] | None = None,
+    ) -> WebResponse:
+        continuation = ""
+        if report.can_continue and start_action and fields:
+            hidden = "".join(
+                f'<input type="hidden" name="{escape_html(key)}" value="{escape_html(value)}">'
+                for key, value in fields.items()
+            )
+            continuation = (
+                f'<form method="post" action="{escape_html(start_action)}">{hidden}'
+                '<button class="button primary" type="submit">Continue to start</button></form>'
+            )
+        else:
+            continuation = (
+                f'<a class="button" href="{escape_html(return_url)}">Return to setup</a>'
+            )
+        content = (
+            '<header class="page-heading"><p class="eyebrow">Pre-run check</p>'
+            f'<h1>{escape_html(title)}</h1>'
+            f'<p class="lead">Overall: {badge(report.status.value, _readiness_tone(report.status))}</p></header>'
+            + _readiness_checks_html(report.checks)
+            + '<div class="actions readiness-actions">' + continuation
+            + f'<a class="button" href="{escape_html(return_url)}">Back</a></div>'
+        )
+        status = 409 if not report.can_continue else 200
+        return WebResponse.html(status, self._page(
+            title, content, current="Test Cases" if "/test-cases/" in return_url else "Test Suites",
+        ))
+
+    def _system_health_page(
+        self, report: ReadinessReport, *, refreshed: bool = False
+    ) -> WebResponse:
+        notice = '<p class="muted">Checks refreshed locally; no provider connection test was made.</p>' if refreshed else ""
+        content = (
+            '<header class="page-heading"><p class="eyebrow">System</p><h1>System Health</h1>'
+            f'<p class="lead">Overall readiness: {badge(report.status.value, _readiness_tone(report.status))}</p></header>'
+            + notice
+            + _readiness_checks_html(report.checks)
+            + '<form method="post" action="/system/health/refresh">'
+            '<button class="button primary" type="submit">Refresh checks</button></form>'
+        )
+        return WebResponse.html(200, self._page(
+            "System Health", content, current="System Health",
+            breadcrumbs=[("Dashboard", "/")],
         ))
 
     def _handle_suite_run_start(self, raw_suite_id: str, body: bytes | str | None) -> WebResponse:
@@ -2961,6 +3182,18 @@ class LocalWebApplication:
             )
         except (ValueError, TypeError):
             return self._suite_run_config_page(suite_id, error="Choose a valid AI policy, cookie consent policy, evidence mode, screenshot scope, and retry count from 0 to 2.", status=400)
+        if self._readiness_service is not None:
+            report = self._readiness_service.suite_report(
+                lambda: self._suite_run_service.preview(suite_id),
+                evidence_policy=config.evidence_policy,
+                cookie_policy=config.cookie_policy,
+            )
+            if not report.can_continue:
+                return self._readiness_result_page(
+                    report,
+                    title="Suite readiness blocked",
+                    return_url=f"/test-suites/{suite_id}/run",
+                )
         result = self._suite_run_service.start(
             suite_id,
             ai_policy=config.ai_policy,
@@ -3766,6 +3999,7 @@ class LocalWebApplication:
                     '<input type="hidden" name="workflow" value="AUTOMATION">'
                     + self._evidence_controls(f"automation-{test_case_id}")
                     + self._cookie_consent_controls(f"automation-{test_case_id}")
+                    + f'<button class="button" type="submit" formaction="/test-cases/{test_case_id}/readiness">Check readiness</button>'
                     + '<button class="button primary" type="submit">Generate Automation</button></form>'
                 )
             if legacy_case:
@@ -3801,6 +4035,7 @@ class LocalWebApplication:
             f'<input type="hidden" name="workflow" value="{workflow.value}">'
             + self._evidence_controls(f"{workflow.value.casefold()}-{test_case_id}")
             + self._cookie_consent_controls(f"{workflow.value.casefold()}-{test_case_id}")
+            + f'<button class="button" type="submit" formaction="/test-cases/{test_case_id}/readiness">Check readiness</button>'
             + f'<button class="button{" primary" if primary else ""}" type="submit">{label}</button></form>'
         )
 
@@ -4151,7 +4386,7 @@ class LocalWebApplication:
         breadcrumbs: list[tuple[str, str]] | None = None,
     ) -> str:
         nav_items = []
-        links = [("Dashboard", "/"), ("Test Cases", "/test-cases"), ("Export", "/export"), ("Drafts", "/drafts"), ("Runs", "/runs")]
+        links = [("Dashboard", "/"), ("Test Cases", "/test-cases"), ("Export", "/export"), ("Drafts", "/drafts"), ("Runs", "/runs"), ("System Health", "/system/health")]
         if self._test_suites is not None:
             links.append(("Test Suites", "/test-suites"))
         if self._llm_usage is not None:
@@ -4191,6 +4426,34 @@ class LocalWebApplication:
             f'<p>{escape_html(message)}</p><a class="button" href="/">Back to Dashboard</a></div>'
         )
         return WebResponse.html(404, self._page("Not found", body))
+
+
+def _readiness_tone(status: ReadinessStatus) -> str:
+    return {
+        ReadinessStatus.READY: "success",
+        ReadinessStatus.WARNING: "warning",
+        ReadinessStatus.BLOCKED: "error",
+        ReadinessStatus.NOT_APPLICABLE: "workflow",
+    }[status]
+
+
+def _readiness_checks_html(checks: tuple[ReadinessCheck, ...]) -> str:
+    rows = []
+    for check in checks:
+        elapsed = (
+            f'<span class="muted">{check.elapsed_ms} ms</span>'
+            if check.elapsed_ms is not None else ""
+        )
+        rows.append(
+            f'<li class="readiness-check" data-readiness-check="{escape_html(check.id)}">'
+            '<div class="readiness-check-heading">'
+            f'<strong>{escape_html(check.name)}</strong> '
+            f'{badge(check.status.value, _readiness_tone(check.status))}{elapsed}</div>'
+            f'<p>{escape_html(check.safe_message)}</p>'
+            + (f'<p class="muted">Next: {escape_html(check.remediation)}</p>' if check.remediation else "")
+            + '</li>'
+        )
+    return '<ul class="readiness-list">' + "".join(rows) + '</ul>'
 
 
 def create_application(
@@ -4248,6 +4511,7 @@ def create_application(
     return LocalWebApplication(
         storage.run_history,
         evidence_root=evidence_root,
+        database_path=storage.database_path,
         test_cases=storage.test_case_repository,
         run_service=run_service,
         authoring_service=TestCaseAuthoringService(automation_router),

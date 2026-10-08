@@ -330,6 +330,34 @@ Portable JSON retains each TestStep failure policy. Generated source is one
 standard Playwright test per TestCase, so the target test framework controls
 whether later actions run after a failed assertion.
 
+### System Readiness
+
+Open **System Health** (`/system/health`) for local database, browser, evidence
+storage, execution worker, and provider configuration diagnostics. **Refresh
+checks** tests Chromium startup and creates then removes a small local evidence
+probe. It never tests a live AI provider connection or consumes LLM tokens.
+The lightweight launcher endpoint `/health` keeps its existing behavior.
+
+TestCase and Suite setup forms offer **Check readiness**, and starting a run
+rechecks readiness before queuing execution. Preflight has a 10-second aggregate
+deadline, including Suite preview, platform checks, and all member targets;
+each target has at most two seconds within that remaining budget. Duplicate
+Suite targets share a probe. Timeout, diagnostic errors, and exhausted check
+capacity block execution without creating a product-failure result.
+
+Target checks use HEAD without redirects, cookies, or authorization. They pin
+validated DNS addresses, reject credentials, common secret query parameters,
+and private, link-local, multicast, and reserved addresses. Explicit localhost
+and loopback development targets are allowed. HTTP error responses are
+diagnostic warnings, not product assertions. HEAD relies on the target server
+honoring HTTP safe-method semantics; readiness does not sandbox later browser
+navigation, redirects, clicks, or subresources.
+
+Saved-plan Validation and Regression do not check provider availability. Suite
+runs preserve TestCase review approval, exact plan-version pins, and the chosen
+evidence and cookie policies. A timed-out diagnostic may finish in a bounded
+background worker; no additional target probes start after its deadline.
+
 ### Partial Automation and manual real-site checks
 
 Automation saves each structurally validated plan version as its step finishes.

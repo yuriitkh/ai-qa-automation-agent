@@ -11,6 +11,7 @@ from urllib.parse import urlencode
 from uuid import uuid4
 
 from qa_agent.execution_repository import InMemoryExecutionRepository
+from qa_agent.automation_lifecycle import AutomationLifecycleService, InMemoryAutomationLifecycleRepository
 from qa_agent.evidence_policy import EvidenceMode, EvidencePolicy, ScreenshotMode
 from qa_agent.cookie_consent import (
     CookieConsentPolicy,
@@ -44,7 +45,9 @@ from qa_agent.suite_runs import (
     SuiteRunStatus,
     suite_run_report_json,
 )
-from qa_agent.test_case_execution import TestCaseExecutionService
+from qa_agent.test_case_execution import TestCaseExecutionService, RunUnavailableError
+from qa_agent.test_case_review import InMemoryTestCaseReviewRepository, TestCaseReviewService as ReviewService
+from qa_agent.pinned_execution import PlanVersionSet, StepPlanSelection
 from qa_agent.test_case_repository import InMemoryTestCaseRepository
 from qa_agent.test_suites import InMemoryTestSuiteRepository, TestSuiteService as DomainTestSuiteService
 from qa_agent.web import LocalWebApplication
@@ -145,6 +148,72 @@ class _UnexpectedAIWorkflow:
 
 
 class SuiteRunExecutionTests(SuiteRunTestHarness, unittest.TestCase):
+    def reviewed_service(self, runner):
+        service = self.make_service(runner)
+        self.review = ReviewService(InMemoryTestCaseReviewRepository(), self.plans)
+        self.review.mark_ready_for_review(self.case)
+        self.run_service._test_case_review = self.review
+        self.lifecycle = AutomationLifecycleService(InMemoryAutomationLifecycleRepository(), self.plans)
+        self.run_service._automation_lifecycle = self.lifecycle
+        self.lifecycle.mark_automation_completed(self.case)
+        return service
+
+    def test_suite_enforces_case_and_exact_plan_approval_without_history(self):
+        calls = []
+        service = self.reviewed_service(lambda plan: calls.append(plan) or {"status": "passed"})
+        try:
+            self.assertFalse(service.preview(self.suite.id).can_start)
+            self.review.approve_test_case(self.case)
+            self.assertFalse(service.preview(self.suite.id).can_start)
+            self.review.approve_for_validation(self.case)
+            self.assertTrue(service.preview(self.suite.id).can_start)
+            old_version = self.plans.find(self.case.steps[0].id)
+            plan, version = _plan(self.case, version=2, plan=self.plans.find_test_plan(self.case.steps[0].id))
+            self.plans.save(self.case.steps[0].id, version, test_plan=plan)
+            self.assertFalse(service.preview(self.suite.id).can_start)
+            with self.assertRaises(RunUnavailableError):
+                self.run_service.run_pinned_regression(self.case, PlanVersionSet((
+                    StepPlanSelection(self.case.steps[0].id, version.id),
+                )))
+            self.assertNotEqual(old_version.id, version.id)
+            self.assertEqual(calls, [])
+            self.assertEqual(self.history.list_for_test_case(self.case.id), [])
+        finally:
+            service.close()
+
+    def test_reviewed_retries_keep_approved_pins_when_latest_automation_changes(self):
+        entered = Event()
+        release = Event()
+        observed = []
+        def runner(plan):
+            observed.append(plan.url)
+            if len(observed) == 1:
+                entered.set()
+                self.assertTrue(release.wait(3))
+                return {"status": "failed", "steps": [{"action": "assert_title", "status": "failed", "error": "mismatch"}]}
+            return {"status": "passed", "steps": [{"action": "assert_title", "status": "passed"}]}
+        service = self.reviewed_service(runner)
+        self.review.approve_test_case(self.case)
+        self.review.approve_for_validation(self.case)
+        try:
+            started = service.start(self.suite.id, retry_count=1)
+            self.assertIsNotNone(started.run)
+            self.assertTrue(entered.wait(3))
+            plan, version = _plan(self.case, version=2, plan=self.plans.find_test_plan(self.case.steps[0].id))
+            # The latest incomplete automation must block new suites without invalidating old pins.
+            version = version.model_copy(update={"qa_test_plan": QATestPlan(
+                url=version.qa_test_plan.url, steps=[QATestStep(action="click", parameters={})],
+            )})
+            self.plans.save(self.case.steps[0].id, version, test_plan=plan)
+            self.assertFalse(service.preview(self.suite.id).can_start)
+            release.set()
+            finished = self.wait_for_terminal(service, started.run.public_id)
+            self.assertEqual(finished.items[0].status, SuiteRunItemStatus.PASSED_AFTER_RETRY)
+            self.assertEqual(observed, ["http://127.0.0.1:8000/v1"] * 2)
+        finally:
+            release.set()
+            service.close()
+
     def test_evidence_policy_is_stored_and_propagated_to_each_child_run(self):
         policy = EvidencePolicy(
             mode=EvidenceMode.EVERY_VERIFICATION,

@@ -53,8 +53,19 @@ class BackgroundRunService:
             thread_name_prefix="qa-agent-run",
         )
         self._capacity = BoundedSemaphore(max_workers + max_pending)
+        self._max_capacity = max_workers + max_pending
+        self._active_jobs = 0
         self._lock = Lock()
         self._closed = False
+
+    def readiness_state(self) -> dict[str, int | bool]:
+        with self._lock:
+            return {
+                "closed": self._closed,
+                "active": self._active_jobs,
+                "capacity": self._max_capacity,
+                "available": not self._closed and self._active_jobs < self._max_capacity,
+            }
 
     def start(
         self,
@@ -77,10 +88,13 @@ class BackgroundRunService:
                 message="The local run queue is busy. Try again shortly.",
             )
             return progress_id
+        reserved = False
         try:
             with self._lock:
                 if self._closed:
                     raise RuntimeError("Background run service is closed.")
+                self._active_jobs += 1
+                reserved = True
                 self._executor.submit(
                     self._execute_with_release,
                     progress_id,
@@ -90,6 +104,9 @@ class BackgroundRunService:
                     cookie_policy or DEFAULT_COOKIE_CONSENT_POLICY,
                 )
         except Exception:
+            if reserved:
+                with self._lock:
+                    self._active_jobs -= 1
             self._capacity.release()
             logger.exception("Could not submit TestCase execution job")
             reporter.finish(
@@ -112,6 +129,8 @@ class BackgroundRunService:
                 progress_id, test_case_id, workflow_type, evidence_policy, cookie_policy
             )
         finally:
+            with self._lock:
+                self._active_jobs -= 1
             self._capacity.release()
 
     def close(self) -> None:

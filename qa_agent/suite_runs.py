@@ -258,9 +258,20 @@ class SuiteRunService:
         self._repository = repository
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="qa-suite-run")
         self._capacity = BoundedSemaphore(max_workers + max_pending)
+        self._max_capacity = max_workers + max_pending
+        self._active_jobs = 0
         self._lock = Lock()
         self._closed = False
         self._repository.interrupt_incomplete()
+
+    def readiness_state(self) -> dict[str, int | bool]:
+        with self._lock:
+            return {
+                "closed": self._closed,
+                "active": self._active_jobs,
+                "capacity": self._max_capacity,
+                "available": not self._closed and self._active_jobs < self._max_capacity,
+            }
 
     @property
     def repository(self) -> SuiteRunRepository:
@@ -292,6 +303,17 @@ class SuiteRunService:
             ]
             ready = availability.regression_available and len(pins) == len(case.steps)
             reasons = [] if ready else [availability.reason or "A complete saved Regression plan is not available."]
+            if ready:
+                selected = PlanVersionSet(tuple(
+                    StepPlanSelection(pin.test_step_id, pin.test_plan_version_id)
+                    for pin in pins
+                ))
+                approval_error = self._execution.pinned_regression_approval_error(
+                    case, selected, check_current_automation=True,
+                )
+                if approval_error:
+                    ready = False
+                    reasons.append(approval_error)
             entries.append(SuiteEligibility(
                 order_index=index,
                 test_case_id=case.id,
@@ -347,12 +369,18 @@ class SuiteRunService:
             })
             self._repository.save(failed)
             return preview.model_copy(update={"run": failed})
+        reserved = False
         try:
             with self._lock:
                 if self._closed:
                     raise RuntimeError("Suite run service is closed.")
+                self._active_jobs += 1
+                reserved = True
                 self._executor.submit(self._execute_with_release, run.id)
         except Exception:
+            if reserved:
+                with self._lock:
+                    self._active_jobs -= 1
             self._capacity.release()
             logger.exception("Could not submit local Suite Run job")
             failed = run.model_copy(update={
@@ -378,6 +406,8 @@ class SuiteRunService:
         try:
             self._execute(run_id)
         finally:
+            with self._lock:
+                self._active_jobs -= 1
             self._capacity.release()
 
     def _execute(self, run_id: UUID) -> None:
