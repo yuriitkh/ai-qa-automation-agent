@@ -325,6 +325,24 @@ class PlanVersionOrigin(str, Enum):
     REPAIRED = "REPAIRED"
 
 
+class AssertionGrounding(str, Enum):
+    """Deterministic provenance for an assertion in one immutable plan version."""
+
+    REQUIREMENT_GROUNDED = "REQUIREMENT_GROUNDED"
+    OBSERVATION_GROUNDED = "OBSERVATION_GROUNDED"
+    INFERRED = "INFERRED"
+    UNKNOWN = "UNKNOWN"
+
+
+class AssertionGroundingEntry(BaseModel):
+    """Value-free grounding metadata keyed to a plan action index."""
+
+    model_config = ConfigDict(frozen=True)
+
+    step_index: int = Field(ge=0)
+    category: AssertionGrounding
+
+
 class TestPlanVersion(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -334,6 +352,23 @@ class TestPlanVersion(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     origin: PlanVersionOrigin | None = None
     qa_test_plan: QATestPlan
+    # Optional for compatibility with saved plans created before grounding.
+    # Metadata records only categories and indexes; it never stores page text.
+    assertion_grounding: tuple[AssertionGroundingEntry, ...] | None = None
+
+    @model_validator(mode="after")
+    def validate_assertion_grounding_indexes(self) -> "TestPlanVersion":
+        if self.assertion_grounding is None:
+            return self
+        indexes = [entry.step_index for entry in self.assertion_grounding]
+        if len(indexes) != len(set(indexes)):
+            raise ValueError("Assertion grounding action indexes must be unique.")
+        for index in indexes:
+            if index >= len(self.qa_test_plan.steps):
+                raise ValueError("Assertion grounding index is outside the saved plan.")
+            if not self.qa_test_plan.steps[index].action.startswith("assert_"):
+                raise ValueError("Assertion grounding metadata must refer to assertion actions.")
+        return self
 
 
 class ExecutionStatus(str, Enum):

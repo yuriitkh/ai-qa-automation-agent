@@ -236,6 +236,9 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
         discovery = DiscoveryResult(
             status=DiscoveryStatus.SUCCESS,
             url=target_url,
+            snapshot={"visible_text_elements": [{
+                "selector": "#confirmation", "tag": "p", "text": "Account created"
+            }]},
             interactive_elements=[
                 InteractiveElement(kind="input", tag="input", selector="#first-name", accessible_name="First name"),
                 InteractiveElement(kind="input", tag="input", selector="#last-name", accessible_name="Last name"),
@@ -263,6 +266,54 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
         self.assertEqual(generated.test_plan_version.origin, PlanVersionOrigin.REPAIRED)
         self.assertIn("MISSING_INPUT_VALUE", router.calls[1]["task"])
         self.assertIn("Enter registration details", router.calls[1]["task"])
+
+    def test_generic_state_assertion_cannot_gain_an_invented_exact_value_during_repair(self) -> None:
+        step = DomainTestStep(
+            name="Verify confirmation",
+            description="Verify the confirmation state.",
+            expected="A confirmation state is displayed.",
+            order=0,
+        )
+        discovery = DiscoveryResult(
+            status=DiscoveryStatus.SUCCESS,
+            url="https://example.test/register",
+            snapshot={"visible_text_elements": [{
+                "selector": "#notice", "tag": "p", "text": "Your account was created."
+            }]},
+        )
+        invented = QATestPlan(url=discovery.url, steps=[
+            QATestStep(
+                action="assert_text_contains",
+                parameters={"expected_text": "Unconfirmed"},
+            ),
+        ])
+        router = _SequencedRouter([invented, invented])
+
+        with self.assertRaises(PlanValidationError) as raised:
+            LLMTestPlanGenerator(router).generate_with_plan(
+                step,
+                discovery,
+                requirement_context="Register a user and verify that a confirmation state is displayed.",
+            )
+
+        self.assertEqual(len(router.calls), 2)
+        self.assertEqual(raised.exception.issues[0].code, "UNGROUNDED_ASSERTION")
+        repair_task = router.calls[1]["task"]
+        self.assertIn("Examples introduced by 'e.g.'", repair_task)
+        self.assertIn("Use a structural assertion", repair_task)
+        self.assertNotIn("Unconfirmed", repair_task)
+
+    def test_plan_prompt_preserves_requirement_strength_and_treats_examples_as_illustrative(self) -> None:
+        task = LLMTestPlanGenerator._build_task_context(
+            self.make_test_step(),
+            self.make_discovery_result(),
+            requirement_context="Verify that a confirmation state is displayed.",
+        )
+
+        self.assertIn("Do not invent exact text", task)
+        self.assertIn("Prefer a structural assertion", task)
+        self.assertIn("illustrative, never mandatory", task)
+        self.assertIn("Original TestCase requirement", task)
 
     def test_repair_lifecycle_is_reported_without_exposing_candidate_output(self) -> None:
         step = self.make_test_step()

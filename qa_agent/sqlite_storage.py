@@ -173,6 +173,16 @@ def _advance_public_id_counter(
     )
 
 
+def _grounding_json(plan_version: TestPlanVersion) -> str | None:
+    if plan_version.assertion_grounding is None:
+        return None
+    return json.dumps(
+        [entry.model_dump(mode="json") for entry in plan_version.assertion_grounding],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
 class _SQLiteStorage:
     def __init__(self, db_path: str | Path) -> None:
         self._db_path = str(db_path)
@@ -228,6 +238,7 @@ class SQLitePlanStore(_SQLiteStorage):
                     created_at TEXT NOT NULL,
                     origin TEXT,
                     qa_test_plan_json TEXT NOT NULL,
+                    assertion_grounding_json TEXT,
                     UNIQUE (test_plan_id, version_number)
                 )
                 """
@@ -238,6 +249,10 @@ class SQLitePlanStore(_SQLiteStorage):
             }
             if "origin" not in columns:
                 connection.execute("ALTER TABLE test_plan_versions ADD COLUMN origin TEXT")
+            if "assertion_grounding_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE test_plan_versions ADD COLUMN assertion_grounding_json TEXT"
+                )
             # Migrate the one current version from databases created by the
             # previous schema. Earlier versions cannot be reconstructed.
             connection.execute(
@@ -286,12 +301,14 @@ class SQLitePlanStore(_SQLiteStorage):
                     plan_version.created_at.isoformat(),
                     plan_version.origin.value if plan_version.origin is not None else None,
                     plan_version.qa_test_plan.model_dump_json(),
+                    _grounding_json(plan_version),
                 )
                 actual = (
                     by_id["test_step_id"], by_id["test_plan_id"],
                     int(by_id["version_number"]), by_id["created_at"],
                     by_id["origin"],
                     by_id["qa_test_plan_json"],
+                    by_id["assertion_grounding_json"],
                 )
                 if actual != expected:
                     raise ValueError("A TestPlanVersion ID cannot be reused for different content.")
@@ -307,14 +324,15 @@ class SQLitePlanStore(_SQLiteStorage):
                     """
                     INSERT INTO test_plan_versions (
                         version_id, test_step_id, test_plan_id, version_number,
-                        created_at, origin, qa_test_plan_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        created_at, origin, qa_test_plan_json, assertion_grounding_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         str(plan_version.id), str(test_step_id), str(test_plan.id),
                         plan_version.version, plan_version.created_at.isoformat(),
                         plan_version.origin.value if plan_version.origin is not None else None,
                         plan_version.qa_test_plan.model_dump_json(),
+                        _grounding_json(plan_version),
                     ),
                 )
             connection.execute(
@@ -393,6 +411,10 @@ class SQLitePlanStore(_SQLiteStorage):
             created_at=datetime.fromisoformat(row["created_at"]),
             origin=(PlanVersionOrigin(row["origin"]) if row["origin"] else None),
             qa_test_plan=QATestPlan.model_validate_json(row["qa_test_plan_json"]),
+            assertion_grounding=(
+                json.loads(row["assertion_grounding_json"])
+                if row["assertion_grounding_json"] else None
+            ),
         )
 
 

@@ -28,6 +28,7 @@ class PlanValidationIssue(BaseModel):
         "INVALID_PARAMETER",
         "DISCOVERY_SELECTOR_MISMATCH",
         "ACTION_TARGET_MISMATCH",
+        "UNGROUNDED_ASSERTION",
     ]
     path: str
     message: str

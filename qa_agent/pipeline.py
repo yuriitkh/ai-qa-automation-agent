@@ -1,4 +1,5 @@
 import time
+import inspect
 from contextvars import copy_context
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
@@ -9,6 +10,7 @@ from uuid import UUID
 from pydantic import ValidationError
 
 from qa_agent.browser_discovery import capture_discovery_result, extract_target_url
+from qa_agent.assertion_grounding import validate_assertion_grounding
 from qa_agent.browser_runner import BrowserRunner
 from qa_agent.execution_repository import ExecutionRepository, InMemoryExecutionRepository
 from qa_agent.execution_trace import (
@@ -426,11 +428,17 @@ class QATestPipeline:
                         related_test_case_public_id=test_case.public_id,
                     ):
                         generated_plan = self._plan_generator.generate_with_plan(
-                            test_step, discovery_result
+                            test_step,
+                            discovery_result,
+                            **_requirement_context_kwargs(
+                                self._plan_generator, test_case.description
+                            ),
                         )
                     generated_plan = _validate_generated_plan(
                         generated_plan,
                         test_step,
+                        discovery_result=discovery_result,
+                        requirement_context=test_case.description,
                         expected_version=1,
                     )
                     generated_plan = _with_plan_origin(
@@ -583,6 +591,7 @@ class QATestPipeline:
                         version=plan_version.version + 1,
                         origin=PlanVersionOrigin.REPAIRED,
                         qa_test_plan=repaired_plan,
+                        assertion_grounding=plan_version.assertion_grounding,
                     )
                     repaired = GeneratedTestPlan(
                         test_plan=generated_plan.test_plan,
@@ -634,10 +643,15 @@ class QATestPipeline:
                         rediscovery_result,
                         existing_test_plan=generated_plan.test_plan,
                         version_number=plan_version.version + 1,
+                        **_requirement_context_kwargs(
+                            self._plan_generator, test_case.description
+                        ),
                     )
                 regenerated_plan = _validate_generated_plan(
                     regenerated_plan,
                     test_step,
+                    discovery_result=rediscovery_result,
+                    requirement_context=test_case.description,
                     expected_version=plan_version.version + 1,
                 )
                 if regenerated_plan.test_plan.id != generated_plan.test_plan.id:
@@ -797,6 +811,8 @@ def _validate_generated_plan(
     generated_plan: GeneratedTestPlan,
     test_step: TestStep,
     *,
+    discovery_result: DiscoveryResult,
+    requirement_context: str | None = None,
     expected_version: int,
 ) -> GeneratedTestPlan:
     """Revalidate plan structure and ownership before any version is saved."""
@@ -810,10 +826,34 @@ def _validate_generated_plan(
     if version.version != expected_version:
         raise ValueError("Plan generator returned an unexpected TestPlanVersion number.")
     executable_plan = validate_executable_plan(version.qa_test_plan)
+    grounding = validate_assertion_grounding(
+        executable_plan,
+        test_step,
+        discovery_result,
+        requirement_context=requirement_context,
+    )
     return GeneratedTestPlan(
         test_plan=generated_plan.test_plan,
-        test_plan_version=version.model_copy(update={"qa_test_plan": executable_plan}),
+        test_plan_version=version.model_copy(update={
+            "qa_test_plan": executable_plan,
+            "assertion_grounding": grounding,
+        }),
     )
+
+
+def _requirement_context_kwargs(generator: TestPlanGenerator, context: str) -> dict[str, str]:
+    """Pass the original requirement to capable generators without breaking older extensions."""
+    try:
+        parameters = inspect.signature(generator.generate_with_plan).parameters.values()
+    except (TypeError, ValueError):
+        return {}
+    if any(
+        parameter.name == "requirement_context"
+        or parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    ):
+        return {"requirement_context": context}
+    return {}
 
 
 def _generation_failure_details(error: Exception) -> tuple[str, str]:

@@ -149,6 +149,27 @@ class RunReportTests(unittest.TestCase):
         )
         self.assertNotIn(self.secret, report.to_json())
 
+    def test_ungrounded_assertion_reason_survives_json_and_html_safely(self) -> None:
+        reason = (
+            "This assertion was not grounded in the requirement or deterministic "
+            "page evidence, so its failure cannot be attributed to product behavior."
+        )
+        executions = list(self.run.executions)
+        executions[1] = executions[1].model_copy(update={"error": reason})
+        run = self.run.model_copy(update={"executions": executions})
+
+        report = self.generator.generate_current(
+            self.case, run, workflow_type=WorkflowType.REGRESSION,
+            outcome="AUTOMATION_EXECUTION_ERROR",
+        )
+        payload = json.loads(report.to_json())
+        html = self.generator.to_html(report)
+
+        self.assertEqual(payload["steps"][1]["attempts"][0]["error"], reason)
+        self.assertIn(reason, html)
+        self.assertNotIn("prompt", report.to_json().casefold())
+        self.assertNotIn(self.secret, report.to_json())
+
     def test_public_ids_and_version_provenance_are_additive_and_readable(self) -> None:
         record = RunHistoryRecord.from_completed_run(
             self.case,

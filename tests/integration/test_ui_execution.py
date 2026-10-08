@@ -87,7 +87,7 @@ class PersistedTestCaseBrowserFlowTests(unittest.TestCase):
                 self.assertIn("EVIDENCE_CAPTURED", event_types)
                 self.assertIn("CLEANUP_SUCCEEDED", event_types)
                 self.assertEqual(event_types[-1], "RUN_FINISHED")
-                self.assertEqual(progress["outcome"], "PRODUCT_FAILURE")
+                self.assertEqual(progress["outcome"], "AUTOMATION_EXECUTION_ERROR")
                 self.assertNotIn(str(evidence_root), progress_body)
                 run_location = progress["final_run_url"]
 
@@ -95,7 +95,7 @@ class PersistedTestCaseBrowserFlowTests(unittest.TestCase):
                 self.assertEqual(progress["elapsed_ms"], record.duration_ms)
                 self.assertEqual(record.workflow_type, WorkflowType.VALIDATION)
                 self.assertEqual(record.status.value, "FAILED")
-                self.assertEqual(record.outcome, "PRODUCT_FAILURE")
+                self.assertEqual(record.outcome, "AUTOMATION_EXECUTION_ERROR")
                 self.assertEqual(
                     [step.status.value for step in record.steps],
                     ["PASSED", "FAILED", "BLOCKED"],

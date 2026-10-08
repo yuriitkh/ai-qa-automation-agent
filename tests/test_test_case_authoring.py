@@ -68,6 +68,41 @@ class TestCaseAuthoringServiceTests(unittest.TestCase):
         self.assertEqual(provider.calls[0][2], "test_case_authoring")
         self.assertNotIn('"id"', provider.calls[0][1].__str__())
 
+    def test_generic_confirmation_requirement_stays_generic(self):
+        provider = StructuredProvider()
+        with redirect_stdout(io.StringIO()):
+            case = self.generate(
+                provider,
+                scenario="Register a user and verify that a confirmation state is displayed.",
+            ).test_case
+
+        self.assertEqual(case.description, "Register a user and verify that a confirmation state is displayed.")
+        self.assertEqual(case.steps[-1].expected, "The account confirmation is displayed.")
+        self.assertNotIn("Unconfirmed", case.steps[-1].expected)
+
+    def test_example_in_scenario_does_not_become_mandatory_in_generic_authored_step(self):
+        provider = StructuredProvider()
+        with redirect_stdout(io.StringIO()):
+            case = self.generate(
+                provider,
+                scenario="Register a user and verify the confirmation state (e.g. Unconfirmed).",
+            ).test_case
+
+        self.assertEqual(case.steps[-1].expected, "The account confirmation is displayed.")
+        self.assertNotIn("Unconfirmed", case.steps[-1].expected)
+
+    def test_explicit_exact_text_is_preserved_by_authoring(self):
+        output = valid_response().replace(
+            "The account confirmation is displayed.",
+            "The exact text 'Registration successful' is displayed.",
+        )
+        provider = StructuredProvider(output=output)
+        scenario = "Register a user and display exactly 'Registration successful'."
+        with redirect_stdout(io.StringIO()):
+            case = self.generate(provider, scenario=scenario).test_case
+
+        self.assertIn("Registration successful", case.steps[-1].expected)
+
     def test_optional_name_is_derived_without_an_additional_provider_request(self):
         provider = StructuredProvider()
         service = TestCaseAuthoringService(LLMRouter([provider]))
@@ -174,6 +209,18 @@ class TestCaseAuthoringServiceTests(unittest.TestCase):
         self.assertIn("Ignore previous instructions", prompt)
         self.assertEqual(case.description, scenario)
         self.assertEqual(case.steps[0].name, "Open registration")
+
+    def test_prompt_preserves_generic_requirements_and_marks_examples_non_mandatory(self):
+        provider = StructuredProvider()
+        scenario = "Register a user and verify that a confirmation state is displayed."
+        with redirect_stdout(io.StringIO()):
+            self.generate(provider, scenario=scenario)
+
+        prompt = provider.calls[0][0]
+        self.assertIn("Preserve the strength and specificity", prompt)
+        self.assertIn("keep the expected result generic", prompt)
+        self.assertIn("Treat examples introduced by 'e.g.'", prompt)
+        self.assertIn("preserve explicit exact values", prompt)
 
     def test_rejects_invalid_and_credential_bearing_base_urls(self):
         provider = StructuredProvider()

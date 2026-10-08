@@ -10,6 +10,8 @@ from urllib.parse import urlencode
 from uuid import UUID
 
 from qa_agent.models import (
+    AssertionGrounding,
+    AssertionGroundingEntry,
     DiscoveryResult,
     DiscoveryStatus,
     ExecutionSegment,
@@ -303,7 +305,10 @@ class ProductDemoSliceTests(unittest.TestCase):
         )
         case = DomainTestCase(
             name="Local registration",
-            description="Create an account on the local registration fixture.",
+            description=(
+                "Create an account on the local registration fixture and verify "
+                "the exact confirmation text 'Account created successfully'."
+            ),
             base_url=target_url,
             steps=[step],
         )
@@ -369,7 +374,10 @@ class ProductDemoSliceTests(unittest.TestCase):
             ]
             test_case = DomainTestCase(
                 name="Registration demo",
-                description="Validate a registration workflow.",
+                description=(
+                    "Validate the registration workflow and require exact title "
+                    "markers step-0, step-1, and step-2 for the respective checks."
+                ),
                 steps=steps,
                 preconditions=[precondition],
             )
@@ -390,6 +398,10 @@ class ProductDemoSliceTests(unittest.TestCase):
                             parameters={"expected": f"step-{step.order}"},
                         )],
                     ),
+                    assertion_grounding=(AssertionGroundingEntry(
+                        step_index=0,
+                        category=AssertionGrounding.REQUIREMENT_GROUNDED,
+                    ),),
                 )
                 plan_store.save(step.id, version, test_plan=test_plan)
                 selected.append(StepPlanSelection(step.id, version.id))
@@ -538,8 +550,8 @@ class ProductDemoSliceTests(unittest.TestCase):
                         "selector": "#delayed-email",
                         "value": "local-test@example.test",
                     }),
-                    QATestStep(action="assert_text_contains", parameters={
-                        "expected_text": "Local-only registration page",
+                    QATestStep(action="assert_visible", parameters={
+                        "selector": "main p",
                     }),
                 ])
                 version = DomainTestPlanVersion(
@@ -800,7 +812,7 @@ class ProductDemoSliceTests(unittest.TestCase):
                     urlencode({
                         "name": "AI registration flow",
                         "base_url": base_url,
-                        "scenario": "Register a user and verify the account confirmation.",
+                        "scenario": "Register a user and verify the exact text 'Account confirmation displayed'.",
                     }),
                 )
                 self.assertEqual(created.status, 303)
@@ -1013,7 +1025,7 @@ class ProductDemoSliceTests(unittest.TestCase):
                     urlencode({
                         "name": "Local registration AI test",
                         "base_url": base_url,
-                        "scenario": "Register a user and verify the account confirmation.",
+                        "scenario": "Register a user and verify the exact text 'Account created successfully'.",
                     }),
                 )
                 self.assertEqual(created.status, 303)

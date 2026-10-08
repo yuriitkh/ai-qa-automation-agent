@@ -19,6 +19,8 @@ from qa_agent.execution_progress import (
     ExecutionProgressStore,
 )
 from qa_agent.models import (
+    AssertionGrounding,
+    AssertionGroundingEntry,
     ExecutionSegment,
     PlanVersionOrigin,
     QATestPlan,
@@ -423,7 +425,8 @@ class ProductAuthoringControlsTests(unittest.TestCase):
 
     def case_with_steps(self, names):
         return DomainTestCase(
-            name="Local product case", description="Verify a behavior on a local page.",
+            name="Local product case",
+            description="Verify the exact Local page title while checking a behavior on this local page.",
             base_url="http://127.0.0.1/local",
             segments=[ExecutionSegment(order=0, is_implicit=True, base_url="http://127.0.0.1/local", steps=[
                 self.step(name, index) for index, name in enumerate(names)
@@ -441,6 +444,10 @@ class ProductAuthoringControlsTests(unittest.TestCase):
             version = DomainTestPlanVersion(
                 test_plan_id=plan.id, version=1, origin=PlanVersionOrigin.AI_GENERATED,
                 qa_test_plan=QATestPlan(url=case.base_url, steps=[QATestStep(action="assert_title", parameters={"expected": "Local page"})]),
+                assertion_grounding=(AssertionGroundingEntry(
+                    step_index=0,
+                    category=AssertionGrounding.REQUIREMENT_GROUNDED,
+                ),),
             )
             self.storage.plan_store.save(step.id, version, test_plan=plan)
             version_ids.append(version.id)

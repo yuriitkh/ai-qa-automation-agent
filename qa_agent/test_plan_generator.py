@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from qa_agent.llm.router import LLMRouter
 from qa_agent.execution_progress import ExecutionEventType, emit_progress_event
 from qa_agent.models import (
+    AssertionGroundingEntry,
     DiscoveryResult,
     PlanVersionOrigin,
     QATestPlan,
@@ -21,6 +22,7 @@ from qa_agent.llm_usage import (
     OP_REPAIR_AUTOMATION_PLAN,
     llm_usage_scope,
 )
+from qa_agent.assertion_grounding import validate_assertion_grounding
 
 
 @dataclass(frozen=True)
@@ -64,6 +66,7 @@ class TestPlanGenerator:
         *,
         existing_test_plan: TestPlan | None = None,
         version_number: int = 1,
+        requirement_context: str | None = None,
     ) -> GeneratedTestPlan:
         """Generate a version while retaining its owning TestPlan object."""
         raise NotImplementedError(
@@ -84,8 +87,11 @@ class LLMTestPlanGenerator(TestPlanGenerator):
         *,
         existing_test_plan: TestPlan | None = None,
         version_number: int = 1,
+        requirement_context: str | None = None,
     ) -> GeneratedTestPlan:
-        task = self._build_task_context(test_step, discovery_result)
+        task = self._build_task_context(
+            test_step, discovery_result, requirement_context=requirement_context
+        )
         page_snapshot = self._build_discovery_context(discovery_result)
         with llm_usage_scope(operation_type=OP_GENERATE_AUTOMATION_PLAN):
             router_result = self._router.create_test_plan(
@@ -98,8 +104,9 @@ class LLMTestPlanGenerator(TestPlanGenerator):
         # implementation cannot create a version from invalid plan data.
         repaired = False
         try:
-            executable_plan = self._validate_generated_plan(
-                router_result, discovery_result, test_step
+            executable_plan, grounding = self._validate_generated_plan(
+                router_result, discovery_result, test_step,
+                requirement_context=requirement_context,
             )
         except PlanValidationError as initial_error:
             repaired = True
@@ -124,8 +131,9 @@ class LLMTestPlanGenerator(TestPlanGenerator):
                 )
                 raise
             try:
-                executable_plan = self._validate_generated_plan(
-                    repaired_result, discovery_result, test_step
+                executable_plan, grounding = self._validate_generated_plan(
+                    repaired_result, discovery_result, test_step,
+                    requirement_context=requirement_context,
                 )
             except PlanValidationError:
                 emit_progress_event(
@@ -157,6 +165,7 @@ class LLMTestPlanGenerator(TestPlanGenerator):
                 else PlanVersionOrigin.AI_GENERATED
             )),
             qa_test_plan=executable_plan,
+            assertion_grounding=grounding,
         )
         return GeneratedTestPlan(test_plan=test_plan, test_plan_version=version)
 
@@ -165,12 +174,20 @@ class LLMTestPlanGenerator(TestPlanGenerator):
         value: object,
         discovery_result: DiscoveryResult,
         test_step: TestStep,
-    ) -> QATestPlan:
+        *,
+        requirement_context: str | None = None,
+    ) -> tuple[QATestPlan, tuple[AssertionGroundingEntry, ...]]:
         executable_plan = validate_executable_plan(value)
         LLMTestPlanGenerator._validate_discovery_capabilities(
             executable_plan, discovery_result, test_step
         )
-        return executable_plan
+        grounding = validate_assertion_grounding(
+            executable_plan,
+            test_step,
+            discovery_result,
+            requirement_context=requirement_context,
+        )
+        return executable_plan, grounding
 
     @staticmethod
     def _build_repair_task(
@@ -187,7 +204,11 @@ class LLMTestPlanGenerator(TestPlanGenerator):
             "corrected plan for the same TestStep, preserving every requested "
             "action and verification. Fix each listed issue. A human TestStep "
             "may require multiple ordered executable actions. Use only actions "
-            "and selectors supported by the supplied schema and page snapshot.\n"
+            "and selectors supported by the supplied schema and page snapshot. "
+            "Do not add exact text, status, value, label, ID, URL, or count unless "
+            "the original requirement explicitly requires it or deterministic page "
+            "evidence shows it. Keep generic state checks structural; examples are "
+            "illustrative and are not requirements.\n"
             f"Safe validation issues:\n{issue_lines}"
         )
 
@@ -195,6 +216,8 @@ class LLMTestPlanGenerator(TestPlanGenerator):
     def _build_task_context(
         test_step: TestStep,
         discovery_result: DiscoveryResult,
+        *,
+        requirement_context: str | None = None,
     ) -> str:
         return (
             "Generate an executable Playwright-oriented QATestPlan for this "
@@ -207,7 +230,15 @@ class LLMTestPlanGenerator(TestPlanGenerator):
             "use its exact selector unchanged. Use select_option for selects, "
             "assert_checked for checkbox/radio, assert_selected for select state, "
             "assert_enabled/assert_disabled for enabled state, and "
-            "assert_text_contains for substring requirements.\n"
+            "assert_text_contains for substring requirements. Do not invent exact "
+            "text, statuses, values, IDs, labels, URLs, or counts that are not "
+            "explicitly required or present in deterministic observed page evidence. "
+            "Prefer a structural assertion when the requirement asks for a generic "
+            "state or status. Examples introduced by 'e.g.', 'for example', or "
+            "'such as' are illustrative, never mandatory unless separately required. "
+            "Exact-value assertions require explicit requirement or observation "
+            "grounding; when uncertain, do not assert the value.\n"
+            f"Original TestCase requirement: {requirement_context or '(not supplied)'}\n"
             f"TestStep order: {test_step.order}\n"
             f"TestStep name: {test_step.name}\n"
             f"TestStep description: {test_step.description}\n"

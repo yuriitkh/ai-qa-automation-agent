@@ -3,9 +3,12 @@ from uuid import uuid4
 
 from qa_agent.execution_repository import InMemoryExecutionRepository
 from qa_agent.models import (
+    AssertionGrounding,
+    AssertionGroundingEntry,
     ExecutionStatus,
     FailurePolicy,
     Precondition,
+    PlanVersionOrigin,
     QATestPlan,
     QATestStep,
     RunContext,
@@ -46,7 +49,10 @@ class PinnedWorkflowTests(unittest.TestCase):
         self.second = self.make_step("Second", 1)
         self.test_case = DomainTestCase(
             name="Catalog flow",
-            description="Verify the catalog flow.",
+            description=(
+                "Verify title step-0-v1 for the first check and title step-1-v1 "
+                "for the second check."
+            ),
             # Input order is deliberately reversed; pinned execution follows
             # TestStep.order deterministically.
             steps=[self.second, self.first],
@@ -82,12 +88,17 @@ class PinnedWorkflowTests(unittest.TestCase):
         return DomainTestPlanVersion(
             test_plan_id=test_plan.id,
             version=number,
+            origin=PlanVersionOrigin.AI_GENERATED,
             qa_test_plan=QATestPlan(
                 url="https://example.test/",
                 steps=[QATestStep(
                     action="assert_title", parameters={"expected": marker}
                 )],
             ),
+            assertion_grounding=(AssertionGroundingEntry(
+                step_index=0,
+                category=AssertionGrounding.REQUIREMENT_GROUNDED,
+            ),),
         )
 
     def record_pass(self, plan):

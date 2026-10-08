@@ -6,6 +6,8 @@ from pathlib import Path
 from uuid import uuid4
 
 from qa_agent.models import (
+    AssertionGrounding,
+    AssertionGroundingEntry,
     QATestPlan,
     QATestStep,
     PlanVersionOrigin,
@@ -68,6 +70,21 @@ class SQLitePlanStoreTests(unittest.TestCase):
         self.assertEqual(restored_plan, self.plan)
         self.assertEqual(restored_version.test_plan_id, restored_plan.id)
         self.assertEqual(restored_plan.test_step_id, self.step.id)
+
+    def test_grounding_metadata_round_trips_without_changing_canonical_plan(self) -> None:
+        version = self.make_version(1).model_copy(update={
+            "assertion_grounding": (AssertionGroundingEntry(
+                step_index=1,
+                category=AssertionGrounding.REQUIREMENT_GROUNDED,
+            ),),
+        })
+
+        SQLitePlanStore(self.db_path).save(self.step.id, version, test_plan=self.plan)
+        restored = SQLitePlanStore(self.db_path).get_version(version.id)
+
+        self.assertEqual(restored.assertion_grounding, version.assertion_grounding)
+        self.assertEqual(restored.qa_test_plan, version.qa_test_plan)
+        self.assertEqual(set(restored.qa_test_plan.model_dump()), {"url", "steps"})
 
     def test_version_two_preserves_version_one_and_both_survive_reopen(self) -> None:
         store = SQLitePlanStore(self.db_path)
@@ -138,6 +155,12 @@ class SQLitePlanStoreTests(unittest.TestCase):
                 "CREATE TABLE cached_test_plans (test_step_id TEXT PRIMARY KEY, "
                 "test_plan_id TEXT NOT NULL, test_plan_name TEXT NOT NULL, version_id TEXT NOT NULL, "
                 "version_number INTEGER NOT NULL, created_at TEXT NOT NULL, qa_test_plan_json TEXT NOT NULL)"
+            )
+            connection.execute(
+                "CREATE TABLE test_plan_versions (version_id TEXT PRIMARY KEY, "
+                "test_step_id TEXT NOT NULL, test_plan_id TEXT NOT NULL, "
+                "version_number INTEGER NOT NULL, created_at TEXT NOT NULL, origin TEXT, "
+                "qa_test_plan_json TEXT NOT NULL, UNIQUE(test_plan_id, version_number))"
             )
             connection.execute(
                 "INSERT INTO cached_test_plans VALUES (?, ?, ?, ?, ?, ?, ?)",

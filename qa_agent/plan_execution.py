@@ -13,6 +13,7 @@ from qa_agent.execution_progress import (
     emit_progress_event,
 )
 from qa_agent.models import (
+    AssertionGrounding,
     Evidence,
     EvidenceType,
     Execution,
@@ -183,6 +184,14 @@ class PlanExecutionService:
             runner_result=runner_result,
             evidence=self._runner_evidence(runner_result, status, execution_id),
         )
+        classification = self._classify(execution, execution_error, plan_version)
+        grounding_reason = self._grounding_failure_reason(
+            execution, plan_version, classification
+        )
+        if grounding_reason is not None:
+            # This static explanation intentionally replaces runner text that
+            # can contain sensitive expected/actual page values.
+            execution = execution.model_copy(update={"error": grounding_reason})
         try:
             self._execution_repository.save(execution)
         except Exception as error:
@@ -195,7 +204,6 @@ class PlanExecutionService:
             )
             raise PlanExecutionPersistenceError(str(error)) from error
 
-        classification = self._classify(execution, execution_error)
         for evidence_index, _item in enumerate(execution.evidence):
             emit_progress_event(
                 ExecutionEventType.EVIDENCE_CAPTURED,
@@ -230,6 +238,7 @@ class PlanExecutionService:
     def _classify(
         execution: Execution,
         execution_error: Exception | None,
+        plan_version: TestPlanVersion | None = None,
     ) -> PlanExecutionClassification:
         if execution_error is not None:
             return PlanExecutionClassification.INFRASTRUCTURE_ERROR
@@ -244,12 +253,61 @@ class PlanExecutionService:
 
         failed_action = _failed_action(execution.runner_result)
         if failed_action is not None and failed_action.startswith("assert_"):
+            if plan_version is not None:
+                grounding = _assertion_grounding(execution, plan_version)
+                if plan_version.origin is not None and plan_version.origin.value == "HUMAN_EDITED":
+                    pass
+                elif grounding == AssertionGrounding.REQUIREMENT_GROUNDED:
+                    pass
+                elif grounding == AssertionGrounding.OBSERVATION_GROUNDED:
+                    return PlanExecutionClassification.AUTOMATION_DRIFT
+                else:
+                    return PlanExecutionClassification.AUTOMATION_EXECUTION_ERROR
             return PlanExecutionClassification.PRODUCT_FAILURE
         if failed_action is not None:
             return PlanExecutionClassification.AUTOMATION_EXECUTION_ERROR
         # A returned failure without explicit assertion evidence is not
         # attributed to the product; its cause is not sufficiently known.
         return PlanExecutionClassification.INFRASTRUCTURE_ERROR
+
+    @staticmethod
+    def _grounding_failure_reason(
+        execution: Execution,
+        plan_version: TestPlanVersion,
+        classification: PlanExecutionClassification,
+    ) -> str | None:
+        failed_action = _failed_action(execution.runner_result)
+        if failed_action is None or not failed_action.startswith("assert_"):
+            return None
+        interaction = execution.planned_interaction(plan_version)
+        if interaction is None or interaction.action != failed_action:
+            return None
+        if plan_version.origin is not None and plan_version.origin.value == "HUMAN_EDITED":
+            return None
+        grounding = _assertion_grounding(execution, plan_version)
+        if grounding == AssertionGrounding.OBSERVATION_GROUNDED:
+            return (
+                "This assertion matched deterministic page evidence when the plan was "
+                "generated. The current failure is treated as possible automation drift."
+            )
+        if (
+            classification == PlanExecutionClassification.AUTOMATION_EXECUTION_ERROR
+            and grounding in {
+                None,
+                AssertionGrounding.INFERRED,
+                AssertionGrounding.UNKNOWN,
+            }
+        ):
+            if grounding is None:
+                return (
+                    "This saved assertion has no grounding metadata, so its failure "
+                    "cannot be attributed to product behavior."
+                )
+            return (
+                "This assertion was not grounded in the requirement or deterministic "
+                "page evidence, so its failure cannot be attributed to product behavior."
+            )
+        return None
 
     @staticmethod
     def _runner_error(runner_result: dict[str, Any]) -> str:
@@ -307,6 +365,28 @@ def _failed_action(runner_result: dict[str, Any] | None) -> str | None:
         if isinstance(step_result, dict) and step_result.get("status") == "failed":
             action = step_result.get("action")
             return action if isinstance(action, str) else None
+    return None
+
+
+def _assertion_grounding(
+    execution: Execution,
+    plan_version: TestPlanVersion,
+) -> AssertionGrounding | None:
+    """Read metadata only for the exact failed action in this saved version."""
+    index = execution.planned_step_index
+    if index is None or plan_version.id != execution.test_plan_version_id:
+        return None
+    failed_action = _failed_action(execution.runner_result)
+    interaction = execution.planned_interaction(plan_version)
+    if (
+        interaction is None
+        or not interaction.action.startswith("assert_")
+        or interaction.action != failed_action
+    ):
+        return None
+    for entry in plan_version.assertion_grounding or ():
+        if entry.step_index == index:
+            return entry.category
     return None
 
 

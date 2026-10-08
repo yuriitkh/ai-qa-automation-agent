@@ -3,9 +3,12 @@ from uuid import uuid4
 
 from qa_agent.execution_repository import InMemoryExecutionRepository
 from qa_agent.models import (
+    AssertionGrounding,
+    AssertionGroundingEntry,
     ExecutionStatus,
     QATestPlan,
     QATestStep,
+    PlanVersionOrigin,
     TestPlanVersion as DomainTestPlanVersion,
     TestStep as DomainTestStep,
 )
@@ -30,6 +33,10 @@ class PlanExecutionServiceTests(unittest.TestCase):
                 url="https://example.com",
                 steps=[QATestStep(action="assert_title", parameters={"expected": "Home"})],
             ),
+            assertion_grounding=(AssertionGroundingEntry(
+                step_index=0,
+                category=AssertionGrounding.REQUIREMENT_GROUNDED,
+            ),),
         )
         self.repository = InMemoryExecutionRepository()
 
@@ -69,6 +76,81 @@ class PlanExecutionServiceTests(unittest.TestCase):
         self.assertEqual(outcome.execution.status, ExecutionStatus.FAILED)
         self.assertEqual(
             len(self.repository.list_for_test_step(self.test_step.id)), 1
+        )
+
+    def test_inferred_exact_assertion_failure_is_not_product_failure(self) -> None:
+        version = self.plan_version.model_copy(update={
+            "assertion_grounding": (AssertionGroundingEntry(
+                step_index=0, category=AssertionGrounding.INFERRED
+            ),),
+        })
+        outcome = PlanExecutionService(
+            lambda _: {
+                "status": "failed",
+                "steps": [{
+                    "action": "assert_title", "status": "failed",
+                    "error": "Expected title SECRET_EXPECTATION, got another title.",
+                }],
+            },
+            self.repository,
+        ).execute(self.test_step, version)
+
+        self.assertEqual(
+            outcome.classification,
+            PlanExecutionClassification.AUTOMATION_EXECUTION_ERROR,
+        )
+        self.assertNotIn("SECRET_EXPECTATION", outcome.execution.error or "")
+        self.assertIn("not grounded", (outcome.execution.error or "").casefold())
+
+    def test_observation_grounded_assertion_failure_is_automation_drift(self) -> None:
+        version = self.plan_version.model_copy(update={
+            "assertion_grounding": (AssertionGroundingEntry(
+                step_index=0, category=AssertionGrounding.OBSERVATION_GROUNDED
+            ),),
+        })
+        outcome = PlanExecutionService(
+            lambda _: {
+                "status": "failed",
+                "steps": [{"action": "assert_title", "status": "failed", "error": "Mismatch."}],
+            },
+            self.repository,
+        ).execute(self.test_step, version)
+
+        self.assertEqual(
+            outcome.classification, PlanExecutionClassification.AUTOMATION_DRIFT
+        )
+
+    def test_legacy_assertion_without_metadata_is_conservative(self) -> None:
+        version = self.plan_version.model_copy(update={"assertion_grounding": None})
+        outcome = PlanExecutionService(
+            lambda _: {
+                "status": "failed",
+                "steps": [{"action": "assert_title", "status": "failed", "error": "Mismatch."}],
+            },
+            self.repository,
+        ).execute(self.test_step, version)
+
+        self.assertEqual(
+            outcome.classification,
+            PlanExecutionClassification.AUTOMATION_EXECUTION_ERROR,
+        )
+        self.assertIn("no grounding metadata", outcome.execution.error or "")
+
+    def test_human_edited_exact_assertion_failure_remains_product_failure(self) -> None:
+        version = self.plan_version.model_copy(update={
+            "origin": PlanVersionOrigin.HUMAN_EDITED,
+            "assertion_grounding": None,
+        })
+        outcome = PlanExecutionService(
+            lambda _: {
+                "status": "failed",
+                "steps": [{"action": "assert_title", "status": "failed", "error": "Mismatch."}],
+            },
+            self.repository,
+        ).execute(self.test_step, version)
+
+        self.assertEqual(
+            outcome.classification, PlanExecutionClassification.PRODUCT_FAILURE
         )
 
     def test_existing_stale_selector_failure_is_automation_drift(self) -> None:
