@@ -1,3 +1,4 @@
+import json
 import os
 from typing import Any
 
@@ -44,6 +45,39 @@ class GroqProvider(LLMProvider):
     def is_available(self) -> bool:
         return bool(self._resolved_api_key())
 
+    def _structured_request_payload(
+        self,
+        prompt: str,
+        schema: dict[str, Any],
+        schema_name: str,
+        max_tokens: int,
+    ) -> dict[str, Any]:
+        """Build a Groq JSON-object request with the schema in the prompt.
+
+        The configured Groq model returns ``json_validate_failed`` for the
+        Chat Completions ``json_schema`` response format, including the minimal
+        connection schema. JSON-object mode is the supported structured mode
+        used here; the normalized schema guides generation and callers still
+        apply their canonical validators to the returned JSON.
+        """
+        schema_text = json.dumps(
+            normalize_strict_json_schema(schema),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        message_content = (
+            f"{prompt}\n\n"
+            f"Output contract: {schema_name}. Return exactly one JSON object "
+            "conforming to this JSON Schema:\n"
+            f"{schema_text}"
+        )
+        return {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": message_content}],
+            "response_format": {"type": "json_object"},
+        }
+
     def create_test_plan(
         self, task: str, target_url: str, page_snapshot: str
     ) -> QATestPlan:
@@ -51,14 +85,6 @@ class GroqProvider(LLMProvider):
         if not api_key:
             raise NonRetryableLLMError("GROQ_API_KEY is not set.")
 
-        response_format: dict[str, Any] = {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "qa_test_plan",
-                "strict": True,
-                "schema": normalize_strict_json_schema(self._response_schema()),
-            },
-        }
         prompt = (
             "Create a structured browser QA test plan for this task. "
             "Output exactly one JSON object matching the supplied schema. "
@@ -134,14 +160,9 @@ class GroqProvider(LLMProvider):
             f"Task: {task}"
         )
 
-        request_payload = {
-            "model": self.model,
-            "max_completion_tokens": 8192,
-            "messages": [
-                {"role": "user", "content": prompt},
-            ],
-            "response_format": response_format,
-        }
+        request_payload = self._structured_request_payload(
+            prompt, self._response_schema(), "qa_test_plan", 8192
+        )
         try:
             response = httpx.post(
                 self._endpoint,
@@ -185,14 +206,14 @@ class GroqProvider(LLMProvider):
         if not api_key:
             raise NonRetryableLLMError("GROQ_API_KEY is not set.")
         schema = AIDiscoveryResult.model_json_schema()
-        payload = {"model": self.model, "max_completion_tokens": self._max_output_tokens,
-                   "messages": [{"role": "user", "content":
-                       "Return grounded structured discovery candidates only. Never return code, "
-                       "instructions to execute, or perform browser actions. "
-                       f"URL: {target_url}\nTask: {task}\nPage info: {page_snapshot}"}],
-                   "response_format": {"type": "json_schema", "json_schema":
-                       {"name": "ai_discovery_result", "strict": True,
-                        "schema": normalize_strict_json_schema(schema)}}}
+        prompt = (
+            "Return grounded structured discovery candidates only. Never return code, "
+            "instructions to execute, or perform browser actions. "
+            f"URL: {target_url}\nTask: {task}\nPage info: {page_snapshot}"
+        )
+        payload = self._structured_request_payload(
+            prompt, schema, "ai_discovery_result", self._max_output_tokens
+        )
         try:
             response = httpx.post(self._endpoint,
                 headers={"Authorization": f"Bearer {api_key}"}, json=payload, timeout=self._timeout_seconds)
@@ -229,19 +250,9 @@ class GroqProvider(LLMProvider):
         api_key = self._resolved_api_key()
         if not api_key:
             raise NonRetryableLLMError("GROQ_API_KEY is not set.")
-        payload = {
-            "model": self.model,
-            "max_completion_tokens": self._max_output_tokens,
-            "messages": [{"role": "user", "content": prompt}],
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": schema_name,
-                    "strict": True,
-                    "schema": normalize_strict_json_schema(schema),
-                },
-            },
-        }
+        payload = self._structured_request_payload(
+            prompt, schema, schema_name, self._max_output_tokens
+        )
         try:
             response = httpx.post(
                 self._endpoint,
@@ -267,7 +278,17 @@ class GroqProvider(LLMProvider):
         try:
             response_data = response.json()
             capture_openai_usage(response_data)
-            return response_data["choices"][0]["message"]["content"]
+            output = response_data["choices"][0]["message"]["content"]
+            parsed_output = json.loads(output)
+            if not isinstance(parsed_output, dict):
+                raise ValueError("structured output root must be an object")
+            return output
+        except json.JSONDecodeError as error:
+            raise RetryableLLMError(
+                "Groq returned invalid JSON.",
+                category="INVALID_RESPONSE",
+                safe_detail="Invalid JSON response",
+            ) from error
         except Exception as error:
             raise RetryableLLMError(
                 "Groq returned an invalid structured-output response.",

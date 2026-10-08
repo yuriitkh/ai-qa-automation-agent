@@ -221,9 +221,14 @@ class LLMProviderContractTests(unittest.TestCase):
 
         self.assertEqual(result, '{"ok":true}')
         payload = post.call_args.kwargs["json"]
-        self.assertEqual(payload["messages"][0]["content"], "authoring prompt")
-        self.assertEqual(payload["response_format"]["json_schema"]["schema"], schema)
-        self.assertTrue(payload["response_format"]["json_schema"]["strict"])
+        self.assertIn("authoring prompt", payload["messages"][0]["content"])
+        self.assertEqual(payload["response_format"], {"type": "json_object"})
+        prompt_schema = json.loads(
+            payload["messages"][0]["content"].rsplit(
+                "conforming to this JSON Schema:\n", 1
+            )[-1]
+        )
+        self.assertEqual(prompt_schema, schema)
 
     def test_groq_prompt_and_schema_cover_all_actions(self) -> None:
         response = MagicMock()
@@ -247,14 +252,13 @@ class LLMProviderContractTests(unittest.TestCase):
         self.assertEqual(plan, self.plan)
         request = post.call_args.kwargs["json"]
         self._assert_prompt_contract(request["messages"][0]["content"])
-        self.assertEqual(
-            request["response_format"]["json_schema"]["schema"],
-            GroqProvider._response_schema(),
+        self.assertEqual(request["response_format"], {"type": "json_object"})
+        schema = json.loads(
+            request["messages"][0]["content"].rsplit(
+                "conforming to this JSON Schema:\n", 1
+            )[-1]
         )
-        self.assertEqual(
-            request["response_format"]["json_schema"]["strict"], True
-        )
-        schema = request["response_format"]["json_schema"]["schema"]
+        self.assertEqual(schema, GroqProvider._response_schema())
         schema_text = json.dumps(schema)
         for unsupported in ("$ref", "$defs", "oneOf"):
             self.assertNotIn(unsupported, schema_text)

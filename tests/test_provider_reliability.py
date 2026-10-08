@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import json as jsonlib
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from types import SimpleNamespace
@@ -80,7 +81,7 @@ def _response(content):
     )
 
 
-def test_authoring_schema_reproduces_strict_mode_mismatch_and_is_normalized_for_groq():
+def test_authoring_schema_is_embedded_for_groq_json_object_mode():
     original = _AuthoringResponse.model_json_schema()
     assert "name" not in original["required"]
     assert _strict_schema_issues(original)
@@ -89,13 +90,19 @@ def test_authoring_schema_reproduces_strict_mode_mismatch_and_is_normalized_for_
 
     def fake_post(url, *, headers, json, timeout):
         captured.update(url=url, headers=headers, payload=json, timeout=timeout)
-        schema = json["response_format"]["json_schema"]["schema"]
-        if _strict_schema_issues(schema):
+        message = json["messages"][0]["content"]
+        schema_text = message.rsplit("conforming to this JSON Schema:\n", 1)[-1]
+        schema = jsonlib.loads(schema_text)
+        if json["response_format"] != {"type": "json_object"} or _strict_schema_issues(schema):
             return SimpleNamespace(
                 is_error=True,
                 status_code=400,
                 headers={},
-                json=lambda: {"error": {"code": "invalid_json_schema", "message": "schema rejected"}},
+                json=lambda: {"error": {
+                    "code": "json_validate_failed",
+                    "param": "response_format.type",
+                    "message": "JSON Schema response format unsupported",
+                }},
             )
         return SimpleNamespace(is_error=False, json=lambda: {
             "choices": [{"message": {"content": _CAPABILITY_RESPONSE}}],
@@ -107,12 +114,16 @@ def test_authoring_schema_reproduces_strict_mode_mismatch_and_is_normalized_for_
             "local fake prompt", original, "test_case_authoring_capability"
         )
 
-    schema = captured["payload"]["response_format"]["json_schema"]["schema"]
+    message = captured["payload"]["messages"][0]["content"]
+    schema = json.loads(
+        message.rsplit("conforming to this JSON Schema:\n", 1)[-1]
+    )
     assert output == _CAPABILITY_RESPONSE
     assert captured["url"] == GroqProvider._endpoint
     assert captured["payload"]["model"] == "test-model"
-    assert captured["payload"]["max_completion_tokens"] == 4096
-    assert captured["payload"]["response_format"]["json_schema"]["strict"] is True
+    assert captured["payload"]["max_tokens"] == 4096
+    assert "max_completion_tokens" not in captured["payload"]
+    assert captured["payload"]["response_format"] == {"type": "json_object"}
     assert schema == normalize_strict_json_schema(original)
     assert not _strict_schema_issues(schema)
     assert "name" in schema["required"]
@@ -149,6 +160,8 @@ class _FakeStatusError(RuntimeError):
         self.status_code = 400
         self.body = {"error": {
             "code": "invalid_json_schema",
+            "type": "invalid_request_error",
+            "param": "response_format.json_schema.schema.properties.segments",
             "message": "strict json_schema rejected",
         }}
         self.response = SimpleNamespace(status_code=400, headers={})
@@ -183,6 +196,9 @@ def test_connection_can_pass_while_authoring_capability_fails_with_same_model_ur
     assert capability.status == "failed"
     assert capability.category == "SCHEMA_ERROR"
     assert capability.http_status == 400
+    assert capability.provider_error_code == "invalid_json_schema"
+    assert capability.provider_error_type == "invalid_request_error"
+    assert capability.provider_error_field == "response_format.json_schema.schema.properties.segments"
     assert [item[0] for item in request_schemas] == [
         "configured-openrouter-model", "configured-openrouter-model",
     ]
@@ -200,6 +216,7 @@ def test_connection_can_pass_while_authoring_capability_fails_with_same_model_ur
     views = {view.id: view for view in settings.provider_views()}
     assert views["openrouter"].health == "connected"
     assert views["openrouter"].capability_status == "failed"
+    assert views["openrouter"].capability_provider_error_code == "invalid_json_schema"
 
     app = LocalWebApplication(
         RunHistoryService(InMemoryRunHistoryRepository()),
@@ -213,6 +230,9 @@ def test_connection_can_pass_while_authoring_capability_fails_with_same_model_ur
     assert "Connection:</strong> Healthy" in html
     assert "Authoring capability:</strong> Failed · Invalid structured output" in html
     assert "fake-openrouter-key" not in html
+    assert "Provider code invalid_json_schema" in html
+    assert "Field response_format.json_schema.schema.properties.segments" in html
+    assert "strict json_schema rejected" not in html
     assert request_schemas[1][1] == "test_case_authoring_capability"
 
 
@@ -222,6 +242,7 @@ def test_connection_can_pass_while_authoring_capability_fails_with_same_model_ur
     (400, {"error": {"message": "invalid request"}}, "INVALID_REQUEST"),
     (429, {}, "RATE_LIMIT"),
     (400, {"error": {"code": "invalid_json_schema", "message": "schema rejected"}}, "SCHEMA_ERROR"),
+    (400, {"error": {"code": "json_validate_failed"}}, "SCHEMA_ERROR"),
     (503, {}, "PROVIDER_UNAVAILABLE"),
 ])
 def test_http_provider_failure_categories_are_safe(status, payload, expected):
@@ -230,6 +251,45 @@ def test_http_provider_failure_categories_are_safe(status, payload, expected):
     assert error.http_status == status
     assert expected not in str(payload) or expected == error.category
     assert "raw" not in str(error).casefold()
+
+
+def test_provider_http_failure_retains_only_sanitized_code_and_field_hints():
+    error = provider_http_failure(
+        "Groq",
+        400,
+        payload={
+            "error": {
+                "code": "unsupported_parameter",
+                "type": "invalid_request_error",
+                "param": "max_completion_tokens",
+                "message": "private prompt and gsk_private-secret-value",
+            },
+        },
+    )
+    detail = failure_detail_for("Groq", error)
+    public = detail.to_public_dict()
+
+    assert detail.category == "INVALID_REQUEST"
+    assert detail.http_status == 400
+    assert detail.provider_error_code == "unsupported_parameter"
+    assert detail.provider_error_type == "invalid_request_error"
+    assert detail.provider_error_field == "max_completion_tokens"
+    assert "private prompt" not in json.dumps(public)
+    assert "gsk_private-secret-value" not in json.dumps(public)
+
+    unsafe = provider_http_failure(
+        "Groq",
+        400,
+        payload={"error": {
+            "code": "gsk_private-secret-value",
+            "param": "gsk_private-secret-value",
+            "message": "private prompt",
+        }},
+    )
+    unsafe_detail = failure_detail_for("Groq", unsafe).to_public_dict()
+    assert unsafe_detail["provider_error_code"] is None
+    assert unsafe_detail["provider_error_field"] is None
+    assert "private prompt" not in json.dumps(unsafe_detail)
 
 
 def test_retry_after_and_invalid_response_are_classified_without_raw_body():

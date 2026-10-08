@@ -50,6 +50,9 @@ class ProviderFailureDetail:
     http_status: int | None = None
     safe_detail: str | None = None
     retry_after_seconds: int | None = None
+    provider_error_code: str | None = None
+    provider_error_type: str | None = None
+    provider_error_field: str | None = None
 
     def __post_init__(self) -> None:
         if self.category not in PROVIDER_FAILURE_CATEGORIES:
@@ -60,6 +63,9 @@ class ProviderFailureDetail:
             object.__setattr__(self, "safe_detail", SAFE_FAILURE_DETAILS[self.category])
         if self.retry_after_seconds is not None and self.retry_after_seconds <= 0:
             object.__setattr__(self, "retry_after_seconds", None)
+        object.__setattr__(self, "provider_error_code", _safe_provider_token(self.provider_error_code))
+        object.__setattr__(self, "provider_error_type", _safe_provider_token(self.provider_error_type))
+        object.__setattr__(self, "provider_error_field", _safe_provider_field(self.provider_error_field))
 
     @property
     def message(self) -> str:
@@ -73,6 +79,9 @@ class ProviderFailureDetail:
             "http_status": self.http_status,
             "message": self.message,
             "retry_after_seconds": self.retry_after_seconds,
+            "provider_error_code": self.provider_error_code,
+            "provider_error_type": self.provider_error_type,
+            "provider_error_field": self.provider_error_field,
         }
 
 
@@ -87,6 +96,9 @@ class RetryableLLMError(Exception):
         http_status: int | None = None,
         safe_detail: str | None = None,
         retry_after_seconds: int | None = None,
+        provider_error_code: str | None = None,
+        provider_error_type: str | None = None,
+        provider_error_field: str | None = None,
     ) -> None:
         super().__init__(message)
         self.category = (
@@ -95,6 +107,9 @@ class RetryableLLMError(Exception):
         self.http_status = http_status
         self.safe_detail = safe_detail
         self.retry_after_seconds = retry_after_seconds
+        self.provider_error_code = _safe_provider_token(provider_error_code)
+        self.provider_error_type = _safe_provider_token(provider_error_type)
+        self.provider_error_field = _safe_provider_field(provider_error_field)
 
 
 class NonRetryableLLMError(Exception):
@@ -147,7 +162,8 @@ def provider_http_failure(
         category = "MODEL_NOT_FOUND"
     elif status in {400, 422} and any(word in searchable for word in (
         "json_schema", "json schema", "response_format", "structured output",
-        "schema is invalid", "schema validation", "schema not supported",
+        "json_validate_failed", "schema is invalid", "schema validation",
+        "schema not supported",
     )):
         category = "SCHEMA_ERROR"
     elif status in {400, 404, 422}:
@@ -165,6 +181,9 @@ def provider_http_failure(
         http_status=status,
         safe_detail=SAFE_FAILURE_DETAILS[category],
         retry_after_seconds=retry_after if category == "RATE_LIMIT" else None,
+        provider_error_code=_provider_hint(payload, ("code",)),
+        provider_error_type=_provider_hint(payload, ("type",)),
+        provider_error_field=_provider_hint(payload, ("param", "field", "path"), field=True),
     )
 
 
@@ -206,6 +225,47 @@ def _safe_classification_text(payload: Any) -> str:
         if isinstance(value, str):
             parts.append(value.casefold()[:2000])
     return " ".join(parts)
+
+
+_SAFE_PROVIDER_TOKEN = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
+_SAFE_PROVIDER_FIELD = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\[\]-]{0,119}$")
+_CREDENTIAL_LIKE = re.compile(
+    r"(?i)(?:\bBearer\b|\b(?:sk|gsk|or|AIza)[-_][A-Za-z0-9_-]{8,})"
+)
+
+
+def _safe_provider_token(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not _SAFE_PROVIDER_TOKEN.fullmatch(cleaned) or _CREDENTIAL_LIKE.search(cleaned):
+        return None
+    return cleaned
+
+
+def _safe_provider_field(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not _SAFE_PROVIDER_FIELD.fullmatch(cleaned) or _CREDENTIAL_LIKE.search(cleaned):
+        return None
+    return cleaned
+
+
+def _provider_hint(
+    payload: Any, names: tuple[str, ...], *, field: bool = False
+) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error", payload)
+    if not isinstance(error, dict):
+        return None
+    for name in names:
+        value = error.get(name)
+        safe = _safe_provider_field(value) if field else _safe_provider_token(value)
+        if safe is not None:
+            return safe
+    return None
 
 
 def category_for_error(error: BaseException) -> str:
@@ -268,6 +328,9 @@ def failure_detail_for(provider_name: str, error: BaseException) -> ProviderFail
                 http_status=latest.http_status,
                 safe_detail=latest.safe_detail,
                 retry_after_seconds=latest.retry_after_seconds,
+                provider_error_code=latest.provider_error_code,
+                provider_error_type=latest.provider_error_type,
+                provider_error_field=latest.provider_error_field,
             )
     category = category_for_error(error)
     current: BaseException | None = error
@@ -275,6 +338,9 @@ def failure_detail_for(provider_name: str, error: BaseException) -> ProviderFail
     status: int | None = None
     retry_after: int | None = None
     safe_detail: str | None = None
+    provider_error_code: str | None = None
+    provider_error_type: str | None = None
+    provider_error_field: str | None = None
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         status = status or getattr(current, "http_status", None) or getattr(current, "status_code", None)
@@ -282,6 +348,9 @@ def failure_detail_for(provider_name: str, error: BaseException) -> ProviderFail
         status = status or getattr(response, "status_code", None)
         retry_after = retry_after or getattr(current, "retry_after_seconds", None)
         safe_detail = safe_detail or getattr(current, "safe_detail", None)
+        provider_error_code = provider_error_code or getattr(current, "provider_error_code", None)
+        provider_error_type = provider_error_type or getattr(current, "provider_error_type", None)
+        provider_error_field = provider_error_field or getattr(current, "provider_error_field", None)
         current = current.__cause__ or current.__context__
     return ProviderFailureDetail(
         provider_name=provider_name,
@@ -289,6 +358,9 @@ def failure_detail_for(provider_name: str, error: BaseException) -> ProviderFail
         http_status=status if isinstance(status, int) else None,
         safe_detail=safe_detail,
         retry_after_seconds=retry_after if isinstance(retry_after, int) else None,
+        provider_error_code=provider_error_code,
+        provider_error_type=provider_error_type,
+        provider_error_field=provider_error_field,
     )
 
 

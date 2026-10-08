@@ -2567,12 +2567,16 @@ class LocalWebApplication:
                 "Connection", provider.health, provider.connection_category,
                 provider.latency_ms, provider.connection_http_status,
                 provider.connection_retry_after_seconds,
+                provider.connection_provider_error_code,
+                provider.connection_provider_error_field,
             )
             capability = _provider_diagnostic_html(
                 "Authoring capability", provider.capability_status,
                 provider.capability_category, provider.capability_latency_ms,
                 provider.capability_http_status,
                 provider.capability_retry_after_seconds,
+                provider.capability_provider_error_code,
+                provider.capability_provider_error_field,
             )
             health = f'<div class="provider-diagnostics">{connection}{capability}</div>'
             if result_provider == provider.id and result_code in result_messages:
@@ -3158,6 +3162,8 @@ def _provider_diagnostic_html(
     latency_ms: int | None,
     http_status: int | None,
     retry_after_seconds: int | None,
+    provider_error_code: str | None = None,
+    provider_error_field: str | None = None,
 ) -> str:
     category_labels = {
         "AUTH_ERROR": "Authentication failed",
@@ -3196,6 +3202,10 @@ def _provider_diagnostic_html(
         )
     if http_status is not None:
         value += f" · HTTP {http_status}"
+    if provider_error_code:
+        value += f" · Provider code {provider_error_code}"
+    if provider_error_field:
+        value += f" · Field {provider_error_field}"
     if latency_ms is not None:
         value += f" · {max(0, latency_ms)} ms"
     if category == "RATE_LIMIT" and retry_after_seconds is not None:

@@ -13,6 +13,7 @@ from typing import Any
 import httpx
 
 from qa_agent.browser_discovery import capture_page_snapshot
+from qa_agent.llm.errors import failure_detail_for, provider_http_failure
 from qa_agent.llm.groq import GroqProvider
 from qa_agent.models import QATestPlan
 
@@ -66,22 +67,34 @@ def _post(api_key: str, prompt: str) -> httpx.Response:
 def _report_response(response: httpx.Response) -> bool:
     print(f"HTTP status: {response.status_code}")
     if response.is_error:
-        print("Full response.text:")
-        print(response.text)
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+        failure = failure_detail_for(
+            "Groq",
+            provider_http_failure(
+                "Groq", response.status_code,
+                payload=payload, headers=response.headers,
+            ),
+        )
+        print(f"Safe error category: {failure.category}")
+        if failure.provider_error_code:
+            print(f"Provider error code: {failure.provider_error_code}")
+        if failure.provider_error_type:
+            print(f"Provider error type: {failure.provider_error_type}")
+        if failure.provider_error_field:
+            print(f"Provider error field: {failure.provider_error_field}")
         return False
     try:
         content = response.json()["choices"][0]["message"]["content"]
     except (ValueError, KeyError, IndexError, TypeError) as error:
-        print(f"Could not read generated JSON content: {type(error).__name__}: {error}")
-        print("Full response.text:")
-        print(response.text)
+        print(f"Could not read generated JSON content: {type(error).__name__}")
         return False
-    print("Generated JSON:")
-    print(content)
     try:
         QATestPlan.model_validate_json(content)
     except Exception as error:
-        print(f"Generated content failed QATestPlan validation: {type(error).__name__}: {error}")
+        print(f"Generated content failed QATestPlan validation: {type(error).__name__}")
         return False
     print("Generated content passed QATestPlan.model_validate_json.")
     return True
@@ -101,7 +114,7 @@ def main() -> int:
     try:
         minimal_response = _post(api_key, minimal_prompt)
     except httpx.RequestError as error:
-        print(f"Minimal request transport failure: {type(error).__name__}: {error}")
+        print(f"Minimal request transport failure: {type(error).__name__}")
         return 1
     minimal_ok = _report_response(minimal_response)
 
@@ -109,7 +122,7 @@ def main() -> int:
     try:
         snapshot = capture_page_snapshot(DNB_URL)
     except Exception as error:
-        print(f"DNB snapshot capture failed: {type(error).__name__}: {error}")
+        print(f"DNB snapshot capture failed: {type(error).__name__}")
         return 1
 
     # Invoke the production prompt/schema path unchanged. Wrap only the HTTP
@@ -127,12 +140,11 @@ def main() -> int:
     groq_module.httpx.post = diagnostic_post
     try:
         print("\n=== Production GroqProvider request for DNB ===")
-        plan = GroqProvider().create_test_plan(DNB_TASK, DNB_URL, snapshot)
-        print("Groq returned a plan accepted by QATestPlan.model_validate_json:")
-        print(plan.model_dump_json(indent=2))
+        GroqProvider().create_test_plan(DNB_TASK, DNB_URL, snapshot)
+        print("Groq returned a plan accepted by QATestPlan.model_validate_json; content omitted.")
         dnb_ok = True
     except Exception as error:
-        print(f"DNB request failed: {type(error).__name__}: {error}")
+        print(f"DNB request failed: {type(error).__name__}")
         dnb_ok = False
     finally:
         groq_module.httpx.post = original_post

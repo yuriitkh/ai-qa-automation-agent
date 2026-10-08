@@ -301,6 +301,12 @@ class ProviderView:
     capability_category: str | None = None
     capability_http_status: int | None = None
     capability_retry_after_seconds: int | None = None
+    connection_provider_error_code: str | None = None
+    connection_provider_error_type: str | None = None
+    connection_provider_error_field: str | None = None
+    capability_provider_error_code: str | None = None
+    capability_provider_error_type: str | None = None
+    capability_provider_error_field: str | None = None
 
 
 @dataclass(frozen=True)
@@ -310,6 +316,9 @@ class ConnectionTestResult:
     category: str | None = None
     http_status: int | None = None
     retry_after_seconds: int | None = None
+    provider_error_code: str | None = None
+    provider_error_type: str | None = None
+    provider_error_field: str | None = None
 
 
 @dataclass(frozen=True)
@@ -319,6 +328,9 @@ class AuthoringCapabilityTestResult:
     category: str | None = None
     http_status: int | None = None
     retry_after_seconds: int | None = None
+    provider_error_code: str | None = None
+    provider_error_type: str | None = None
+    provider_error_field: str | None = None
 
 
 class ProviderSettingsService:
@@ -450,6 +462,12 @@ class ProviderSettingsService:
                 capability.category if capability else None,
                 capability.http_status if capability else None,
                 capability.retry_after_seconds if capability else None,
+                health.provider_error_code if health else None,
+                health.provider_error_type if health else None,
+                health.provider_error_field if health else None,
+                capability.provider_error_code if capability else None,
+                capability.provider_error_type if capability else None,
+                capability.provider_error_field if capability else None,
             ))
         return views
 
@@ -692,6 +710,9 @@ class ProviderSettingsService:
                 category=failure.category,
                 http_status=failure.http_status,
                 retry_after_seconds=failure.retry_after_seconds,
+                provider_error_code=failure.provider_error_code,
+                provider_error_type=failure.provider_error_type,
+                provider_error_field=failure.provider_error_field,
             )
         self._health[provider_id] = result
         return result
@@ -742,6 +763,9 @@ class ProviderSettingsService:
                 category=failure.category,
                 http_status=failure.http_status,
                 retry_after_seconds=failure.retry_after_seconds,
+                provider_error_code=failure.provider_error_code,
+                provider_error_type=failure.provider_error_type,
+                provider_error_field=failure.provider_error_field,
             )
         self._capability[provider_id] = result
         return result

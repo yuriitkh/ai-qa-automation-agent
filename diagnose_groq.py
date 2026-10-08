@@ -18,6 +18,7 @@ from typing import Any
 import httpx
 
 from qa_agent.browser_discovery import capture_page_snapshot
+from qa_agent.llm.errors import failure_detail_for, provider_http_failure
 from qa_agent.llm.groq import GroqProvider
 import qa_agent.llm.groq as groq_module
 
@@ -88,21 +89,30 @@ def run_case(name: str, task: str, target_url: str, snapshot: str) -> None:
     print(f"snapshot length: {len(snapshot)} characters")
     if response is not None:
         if response.is_error:
-            print("Full Groq error body:")
-            print(response.text)
             try:
-                error_body = response.json().get("error", {})
-                if "failed_generation" in error_body:
-                    print(f"failed_generation: {error_body['failed_generation']!r}")
-            except (ValueError, AttributeError):
-                pass
+                payload = response.json()
+            except ValueError:
+                payload = None
+            failure = failure_detail_for(
+                "Groq",
+                provider_http_failure(
+                    "Groq", response.status_code,
+                    payload=payload, headers=response.headers,
+                ),
+            )
+            print(f"safe error category: {failure.category}")
+            if failure.provider_error_code:
+                print(f"provider error code: {failure.provider_error_code}")
+            if failure.provider_error_type:
+                print(f"provider error type: {failure.provider_error_type}")
+            if failure.provider_error_field:
+                print(f"provider error field: {failure.provider_error_field}")
         else:
-            print("Response text:")
-            print(response.text)
+            print("Structured output accepted and validated; response content omitted.")
     elif error is not None:
-        print(f"Request failed before receiving an HTTP response: {type(error).__name__}: {error}")
+        print(f"Request failed before receiving an HTTP response: {type(error).__name__}")
     if error is not None and response is not None and not response.is_error:
-        print(f"Provider rejected the successful HTTP response: {type(error).__name__}: {error}")
+        print(f"Provider rejected the successful HTTP response: {type(error).__name__}")
 
 
 def main() -> int:

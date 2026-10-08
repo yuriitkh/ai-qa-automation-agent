@@ -125,6 +125,9 @@ class OpenAICompatibleProvider(LLMProvider):
                     http_status=failure.http_status,
                     safe_detail=failure.safe_detail,
                     retry_after_seconds=failure.retry_after_seconds,
+                    provider_error_code=failure.provider_error_code,
+                    provider_error_type=failure.provider_error_type,
+                    provider_error_field=failure.provider_error_field,
                 ) from error
             if error.__class__.__module__.startswith("openai"):
                 category = (
