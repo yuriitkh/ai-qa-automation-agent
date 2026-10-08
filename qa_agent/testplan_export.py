@@ -15,6 +15,12 @@ from urllib.parse import parse_qsl, urlsplit
 from uuid import UUID
 
 from qa_agent.models import QATestPlan, QATestStep, TestCase, TestPlanVersion
+from qa_agent.execution_semantics import (
+    ACTION_TIMEOUT_MS,
+    ASSERTION_TIMEOUT_MS,
+    NAVIGATION_LOAD_STATE,
+    NAVIGATION_TIMEOUT_MS,
+)
 from qa_agent.plan_store import PlanStore
 from qa_agent.test_case_repository import TestCaseRepository
 from qa_agent.test_plan_validation import PlanValidationError, validate_executable_plan
@@ -289,41 +295,50 @@ def _normalized_expected(value: str) -> str:
     return value.replace("\\n", "\n")
 
 
+def _regex_escape(value: str) -> str:
+    return re.sub(r"([\\^$.*+?()\[\]{}|])", r"\\\1", value)
+
+
 def _emit_python(action: str, p: dict, i: int) -> list[str]:
     if action == "navigate":
-        return [f"page.goto({_python_string(p['url'])})"]
+        return [f"page.goto({_python_string(p['url'])}, wait_until={_python_string(NAVIGATION_LOAD_STATE)}, timeout={NAVIGATION_TIMEOUT_MS})"]
     if action == "click":
-        return [f"page.locator({_python_string(p['selector'])}).click()", "page.wait_for_load_state('load', timeout=10000)"]
+        return [f"page.locator({_python_string(p['selector'])}).click(timeout={ACTION_TIMEOUT_MS})"]
     if action == "fill":
-        return [f"page.locator({_python_string(p['selector'])}).fill({_python_string(p['value'])})"]
+        return [f"page.locator({_python_string(p['selector'])}).fill({_python_string(p['value'])}, timeout={ACTION_TIMEOUT_MS})"]
     if action == "select_option":
-        return [f"page.locator({_python_string(p['selector'])}).select_option(label={_python_string(p['option_label'])})"]
+        return [f"page.locator({_python_string(p['selector'])}).select_option(label={_python_string(p['option_label'])}, timeout={ACTION_TIMEOUT_MS})"]
     if action == "assert_page_loaded":
-        return ["page.wait_for_load_state('load')"]
+        return [f"page.wait_for_load_state({_python_string(NAVIGATION_LOAD_STATE)}, timeout={NAVIGATION_TIMEOUT_MS})"]
     if action == "assert_title":
-        return [f"expect(page).to_have_title({_python_string(p['expected'])})"]
+        return [f"expect(page).to_have_title({_python_string(p['expected'])}, timeout={ASSERTION_TIMEOUT_MS})"]
     if action == "assert_url":
-        return [f"expect(page).to_have_url({_python_string(p['expected'])})"]
+        return [f"expect(page).to_have_url({_python_string(p['expected'])}, timeout={ASSERTION_TIMEOUT_MS})"]
     if action == "assert_visible":
-        lines = [f"element_{i} = page.locator({_python_string(p['selector'])})", f"expect(element_{i}).to_be_visible()"]
-        if "expected_text" in p:
-            lines.append(f"expect(element_{i}).to_have_text({_python_string(_normalized_expected(p['expected_text']))}, use_inner_text=True)")
+        lines = [f"element_{i} = page.locator({_python_string(p['selector'])})", f"expect(element_{i}).to_be_visible(timeout={ASSERTION_TIMEOUT_MS})"]
+        if p.get("expected_text") is not None:
+            lines.append(f"expect(element_{i}).to_have_js_property('innerText', {_python_string(_normalized_expected(p['expected_text']))}, timeout={ASSERTION_TIMEOUT_MS})")
         return lines
     if action == "assert_hidden":
-        return [f"expect(page.locator({_python_string(p['selector'])})).to_be_hidden()"]
+        return [f"expect(page.locator({_python_string(p['selector'])})).to_be_hidden(timeout={ASSERTION_TIMEOUT_MS})"]
     if action == "assert_text_contains":
         target = f"page.locator({_python_string(p['selector'])})" if p.get("selector") else "page.locator('body')"
         expected = _python_string(_normalized_expected(p["expected_text"]))
-        return [f"target_{i} = {target}", f"expect(target_{i}.get_by_text({expected}, exact=False)).to_be_visible()", f"expect(target_{i}).to_contain_text({expected}, use_inner_text=True)"]
+        pattern = _python_string(".*" + _regex_escape(_normalized_expected(p["expected_text"])) + ".*")
+        return [f"target_{i} = {target}", f"expect(target_{i}.get_by_text({expected}, exact=False)).to_be_visible(timeout={ASSERTION_TIMEOUT_MS})", f"expect(target_{i}).to_have_text(re.compile({pattern}, re.DOTALL), use_inner_text=True, timeout={ASSERTION_TIMEOUT_MS})"]
     if action == "assert_checked":
-        return [f"expect(page.locator({_python_string(p['selector'])})).to_be_checked()"]
+        return [f"expect(page.locator({_python_string(p['selector'])})).to_be_checked(timeout={ASSERTION_TIMEOUT_MS})"]
     if action == "assert_selected":
-        lines = [f"element_{i} = page.locator({_python_string(p['selector'])})", f"element_{i}.wait_for(state='visible', timeout=5000)", f"kind_{i} = element_{i}.evaluate(\"element => ({{tag: element.tagName.toLowerCase(), type: element.type}})\")"]
+        lines = [
+            f"element_{i} = page.locator({_python_string(p['selector'])})",
+            f"expect(element_{i}).to_be_visible(timeout={ASSERTION_TIMEOUT_MS})",
+            f"kind_{i} = element_{i}.evaluate(\"element => ({{tag: element.tagName.toLowerCase(), type: element.type}})\")",
+        ]
         lines.extend(_python_selected_assertion(p, i))
         return lines
     if action in {"assert_enabled", "assert_disabled"}:
         method = "to_be_enabled" if action == "assert_enabled" else "to_be_disabled"
-        return [f"expect(page.locator({_python_string(p['selector'])})).{method}()"]
+        return [f"expect(page.locator({_python_string(p['selector'])})).{method}(timeout={ASSERTION_TIMEOUT_MS})"]
     raise TestPlanExportError(f"The Python exporter does not support action {action}.")
 
 
@@ -333,16 +348,22 @@ def _python_selected_assertion(p: dict, i: int) -> list[str]:
     if expected is not None:
         lines.append("    raise AssertionError('Radio assert_selected does not accept an expected value.')")
     else:
-        lines.append(f"    expect(element_{i}).to_be_checked()")
+        lines.append(f"    expect(element_{i}).to_be_checked(timeout={ASSERTION_TIMEOUT_MS})")
     lines.extend([f"elif kind_{i}['tag'] == 'select':"])
     if expected is None:
         lines.append("    raise AssertionError('Select assert_selected requires an expected label or value.')")
     else:
         lines.extend([
             f"    selected_{i} = element_{i}.locator('option:checked').first",
-            f"    label_{i} = selected_{i}.inner_text()",
-            f"    value_{i} = selected_{i}.get_attribute('value')",
-            f"    assert {_python_string(expected)} in {{label_{i}, value_{i}}}",
+            f"    options_{i} = element_{i}.locator('option')",
+            f"    option_labels_{i} = options_{i}.all_inner_texts()",
+            f"    option_values_{i} = [option.get_attribute('value') for option in options_{i}.all()]",
+            f"    if {_python_string(expected)} in option_labels_{i}:",
+            f"        expect(selected_{i}).to_have_js_property('innerText', {_python_string(expected)}, timeout={ASSERTION_TIMEOUT_MS})",
+            f"    elif {_python_string(expected)} in option_values_{i}:",
+            f"        expect(selected_{i}).to_have_attribute('value', {_python_string(expected)}, timeout={ASSERTION_TIMEOUT_MS})",
+            "    else:",
+            "        raise AssertionError('Expected option label or value is not available.')",
         ])
     lines.append("else:")
     lines.append("    raise AssertionError('assert_selected supports radio inputs and select elements.')")
@@ -351,39 +372,40 @@ def _python_selected_assertion(p: dict, i: int) -> list[str]:
 
 def _emit_typescript(action: str, p: dict, i: int) -> list[str]:
     if action == "navigate":
-        return [f"await page.goto({_js_string(p['url'])});"]
+        return [f"await page.goto({_js_string(p['url'])}, {{ waitUntil: {_js_string(NAVIGATION_LOAD_STATE)}, timeout: {NAVIGATION_TIMEOUT_MS} }});"]
     if action == "click":
-        return [f"await page.locator({_js_string(p['selector'])}).click();", "await page.waitForLoadState('load', { timeout: 10000 });"]
+        return [f"await page.locator({_js_string(p['selector'])}).click({{ timeout: {ACTION_TIMEOUT_MS} }});"]
     if action == "fill":
-        return [f"await page.locator({_js_string(p['selector'])}).fill({_js_string(p['value'])});"]
+        return [f"await page.locator({_js_string(p['selector'])}).fill({_js_string(p['value'])}, {{ timeout: {ACTION_TIMEOUT_MS} }});"]
     if action == "select_option":
-        return [f"await page.locator({_js_string(p['selector'])}).selectOption({{ label: {_js_string(p['option_label'])} }});"]
+        return [f"await page.locator({_js_string(p['selector'])}).selectOption({{ label: {_js_string(p['option_label'])} }}, {{ timeout: {ACTION_TIMEOUT_MS} }});"]
     if action == "assert_page_loaded":
-        return ["await page.waitForLoadState('load');"]
+        return [f"await page.waitForLoadState({_js_string(NAVIGATION_LOAD_STATE)}, {{ timeout: {NAVIGATION_TIMEOUT_MS} }});"]
     if action == "assert_title":
-        return [f"await expect(page).toHaveTitle({_js_string(p['expected'])});"]
+        return [f"await expect(page).toHaveTitle({_js_string(p['expected'])}, {{ timeout: {ASSERTION_TIMEOUT_MS} }});"]
     if action == "assert_url":
-        return [f"await expect(page).toHaveURL({_js_string(p['expected'])});"]
+        return [f"await expect(page).toHaveURL({_js_string(p['expected'])}, {{ timeout: {ASSERTION_TIMEOUT_MS} }});"]
     if action == "assert_visible":
-        lines = [f"const element_{i} = page.locator({_js_string(p['selector'])});", f"await expect(element_{i}).toBeVisible();"]
-        if "expected_text" in p:
-            lines.append(f"await expect(element_{i}).toHaveText({_js_string(_normalized_expected(p['expected_text']))}, {{ useInnerText: true }});")
+        lines = [f"const element_{i} = page.locator({_js_string(p['selector'])});", f"await expect(element_{i}).toBeVisible({{ timeout: {ASSERTION_TIMEOUT_MS} }});"]
+        if p.get("expected_text") is not None:
+            lines.append(f"await expect(element_{i}).toHaveJSProperty('innerText', {_js_string(_normalized_expected(p['expected_text']))}, {{ timeout: {ASSERTION_TIMEOUT_MS} }});")
         return lines
     if action == "assert_hidden":
-        return [f"await expect(page.locator({_js_string(p['selector'])})).toBeHidden();"]
+        return [f"await expect(page.locator({_js_string(p['selector'])})).toBeHidden({{ timeout: {ASSERTION_TIMEOUT_MS} }});"]
     if action == "assert_text_contains":
         target = f"page.locator({_js_string(p['selector'])})" if p.get("selector") else "page.locator('body')"
         expected = _js_string(_normalized_expected(p["expected_text"]))
-        return [f"const target_{i} = {target};", f"await expect(target_{i}.getByText({expected}, {{ exact: false }})).toBeVisible();", f"await expect(target_{i}).toContainText({expected}, {{ useInnerText: true }});"]
+        pattern = _js_string(".*" + _regex_escape(_normalized_expected(p["expected_text"])) + ".*")
+        return [f"const target_{i} = {target};", f"await expect(target_{i}.getByText({expected}, {{ exact: false }})).toBeVisible({{ timeout: {ASSERTION_TIMEOUT_MS} }});", f"await expect(target_{i}).toHaveText(new RegExp({pattern}, 's'), {{ useInnerText: true, timeout: {ASSERTION_TIMEOUT_MS} }});"]
     if action == "assert_checked":
-        return [f"await expect(page.locator({_js_string(p['selector'])})).toBeChecked();"]
+        return [f"await expect(page.locator({_js_string(p['selector'])})).toBeChecked({{ timeout: {ASSERTION_TIMEOUT_MS} }});"]
     if action == "assert_selected":
-        lines = [f"const element_{i} = page.locator({_js_string(p['selector'])});", f"await element_{i}.waitFor({{ state: 'visible', timeout: 5000 }});", f"const kind_{i} = await element_{i}.evaluate(node => ({{ tag: node.tagName.toLowerCase(), type: (node as HTMLInputElement | HTMLSelectElement).type }}));"]
+        lines = [f"const element_{i} = page.locator({_js_string(p['selector'])});", f"await expect(element_{i}).toBeVisible({{ timeout: {ASSERTION_TIMEOUT_MS} }});", f"const kind_{i} = await element_{i}.evaluate(node => ({{ tag: node.tagName.toLowerCase(), type: (node as HTMLInputElement | HTMLSelectElement).type }}));"]
         lines.extend(_typescript_selected_assertion(p, i))
         return lines
     if action in {"assert_enabled", "assert_disabled"}:
         method = "toBeEnabled" if action == "assert_enabled" else "toBeDisabled"
-        return [f"await expect(page.locator({_js_string(p['selector'])})).{method}();"]
+        return [f"await expect(page.locator({_js_string(p['selector'])})).{method}({{ timeout: {ASSERTION_TIMEOUT_MS} }});"]
     raise TestPlanExportError(f"The TypeScript exporter does not support action {action}.")
 
 
@@ -393,16 +415,23 @@ def _typescript_selected_assertion(p: dict, i: int) -> list[str]:
     if expected is not None:
         lines.append("  throw new Error('Radio assert_selected does not accept an expected value.');")
     else:
-        lines.append(f"  await expect(element_{i}).toBeChecked();")
+        lines.append(f"  await expect(element_{i}).toBeChecked({{ timeout: {ASSERTION_TIMEOUT_MS} }});")
     lines.append(f"}} else if (kind_{i}.tag === 'select') {{")
     if expected is None:
         lines.append("  throw new Error('Select assert_selected requires an expected label or value.');")
     else:
         lines.extend([
             f"  const selected_{i} = element_{i}.locator('option:checked').first();",
-            f"  const label_{i} = await selected_{i}.innerText();",
-            f"  const value_{i} = await selected_{i}.getAttribute('value');",
-            f"  expect([{f'label_{i}, value_{i}'}]).toContain({_js_string(expected)});",
+            f"  const options_{i} = await element_{i}.locator('option').all();",
+            f"  const option_labels_{i} = await Promise.all(options_{i}.map(option => option.innerText()));",
+            f"  const option_values_{i} = await Promise.all(options_{i}.map(option => option.getAttribute('value')));",
+            f"  if (option_labels_{i}.includes({_js_string(expected)})) {{",
+            f"    await expect(selected_{i}).toHaveJSProperty('innerText', {_js_string(expected)}, {{ timeout: {ASSERTION_TIMEOUT_MS} }});",
+            f"  }} else if (option_values_{i}.includes({_js_string(expected)})) {{",
+            f"    await expect(selected_{i}).toHaveAttribute('value', {_js_string(expected)}, {{ timeout: {ASSERTION_TIMEOUT_MS} }});",
+            "  } else {",
+            "    throw new Error('Expected option label or value is not available.');",
+            "  }",
         ])
     lines.extend(["} else {", "  throw new Error('assert_selected supports radio inputs and select elements.');", "}"])
     return lines
@@ -410,54 +439,65 @@ def _typescript_selected_assertion(p: dict, i: int) -> list[str]:
 
 def _emit_csharp(action: str, p: dict, i: int) -> list[str]:
     if action == "navigate":
-        return [f"await page.GotoAsync({_csharp_string(p['url'])});"]
+        return [f"await page.GotoAsync({_csharp_string(p['url'])}, new() {{ WaitUntil = WaitUntilState.{NAVIGATION_LOAD_STATE.title()}, Timeout = {NAVIGATION_TIMEOUT_MS} }});"]
     if action == "click":
-        return [f"await page.Locator({_csharp_string(p['selector'])}).ClickAsync();", "await page.WaitForLoadStateAsync(LoadState.Load, new() { Timeout = 10000 });"]
+        return [f"await page.Locator({_csharp_string(p['selector'])}).ClickAsync(new() {{ Timeout = {ACTION_TIMEOUT_MS} }});"]
     if action == "fill":
-        return [f"await page.Locator({_csharp_string(p['selector'])}).FillAsync({_csharp_string(p['value'])});"]
+        return [f"await page.Locator({_csharp_string(p['selector'])}).FillAsync({_csharp_string(p['value'])}, new() {{ Timeout = {ACTION_TIMEOUT_MS} }});"]
     if action == "select_option":
-        return [f"await page.Locator({_csharp_string(p['selector'])}).SelectOptionAsync(new SelectOptionValue {{ Label = {_csharp_string(p['option_label'])} }});"]
+        return [f"await page.Locator({_csharp_string(p['selector'])}).SelectOptionAsync(new SelectOptionValue {{ Label = {_csharp_string(p['option_label'])} }}, new() {{ Timeout = {ACTION_TIMEOUT_MS} }});"]
     if action == "assert_page_loaded":
-        return ["await page.WaitForLoadStateAsync(LoadState.Load);"]
+        return [f"await page.WaitForLoadStateAsync(LoadState.{NAVIGATION_LOAD_STATE.title()}, new() {{ Timeout = {NAVIGATION_TIMEOUT_MS} }});"]
     if action == "assert_title":
-        return [f"Assert.That(await page.TitleAsync(), Is.EqualTo({_csharp_string(p['expected'])}));"]
+        return [f"await Expect(page).ToHaveTitleAsync({_csharp_string(p['expected'])}, new() {{ Timeout = {ASSERTION_TIMEOUT_MS} }});"]
     if action == "assert_url":
-        return [f"Assert.That(page.Url, Is.EqualTo({_csharp_string(p['expected'])}));"]
+        return [f"await Expect(page).ToHaveURLAsync({_csharp_string(p['expected'])}, new() {{ Timeout = {ASSERTION_TIMEOUT_MS} }});"]
     if action == "assert_visible":
-        lines = [f"var element_{i} = page.Locator({_csharp_string(p['selector'])});", f"await element_{i}.WaitForAsync(new() {{ State = WaitForSelectorState.Visible, Timeout = 5000 }});", f"Assert.That(await element_{i}.IsVisibleAsync(), Is.True);"]
-        if "expected_text" in p:
-            lines.append(f"Assert.That(await element_{i}.InnerTextAsync(), Is.EqualTo({_csharp_string(_normalized_expected(p['expected_text']))}));")
+        lines = [f"var element_{i} = page.Locator({_csharp_string(p['selector'])});", f"await Expect(element_{i}).ToBeVisibleAsync(new() {{ Timeout = {ASSERTION_TIMEOUT_MS} }});"]
+        if p.get("expected_text") is not None:
+            lines.append(f"await Expect(element_{i}).ToHaveJSPropertyAsync(\"innerText\", {_csharp_string(_normalized_expected(p['expected_text']))}, new() {{ Timeout = {ASSERTION_TIMEOUT_MS} }});")
         return lines
     if action == "assert_hidden":
-        return [f"Assert.That(await page.Locator({_csharp_string(p['selector'])}).IsHiddenAsync(), Is.True);"]
+        return [f"await Expect(page.Locator({_csharp_string(p['selector'])})).ToBeHiddenAsync(new() {{ Timeout = {ASSERTION_TIMEOUT_MS} }});"]
     if action == "assert_text_contains":
         target = f"page.Locator({_csharp_string(p['selector'])})" if p.get("selector") else 'page.Locator("body")'
         expected = _csharp_string(_normalized_expected(p["expected_text"]))
-        return [f"var target_{i} = {target};", f"await target_{i}.GetByText({expected}, new() {{ Exact = false }}).WaitForAsync(new() {{ State = WaitForSelectorState.Visible, Timeout = 1500 }});", f"Assert.That(await target_{i}.InnerTextAsync(), Does.Contain({expected}));"]
+        pattern = _csharp_string(".*" + _regex_escape(_normalized_expected(p["expected_text"])) + ".*")
+        return [f"var target_{i} = {target};", f"await Expect(target_{i}.GetByText({expected}, new() {{ Exact = false }})).ToBeVisibleAsync(new() {{ Timeout = {ASSERTION_TIMEOUT_MS} }});", f"await Expect(target_{i}).ToHaveTextAsync(new Regex({pattern}, RegexOptions.Singleline), new() {{ UseInnerText = true, Timeout = {ASSERTION_TIMEOUT_MS} }});"]
     if action == "assert_checked":
-        return [f"Assert.That(await page.Locator({_csharp_string(p['selector'])}).IsCheckedAsync(), Is.True);"]
+        return [f"await Expect(page.Locator({_csharp_string(p['selector'])})).ToBeCheckedAsync(new() {{ Timeout = {ASSERTION_TIMEOUT_MS} }});"]
     if action == "assert_selected":
-        lines = [f"var element_{i} = page.Locator({_csharp_string(p['selector'])});", f"await element_{i}.WaitForAsync(new() {{ State = WaitForSelectorState.Visible, Timeout = 5000 }});", f"var tag_{i} = await element_{i}.EvaluateAsync<string>(\"element => element.tagName.toLowerCase()\");", f"var type_{i} = await element_{i}.GetAttributeAsync(\"type\");", f"if (tag_{i} == \"input\" && type_{i} == \"radio\") {{"]
+        lines = [f"var element_{i} = page.Locator({_csharp_string(p['selector'])});", f"await Expect(element_{i}).ToBeVisibleAsync(new() {{ Timeout = {ASSERTION_TIMEOUT_MS} }});", f"var tag_{i} = await element_{i}.EvaluateAsync<string>(\"element => element.tagName.toLowerCase()\");", f"var type_{i} = await element_{i}.EvaluateAsync<string>(\"element => element.type\");", f"if (tag_{i} == \"input\" && type_{i} == \"radio\") {{"]
         expected = p.get("expected")
         if expected is not None:
             lines.append('    Assert.Fail("Radio assert_selected does not accept an expected value.");')
         else:
-            lines.append(f"    Assert.That(await element_{i}.IsCheckedAsync(), Is.True);")
+            lines.append(f"    await Expect(element_{i}).ToBeCheckedAsync(new() {{ Timeout = {ASSERTION_TIMEOUT_MS} }});")
         lines.append(f"}} else if (tag_{i} == \"select\") {{")
         if expected is None:
             lines.append('    Assert.Fail("Select assert_selected requires an expected label or value.");')
         else:
             lines.extend([
-                f"    var selected_{i} = element_{i}.Locator(\"option:checked\").First;",
-                f"    var label_{i} = await selected_{i}.InnerTextAsync();",
-                f"    var value_{i} = await selected_{i}.GetAttributeAsync(\"value\");",
-                f"    Assert.That(new[] {{ label_{i}, value_{i} }}, Does.Contain({_csharp_string(expected)}));",
+                f"    var selected_{i} = element_{i}.Locator(\"option:checked\");",
+                f"    var has_label_{i} = false;",
+                f"    var has_value_{i} = false;",
+                f"    foreach (var option_{i} in await element_{i}.Locator(\"option\").AllAsync()) {{",
+                f"        has_label_{i} |= await option_{i}.InnerTextAsync() == {_csharp_string(expected)};",
+                f"        has_value_{i} |= await option_{i}.GetAttributeAsync(\"value\") == {_csharp_string(expected)};",
+                "    }",
+                f"    if (has_label_{i}) {{",
+                f"        await Expect(selected_{i}).ToHaveJSPropertyAsync(\"innerText\", {_csharp_string(expected)}, new() {{ Timeout = {ASSERTION_TIMEOUT_MS} }});",
+                f"    }} else if (has_value_{i}) {{",
+                f"        await Expect(selected_{i}).ToHaveAttributeAsync(\"value\", {_csharp_string(expected)}, new() {{ Timeout = {ASSERTION_TIMEOUT_MS} }});",
+                "    } else {",
+                '        Assert.Fail("Expected option label or value is not available.");',
+                "    }",
             ])
         lines.extend(["} else {", '    Assert.Fail("assert_selected supports radio inputs and select elements.");', "}"])
         return lines
     if action in {"assert_enabled", "assert_disabled"}:
-        expected = "true" if action == "assert_enabled" else "false"
-        return [f"Assert.That(await page.Locator({_csharp_string(p['selector'])}).IsEnabledAsync(), Is.EqualTo({expected}));"]
+        method = "ToBeEnabledAsync" if action == "assert_enabled" else "ToBeDisabledAsync"
+        return [f"await Expect(page.Locator({_csharp_string(p['selector'])})).{method}(new() {{ Timeout = {ASSERTION_TIMEOUT_MS} }});"]
     raise TestPlanExportError(f"The C# exporter does not support action {action}.")
 
 
@@ -533,13 +573,13 @@ def _code_for(exportable: ExportableTestCase, language: str) -> str:
     lines: list[str]
     case = exportable.test_case
     if language == "python":
-        lines = ["import pytest", "from playwright.sync_api import Page, expect", "", "", f"def {_python_function_name(case.name)}(page: Page) -> None:"]
+        lines = ["import re", "import pytest", "from playwright.sync_api import Page, expect", "", "", f"def {_python_function_name(case.name)}(page: Page) -> None:"]
     elif language == "typescript":
         lines = ["import { test, expect } from '@playwright/test';", "", "", f"test({_js_string(_ts_test_name(case.name))}, async ({{ page }}) => {{"]
     else:
         class_name = _csharp_identifier(case.name) + "Tests"
         method_name = _csharp_identifier(case.name) + "Test"
-        lines = ["using System.Threading.Tasks;", "using Microsoft.Playwright;", "using Microsoft.Playwright.NUnit;", "using NUnit.Framework;", "", "[TestFixture]", f"public class {class_name} : PageTest", "{"]
+        lines = ["using System.Text.RegularExpressions;", "using System.Threading.Tasks;", "using Microsoft.Playwright;", "using Microsoft.Playwright.NUnit;", "using NUnit.Framework;", "", "[TestFixture]", f"public class {class_name} : PageTest", "{"]
         lines.extend(["    [Test]", f"    public async Task {method_name}()", "    {"])
     indent = "    " if language != "python" else "    "
     if language == "csharp":

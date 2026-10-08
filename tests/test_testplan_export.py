@@ -15,6 +15,11 @@ from qa_agent.models import (
     TestPlanVersion as DomainTestPlanVersion,
     TestStep as DomainTestStep,
 )
+from qa_agent.execution_semantics import (
+    ACTION_TIMEOUT_MS,
+    ASSERTION_TIMEOUT_MS,
+    NAVIGATION_TIMEOUT_MS,
+)
 from qa_agent.plan_store import InMemoryPlanStore
 from qa_agent.test_case_repository import InMemoryTestCaseRepository
 from qa_agent.testplan_export import (
@@ -157,10 +162,10 @@ class TestPlanExportTests(unittest.TestCase):
         source = python_source(self.service.get(self.case.id))
         compile(source, "exported_test.py", "exec")
         for fragment in (
-            "page.goto(", "page.wait_for_load_state('load')", "to_have_title(",
-            "to_have_text(", ".click()", ".fill(", "to_be_hidden()",
-            "to_have_url(", "select_option(label=", "to_contain_text(",
-            "to_be_checked()", "option:checked", "to_be_enabled()", "to_be_disabled()",
+            "page.goto(", "page.wait_for_load_state(", "to_have_title(",
+            "to_have_text(re.compile(", f".click(timeout={ACTION_TIMEOUT_MS})", ".fill(", "to_be_hidden(",
+            "to_have_url(", "select_option(label=",
+            "to_be_checked(", "option:checked", "to_be_enabled(", "to_be_disabled(",
         ):
             self.assertIn(fragment, source)
         self.assertIn("page.locator(\"button[type='submit']\")", source)
@@ -171,9 +176,9 @@ class TestPlanExportTests(unittest.TestCase):
         source = typescript_source(self.service.get(self.case.id))
         for fragment in (
             "import { test, expect }", "await page.goto(", "waitForLoadState(",
-            "toHaveTitle(", "toHaveText(", ".click()", ".fill(",
-            "toBeHidden()", "toHaveURL(", "selectOption(", "toContainText(",
-            "toBeChecked()", "option:checked", "toBeEnabled()", "toBeDisabled()",
+            "toHaveTitle(", "toHaveText(", f".click({{ timeout: {ACTION_TIMEOUT_MS} }})", ".fill(",
+            "toBeHidden(", "toHaveURL(", "selectOption(", "toHaveText(new RegExp(",
+            "toBeChecked(", "option:checked", "toBeEnabled(", "toBeDisabled(",
         ):
             self.assertIn(fragment, source)
         self.assertNotIn("qa_agent", source)
@@ -182,13 +187,51 @@ class TestPlanExportTests(unittest.TestCase):
         source = csharp_source(self.service.get(self.case.id))
         for fragment in (
             "Microsoft.Playwright.NUnit", "[Test]", "await page.GotoAsync(",
-            "WaitForLoadStateAsync(", "page.TitleAsync()", "InnerTextAsync()",
-            ".ClickAsync()", ".FillAsync(", "IsHiddenAsync()", "page.Url",
-            "SelectOptionAsync(", "GetByText(", "IsCheckedAsync()", "option:checked",
-            "IsEnabledAsync()",
+            "WaitForLoadStateAsync(", "ToHaveTitleAsync(", "InnerTextAsync()",
+            ".ClickAsync(", ".FillAsync(", "ToBeHiddenAsync(", "ToHaveURLAsync(",
+            "SelectOptionAsync(", "GetByText(", "option:checked",
+            "ToBeCheckedAsync(", "ToBeEnabledAsync(",
         ):
             self.assertIn(fragment, source)
         self.assertNotIn("qa_agent", source)
+
+    def test_click_and_timeout_semantics_match_all_export_targets(self):
+        exportable = self.service.get(self.case.id)
+        py = python_source(exportable)
+        ts = typescript_source(exportable)
+        cs = csharp_source(exportable)
+
+        self.assertIn(f".click(timeout={ACTION_TIMEOUT_MS})", py)
+        self.assertIn(f".click({{ timeout: {ACTION_TIMEOUT_MS} }})", ts)
+        self.assertIn(f".ClickAsync(new() {{ Timeout = {ACTION_TIMEOUT_MS} }})", cs)
+        self.assertNotIn("expect_navigation", py)
+        self.assertNotIn("wait_for_load_state('load', timeout=10000)", py)
+        self.assertNotIn("waitForLoadState('load', { timeout: 10000 })", ts)
+        self.assertNotIn("Timeout = 10000", cs)
+        self.assertIn(f"timeout={ASSERTION_TIMEOUT_MS}", py)
+        self.assertIn(f"timeout: {ASSERTION_TIMEOUT_MS}", ts)
+        self.assertIn(f"Timeout = {ASSERTION_TIMEOUT_MS}", cs)
+        self.assertIn(f"timeout={NAVIGATION_TIMEOUT_MS}", py)
+        self.assertIn(f"timeout: {NAVIGATION_TIMEOUT_MS}", ts)
+        self.assertIn(f"Timeout = {NAVIGATION_TIMEOUT_MS}", cs)
+
+    def test_text_semantics_remain_exact_or_contains_across_targets(self):
+        exportable = self.service.get(self.case.id)
+        py = python_source(exportable)
+        ts = typescript_source(exportable)
+        cs = csharp_source(exportable)
+
+        self.assertIn("to_have_js_property('innerText'", py)
+        self.assertIn("toHaveJSProperty('innerText'", ts)
+        self.assertIn("ToHaveJSPropertyAsync(\"innerText\"", cs)
+        self.assertIn("re.compile(", py)
+        self.assertIn("new RegExp(", ts)
+        self.assertIn("to_have_text(re.compile(", py)
+        self.assertIn("toHaveText(new RegExp(", ts)
+        self.assertIn("ToHaveTextAsync(new Regex(", cs)
+        self.assertIn("exact=False", py)
+        self.assertIn("exact: false", ts)
+        self.assertIn("Exact = false", cs)
 
     def test_locators_and_special_characters_are_escaped_without_strategy_changes(self):
         source = python_source(self.service.get(self.case.id))

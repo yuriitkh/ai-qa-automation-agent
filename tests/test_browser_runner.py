@@ -1,15 +1,93 @@
 import unittest
 import tempfile
+import re
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from qa_agent.browser_runner import BrowserRunner, run_test_plan
+from qa_agent.execution_semantics import (
+    ACTION_TIMEOUT_MS,
+    ASSERTION_TIMEOUT_MS,
+    NAVIGATION_TIMEOUT_MS,
+)
 from qa_agent.models import (
     ExecutionSegment,
     QATestPlan,
     TestCase as DomainTestCase,
     TestStep as DomainTestStep,
 )
+
+
+class _FakeAssertions:
+    def __init__(self, actual, calls):
+        self.actual = actual
+        self.calls = calls
+
+    def _record(self, name, *args, **kwargs):
+        self.calls.append((name, args, kwargs))
+
+    def to_have_title(self, expected, *, timeout):
+        self._record("to_have_title", expected, timeout=timeout)
+        for _ in range(10):
+            actual = self.actual.title()
+            if actual == expected:
+                return
+        raise AssertionError(f"Expected title {expected!r}, but got {actual!r}.")
+
+    def to_have_url(self, expected, *, timeout):
+        self._record("to_have_url", expected, timeout=timeout)
+        for _ in range(10):
+            actual = self.actual.url
+            if callable(actual):
+                actual = actual()
+            if actual == expected:
+                return
+        raise AssertionError(f"Expected URL {expected!r}, but got {actual!r}.")
+
+    def to_be_visible(self, *, timeout):
+        self._record("to_be_visible", timeout=timeout)
+        self.actual.wait_for(state="visible", timeout=timeout)
+
+    def to_be_hidden(self, *, timeout):
+        self._record("to_be_hidden", timeout=timeout)
+        if not self.actual.is_hidden():
+            raise AssertionError(f"Element matching selector is visible.")
+
+    def to_have_js_property(self, name, expected, *, timeout):
+        self._record("to_have_js_property", name, expected, timeout=timeout)
+        actual = self.actual.first.inner_text()
+        if name != "innerText" or actual != expected:
+            raise AssertionError(f"Expected exact visible text {expected!r}, got {actual!r}.")
+
+    def to_have_text(self, expected, *, use_inner_text=False, timeout):
+        self._record("to_have_text", expected, use_inner_text=use_inner_text, timeout=timeout)
+        actual = self.actual.inner_text()
+        if isinstance(expected, re.Pattern):
+            matches = expected.fullmatch(actual) is not None
+        else:
+            matches = actual == expected
+        if not matches:
+            raise AssertionError(f"Expected text {expected!r} to be contained in visible text; got {actual!r}.")
+
+    def to_have_attribute(self, name, expected, *, timeout):
+        self._record("to_have_attribute", name, expected, timeout=timeout)
+        if self.actual.get_attribute(name) != expected:
+            raise AssertionError(f"Expected {name}={expected!r}.")
+
+    def to_be_checked(self, *, timeout):
+        self._record("to_be_checked", timeout=timeout)
+        if not self.actual.is_checked():
+            raise AssertionError("Expected checkbox/radio to be checked.")
+
+    def to_be_enabled(self, *, timeout):
+        self._record("to_be_enabled", timeout=timeout)
+        if not self.actual.is_enabled():
+            raise AssertionError("Expected element to be enabled.")
+
+    def to_be_disabled(self, *, timeout):
+        self._record("to_be_disabled", timeout=timeout)
+        if self.actual.is_enabled():
+            raise AssertionError("Expected element to be disabled.")
 
 
 class BrowserRunnerActionTests(unittest.TestCase):
@@ -28,6 +106,13 @@ class BrowserRunnerActionTests(unittest.TestCase):
         self.playwright.chromium.launch.return_value = self.browser
         self.manager = MagicMock()
         self.manager.__enter__.return_value = self.playwright
+        self.expect_calls = []
+        self.expect_patcher = patch(
+            "qa_agent.browser_runner.expect",
+            side_effect=lambda actual: _FakeAssertions(actual, self.expect_calls),
+        )
+        self.expect_patcher.start()
+        self.addCleanup(self.expect_patcher.stop)
 
     def run_steps(self, *steps: dict[str, object]) -> dict[str, object]:
         plan = QATestPlan(url="https://example.com", steps=list(steps))
@@ -44,12 +129,25 @@ class BrowserRunnerActionTests(unittest.TestCase):
         self.assertEqual(result["status"], "passed")
         self.assertEqual(result["steps"][0]["status"], "passed")
         self.page.locator.assert_called_once_with("#submit")
-        self.locator.wait_for.assert_called_once_with(
-            state="visible", timeout=5000
+        self.locator.click.assert_called_once_with(timeout=ACTION_TIMEOUT_MS)
+        self.page.expect_navigation.assert_not_called()
+        self.page.wait_for_load_state.assert_not_called()
+
+    def test_click_can_be_followed_by_state_and_explicit_load_assertions(self) -> None:
+        target_url = "https://example.test/result"
+        self.locator.click.side_effect = lambda **_: setattr(self.page, "url", target_url)
+
+        result = self.run_steps(
+            {"action": "click", "parameters": {"selector": "#submit"}},
+            {"action": "assert_url", "parameters": {"expected": target_url}},
+            {"action": "assert_page_loaded", "parameters": {}},
         )
-        self.locator.click.assert_called_once_with()
+
+        self.assertEqual(result["status"], "passed")
+        self.locator.click.assert_called_once_with(timeout=ACTION_TIMEOUT_MS)
+        self.page.expect_navigation.assert_not_called()
         self.page.wait_for_load_state.assert_called_once_with(
-            "load", timeout=10000
+            "load", timeout=NAVIGATION_TIMEOUT_MS
         )
 
     def test_navigate_action_uses_its_url_without_automatic_plan_navigation(self) -> None:
@@ -58,7 +156,11 @@ class BrowserRunnerActionTests(unittest.TestCase):
         )
 
         self.assertEqual(result["status"], "passed")
-        self.page.goto.assert_called_once_with("https://target.example/path")
+        self.page.goto.assert_called_once_with(
+            "https://target.example/path",
+            wait_until="load",
+            timeout=NAVIGATION_TIMEOUT_MS,
+        )
 
     def test_browser_runner_calls_remain_isolated_per_invocation(self) -> None:
         second_page = MagicMock()
@@ -123,7 +225,10 @@ class BrowserRunnerActionTests(unittest.TestCase):
         self.browser.new_context.assert_called_once_with()
         self.context.new_page.assert_has_calls([unittest.mock.call(), unittest.mock.call()])
         self.page.wait_for_load_state.assert_has_calls(
-            [unittest.mock.call("load"), unittest.mock.call("load")]
+            [
+                unittest.mock.call("load", timeout=NAVIGATION_TIMEOUT_MS),
+                unittest.mock.call("load", timeout=NAVIGATION_TIMEOUT_MS),
+            ]
         )
         self.context.close.assert_called_once_with()
         self.browser.close.assert_called_once_with()
@@ -256,8 +361,7 @@ class BrowserRunnerActionTests(unittest.TestCase):
         self.assertEqual(result["status"], "passed")
         self.assertEqual(result["steps"][0]["status"], "passed")
         self.page.locator.assert_called_once_with("#name")
-        self.locator.wait_for.assert_called_once_with(state="visible", timeout=5000)
-        self.locator.fill.assert_called_once_with("Ada", timeout=5000)
+        self.locator.fill.assert_called_once_with("Ada", timeout=ACTION_TIMEOUT_MS)
 
     def test_assert_url_passes_for_exact_match(self) -> None:
         result = self.run_steps(
@@ -295,6 +399,24 @@ class BrowserRunnerActionTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertIn("https://www.dnb.no/lan/extra", result["steps"][0]["error"])
 
+    def test_title_and_url_assertions_retry_with_the_shared_timeout(self) -> None:
+        self.page.title.side_effect = ["Old title", "Expected title"]
+        result = self.run_steps({
+            "action": "assert_title", "parameters": {"expected": "Expected title"}
+        })
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(self.page.title.call_count, 2)
+        self.assertEqual(self.expect_calls[-1][0], "to_have_title")
+        self.assertEqual(self.expect_calls[-1][2]["timeout"], ASSERTION_TIMEOUT_MS)
+
+        self.page.url = MagicMock(side_effect=["https://example.com/old", "https://example.com/expected"])
+        result = self.run_steps({
+            "action": "assert_url", "parameters": {"expected": "https://example.com/expected"}
+        })
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(self.expect_calls[-1][0], "to_have_url")
+        self.assertEqual(self.expect_calls[-1][2]["timeout"], ASSERTION_TIMEOUT_MS)
+
     def test_assert_text_contains_passes_for_substring(self) -> None:
         self.locator.inner_text.return_value = "Documentation examples are allowed without needing permission today."
         result = self.run_steps({"action": "assert_text_contains", "parameters": {"expected_text": "without needing permission"}})
@@ -305,6 +427,14 @@ class BrowserRunnerActionTests(unittest.TestCase):
         result = self.run_steps({"action": "assert_text_contains", "parameters": {"expected_text": "missing phrase"}})
         self.assertEqual(result["status"], "failed")
         self.assertIn("to be contained", result["steps"][0]["error"])
+
+    def test_assert_text_contains_treats_regex_metacharacters_as_literal_text(self) -> None:
+        self.locator.inner_text.return_value = "The expression a+b is shown."
+        result = self.run_steps({
+            "action": "assert_text_contains",
+            "parameters": {"expected_text": "a+b"},
+        })
+        self.assertEqual(result["status"], "passed")
 
     def test_checked_assertion_handles_checkbox_and_radio(self) -> None:
         for selector in ("#checkbox", "#radio"):
@@ -322,13 +452,15 @@ class BrowserRunnerActionTests(unittest.TestCase):
         self.locator.locator.return_value = self.locator
         self.locator.first = self.locator
         self.locator.inner_text.return_value = "Two"
+        self.locator.all_inner_texts.return_value = ["Two"]
+        self.locator.all.return_value = []
         self.locator.get_attribute.return_value = "2"
         result = self.run_steps(
             {"action": "select_option", "parameters": {"selector": "select", "option_label": "Two"}},
             {"action": "assert_selected", "parameters": {"selector": "select", "expected": "Two"}},
         )
         self.assertEqual(result["status"], "passed")
-        self.locator.select_option.assert_called_once_with(label="Two", timeout=5000)
+        self.locator.select_option.assert_called_once_with(label="Two", timeout=ACTION_TIMEOUT_MS)
 
     def test_assert_selected_checks_radio_state(self) -> None:
         self.locator.evaluate.return_value = {"tag": "input", "type": "radio"}
@@ -440,7 +572,6 @@ class BrowserRunnerActionTests(unittest.TestCase):
         self.assertIn("is visible", result["steps"][0]["error"])
 
     def test_missing_selectors_fail_clearly_for_click_and_fill(self) -> None:
-        self.locator.count.return_value = 0
         steps = (
             {"action": "click", "parameters": {"selector": "#missing"}},
             {
@@ -451,25 +582,20 @@ class BrowserRunnerActionTests(unittest.TestCase):
 
         for step in steps:
             with self.subTest(action=step["action"]):
-                self.locator.wait_for.side_effect = RuntimeError(
-                    "selector did not become visible"
-                )
+                action_method = self.locator.click if step["action"] == "click" else self.locator.fill
+                action_method.side_effect = RuntimeError("selector did not become visible")
                 result = self.run_steps(step)
                 error = result["steps"][0]["error"]
                 self.assertEqual(result["status"], "failed")
                 self.assertIn("#missing", error)
                 if step["action"] == "click":
                     self.assertIn("Could not click", error)
-                    self.locator.click.assert_not_called()
-                    self.locator.wait_for.side_effect = None
                 else:
-                    self.assertIn("not found", error)
-                    self.locator.wait_for.side_effect = None
+                    self.assertIn("Could not fill", error)
+                action_method.side_effect = None
 
     def test_failed_new_action_stops_following_steps(self) -> None:
-        self.locator.wait_for.side_effect = RuntimeError(
-            "selector did not become visible"
-        )
+        self.locator.click.side_effect = RuntimeError("selector did not become visible")
 
         result = self.run_steps(
             {"action": "click", "parameters": {"selector": "#missing"}},
@@ -514,7 +640,7 @@ class BrowserRunnerActionTests(unittest.TestCase):
             self.assertEqual(len(result["evidence"]), 1)
 
     def test_locator_failure_captures_screenshot_when_page_is_available(self) -> None:
-        self.locator.wait_for.side_effect = RuntimeError("selector timeout")
+        self.locator.click.side_effect = RuntimeError("selector timeout")
         with tempfile.TemporaryDirectory() as directory:
             self.page.screenshot.side_effect = lambda *, path: Path(path).write_bytes(b"png")
             plan = QATestPlan(url="https://example.com", steps=[{

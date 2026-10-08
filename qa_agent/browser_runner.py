@@ -1,16 +1,18 @@
 from contextlib import contextmanager
 from pathlib import Path
+import re
 from typing import Any, Iterator
 from uuid import uuid4
 
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import expect, sync_playwright
 
+from .execution_semantics import (
+    ACTION_TIMEOUT_MS,
+    ASSERTION_TIMEOUT_MS,
+    NAVIGATION_LOAD_STATE,
+    NAVIGATION_TIMEOUT_MS,
+)
 from .models import QATestPlan, TestCase
-
-
-LOCATOR_TIMEOUT_MS = 5000
-TEXT_ASSERTION_TIMEOUT_MS = 1500
 
 
 class BrowserSession:
@@ -200,24 +202,16 @@ def _run_plan_on_page(
 
         try:
             if step.action == "navigate":
-                page.goto(step.parameters["url"])
+                page.goto(
+                    step.parameters["url"],
+                    wait_until=NAVIGATION_LOAD_STATE,
+                    timeout=NAVIGATION_TIMEOUT_MS,
+                )
             elif step.action == "click":
                 selector = step.parameters["selector"]
                 try:
                     element = page.locator(selector)
-                    element.wait_for(state="visible", timeout=LOCATOR_TIMEOUT_MS)
-                    click_completed = False
-                    try:
-                        with page.expect_navigation(
-                            wait_until="commit", timeout=10000
-                        ):
-                            element.click()
-                            click_completed = True
-                    except PlaywrightTimeoutError:
-                        if not click_completed:
-                            raise
-                    page.wait_for_load_state("load", timeout=10000)
-                    print(f"CLICK: {selector} -> URL: {page.url}")
+                    element.click(timeout=ACTION_TIMEOUT_MS)
                 except AssertionError:
                     raise
                 except Exception as error:
@@ -230,13 +224,7 @@ def _run_plan_on_page(
                 value = step.parameters["value"]
                 element = page.locator(selector)
                 try:
-                    element.wait_for(state="visible", timeout=LOCATOR_TIMEOUT_MS)
-                except Exception as error:
-                    raise AssertionError(
-                        f"Selector {selector!r} was not found or visible: {error}"
-                    ) from error
-                try:
-                    element.fill(value, timeout=LOCATOR_TIMEOUT_MS)
+                    element.fill(value, timeout=ACTION_TIMEOUT_MS)
                 except AssertionError:
                     raise
                 except Exception as error:
@@ -249,81 +237,63 @@ def _run_plan_on_page(
                 label = step.parameters["option_label"]
                 try:
                     element = page.locator(selector)
-                    element.wait_for(state="visible", timeout=LOCATOR_TIMEOUT_MS)
-                    element.select_option(label=label, timeout=LOCATOR_TIMEOUT_MS)
+                    element.select_option(label=label, timeout=ACTION_TIMEOUT_MS)
                 except Exception as error:
                     raise AssertionError(
                         f"Could not select option label {label!r} in {selector!r}: {error}"
                     ) from error
             elif step.action == "assert_page_loaded":
-                page.wait_for_load_state("load")
+                page.wait_for_load_state(
+                    NAVIGATION_LOAD_STATE,
+                    timeout=NAVIGATION_TIMEOUT_MS,
+                )
             elif step.action == "assert_title":
                 expected_title = step.parameters["expected"]
-                actual_title = page.title()
-                if actual_title != expected_title:
-                    raise AssertionError(
-                        f"Expected title {expected_title!r}, "
-                        f"but got {actual_title!r}."
-                    )
+                expect(page).to_have_title(
+                    expected_title,
+                    timeout=ASSERTION_TIMEOUT_MS,
+                )
             elif step.action == "assert_url":
                 expected_url = step.parameters["expected"]
-                actual_url = page.url
-                if actual_url != expected_url:
-                    raise AssertionError(
-                        f"Expected URL {expected_url!r}, "
-                        f"but got {actual_url!r}."
-                    )
+                expect(page).to_have_url(
+                    expected_url,
+                    timeout=ASSERTION_TIMEOUT_MS,
+                )
             elif step.action == "assert_visible":
                 selector = step.parameters["selector"]
                 expected_text = step.parameters.get("expected_text")
                 element = page.locator(selector)
-                element.wait_for(state="visible", timeout=LOCATOR_TIMEOUT_MS)
-                element = element.first
+                expect(element).to_be_visible(timeout=ASSERTION_TIMEOUT_MS)
                 if expected_text is not None:
-                    try:
-                        element.get_by_text(
-                            expected_text.replace("\\n", "\n"), exact=True
-                        ).wait_for(
-                            state="visible",
-                            timeout=TEXT_ASSERTION_TIMEOUT_MS,
-                        )
-                        actual_text = element.inner_text(timeout=1000)
-                    except Exception as error:
-                        raise AssertionError(
-                            f"Could not read visible text for selector "
-                            f"{selector!r} within 1 second: {error}"
-                        ) from error
-                    comparable_expected_text = expected_text.replace("\\n", "\n")
-                    if actual_text != comparable_expected_text:
-                        raise AssertionError(
-                            f"Expected text {expected_text!r} was not present "
-                            f"as the exact visible text for {selector!r}; "
-                            f"got {actual_text!r}."
-                        )
+                    expect(element).to_have_js_property(
+                        "innerText",
+                        expected_text.replace("\\n", "\n"),
+                        timeout=ASSERTION_TIMEOUT_MS,
+                    )
             elif step.action == "assert_text_contains":
                 expected_text = step.parameters["expected_text"].replace("\\n", "\n")
                 selector = step.parameters.get("selector")
                 target = page.locator(selector) if selector else page.locator("body")
-                target.get_by_text(expected_text, exact=False).wait_for(
-                    state="visible",
-                    timeout=TEXT_ASSERTION_TIMEOUT_MS,
+                expect(target.get_by_text(expected_text, exact=False)).to_be_visible(
+                    timeout=ASSERTION_TIMEOUT_MS,
                 )
-                actual_text = target.inner_text(timeout=1000)
-                if expected_text not in actual_text:
-                    raise AssertionError(
-                        f"Expected text {expected_text!r} to be contained in visible text"
-                        f"{f' for {selector!r}' if selector else ''}; got {actual_text!r}."
-                    )
+                expected_pattern = re.compile(
+                    ".*" + re.escape(expected_text) + ".*",
+                    re.DOTALL,
+                )
+                expect(target).to_have_text(
+                    expected_pattern,
+                    use_inner_text=True,
+                    timeout=ASSERTION_TIMEOUT_MS,
+                )
             elif step.action == "assert_checked":
                 selector = step.parameters["selector"]
                 element = page.locator(selector)
-                element.wait_for(state="visible", timeout=LOCATOR_TIMEOUT_MS)
-                if not element.is_checked():
-                    raise AssertionError(f"Expected checkbox/radio {selector!r} to be checked.")
+                expect(element).to_be_checked(timeout=ASSERTION_TIMEOUT_MS)
             elif step.action == "assert_selected":
                 selector = step.parameters["selector"]
                 element = page.locator(selector)
-                element.wait_for(state="visible", timeout=LOCATOR_TIMEOUT_MS)
+                expect(element).to_be_visible(timeout=ASSERTION_TIMEOUT_MS)
                 element_info = element.evaluate(
                     "element => ({tag: element.tagName.toLowerCase(), type: element.type})"
                 )
@@ -333,20 +303,31 @@ def _run_plan_on_page(
                         raise AssertionError(
                             f"assert_selected for radio {selector!r} does not take expected."
                         )
-                    if not element.is_checked():
-                        raise AssertionError(f"Expected radio {selector!r} to be selected.")
+                    expect(element).to_be_checked(timeout=ASSERTION_TIMEOUT_MS)
                 elif element_info["tag"] == "select":
                     if not isinstance(expected, str):
                         raise AssertionError(
                             f"assert_selected for select {selector!r} requires expected option label or value."
                         )
                     selected = element.locator("option:checked").first
-                    actual_label = selected.inner_text()
-                    actual_value = selected.get_attribute("value")
-                    if expected not in {actual_label, actual_value}:
+                    options = element.locator("option")
+                    option_labels = options.all_inner_texts()
+                    option_values = [option.get_attribute("value") for option in options.all()]
+                    if expected in option_labels:
+                        expect(selected).to_have_js_property(
+                            "innerText",
+                            expected,
+                            timeout=ASSERTION_TIMEOUT_MS,
+                        )
+                    elif expected in option_values:
+                        expect(selected).to_have_attribute(
+                            "value",
+                            expected,
+                            timeout=ASSERTION_TIMEOUT_MS,
+                        )
+                    else:
                         raise AssertionError(
-                            f"Expected selected option {expected!r} for {selector!r}, "
-                            f"got label={actual_label!r}, value={actual_value!r}."
+                            f"Expected option label or value {expected!r} is not available for {selector!r}."
                         )
                 else:
                     raise AssertionError(
@@ -355,22 +336,16 @@ def _run_plan_on_page(
             elif step.action in {"assert_enabled", "assert_disabled"}:
                 selector = step.parameters["selector"]
                 element = page.locator(selector)
-                element.wait_for(state="visible", timeout=LOCATOR_TIMEOUT_MS)
-                enabled = element.is_enabled()
-                expected_enabled = step.action == "assert_enabled"
-                if enabled != expected_enabled:
-                    state = "enabled" if enabled else "disabled"
-                    wanted = "enabled" if expected_enabled else "disabled"
-                    raise AssertionError(f"Expected {selector!r} to be {wanted}, but it is {state}.")
+                if step.action == "assert_enabled":
+                    expect(element).to_be_enabled(timeout=ASSERTION_TIMEOUT_MS)
+                else:
+                    expect(element).to_be_disabled(timeout=ASSERTION_TIMEOUT_MS)
 
             elif step.action == "assert_hidden":
                 selector = step.parameters["selector"]
                 try:
                     element = page.locator(selector)
-                    if not element.is_hidden():
-                        raise AssertionError(
-                            f"Element matching selector {selector!r} is visible."
-                        )
+                    expect(element).to_be_hidden(timeout=ASSERTION_TIMEOUT_MS)
                 except AssertionError:
                     raise
                 except Exception as error:
