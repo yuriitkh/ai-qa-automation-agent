@@ -18,7 +18,7 @@ from qa_agent.expected_result_coverage import (
 )
 from qa_agent.execution_repository import ExecutionRepository
 from qa_agent.execution_progress import get_active_execution_progress
-from qa_agent.models import QATestPlan
+from qa_agent.models import QATestPlan, TestCase
 from qa_agent.pipeline import PipelineResult
 from qa_agent.plan_execution import PlanExecutionService
 from qa_agent.pinned_execution import (
@@ -105,6 +105,10 @@ class TestCaseExecutionService:
         test_case = self._test_cases.get(test_case_id)
         if test_case is None:
             raise RunUnavailableError("TestCase not found.")
+        return self.workflow_availability_for_test_case(test_case)
+
+    def workflow_availability_for_test_case(self, test_case: TestCase) -> WorkflowAvailability:
+        """Assess a supplied case snapshot without reloading its definition."""
         versions: list[tuple[UUID, int, UUID]] = []
         steps = sorted(test_case.steps, key=lambda item: item.order)
         for step in steps:
@@ -153,6 +157,30 @@ class TestCaseExecutionService:
             plan_versions=tuple(versions),
             reason=ready_reason,
         )
+
+    def run_pinned_regression(
+        self,
+        test_case: TestCase,
+        selected_versions: PlanVersionSet,
+    ) -> PinnedWorkflowResult:
+        """Execute a supplied TestCase snapshot against only its exact saved pins."""
+        runner = self._runner_factory(self._evidence_directory)
+        plan_execution = PlanExecutionService(runner, self._execution_repository)
+        executor = PinnedExecutionService(self._plan_store, plan_execution)
+        workflow = RegressionWorkflow(
+            executor,
+            self._setup_cleanup_factory(),
+            self._run_history,
+        )
+        try:
+            return workflow.run(test_case, selected_versions, RunContext())
+        except ExpectedResultCoverageError as error:
+            raise RunUnavailableError(str(error), category="MISSING_AUTOMATION") from error
+        except PlanSelectionError as error:
+            raise RunUnavailableError(
+                "A pinned saved plan is no longer available for this Suite Run.",
+                category="MISSING_AUTOMATION",
+            ) from error
 
     def run(
         self,

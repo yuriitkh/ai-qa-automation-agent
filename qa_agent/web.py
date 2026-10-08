@@ -83,6 +83,17 @@ from qa_agent.test_suites import (
     SQLiteTestSuiteRepository,
     TestSuiteService,
 )
+from qa_agent.suite_runs import (
+    AIPolicy,
+    SuiteEligibility,
+    SuiteRun,
+    SuiteRunConfig,
+    SuiteRunItemStatus,
+    SuiteRunService,
+    SuiteRunStatus,
+    suite_run_report_json,
+)
+from qa_agent.suite_run_storage import SQLiteSuiteRunRepository
 from qa_agent.test_case_decomposer import TestCaseDecomposer
 from qa_agent.test_plan_generator import LLMTestPlanGenerator
 from qa_agent.test_case_editing import TestCaseEditError, create_manual_test_case, edit_test_case
@@ -147,6 +158,7 @@ class LocalWebApplication:
         drafts: DraftRepository | None = None,
         automation_lifecycle: AutomationLifecycleService | None = None,
         automation_lifecycle_repository: AutomationLifecycleRepository | None = None,
+        suite_run_service: SuiteRunService | None = None,
     ) -> None:
         self._run_history = run_history
         self._reports = reports or RunReportGenerator()
@@ -168,6 +180,7 @@ class LocalWebApplication:
         self._test_suites = test_suites or TestSuiteService(
             InMemoryTestSuiteRepository(), test_cases
         )
+        self._suite_run_service = suite_run_service
         self._testplan_exports = (
             TestPlanExportService(test_cases, plan_store)
             if test_cases is not None and plan_store is not None else None
@@ -192,6 +205,8 @@ class LocalWebApplication:
     def close(self) -> None:
         if self._background_runs is not None:
             self._background_runs.close()
+        if self._suite_run_service is not None:
+            self._suite_run_service.close()
         if self._background_authoring is not None:
             self._background_authoring.close()
 
@@ -242,6 +257,15 @@ class LocalWebApplication:
             )
         if len(parts) == 3 and parts[:2] == ["test-cases", "authoring-progress"]:
             return self._authoring_progress_page(parts[2])
+        if len(parts) == 3 and parts[:2] == ["api", "suite-runs"]:
+            return self._suite_run_progress_json(parts[2])
+        if len(parts) == 3 and parts[0] == "suite-runs" and parts[2] == "report.json":
+            run = self._suite_run_service.get(parts[1]) if self._suite_run_service else None
+            if run is None:
+                return self._not_found("Suite Run report not found.")
+            return WebResponse.json(200, suite_run_report_json(run))
+        if len(parts) == 2 and parts[0] == "suite-runs":
+            return self._suite_run_page(parts[1])
         if path == "/":
             return WebResponse.html(200, self._dashboard())
         if path == "/settings/providers" and self._provider_settings is not None:
@@ -336,6 +360,11 @@ class LocalWebApplication:
             if suite_id is None:
                 return self._not_found("Test Suite not found")
             return self._test_suite_export(suite_id, query)
+        if len(parts) == 3 and parts[0] == "test-suites" and parts[2] == "run":
+            suite_id = _parse_uuid(parts[1])
+            if suite_id is None:
+                return self._not_found("Test Suite not found.")
+            return self._suite_run_config_page(suite_id)
         if len(parts) == 2 and parts[0] == "test-suites":
             suite_id = _parse_uuid(parts[1])
             if suite_id is None:
@@ -390,6 +419,8 @@ class LocalWebApplication:
             return self._handle_test_suite_update(parts[1], body)
         if len(parts) == 4 and parts[0] == "test-suites" and parts[2] == "members":
             return self._handle_test_suite_members(parts[1], parts[3], body)
+        if len(parts) == 3 and parts[0] == "test-suites" and parts[2] == "run":
+            return self._handle_suite_run_start(parts[1], body)
         if parts == ["test-cases", "generate"]:
             return self._handle_generate_test_case(body)
         if (
@@ -2578,6 +2609,10 @@ class LocalWebApplication:
             '<p class="muted">Review member readiness and choose a format in the Export workspace.</p></div>'
             f'<a class="button primary" href="/export?mode=suites&amp;suite={suite_id}">Export suite &rarr;</a>'
             '</div></section>'
+            '<section class="panel"><div class="section-heading"><div><h2>Execute suite</h2>'
+            '<p class="muted">Run saved automation in member order, with pinned versions and optional retries.</p></div>'
+            f'<a class="button primary" href="/test-suites/{suite_id}/run">Configure Suite Run</a>'
+            '</div></section>'
             '<section class="panel"><h2>Edit suite</h2>'
             f'<form method="post" action="/test-suites/{suite_id}/update" class="suite-form" data-inline-validation novalidate>'
             f'<div class="field"><label for="suite-name">Name</label><input id="suite-name" name="name" maxlength="120" required value="{escape_html(suite.name)}"></div>'
@@ -2590,6 +2625,141 @@ class LocalWebApplication:
         return WebResponse.html(200, self._page(
             suite.name, content, current="Test Suites",
             breadcrumbs=[("Dashboard", "/"), ("Test Suites", "/test-suites")],
+        ))
+
+    def _suite_run_config_page(self, suite_id: UUID, error: str | None = None, status: int = 200) -> WebResponse:
+        if self._suite_run_service is None:
+            return self._not_found("Suite execution is unavailable.")
+        preview = self._suite_run_service.preview(suite_id)
+        if preview.suite is None:
+            return self._not_found("Test Suite not found.")
+        rows = []
+        for item in preview.eligibility:
+            pin_summary = ", ".join(
+                f"{escape_html(pin.test_step_id)} v{pin.version_number}"
+                for pin in item.pinned_plans
+            ) or "No saved plan versions"
+            reasons = "".join(f"<li>{escape_html(reason)}</li>" for reason in item.reasons)
+            state = "Ready" if item.eligible else "Blocked"
+            rows.append(
+                f'<tr><td>{item.order_index + 1}</td>'
+                f'<td><span class="id-code">{escape_html(item.test_case_public_id or str(item.test_case_id))}</span> '
+                f'{escape_html(item.test_case_name)}</td>'
+                f'<td>{badge(state, "success" if item.eligible else "error")}'
+                + (f'<ul class="suite-run-blockers">{reasons}</ul>' if reasons else "")
+                + f'</td><td><small>{pin_summary}</small></td></tr>'
+            )
+        eligibility = (
+            '<div class="table-wrap"><table><thead><tr><th>Order</th><th>TestCase</th>'
+            '<th>Eligibility</th><th>Pinned plan versions at start</th></tr></thead><tbody>'
+            + "".join(rows) + '</tbody></table></div>'
+            if rows else self._empty_state("No suite members.", "Add TestCases before starting a Suite Run.")
+        )
+        issue = error or preview.suite_error
+        if issue is None and not preview.can_start:
+            issue = "Resolve every blocked member before starting. Suite Runs never omit ineligible TestCases."
+        error_html = f'<div class="error-state" role="alert">{escape_html(issue)}</div>' if issue else ""
+        can_start = preview.can_start
+        form = (
+            '<form method="post" class="suite-run-config" data-inline-validation novalidate '
+            f'action="/test-suites/{suite_id}/run">'
+            '<div class="field"><label for="suite-workflow">Workflow</label>'
+            '<select id="suite-workflow" name="workflow"><option value="REGRESSION" selected>Regression — saved automation</option></select></div>'
+            '<div class="field"><label for="suite-execution-type">Execution type</label>'
+            '<select id="suite-execution-type" name="execution_type"><option value="SEQUENTIAL" selected>Sequential</option></select></div>'
+            '<div class="field"><label for="suite-ai-policy">AI policy</label><select id="suite-ai-policy" name="ai_policy">'
+            '<option value="DISABLED" selected>Disabled</option><option value="ALLOWED">Allowed</option></select>'
+            '<small>This Regression workflow uses saved plans and makes no LLM calls under either policy.</small></div>'
+            '<div class="field"><label for="suite-retries">Retry count</label><select id="suite-retries" name="retry_count">'
+            '<option value="0" selected>0 retries</option><option value="1">1 retry</option><option value="2">2 retries</option></select>'
+            '<small>Each retry is a fresh TestCase Run against the same pinned plan versions.</small></div>'
+            + f'<button class="button primary" type="submit"{("" if can_start else " disabled aria-disabled=\"true\"")}>Start Suite Run</button>'
+            + '</form>'
+        )
+        content = (
+            '<header class="page-heading"><p class="eyebrow">Suite Run setup</p>'
+            f'<h1>{escape_html(preview.suite.name)}</h1>'
+            '<p class="lead">Review every ordered member and the exact saved plan versions that will be pinned.</p></header>'
+            + error_html
+            + '<section class="panel"><h2>Eligibility</h2>' + eligibility + '</section>'
+            + '<section class="panel"><h2>Run configuration</h2>' + form + '</section>'
+        )
+        return WebResponse.html(status, self._page(
+            "Configure Suite Run", content, current="Test Suites",
+            breadcrumbs=[("Dashboard", "/"), ("Test Suites", "/test-suites"), (preview.suite.name, f"/test-suites/{suite_id}")],
+        ))
+
+    def _handle_suite_run_start(self, raw_suite_id: str, body: bytes | str | None) -> WebResponse:
+        suite_id = _parse_uuid(raw_suite_id)
+        if suite_id is None:
+            return self._not_found("Test Suite not found.")
+        if self._suite_run_service is None:
+            return self._not_found("Suite execution is unavailable.")
+        form, form_error = _parse_form_body(body)
+        if form_error:
+            return self._suite_run_config_page(suite_id, error=form_error, status=400)
+        if form.get("workflow", [""])[0] != WorkflowType.REGRESSION.value:
+            return self._suite_run_config_page(suite_id, error="Choose the saved-plan Regression workflow.", status=400)
+        if form.get("execution_type", [""])[0] != "SEQUENTIAL":
+            return self._suite_run_config_page(suite_id, error="Choose sequential execution.", status=400)
+        try:
+            ai_policy = AIPolicy(form.get("ai_policy", [AIPolicy.DISABLED.value])[0])
+            retry_count = int(form.get("retry_count", ["0"])[0])
+            config = SuiteRunConfig(ai_policy=ai_policy, retry_count=retry_count)
+        except (ValueError, TypeError):
+            return self._suite_run_config_page(suite_id, error="Choose a valid AI policy and retry count from 0 to 2.", status=400)
+        result = self._suite_run_service.start(
+            suite_id, ai_policy=config.ai_policy, retry_count=config.retry_count
+        )
+        if result.run is None:
+            message = result.suite_error or "Resolve every blocked member before starting this Suite Run."
+            return self._suite_run_config_page(suite_id, error=message, status=409)
+        return WebResponse.redirect(f"/suite-runs/{result.run.public_id}")
+
+    def _suite_run_progress_json(self, public_id: str) -> WebResponse:
+        run = self._suite_run_service.get(public_id) if self._suite_run_service else None
+        if run is None:
+            return WebResponse.json(404, json.dumps({"error": "Suite Run is not available."}))
+        return WebResponse.json(200, json.dumps(_suite_run_public_dict(run), ensure_ascii=False, sort_keys=True))
+
+    def _suite_run_page(self, public_id: str) -> WebResponse:
+        run = self._suite_run_service.get(public_id) if self._suite_run_service else None
+        if run is None:
+            return self._not_found("Suite Run not found.")
+        item_rows = []
+        for item in run.items:
+            attempts = "".join(
+                f'<li>Attempt {attempt.attempt_number}: '
+                + (f'<a href="/runs/{attempt.run_id}">{escape_html(attempt.run_public_id or "Open TestCase Run")}</a> '
+                   if attempt.run_id else "No Run History record ")
+                + f'— {escape_html(attempt.outcome)} ({escape_html(attempt.run_status)})</li>'
+                for attempt in item.attempts
+            )
+            item_rows.append(
+                f'<li class="suite-run-item" data-suite-item="{item.order_index}">'
+                f'<div><strong>{item.order_index + 1}. {escape_html(item.test_case_public_id or "")} '
+                f'{escape_html(item.test_case_name)}</strong> {badge(item.status.value)}</div>'
+                + (f'<ul>{attempts}</ul>' if attempts else '<p class="muted">Waiting to start</p>')
+                + '</li>'
+            )
+        report_url = f"/suite-runs/{escape_html(run.public_id or public_id)}/report.json"
+        live = run.status in {SuiteRunStatus.QUEUED, SuiteRunStatus.RUNNING}
+        content = (
+            '<header class="page-heading"><p class="eyebrow">Suite Run</p>'
+            f'<h1>{escape_html(run.public_id or public_id)} — {escape_html(run.suite_name)}</h1>'
+            f'<p class="lead">{badge(run.status.value)} Workflow: Regression · Execution: Sequential · '
+            f'AI policy: {escape_html(run.config.ai_policy.value)} · Retries: {run.config.retry_count}</p></header>'
+            f'<section class="panel" data-suite-run-progress="/api/suite-runs/{escape_html(run.public_id or public_id)}">'
+            '<h2>Progress</h2>'
+            f'<p data-suite-run-summary>{run.passed_count} passed · {run.failed_count} failed · {run.flaky_count} flaky · {len(run.items)} total</p>'
+            + ('<p data-suite-run-live>Refreshing saved progress…</p>' if live else '<p data-suite-run-live>Run finished.</p>')
+            + '<ol data-suite-run-items>' + "".join(item_rows) + '</ol></section>'
+            + f'<p><a class="button" href="{report_url}" download>Download JSON report</a> '
+            + f'<a class="button" href="/test-suites/{run.suite_id}">Back to Test Suite</a></p>'
+        )
+        return WebResponse.html(200, self._page(
+            run.public_id or "Suite Run", content, current="Test Suites",
+            breadcrumbs=[("Dashboard", "/"), ("Test Suites", "/test-suites"), (run.suite_name, f"/test-suites/{run.suite_id}")],
         ))
 
     def _handle_test_suite_create(self, body: bytes | str | None) -> WebResponse:
@@ -3631,6 +3801,17 @@ def create_application(
         automation_workflow=automation_workflow,
         automation_lifecycle=automation_lifecycle,
     )
+    test_suites = TestSuiteService(
+        SQLiteTestSuiteRepository(storage.database_path),
+        storage.test_case_repository,
+    )
+    suite_run_service = SuiteRunService(
+        test_suites,
+        storage.test_case_repository,
+        run_service,
+        storage.run_history,
+        SQLiteSuiteRunRepository(storage.database_path),
+    )
     return LocalWebApplication(
         storage.run_history,
         evidence_root=evidence_root,
@@ -3644,10 +3825,8 @@ def create_application(
         drafts=storage.draft_repository,
         automation_lifecycle=automation_lifecycle,
         automation_lifecycle_repository=storage.automation_lifecycle_repository,
-        test_suites=TestSuiteService(
-            SQLiteTestSuiteRepository(storage.database_path),
-            storage.test_case_repository,
-        ),
+        test_suites=test_suites,
+        suite_run_service=suite_run_service,
     )
 
 
@@ -3764,6 +3943,45 @@ def _parse_uuid(value: str) -> UUID | None:
         return UUID(value)
     except (ValueError, AttributeError):
         return None
+
+
+def _suite_run_public_dict(run: SuiteRun) -> dict:
+    return {
+        "public_id": run.public_id,
+        "status": run.status.value,
+        "workflow_type": run.config.workflow_type.value,
+        "execution_type": run.config.execution_type,
+        "ai_policy": run.config.ai_policy.value,
+        "retry_count": run.config.retry_count,
+        "counts": {
+            "passed": run.passed_count,
+            "failed": run.failed_count,
+            "flaky": run.flaky_count,
+            "total": len(run.items),
+        },
+        "items": [
+            {
+                "order_index": item.order_index,
+                "test_case_id": str(item.test_case_id),
+                "test_case_public_id": item.test_case_public_id,
+                "test_case_name": item.test_case_name,
+                "status": item.status.value,
+                "error_category": item.error_category,
+                "attempts": [
+                    {
+                        "attempt_number": attempt.attempt_number,
+                        "run_id": str(attempt.run_id) if attempt.run_id else None,
+                        "run_public_id": attempt.run_public_id,
+                        "run_status": attempt.run_status,
+                        "outcome": attempt.outcome,
+                        "error_category": attempt.error_category,
+                    }
+                    for attempt in item.attempts
+                ],
+            }
+            for item in run.items
+        ],
+    }
 
 
 def _url_contains_credentials(value: str) -> bool:
@@ -4955,6 +5173,59 @@ _UI_JAVASCRIPT = r"""
     if (!stopped) window.setTimeout(poll, 750);
   }
   poll();
+})();
+
+(() => {
+  const root = document.querySelector('[data-suite-run-progress]');
+  if (!root) return;
+  const endpoint = root.dataset.suiteRunProgress;
+  const summary = root.querySelector('[data-suite-run-summary]');
+  const live = root.querySelector('[data-suite-run-live]');
+  const list = root.querySelector('[data-suite-run-items]');
+  const terminal = new Set(['COMPLETED', 'COMPLETED_WITH_FAILURES', 'INTERRUPTED', 'FAILED']);
+  const render = (run) => {
+    summary.textContent = `${run.counts.passed} passed · ${run.counts.failed} failed · ${run.counts.flaky} flaky · ${run.counts.total} total`;
+    live.textContent = terminal.has(run.status) ? `Run finished: ${run.status}.` : `Run ${run.status.toLowerCase()}…`;
+    list.replaceChildren();
+    run.items.forEach((item) => {
+      const row = document.createElement('li'); row.className = 'suite-run-item';
+      const heading = document.createElement('strong');
+      heading.textContent = `${item.order_index + 1}. ${item.test_case_public_id || ''} ${item.test_case_name} — ${item.status}`;
+      row.append(heading);
+      if (item.attempts.length) {
+        const attempts = document.createElement('ul');
+        item.attempts.forEach((attempt) => {
+          const line = document.createElement('li');
+          line.append(document.createTextNode(`Attempt ${attempt.attempt_number}: `));
+          if (attempt.run_id) {
+            const link = document.createElement('a'); link.href = `/runs/${encodeURIComponent(attempt.run_id)}`;
+            link.textContent = attempt.run_public_id || 'Open TestCase Run'; line.append(link);
+            line.append(document.createTextNode(` — ${attempt.outcome} (${attempt.run_status})`));
+          } else {
+            line.append(document.createTextNode(`${attempt.outcome} (${attempt.error_category || 'no Run History record'})`));
+          }
+          attempts.append(line);
+        });
+        row.append(attempts);
+      } else {
+        const waiting = document.createElement('p'); waiting.className = 'muted';
+        waiting.textContent = item.status === 'RUNNING' ? 'Running…' : 'Waiting to start'; row.append(waiting);
+      }
+      list.append(row);
+    });
+  };
+  const pollSuite = async () => {
+    try {
+      const response = await fetch(endpoint, {headers: {'Accept': 'application/json'}, cache: 'no-store'});
+      if (!response.ok) throw new Error('Progress unavailable');
+      const run = await response.json(); render(run);
+      if (terminal.has(run.status)) return;
+    } catch (_error) {
+      live.textContent = 'Live updates are temporarily unavailable. Retrying…';
+    }
+    window.setTimeout(pollSuite, 1000);
+  };
+  pollSuite();
 })();
 """
 

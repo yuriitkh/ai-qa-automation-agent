@@ -315,6 +315,10 @@ class TestSuiteService:
         available_ids = {case.id for case in self._test_cases.list()}
         return [case_id for case_id in self._repository.members(suite_id) if case_id in available_ids]
 
+    def all_member_ids(self, suite_id: UUID) -> list[UUID]:
+        """Return persisted membership in order, including stale references."""
+        return self._repository.members(suite_id)
+
     def members(self, suite_id: UUID) -> list[TestCase]:
         if self._test_cases is None:
             return []
