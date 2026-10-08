@@ -254,7 +254,8 @@ class TestCaseAuthoringWebTests(unittest.TestCase):
                 urlencode({"name": " ", "base_url": "not-a-url", "scenario": "Check."}),
             )
         self.assertEqual(invalid.status, 400)
-        self.assertIn(b"Enter a TestCase name", invalid.body)
+        self.assertNotIn(b"Enter a TestCase name", invalid.body)
+        self.assertIn(b"Summary (optional)", invalid.body)
         self.assertEqual(self.provider.prompts, [])
         self.assertEqual(self.app._draft_store._drafts, {})
         self.assertEqual(
@@ -638,7 +639,7 @@ class TestCaseAuthoringWebTests(unittest.TestCase):
         self.assertEqual(self.app.handle("GET", f"/test-cases/review/{new_token}").status, 200)
         self.assertEqual(self.cases.list(), [])
 
-    def test_generate_again_uses_original_authoring_input_not_manual_edits(self):
+    def test_generate_again_preserves_edited_summary_and_uses_original_scenario(self):
         with redirect_stdout(io.StringIO()):
             generated = self.post_generate(name="Original name", scenario="Original scenario.")
         old_token = generated.headers["Location"].rsplit("/", 1)[1]
@@ -652,9 +653,10 @@ class TestCaseAuthoringWebTests(unittest.TestCase):
         self.assertTrue(completed["success"])
         self.assertEqual(len(self.provider.prompts), 2)
         second_prompt = self.provider.prompts[1][0]
-        self.assertIn('"name": "Original name"', second_prompt)
+        self.assertIn('"name": "Unsaved manual edit"', second_prompt)
         self.assertIn('"scenario": "Original scenario."', second_prompt)
-        self.assertNotIn("Unsaved manual edit", second_prompt)
+        new_token = completed["review_url"].rsplit("/", 1)[1]
+        self.assertEqual(self.app._draft_store.get(new_token).test_case.name, "Unsaved manual edit")
         self.assertNotIn("Unsaved scenario edit", second_prompt)
 
     def test_default_application_renders_authoring_without_configured_provider(self):

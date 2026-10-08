@@ -106,7 +106,9 @@ class ProductAuthoringControlsTests(unittest.TestCase):
         listed = self.app.handle("GET", "/drafts")
         self.assertIn(b"Password reset edge cases", listed.body)
         self.assertIn(f'href="/drafts/{draft_id}"'.encode(), listed.body)
-        self.assertIn(b"Recent Drafts", self.app.handle("GET", "/").body)
+        dashboard = self.app.handle("GET", "/").body
+        self.assertNotIn(b"Recent Drafts", dashboard)
+        self.assertIn(f'data-draft-id="{draft_id}"'.encode(), dashboard)
         self.assertIn(b"Password reset edge cases", self.app.handle("GET", "/test-cases/new").body)
 
         response = self.post(f"/drafts/{draft_id}/update", {
@@ -313,7 +315,7 @@ class ProductAuthoringControlsTests(unittest.TestCase):
         })
         self.assertEqual(response.status, 503)
         page = response.body.decode()
-        self.assertIn("Create manually with these details", page)
+        self.assertIn("Create Manually", page)
         prepared = self.app.handle("POST", "/test-cases/manual/prepare", urlencode({
             "name": "Local-only sign-in",
             "base_url": "http://127.0.0.1/sign-in",

@@ -68,6 +68,8 @@ from qa_agent.test_case_authoring import (
     TestCaseDraftStore,
     editable_test_case_values,
     merge_test_case_edits,
+    scenario_input_error,
+    _derive_test_case_name,
 )
 from qa_agent.test_case_repository import TestCaseRepository
 from qa_agent.storage import create_sqlite_storage
@@ -327,7 +329,16 @@ class LocalWebApplication:
         if len(parts) == 2 and parts[0] == "suite-runs":
             return self._suite_run_page(parts[1])
         if path == "/":
-            return WebResponse.html(200, self._dashboard())
+            draft_id = _parse_uuid(query.get("draft_id", [""])[0])
+            selected = self._drafts.get(draft_id) if draft_id else None
+            if selected is not None and selected.status != DraftStatus.ACTIVE:
+                selected = None
+            return WebResponse.html(200, self._dashboard(
+                name=selected.title if selected else "",
+                source_draft_id=str(selected.id) if selected else "",
+                base_url=selected.base_url or "" if selected else "",
+                scenario=selected.body if selected else "",
+            ))
         if path == "/settings/providers" and self._provider_settings is not None:
             return WebResponse.html(200, self._provider_settings_page(query))
         if path == "/settings/usage" and self._llm_usage is not None:
@@ -348,6 +359,7 @@ class LocalWebApplication:
             if selected is not None and selected.status != DraftStatus.ACTIVE:
                 selected = None
             return WebResponse.html(200, self._new_test_case_page(
+                name=selected.title if selected else "",
                 source_draft_id=str(selected.id) if selected else "",
                 base_url=selected.base_url or "" if selected else "",
                 scenario=selected.body if selected else "",
@@ -466,9 +478,11 @@ class LocalWebApplication:
             values = {key: items[0] for key, items in form.items()}
             if error:
                 return WebResponse.html(400, self._manual_test_case_page(error=error))
+            scenario = values.get("scenario", values.get("description", ""))
             return WebResponse.html(200, self._manual_test_case_page(
-                name=values.get("name", ""), base_url=values.get("base_url", ""),
-                scenario=values.get("description", ""),
+                name=values.get("name", "").strip() or _derive_test_case_name(scenario),
+                base_url=values.get("base_url", ""),
+                scenario=scenario,
                 source_draft_id=values.get("source_draft_id", ""),
             ))
         if len(parts) == 3 and parts[0] == "test-cases" and parts[2] == "edit":
@@ -635,12 +649,18 @@ class LocalWebApplication:
     ) -> WebResponse:
         form, error = _parse_form_body(body, max_bytes=_MAX_DRAFT_SAVE_BODY_BYTES)
         values = {key: items[0] for key, items in form.items()}
+        dashboard_entry = values.get("authoring_entry") == "dashboard"
+
+        def error_response(message: str, status: int = 400) -> WebResponse:
+            details = {key: values.get(key, "") for key in ("name", "base_url", "scenario", "source_draft_id")}
+            page = (
+                self._dashboard(authoring_error=message, **details) if dashboard_entry
+                else self._new_test_case_page(message, **details)
+            )
+            return WebResponse.html(status, page)
+
         if error:
-            return WebResponse.html(400, self._new_test_case_page(error, **{
-                "base_url": values.get("base_url", ""),
-                "scenario": values.get("scenario", ""),
-                "source_draft_id": values.get("source_draft_id", ""),
-            }))
+            return error_response(error)
         scenario = values.get("scenario", "").strip()
         base_url = values.get("base_url", "").strip()
         source_text = values.get("source_draft_id", "").strip()
@@ -649,19 +669,13 @@ class LocalWebApplication:
             source_id = _parse_uuid(source_text)
             source = self._drafts.get(source_id) if source_id is not None else None
             if source is None or source.status != DraftStatus.ACTIVE:
-                return WebResponse.html(409, self._new_test_case_page(
-                    "The selected Draft is no longer active. Choose another Draft.",
-                    base_url=base_url, scenario=scenario,
-                ))
-        if not scenario or len(scenario) > 6000 or len(base_url) > 2048:
-            return WebResponse.html(400, self._new_test_case_page(
-                "Enter a scenario of 1–6,000 characters and a Website of 2,048 characters or fewer.",
-                base_url=base_url, scenario=scenario,
-                source_draft_id=source_text if source is not None else "",
-            ))
-        title = source.title if source is not None else next(
+                return error_response("The selected Draft is no longer active. Choose another Draft.", 409)
+        name = values.get("name", "").strip()
+        if len(name) > 200 or len(scenario) > 6000 or len(base_url) > 2048:
+            return error_response("Keep Summary under 200 characters, Scenario under 6,000, and Website under 2,048.")
+        title = name or (source.title if source is not None else next(
             (line.strip() for line in scenario.splitlines() if line.strip()), ""
-        )[:200]
+        )[:200]) or "Untitled Draft"
         draft_values = {
             "id": source.id if source is not None else uuid4(),
             "title": title,
@@ -981,21 +995,6 @@ class LocalWebApplication:
             if rows else ""
         )
 
-    def _recent_drafts_panel(self) -> str:
-        drafts = [item for item in self._drafts.list(500) if item.status == DraftStatus.ACTIVE][:5]
-        if not drafts:
-            summary = '<p class="muted">Save an unfinished idea and return to it later.</p>'
-        else:
-            summary = '<ul class="compact-list">' + "".join(
-                f'<li><a href="/drafts/{item.id}">{escape_html(item.title)}</a></li>'
-                for item in drafts
-            ) + '</ul>'
-        return (
-            '<section class="panel"><div class="section-heading"><h2>Recent Drafts</h2>'
-            '<a class="button" href="/drafts">View all drafts</a></div>'
-            + summary + '<a class="button" href="/drafts/new">Save draft</a></section>'
-        )
-
     def _drafts_page(self) -> str:
         drafts = self._drafts.list(500)
         rows = "".join(
@@ -1058,7 +1057,7 @@ class LocalWebApplication:
             + '<div class="field"><label for="draft-title">Title</label>'
             + f'<input id="draft-title" name="title" maxlength="200" required value="{escape_html(title)}"></div>'
             + '<div class="field"><label for="draft-body">Testing idea / scenario</label>'
-            + f'<textarea id="draft-body" name="body" maxlength="6000" rows="8" required>{escape_html(body)}</textarea></div>'
+            + f'<textarea id="draft-body" name="body" maxlength="6000" rows="8">{escape_html(body)}</textarea></div>'
             + '<div class="field"><label for="draft-url">Base URL (optional)</label>'
             + f'<input id="draft-url" name="base_url" maxlength="2048" value="{escape_html(base_url)}"></div>'
             + '<div class="field"><label for="draft-notes">Notes (optional)</label>'
@@ -1144,8 +1143,8 @@ class LocalWebApplication:
                 title = next((line.strip() for line in scenario.splitlines() if line.strip()), "")[:200]
             if not title or len(title) > 200:
                 raise ValueError("Enter a Draft title of 1–200 characters.")
-            if not scenario or len(scenario) > 6000:
-                raise ValueError("Enter a testing idea of 1–6,000 characters.")
+            if len(scenario) > 6000:
+                raise ValueError("Keep the testing idea under 6,000 characters.")
             base_url = values.get("base_url", "").strip()
             notes = values.get("notes", "").strip()
             if len(base_url) > 2048 or len(notes) > 6000:
@@ -1626,13 +1625,15 @@ class LocalWebApplication:
         source_draft = self._drafts.get(source_draft_id) if source_draft_id else None
 
         dashboard_entry = form.get("authoring_entry", [""])[0] == "dashboard"
-        require_name = not dashboard_entry and form.get("authoring_entry", [""])[0] != "new"
+        require_name = False
         field_errors: dict[str, str] = {}
 
         def error_response(status: int, message: str) -> WebResponse:
             if dashboard_entry:
                 return WebResponse.html(status, self._dashboard(
                     authoring_error=message,
+                    name=values["name"],
+                    source_draft_id=source_draft_text,
                     base_url=values["base_url"],
                     scenario=values["scenario"],
                     field_errors=field_errors,
@@ -1764,7 +1765,7 @@ class LocalWebApplication:
         form, form_error = _parse_form_body(
             body,
             max_bytes=(
-                _MAX_DRAFT_SAVE_BODY_BYTES if action == "save" else _MAX_FORM_BODY_BYTES
+                _MAX_DRAFT_SAVE_BODY_BYTES if action in {"save", "regenerate"} else _MAX_FORM_BODY_BYTES
             ),
         )
         if form_error is not None:
@@ -1776,25 +1777,32 @@ class LocalWebApplication:
         if draft is None:
             return self._not_found("Draft not found or expired")
         if action == "regenerate":
+            summary = form.get("name", [draft.authoring_name or draft.test_case.name])[0]
+            submitted_values = {key: items[0] for key, items in form.items()}
             if self._authoring_service is None:
                 return WebResponse.html(503, self._draft_review_html(
-                    draft, token, "AI generation is unavailable. Configure an LLM provider and try again."
+                    draft, token, "AI generation is unavailable. Configure an LLM provider and try again.",
+                    values=submitted_values,
                 ))
             try:
                 validated = self._authoring_service.validate_input(
-                    draft.authoring_name or draft.test_case.name,
+                    summary,
                     draft.authoring_scenario or draft.test_case.description,
                     draft.authoring_base_url or draft.test_case.base_url or "",
                 )
             except TestCaseAuthoringError as error:
-                return WebResponse.html(400, self._draft_review_html(draft, token, str(error)))
+                return WebResponse.html(400, self._draft_review_html(
+                    draft, token, str(error), values=submitted_values,
+                ))
             except Exception:
                 return WebResponse.html(503, self._draft_review_html(
-                    draft, token, "Authoring could not be started. Try again later."
+                    draft, token, "Authoring could not be started. Try again later.",
+                    values=submitted_values,
                 ))
             if self._background_authoring is None:
                 return WebResponse.html(503, self._draft_review_html(
-                    draft, token, "AI generation is unavailable. Try again later."
+                    draft, token, "AI generation is unavailable. Try again later.",
+                    values=submitted_values,
                 ))
             progress_id = self._background_authoring.start(
                 name=validated.name,
@@ -1938,7 +1946,7 @@ class LocalWebApplication:
             + edited_badge + '</p></header>'
             + error_html
             + form_error_html
-            + f'<form method="post" class="testcase-editor" action="/test-cases/review/{escape_html(token)}/save" data-testcase-editor>'
+            + f'<form id="testcase-review-form" method="post" class="testcase-editor" action="/test-cases/review/{escape_html(token)}/save" data-testcase-editor>'
             + '<section class="panel"><h2>Definition</h2>'
             + editable_field("name", "TestCase name", textarea=False, maximum=200)
             + f'<p><strong>Base URL:</strong> {escape_html(test_case.base_url or "")}</p>'
@@ -1951,8 +1959,9 @@ class LocalWebApplication:
             + '</section><div class="actions">'
             + '<button class="button primary" type="submit">Save TestCase for review</button></div></form>'
             + '<div class="actions">'
-            + f'<form method="post" action="/test-cases/review/{escape_html(token)}/regenerate" data-authoring-form>'
-            + '<button class="button" type="submit">Generate Again</button></form>'
+            + f'<button class="button" type="submit" form="testcase-review-form" '
+            f'formaction="/test-cases/review/{escape_html(token)}/regenerate" formnovalidate data-regenerate-testcase>Generate Again</button>'
+            + '<span class="muted">Keeps your current Summary and uses the original Scenario.</span>'
             + f'<form method="post" action="/test-cases/review/{escape_html(token)}/cancel">'
             + '<button class="button" type="submit">Cancel</button></form></div>'
         )
@@ -1973,6 +1982,8 @@ class LocalWebApplication:
         self,
         *,
         authoring_error: str | None = None,
+        name: str = "",
+        source_draft_id: str = "",
         base_url: str = "",
         scenario: str = "",
         field_errors: dict[str, str] | None = None,
@@ -1996,48 +2007,13 @@ class LocalWebApplication:
             for label, count in counts.items()
         )
         recent = records[:12]
-        entry_error = (
-            f'<p class="authoring-error" id="authoring-entry-error" role="alert">'
-            f'{escape_html(authoring_error)}</p>'
-            if authoring_error else ""
-        )
-        error_description = ' aria-describedby="authoring-entry-error"' if authoring_error else ""
-        website_error = field_errors.get("base_url")
-        scenario_error = field_errors.get("scenario")
-        website_invalid = _inline_invalid_attrs("dashboard-website-error", website_error)
-        scenario_invalid = _inline_invalid_attrs("dashboard-scenario-error", scenario_error)
-        authoring_entry = (
-            '<section class="panel authoring-entry" aria-labelledby="authoring-entry-title">'
-            '<h2 id="authoring-entry-title">What do you want to test?</h2>'
-            '<p class="muted">Describe a web scenario in natural language. AI turns it into a reusable automated test.</p>'
-            '<form method="post" action="/test-cases/generate" data-authoring-form data-inline-validation novalidate>'
-            '<input type="hidden" name="authoring_entry" value="dashboard">'
-            + entry_error
-            + '<div class="field"><label for="dashboard-base-url">Website</label>'
-            + f'<input id="dashboard-base-url" name="base_url" type="url" maxlength="2048" required value="{escape_html(base_url)}" placeholder="https://example.com"{error_description}{website_invalid}></div>'
-            + _inline_error_html("dashboard-website-error", "dashboard-base-url", website_error)
-            + '<div class="field"><label for="dashboard-scenario">Scenario</label>'
-            + f'<textarea id="dashboard-scenario" name="scenario" rows="8" maxlength="6000" required placeholder="Describe the behavior you want to verify…"{error_description}{scenario_invalid}>{escape_html(scenario)}</textarea></div>'
-            + _inline_error_html("dashboard-scenario-error", "dashboard-scenario", scenario_error)
-            + self._authoring_voice_controls("dashboard-scenario")
-            + '<button class="button primary authoring-submit" type="submit">Generate Test with AI</button>'
-            + '</form>'
-            + '<form method="post" action="/test-cases/manual/prepare">'
-            + f'<input type="hidden" name="base_url" value="{escape_html(base_url)}">'
-            + f'<input type="hidden" name="description" value="{escape_html(scenario)}">'
-            + '<button class="button" type="submit">Create manually</button></form>'
-            + '<form method="post" action="/drafts">'
-            + f'<input type="hidden" name="body" value="{escape_html(scenario)}">'
-            + f'<input type="hidden" name="base_url" value="{escape_html(base_url)}">'
-            + '<button class="button" type="submit">Save as Draft</button></form>'
-            + '<ol class="product-flow" aria-label="Test lifecycle">'
-            + '<li>Describe</li><li>Generate</li><li>Run</li><li>Reuse</li></ol>'
-            + '</section>'
+        authoring_entry = self._test_case_creation_form(
+            entry="dashboard", error=authoring_error, name=name, base_url=base_url,
+            scenario=scenario, source_draft_id=source_draft_id, field_errors=field_errors,
         )
         content = (
             '<header class="page-heading"><h1>AI QA Agent</h1></header>'
             + authoring_entry
-            + self._recent_drafts_panel()
             + f'<section aria-label="Run summary"><div class="summary-grid">{cards}</div>'
             '<p class="muted">Summary of the latest recorded history.</p></section>'
             '<section class="panel"><div class="section-heading"><h2>Recent runs</h2>'
@@ -2065,63 +2041,65 @@ class LocalWebApplication:
             '<p class="voice-privacy muted">Your browser handles speech recognition; this app receives recognized text only and never receives audio.</p>'
         )
 
-    def _new_test_case_page(
-        self,
-        error: str | None = None,
-        *,
-        name: str = "",
-        base_url: str = "",
-        scenario: str = "",
-        source_draft_id: str = "",
+    def _test_case_creation_form(
+        self, *, entry: str = "new", error: str | None = None, name: str = "",
+        base_url: str = "", scenario: str = "", source_draft_id: str = "",
         field_errors: dict[str, str] | None = None,
     ) -> str:
+        """Render the same editable creation form and Drafts panel on both pages."""
         field_errors = field_errors or {}
         selected_id = _parse_uuid(source_draft_id) if source_draft_id else None
         selected = self._drafts.get(selected_id) if selected_id else None
         if selected is not None and selected.status != DraftStatus.ACTIVE:
             selected = None
         error_html = (
-            f'<p class="authoring-error" id="new-case-authoring-error" role="alert">{escape_html(error)}</p>'
+            f'<p class="authoring-error" id="case-authoring-error" role="alert">{escape_html(error)}</p>'
             if error else ""
         )
-        website_invalid = _inline_invalid_attrs("case-website-error", field_errors.get("base_url"))
-        scenario_invalid = _inline_invalid_attrs("case-scenario-error", field_errors.get("scenario"))
         selected_html = (
-            f'<p class="draft-selection-status" data-draft-selection-status role="status" aria-live="polite">'
-            f'Loaded Draft: <strong>{escape_html(selected.title)}</strong>. Changes here are saved only when you choose Save Draft.</p>'
+            '<p class="draft-selection-status" data-draft-selection-status role="status" aria-live="polite">'
+            f'Loaded Draft: <strong>{escape_html(selected.title)}</strong>. Edits are saved only when you choose Save Draft.</p>'
             if selected is not None else
-            '<p class="draft-selection-status muted" data-draft-selection-status role="status" aria-live="polite">Choose a Draft to load its Website and Scenario.</p>'
+            '<p class="draft-selection-status muted" data-draft-selection-status role="status" aria-live="polite">Choose a Draft to load its Summary, Website and Scenario.</p>'
         )
-        manual_name = name or next(
-            (line.strip() for line in scenario.splitlines() if line.strip()), ""
-        )[:200]
+        return (
+            '<div class="new-testcase-layout"><section class="panel authoring-entry" aria-labelledby="authoring-entry-title">'
+            '<h2 id="authoring-entry-title">What do you want to test?</h2>'
+            '<form method="post" action="/test-cases/generate" data-authoring-form data-inline-validation novalidate>'
+            f'<input type="hidden" name="authoring_entry" value="{escape_html(entry)}">'
+            f'<input type="hidden" name="source_draft_id" value="{escape_html(source_draft_id)}" data-source-draft-id>'
+            + error_html + selected_html
+            + '<div class="field"><label for="case-name">Summary (optional)</label>'
+            + f'<input id="case-name" name="name" maxlength="200" value="{escape_html(name)}"'
+            + (_inline_invalid_attrs("case-name-error", field_errors.get("name")) if field_errors.get("name") else ' aria-describedby="case-summary-help"') + '>'
+            + '<small id="case-summary-help">Leave this empty for a suggestion from your Scenario. You can edit it during review.</small></div>'
+            + _inline_error_html("case-name-error", "case-name", field_errors.get("name"))
+            + '<div class="field"><label for="case-base-url">Website</label>'
+            + f'<input id="case-base-url" name="base_url" type="url" maxlength="2048" required value="{escape_html(base_url)}" placeholder="https://example.com"{_inline_invalid_attrs("case-website-error", field_errors.get("base_url"))}></div>'
+            + _inline_error_html("case-website-error", "case-base-url", field_errors.get("base_url"))
+            + '<div class="field"><label for="case-scenario">Scenario</label>'
+            + f'<textarea id="case-scenario" name="scenario" rows="8" maxlength="6000" required placeholder="Describe an action and the result you expect..."{_inline_invalid_attrs("case-scenario-error", field_errors.get("scenario"))}>{escape_html(scenario)}</textarea></div>'
+            + _inline_error_html("case-scenario-error", "case-scenario", field_errors.get("scenario"))
+            + self._authoring_voice_controls("case-scenario")
+            + '<div class="actions creation-actions"><button class="button primary" type="submit">Generate TestCase</button>'
+            + '<button class="button" type="submit" formaction="/test-cases/drafts/save" formnovalidate>Save Draft</button>'
+            + '<button class="button" type="submit" formaction="/test-cases/manual/prepare" formnovalidate>Create Manually</button></div>'
+            + '</form><p class="muted">Review the TestCase before approving it. Saving does not start automation.</p>'
+            + '</section>' + self._draft_selection_panel(selected.id if selected else None) + '</div>'
+        )
+
+    def _new_test_case_page(
+        self, error: str | None = None, *, name: str = "", base_url: str = "",
+        scenario: str = "", source_draft_id: str = "",
+        field_errors: dict[str, str] | None = None,
+    ) -> str:
         content = (
             '<header class="page-heading"><h1>New Test Case</h1>'
             '<p class="lead">Describe what you want to verify, then review the generated TestCase.</p></header>'
-            '<div class="new-testcase-layout"><section class="panel authoring-entry">'
-            '<h2>What do you want to test?</h2>'
-            '<form method="post" action="/test-cases/generate" data-authoring-form data-inline-validation novalidate>'
-            '<input type="hidden" name="authoring_entry" value="new">'
-            f'<input type="hidden" name="source_draft_id" value="{escape_html(source_draft_id)}" data-source-draft-id>'
-            + error_html + selected_html
-            + '<div class="field"><label for="case-base-url">Website</label>'
-            + f'<input id="case-base-url" name="base_url" type="url" maxlength="2048" required value="{escape_html(base_url)}" placeholder="https://example.com"{website_invalid}></div>'
-            + _inline_error_html("case-website-error", "case-base-url", field_errors.get("base_url"))
-            + '<div class="field"><label for="case-scenario">Scenario</label>'
-            + f'<textarea id="case-scenario" name="scenario" rows="8" maxlength="6000" required placeholder="Describe the behavior you want to verify\u2026"{scenario_invalid}>{escape_html(scenario)}</textarea></div>'
-            + _inline_error_html("case-scenario-error", "case-scenario", field_errors.get("scenario"))
-            + self._authoring_voice_controls("case-scenario")
-            + '<div class="actions"><button class="button primary" type="submit">Generate TestCase</button>'
-            + '<button class="button" type="submit" formaction="/test-cases/drafts/save" formnovalidate>Save Draft</button></div>'
-            + '</form><p class="muted">The TestCase name is suggested from your scenario and can be edited during review.</p>'
-            + '</section>' + self._draft_selection_panel(selected.id if selected else None) + '</div>'
-            + '<div class="muted manual-authoring-link"><span>Prefer to create it yourself?</span>'
-            + '<form method="post" action="/test-cases/manual/prepare">'
-            + f'<input type="hidden" name="name" value="{escape_html(manual_name)}">'
-            + f'<input type="hidden" name="base_url" value="{escape_html(base_url)}">'
-            + f'<input type="hidden" name="description" value="{escape_html(scenario)}">'
-            + f'<input type="hidden" name="source_draft_id" value="{escape_html(source_draft_id)}">'
-            + '<button class="text-button" type="submit">Create manually with these details</button></form></div>'
+            + self._test_case_creation_form(
+                error=error, name=name, base_url=base_url, scenario=scenario,
+                source_draft_id=source_draft_id, field_errors=field_errors,
+            )
         )
         return self._page(
             "New Test Case", content, current="Test Cases",
@@ -2129,26 +2107,30 @@ class LocalWebApplication:
         )
 
     def _draft_selection_panel(self, selected_draft_id: UUID | None = None) -> str:
-        active = [item for item in self._drafts.list(500) if item.status == DraftStatus.ACTIVE][:5]
-        if not active:
-            rows = '<p class="muted">No active Drafts yet. Save an unfinished idea to reuse it here.</p>'
-        else:
-            rows = '<ul class="draft-sidebar-list">' + "".join(
+        active = [item for item in self._drafts.list(500) if item.status == DraftStatus.ACTIVE][:20]
+        rows = []
+        for item in active:
+            preview = " ".join(item.body.split())
+            preview = preview[:240].rstrip() + ("…" if len(preview) > 240 else "")
+            rows.append(
                 f'<li><button class="draft-select-button" type="button" data-draft-select '
                 f'data-draft-id="{item.id}" data-title="{escape_html(item.title)}" '
                 f'data-website="{escape_html(item.base_url or "")}" '
                 f'data-scenario="{escape_html(item.body)}" '
                 f'aria-pressed="{"true" if item.id == selected_draft_id else "false"}">'
                 f'<strong>{escape_html(item.title)}</strong>'
-                + (f'<span>{escape_html(item.base_url)}</span>' if item.base_url else '')
-                + '</button></li>'
-                for item in active
-            ) + '</ul>'
+                f'<span class="draft-scenario-preview">{escape_html(preview or "No scenario yet.")}</span>'
+                f'</button><a class="draft-details" href="/drafts/{item.id}">View details</a></li>'
+            )
+        list_html = (
+            '<ul class="draft-sidebar-list">' + "".join(rows) + '</ul>' if rows else
+            '<p class="muted drafts-empty">No active Drafts yet. Save an unfinished idea to reuse it here.</p>'
+        )
         return (
-            '<aside class="panel drafts-sidebar" aria-labelledby="new-case-drafts-title">'
-            '<div class="section-heading"><h2 id="new-case-drafts-title">Drafts</h2>'
+            '<aside class="panel drafts-sidebar" aria-labelledby="case-drafts-title">'
+            '<div class="section-heading"><h2 id="case-drafts-title">Drafts</h2>'
             '<a class="button" href="/drafts">View all</a></div>'
-            + rows + '<a class="button" href="/drafts/new">New Draft</a></aside>'
+            + list_html + '<a class="button" href="/drafts/new">New Draft</a></aside>'
         )
 
     def _test_case_list(self) -> str:
@@ -5224,14 +5206,15 @@ def _authoring_field_errors(
             )
         except TestCaseAuthoringError:
             errors["base_url"] = "Enter a valid URL, for example https://example.com"
-    if not scenario.strip() or not any(character.isalnum() for character in scenario):
-        errors["scenario"] = "Describe what you want to test."
+    scenario_error = scenario_input_error(scenario)
+    if scenario_error:
+        errors["scenario"] = scenario_error
     elif len(scenario) > 6000:
         errors["scenario"] = "Keep the scenario under 6,000 characters."
     if require_name and not name.strip():
         errors["name"] = "Enter a TestCase name."
     elif len(name.strip()) > 200:
-        errors["name"] = "Keep the TestCase name under 200 characters."
+        errors["name"] = "Keep Summary under 200 characters."
     return errors
 
 
@@ -5298,12 +5281,15 @@ _UI_JAVASCRIPT = r"""
   const draftStatus = document.querySelector('[data-draft-selection-status]');
   document.querySelectorAll('[data-draft-select]').forEach((button) => {
     button.addEventListener('click', () => {
+      const summary = document.getElementById('case-name');
       const website = document.getElementById('case-base-url');
       const scenario = document.getElementById('case-scenario');
-      if (!website || !scenario || !draftSource || !draftStatus) return;
+      if (!summary || !website || !scenario || !draftSource || !draftStatus) return;
+      summary.value = button.dataset.title || '';
       website.value = button.dataset.website || '';
       scenario.value = button.dataset.scenario || '';
       draftSource.value = button.dataset.draftId || '';
+      summary.dispatchEvent(new Event('input', { bubbles: true }));
       website.dispatchEvent(new Event('input', { bubbles: true }));
       scenario.dispatchEvent(new Event('input', { bubbles: true }));
       document.querySelectorAll('[data-draft-select]').forEach((item) => {
@@ -5428,9 +5414,16 @@ _UI_JAVASCRIPT = r"""
     }, { once: true });
   });
 
+  const scenarioInputError = (value) => {
+    const words = value.match(/\p{L}+/gu) || [];
+    const insufficient = !words.length || words.every((word) => [...word].length === 1) ||
+      words.every((word) => new Set([...word.toLowerCase()]).size === 1) ||
+      (words.length === 1 && /^[A-Za-z]+$/.test(words[0]) && words[0].length <= 2 && words[0].toLowerCase() !== 'go');
+    return insufficient ? 'Describe an action and what you expect to happen, for example "Check login". You can also choose Create Manually without AI.' : '';
+  };
   let generatedInlineValidationControlId = 0;
   document.querySelectorAll('form[data-inline-validation]').forEach((form) => {
-    const controls = [...form.querySelectorAll('input[required], textarea[required], select[required]')];
+    const controls = [...form.querySelectorAll('input[required], textarea[required], select[required], #case-name')];
     const ruleFor = (control) => control.dataset.validationRule ||
       (control.name === 'base_url' ? 'website' :
         control.name === 'scenario' || control.name === 'description' || control.name === 'body' ? 'scenario' : 'required');
@@ -5466,8 +5459,12 @@ _UI_JAVASCRIPT = r"""
         }
       } else if (rule === 'scenario') {
         if (!value || !/[\p{L}\p{N}]/u.test(value)) message = 'Describe what you want to test.';
+        if (form.hasAttribute('data-authoring-form')) message = scenarioInputError(value);
       } else if (control.required && !value) {
         message = 'Complete this field.';
+      }
+      if (form.hasAttribute('data-authoring-form') && control.maxLength > 0 && control.value.length > control.maxLength) {
+        message = control.name === 'name' ? 'Keep Summary under 200 characters.' : 'Shorten this field to the displayed limit.';
       }
       const error = errorFor(control);
       if (error) {
@@ -5496,6 +5493,7 @@ _UI_JAVASCRIPT = r"""
       });
     });
     form.addEventListener('submit', (event) => {
+      if (event.submitter?.formNoValidate) return;
       const invalid = controls.find((control) => Boolean(validate(control)));
       if (invalid) {
         event.preventDefault();
@@ -5505,15 +5503,17 @@ _UI_JAVASCRIPT = r"""
     });
   });
 
-  document.querySelectorAll('[data-authoring-form]').forEach((form) => {
+  document.querySelectorAll('[data-authoring-form], [data-testcase-editor]').forEach((form) => {
     form.addEventListener('submit', (event) => {
       const button = event.submitter;
-      if (!button) return;
+      if (!button || event.defaultPrevented) return;
+      if (form.hasAttribute('data-testcase-editor') && !button.hasAttribute('data-regenerate-testcase')) return;
       button.disabled = true;
       button.classList.add('is-disabled');
       button.setAttribute('aria-busy', 'true');
-      button.textContent = button.formAction.includes('/drafts/save') ? 'Saving...' : 'Starting...';
-    }, { once: true });
+      button.textContent = button.formAction.includes('/drafts/save') ? 'Saving...' :
+        button.formAction.includes('/manual/prepare') ? 'Opening manual form...' : 'Starting...';
+    });
   });
 
   document.querySelectorAll('[data-voice-control]').forEach((control) => {

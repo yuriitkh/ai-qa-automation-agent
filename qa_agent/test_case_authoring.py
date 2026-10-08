@@ -34,6 +34,24 @@ from qa_agent.llm_usage import OP_AUTHOR_TESTCASE, OP_OTHER, llm_usage_scope
 logger = logging.getLogger(__name__)
 
 
+def scenario_input_error(scenario: str) -> str | None:
+    """Reject clearly insufficient input without judging scenario completeness."""
+    words = re.findall(r"[^\W\d_]+", scenario, flags=re.UNICODE)
+    insufficient = (
+        not words
+        or all(len(word) == 1 for word in words)
+        or all(len(set(word.casefold())) == 1 for word in words)
+        or (len(words) == 1 and words[0].isascii() and len(words[0]) <= 2
+            and words[0].casefold() != "go")
+    )
+    if insufficient:
+        return (
+            'Describe an action and what you expect to happen, for example "Check login". '
+            "You can also choose Create Manually without AI."
+        )
+    return None
+
+
 class _StrictProposal(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -235,9 +253,10 @@ class TestCaseAuthoringService:
             else ""
         )
         clean_url = base_url.strip() if isinstance(base_url, str) else ""
-        if not clean_scenario or not any(character.isalnum() for character in clean_scenario):
+        scenario_error = scenario_input_error(clean_scenario)
+        if scenario_error:
             raise TestCaseAuthoringError(
-                "Enter a natural-language scenario.",
+                scenario_error,
                 category="INVALID_AUTHORING_INPUT",
             )
         if len(supplied_name) > 200:

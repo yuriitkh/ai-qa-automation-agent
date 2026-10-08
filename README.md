@@ -223,22 +223,37 @@ persisted yet.
 
 ### Async AI TestCase authoring
 
-The Dashboard provides a direct authoring form for a website and a natural-language
-scenario. If no name is supplied, the app derives a short name from the scenario.
-Where supported, **Speak scenario** uses browser speech recognition and appends
-editable text to the scenario; the app receives text only, never audio. Submitting
-the form follows the same asynchronous progress and editable Review flow as the
-dedicated New Test Case page.
+Dashboard and New TestCase share one creation form, with **Summary (optional)**,
+**Website**, and **Scenario** in that order. A supplied Summary is preserved
+through generation and review. If it is empty, the app derives a short Summary
+from the scenario without a separate AI request. Summary uses the existing
+TestCase name field; no database migration is needed.
 
-Submit **Generate Test with AI** from **Test Cases в†’ New Test Case** to get an
-immediate authoring progress page. The page polls actual provider and validation
-events, then redirects to the existing editable Review page when the draft is
-ready. **Generate Again** follows the same progress flow and uses the original
-authoring inputs. The generated Review proposal remains temporary until **Save Test Case**. A failed
-request creates no draft or persisted TestCase; **Try Again** starts a new
-request with the original inputs. Authoring jobs use a separate bounded worker
-pool so long runs cannot occupy authoring workers. Review proposals and their
-progress are temporary and are cleared when the server restarts.
+Both pages put **Drafts** beside the form at the same height on desktop and below
+it on narrow screens. The panel shows up to 20 active Drafts, with an emphasized
+Title and a Scenario preview limited to two lines. Its list scrolls internally;
+**View all**, **New Draft**, and individual details remain accessible. Selecting
+a Draft fills Summary from its Title, Website, and Scenario without changing its
+status. All three fields remain editable. A Draft becomes Used only after a
+TestCase is successfully saved, and remains available in Draft history.
+
+The main actions are **Generate TestCase**, **Save Draft**, and **Create Manually**.
+Manual creation transfers the current three fields without AI. Draft saving
+allows unfinished or empty scenarios. Before generation, both the browser and
+server reject obvious insufficient input, including empty text, isolated
+characters, and repeated letters such as `aa`. Short meaningful scenarios such
+as `Check login` remain accepted. Inline guidance lets users edit their Scenario
+or continue manually.
+
+Where supported, **Speak scenario** uses browser speech recognition and appends
+editable text; the app receives text only, never audio. Generation redirects to
+asynchronous progress, then to editable Review. **Generate Again** preserves the
+current Summary and uses the original Scenario and Website. The proposal remains temporary until **Save TestCase
+for review**. Saving keeps the existing review and approval states and does not
+generate automation automatically. An unsuccessful request creates no proposal
+or persisted TestCase; **Try Again** starts a new request with the original inputs.
+Authoring uses a separate bounded worker pool. Review proposals and progress are
+temporary and are cleared when the server restarts.
 
 ### Persistent Drafts and manual TestCases
 
@@ -248,7 +263,7 @@ remain separate from TestCases, Run History, and Test Suites. From a Draft, use
 **Create TestCase manually** or **Generate with AI**; converting it leaves the
 Draft in place until you explicitly delete it.
 
-The **New Test Case** page also has **Create manually**. Manual creation does not
+Dashboard and **New Test Case** both offer **Create Manually**. Manual creation does not
 call an LLM and lets you enter a description, optional Base URL, preconditions,
 and up to eight initial steps. Open a saved TestCase and choose **Edit TestCase**
 to update its name, scenario, preconditions, and steps. Step actions preserve

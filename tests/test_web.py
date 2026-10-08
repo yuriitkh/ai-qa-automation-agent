@@ -157,15 +157,14 @@ class LocalWebApplicationTests(unittest.TestCase):
         self.assertIn("What do you want to test?", entry)
         self.assertIn('name="base_url"', entry)
         self.assertIn('name="scenario"', entry)
-        self.assertIn("Generate Test with AI", entry)
+        self.assertIn("Generate TestCase", entry)
         self.assertIn("Speak scenario", entry)
-        self.assertNotIn('name="name"', entry)
+        self.assertIn('name="name"', entry)
         self.assertNotIn("FINN.no", entry)
         self.assertNotIn("checkout", entry.casefold())
-        self.assertIn("Describe", entry)
-        self.assertIn("Generate", entry)
-        self.assertIn("Run", entry)
-        self.assertIn("Reuse", entry)
+        self.assertIn("Summary (optional)", entry)
+        self.assertIn("Save Draft", entry)
+        self.assertIn("Create Manually", entry)
         self.assertIn("Recent runs", body)
         self.assertIn(f"RUN-000001", body)
 
@@ -203,7 +202,7 @@ class LocalWebApplicationTests(unittest.TestCase):
         body = response.body.decode("utf-8")
 
         self.assertEqual(response.status, 400)
-        self.assertIn("Describe what you want to test.", body)
+        self.assertIn("Describe an action and what you expect to happen", body)
         self.assertIn('class="field-error"', body)
         self.assertIn("What do you want to test?", body)
 
@@ -223,8 +222,8 @@ class LocalWebApplicationTests(unittest.TestCase):
         self.assertEqual(response.status, 400)
         self.assertIn("Enter the website URL you want to test.", body)
         self.assertIn(scenario, body)
-        self.assertIn('id="dashboard-website-error"', body)
-        self.assertIn('aria-describedby="dashboard-website-error"', body)
+        self.assertIn('id="case-website-error"', body)
+        self.assertIn('aria-describedby="case-website-error"', body)
         self.assertIn("novalidate", body)
 
     def test_dashboard_summary_uses_public_run_id_and_friendly_time_duration(self) -> None:

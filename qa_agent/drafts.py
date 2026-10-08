@@ -23,7 +23,7 @@ class Draft(BaseModel):
 
     id: UUID = Field(default_factory=uuid4)
     title: str = Field(min_length=1, max_length=200)
-    body: str = Field(min_length=1, max_length=6000)
+    body: str = Field(max_length=6000)
     base_url: str | None = Field(default=None, max_length=2048)
     notes: str | None = Field(default=None, max_length=6000)
     status: DraftStatus = DraftStatus.ACTIVE

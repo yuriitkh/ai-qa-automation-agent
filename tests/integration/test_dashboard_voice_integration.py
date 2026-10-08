@@ -1,10 +1,12 @@
 import threading
 import unittest
+from uuid import UUID
 from http.server import ThreadingHTTPServer
 
 from playwright.sync_api import sync_playwright
 
 from qa_agent.llm.base import LLMProvider
+from qa_agent.drafts import Draft, DraftStatus
 from qa_agent.llm.router import LLMRouter
 from qa_agent.models import QATestPlan
 from qa_agent.run_history import InMemoryRunHistoryRepository, RunHistoryService
@@ -70,6 +72,124 @@ class DashboardVoiceIntegrationTests(unittest.TestCase):
         server.server_close()
         server_thread.join(timeout=5)
 
+    def test_shared_layout_draft_selection_validation_and_incomplete_save_in_browser(self) -> None:
+        application, provider, test_cases, server, server_thread, origin = self.make_server()
+        for index in range(24):
+            application._drafts.save(Draft(
+                title=f'Account Draft {index} <unsafe>',
+                body="Check login, account details and logout. " * 35,
+                base_url=f"{origin}/account",
+            ))
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                page = browser.new_page(viewport={"width": 1280, "height": 1000})
+                for path in ("/", "/test-cases/new"):
+                    with self.subTest(path=path):
+                        page.set_viewport_size({"width": 1280, "height": 1000})
+                        page.goto(origin + path)
+                        self.assertEqual(page.locator('[data-draft-select]').count(), 20)
+                        self.assertEqual(page.get_by_text("Recent Drafts", exact=True).count(), 0)
+                        form_box = page.locator('.authoring-entry').bounding_box()
+                        panel_box = page.locator('.drafts-sidebar').bounding_box()
+                        self.assertAlmostEqual(form_box["height"], panel_box["height"], delta=1)
+                        self.assertGreater(panel_box["x"], form_box["x"] + form_box["width"])
+                        self.assertTrue(page.locator('.draft-sidebar-list').evaluate(
+                            '(list) => list.scrollHeight > list.clientHeight'))
+                        preview = page.locator('.draft-scenario-preview').first
+                        self.assertTrue(preview.evaluate(
+                            '(element) => element.clientHeight <= parseFloat(getComputedStyle(element).lineHeight) * 2 + 1'))
+                        source_button = page.locator('[data-draft-select]').first
+                        draft_id = UUID(source_button.get_attribute('data-draft-id'))
+                        before = application._drafts.get(draft_id)
+                        source_button.click()
+                        self.assertEqual(page.get_by_label("Summary (optional)").input_value(), before.title)
+                        self.assertEqual(page.get_by_label("Website", exact=True).input_value(), before.base_url)
+                        self.assertEqual(page.get_by_role("textbox", name="Scenario", exact=True).input_value(), before.body)
+                        self.assertEqual(application._drafts.get(draft_id), before)
+                        self.assertEqual(page.locator('unsafe').count(), 0)
+                        page.get_by_label("Summary (optional)").fill("My edited account summary")
+                        page.get_by_role("textbox", name="Scenario", exact=True).fill("aa")
+                        page.get_by_role("button", name="Generate TestCase", exact=True).click()
+                        self.assertEqual(page.url, origin + path)
+                        self.assertIn("Describe an action", page.locator('#case-scenario-error').inner_text())
+                        self.assertTrue(page.get_by_role("button", name="Generate TestCase", exact=True).is_enabled())
+                        self.assertEqual(provider.calls, 0)
+                        page.set_viewport_size({"width": 390, "height": 844})
+                        form_box = page.locator('.authoring-entry').bounding_box()
+                        panel_box = page.locator('.drafts-sidebar').bounding_box()
+                        self.assertGreaterEqual(panel_box["y"], form_box["y"] + form_box["height"])
+                        self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), 390)
+                        page.get_by_role("button", name="Save Draft", exact=True).click()
+                        page.wait_for_url(f"**/drafts/{draft_id}?saved=1")
+                        saved = application._drafts.get(draft_id)
+                        self.assertEqual(saved.title, "My edited account summary")
+                        self.assertEqual(saved.body, "aa")
+                        self.assertEqual(saved.status, DraftStatus.ACTIVE)
+                        self.assertEqual(provider.calls, 0)
+                        self.assertEqual(test_cases.list(), [])
+                browser.close()
+        finally:
+            application.close()
+            self.stop_server(server, server_thread)
+
+    def test_manual_action_transfers_current_fields_without_ai_or_validation_gate(self) -> None:
+        application, provider, test_cases, server, server_thread, origin = self.make_server()
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                page = browser.new_page()
+                for path in ("/", "/test-cases/new"):
+                    page.goto(origin + path)
+                    page.get_by_label("Summary (optional)").fill('Edited summary <unsafe>')
+                    page.get_by_label("Website", exact=True).fill(origin + '/updated-account')
+                    page.get_by_role("textbox", name="Scenario", exact=True).fill('aa')
+                    page.get_by_role("button", name="Create Manually", exact=True).click()
+                    page.wait_for_url('**/test-cases/manual/prepare')
+                    self.assertEqual(page.locator('#manual-name').input_value(), 'Edited summary <unsafe>')
+                    self.assertEqual(page.locator('#manual-base-url').input_value(), origin + '/updated-account')
+                    self.assertEqual(page.locator('#manual-description').input_value(), 'aa')
+                    self.assertEqual(page.locator('unsafe').count(), 0)
+                    self.assertEqual(provider.calls, 0)
+                    self.assertEqual(test_cases.list(), [])
+                browser.close()
+        finally:
+            application.close()
+            self.stop_server(server, server_thread)
+
+    def test_user_summary_survives_generation_and_review_in_browser(self) -> None:
+        application, provider, test_cases, server, server_thread, origin = self.make_server()
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                page = browser.new_page()
+                page.goto(origin)
+                page.get_by_label("Summary (optional)").fill('User chosen account summary')
+                page.get_by_label("Website", exact=True).fill(origin + '/account')
+                page.get_by_role("textbox", name="Scenario", exact=True).fill('Check login')
+                page.get_by_role("button", name="Generate TestCase", exact=True).click()
+                page.wait_for_url('**/test-cases/review/**', timeout=8000)
+                self.assertEqual(page.locator('#edit-name').input_value(), 'User chosen account summary')
+                self.assertEqual(provider.calls, 1)
+                self.assertEqual(test_cases.list(), [])
+                page.locator('#edit-name').fill('Summary edited during review')
+                page.locator('#edit-description').fill('Unsaved Scenario edits stay separate.')
+                page.get_by_role("button", name="Generate Again", exact=True).click()
+                page.wait_for_url('**/test-cases/authoring-progress/**')
+                page.wait_for_url('**/test-cases/review/**', timeout=8000)
+                self.assertEqual(page.locator('#edit-name').input_value(), 'Summary edited during review')
+                self.assertEqual(page.locator('#edit-description').input_value(), 'Check login')
+                self.assertEqual(provider.calls, 2)
+                page.get_by_role("button", name="Save TestCase for review").click()
+                page.wait_for_url('**/test-cases/*')
+                self.assertEqual(test_cases.list()[0].name, 'Summary edited during review')
+                self.assertIn('Ready for review', page.content())
+                self.assertEqual(provider.calls, 2)
+                browser.close()
+        finally:
+            application.close()
+            self.stop_server(server, server_thread)
+
     def test_voice_appends_editable_text_and_dashboard_reuses_async_authoring(self) -> None:
         application, provider, test_cases, server, server_thread, origin = self.make_server()
         try:
@@ -104,7 +224,7 @@ class DashboardVoiceIntegrationTests(unittest.TestCase):
                     page.evaluate("navigator.languages[0] || navigator.language || document.documentElement.lang || ''"),
                 )
 
-                page.get_by_role("button", name="Generate Test with AI").click()
+                page.get_by_role("button", name="Generate TestCase").click()
                 page.wait_for_url("**/test-cases/authoring-progress/**")
                 page.wait_for_url("**/test-cases/review/**", timeout=8000)
                 self.assertEqual(provider.calls, 1)
@@ -150,7 +270,7 @@ class DashboardVoiceIntegrationTests(unittest.TestCase):
                 page.get_by_role("textbox", name="Scenario", exact=True).fill(
                     "Check that the account page opens."
                 )
-                page.get_by_role("button", name="Generate Test with AI").click()
+                page.get_by_role("button", name="Generate TestCase").click()
                 page.wait_for_url("**/test-cases/authoring-progress/**")
                 page.wait_for_url("**/test-cases/review/**", timeout=8000)
                 self.assertEqual(provider.calls, 1)
