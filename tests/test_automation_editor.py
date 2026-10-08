@@ -122,7 +122,9 @@ class AutomationEditorTests(unittest.TestCase):
             "GET", f"/test-cases/{self.case.id}/automation/edit?saved=1"
         ).body.decode()
         self.assertIn("Automation saved.", confirmation)
-        self.assertIn("Validation required before this TestCase is Automation ready.", confirmation)
+        self.assertIn("Review the current TestPlan", confirmation)
+        self.assertIn("approve these saved versions for Validation", confirmation)
+        self.assertNotIn("Run Validation", confirmation)
         self.assertIn("Edited locally", confirmation)
         self.app.handle("GET", f"/test-cases/{self.case.id}/automation/edit?saved=1")
         self.assertEqual(self.plans.find(self.step.id).version, 2)

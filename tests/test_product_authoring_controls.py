@@ -12,7 +12,7 @@ from qa_agent.automation_lifecycle import (
     AutomationStatus,
     SQLiteAutomationLifecycleRepository,
 )
-from qa_agent.drafts import Draft, SQLiteDraftRepository
+from qa_agent.drafts import Draft, DraftStatus, SQLiteDraftRepository
 from qa_agent.execution_progress import (
     AuthoringEventType,
     AuthoringProgressReporter,
@@ -33,7 +33,7 @@ from qa_agent.models import (
 from qa_agent.run_history import WorkflowType
 from qa_agent.storage import create_sqlite_storage
 from qa_agent.test_case_editing import create_manual_test_case, edit_test_case
-from qa_agent.test_case_execution import TestCaseExecutionService
+from qa_agent.test_case_execution import RunUnavailableError, TestCaseExecutionService
 from qa_agent.web import LocalWebApplication, should_suppress_successful_progress_log
 
 
@@ -141,8 +141,59 @@ class ProductAuthoringControlsTests(unittest.TestCase):
         converted = self.storage.test_case_repository.get(case_id)
         self.assertEqual(converted.description, draft.body)
         self.assertEqual(converted.steps[0].description, draft.body)
-        self.assertIsNotNone(self.drafts.get(draft.id))
+        preserved = self.drafts.get(draft.id)
+        self.assertIsNotNone(preserved)
+        self.assertEqual(preserved.status, DraftStatus.USED)
+        self.assertEqual(preserved.converted_test_case_id, case_id)
         self.assertEqual(self.lifecycle.status(converted), AutomationStatus.NOT_AUTOMATED)
+        self.assertIn("Ready for review", self.app.handle("GET", f"/test-cases/{case_id}").body.decode())
+        self.assertNotIn(f'data-draft-id="{draft.id}"'.encode(), self.app.handle("GET", "/test-cases/new").body)
+        draft_history = self.app.handle("GET", "/drafts").body.decode()
+        self.assertIn("Used", draft_history)
+        self.assertIn(f'href="/test-cases/{case_id}"', draft_history)
+        used_detail = self.app.handle("GET", f"/drafts/{draft.id}").body.decode()
+        self.assertIn("Used Draft", used_detail)
+        self.assertIn("This Draft remains saved and can be reused.", used_detail)
+
+    def test_new_testcase_sidebar_loads_draft_without_mutating_and_can_save_edits(self):
+        draft = Draft(
+            title="Local checkout",
+            body="Submit the local checkout form and confirm the order.",
+            base_url="http://127.0.0.1/checkout",
+        )
+        self.drafts.save(draft)
+
+        page = self.app.handle("GET", "/test-cases/new").body.decode()
+        self.assertIn("What do you want to test?", page)
+        self.assertIn("Drafts", page)
+        self.assertIn(f'data-draft-id="{draft.id}"', page)
+        self.assertIn('data-website="http://127.0.0.1/checkout"', page)
+        self.assertIn('data-scenario="Submit the local checkout form and confirm the order."', page)
+        self.assertIn('id="case-base-url" name="base_url"', page)
+        self.assertIn('id="case-scenario" name="scenario"', page)
+        self.assertIn("grid-template-columns:minmax(0,1fr)", page)
+        script = self.app.handle("GET", "/assets/ui.js").body.decode()
+        self.assertIn("website.value = button.dataset.website", script)
+        self.assertIn("scenario.value = button.dataset.scenario", script)
+        self.assertEqual(self.drafts.get(draft.id).status, DraftStatus.ACTIVE)
+
+        selected = self.app.handle("GET", f"/test-cases/new?draft_id={draft.id}").body.decode()
+        self.assertIn('value="http://127.0.0.1/checkout"', selected)
+        self.assertIn(">Submit the local checkout form and confirm the order.</textarea>", selected)
+        self.assertIn('aria-pressed="true"', selected)
+        self.assertEqual(self.drafts.get(draft.id).status, DraftStatus.ACTIVE)
+
+        saved = self.post("/test-cases/drafts/save", {
+            "source_draft_id": str(draft.id),
+            "base_url": "http://127.0.0.1/checkout-updated",
+            "scenario": "Submit a changed local checkout form.",
+        })
+        self.assertEqual(saved.status, 303)
+        updated = self.drafts.get(draft.id)
+        self.assertEqual(updated.body, "Submit a changed local checkout form.")
+        self.assertEqual(updated.base_url, "http://127.0.0.1/checkout-updated")
+        self.assertEqual(updated.status, DraftStatus.ACTIVE)
+        self.assertEqual(self.storage.test_case_repository.list(), [])
 
     def test_manual_creation_works_without_an_authoring_service_and_escapes_html(self):
         response = self.post("/test-cases/manual", {
@@ -167,11 +218,92 @@ class ProductAuthoringControlsTests(unittest.TestCase):
         self.assertIn("&lt;unsafe&gt;", page)
         self.assertNotIn("<script>Checkout</script>", page)
         self.assertIn("Not automated", page)
+        self.assertIn("Ready for review", page)
+        self.assertIn("Approve TestCase", page)
         self.assertIn("View TestPlan", page)
+        self.assertEqual(
+            self.post(f"/test-cases/{case_id}/approve").status, 303
+        )
+        self.assertIn("TestCase content is approved.", self.app.handle("GET", f"/test-cases/{case_id}").body.decode())
         plan_page = self.app.handle("GET", f"/test-cases/{case_id}/plans").body.decode()
         self.assertIn("Read-only view", plan_page)
         self.assertIn("No saved TestPlan", plan_page)
         self.assertIsNone(self.app._authoring_service)
+
+    def test_review_automation_pin_and_validation_gate_are_explicit(self):
+        case = self.case_with_steps(["Assert the local page title"])
+        self.storage.test_case_repository.save(case)
+        review = self.app._test_case_review
+        review.mark_ready_for_review(case)
+        outcomes = ["failed", "passed"]
+        service = TestCaseExecutionService(
+            self.storage.test_case_repository,
+            self.storage.plan_store,
+            self.storage.execution_repository,
+            self.storage.run_history,
+            runner_factory=lambda _directory: lambda plan: {
+                "status": outcomes.pop(0),
+                "url": plan.url,
+                "steps": ([{
+                    "action": "assert_title",
+                    "status": "failed",
+                    "error": "Expected title was absent.",
+                }] if outcomes and outcomes[0] == "passed" else []),
+                "evidence": [],
+            },
+            automation_workflow=object(),
+            automation_lifecycle=self.lifecycle,
+            test_case_review=review,
+        )
+        availability = service.workflow_availability(case.id)
+        blocked_panel = self.app._workflow_panel(case.id, case, availability)
+        self.assertIn("Approve the TestCase before generating automation.", blocked_panel)
+        self.assertNotIn("Generate Automation</button>", blocked_panel)
+        self.assertIn("Approve TestCase", self.app.handle("GET", f"/test-cases/{case.id}").body.decode())
+
+        self.assertEqual(self.post(f"/test-cases/{case.id}/approve").status, 303)
+        detail = self.app.handle("GET", f"/test-cases/{case.id}").body.decode()
+        self.assertIn("Review status", detail)
+        self.assertIn("Automation status", detail)
+        self.assertIn("Run status", detail)
+        approved_panel = self.app._workflow_panel(case.id, case, service.workflow_availability(case.id))
+        self.assertIn("Generate Automation", approved_panel)
+
+        self.save_plans(case)
+        self.lifecycle.mark_automation_completed(case)
+        automation_review = self.app._workflow_panel(
+            case.id, case, service.workflow_availability(case.id)
+        )
+        self.assertIn("Automation is ready for review.", automation_review)
+        self.assertIn("View TestPlan", automation_review)
+        self.assertIn("Edit Automation", automation_review)
+        self.assertIn("Approve for Validation", automation_review)
+        self.assertNotIn("Run Validation", automation_review)
+        with self.assertRaises(RunUnavailableError):
+            service.run(case.id, WorkflowType.VALIDATION)
+
+        self.assertEqual(
+            self.post(f"/test-cases/{case.id}/approve-validation").status, 303
+        )
+        self.assertEqual(self.lifecycle.status(case), AutomationStatus.NEEDS_VALIDATION)
+        approved_versions = self.storage.plan_store.find(case.steps[0].id)
+        self.assertEqual(
+            review.record(case.id).approved_plan_fingerprint,
+            self.app._test_case_review.plan_fingerprint(case),
+        )
+        approved_panel = self.app._workflow_panel(
+            case.id, case, service.workflow_availability(case.id)
+        )
+        self.assertIn("Run Validation", approved_panel)
+        self.assertNotIn("Approve for Validation", approved_panel)
+
+        failed = service.run(case.id, WorkflowType.VALIDATION)
+        self.assertEqual(failed.outcome.value, "PRODUCT_FAILURE")
+        self.assertEqual(self.lifecycle.status(case), AutomationStatus.NEEDS_VALIDATION)
+        self.assertEqual(self.storage.plan_store.find(case.steps[0].id), approved_versions)
+        passed = service.run(case.id, WorkflowType.VALIDATION)
+        self.assertEqual(passed.outcome.value, "PASSED")
+        self.assertEqual(self.lifecycle.status(case), AutomationStatus.AUTOMATION_READY)
 
     def test_unconfigured_ai_does_not_block_manual_fallback_and_preserves_inputs(self):
         response = self.post("/test-cases/generate", {

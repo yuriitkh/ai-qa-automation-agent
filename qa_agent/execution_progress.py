@@ -360,6 +360,7 @@ class _AuthoringProgressRecord:
     original_base_url: str
     scenario: str
     source_draft_token: str | None
+    source_draft_id: UUID | None
     requested_at: datetime
     state: ProgressState = ProgressState.QUEUED
     phase: str = "Preparing"
@@ -451,6 +452,7 @@ class ExecutionProgressStore:
         base_url: str,
         scenario: str,
         source_draft_token: str | None = None,
+        source_draft_id: UUID | None = None,
     ) -> str:
         now = self._now()
         safe_url = redact_secrets(_safe_authoring_base_url(base_url))
@@ -466,9 +468,18 @@ class ExecutionProgressStore:
                 original_base_url=base_url,
                 scenario=scenario,
                 source_draft_token=source_draft_token,
+                source_draft_id=source_draft_id,
                 requested_at=now,
             )
         return progress_id
+
+    def get_authoring_source_draft_id(self, progress_id: str) -> UUID | None:
+        """Return the server-held persistent Draft source for a job."""
+        now = self._now()
+        with self._lock:
+            self._prune(now)
+            record = self._authoring_records.get(progress_id)
+            return record.source_draft_id if record is not None else None
 
     def get_authoring(self, progress_id: str) -> AuthoringProgressSnapshot | None:
         now = self._now()

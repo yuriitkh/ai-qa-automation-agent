@@ -1,4 +1,5 @@
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
+from uuid import UUID
 import json
 import os
 import tempfile
@@ -14,6 +15,7 @@ from qa_agent.llm.base import LLMProvider
 from qa_agent.llm.errors import RetryableLLMError
 from qa_agent.llm.router import LLMRouter
 from qa_agent.models import QATestPlan
+from qa_agent.drafts import Draft, DraftStatus
 from qa_agent.plan_store import InMemoryPlanStore
 from qa_agent.provider_settings import UnavailableSecretStore
 from qa_agent.run_history import InMemoryRunHistoryRepository, RunHistoryService
@@ -99,9 +101,44 @@ class TestCaseAuthoringWebTests(unittest.TestCase):
         page = self.app.handle("GET", "/test-cases/new")
         self.assertIn(b"+ New Test Case", listing.body)
         self.assertIn(b'method="post" action="/test-cases/generate"', page.body)
-        self.assertIn(b"Generate Test with AI", page.body)
+        self.assertIn(b"Generate TestCase", page.body)
         self.assertIn(b'name="scenario"', page.body)
         self.assertIn(b"data-authoring-form", page.body)
+
+    def test_persistent_draft_is_used_only_after_generated_testcase_is_saved(self):
+        saved_draft = Draft(
+            title="Registration idea",
+            body="Register a user and confirm the page appears.",
+            base_url="http://127.0.0.1:8000/demo-target/registration",
+        )
+        self.app._drafts.save(saved_draft)
+        generated = self.app.handle("POST", "/test-cases/generate", urlencode({
+            "authoring_entry": "new",
+            "source_draft_id": str(saved_draft.id),
+            "base_url": saved_draft.base_url,
+            "scenario": saved_draft.body,
+        }))
+        progress = self.wait_for_authoring(generated)
+        self.assertEqual(self.app._drafts.get(saved_draft.id).status, DraftStatus.ACTIVE)
+        token = progress["review_url"].rsplit("/", 1)[1]
+        proposal = self.app._draft_store.get(token)
+        self.assertEqual(proposal.source_draft_id, saved_draft.id)
+        review_page = self.app.handle("GET", progress["review_url"])
+        self.assertIn(b"Review TestCase", review_page.body)
+        self.assertIn(b"The registration page is visible.", review_page.body)
+
+        saved = self.app.handle(
+            "POST", f"/test-cases/review/{token}/save", ""
+        )
+        self.assertEqual(saved.status, 303)
+        case_id = UUID(urlsplit(saved.headers["Location"]).path.split("/")[2])
+        converted = self.app._drafts.get(saved_draft.id)
+        self.assertEqual(converted.status, DraftStatus.USED)
+        self.assertEqual(converted.converted_test_case_id, case_id)
+        self.assertIsNotNone(converted)
+        self.assertEqual(
+            self.app._test_case_review.status(case_id).value, "READY_FOR_REVIEW"
+        )
 
     def test_dashboard_form_uses_async_authoring_and_derives_name_when_omitted(self):
         scenario = "Check account details and sign in. Confirm the welcome page appears."

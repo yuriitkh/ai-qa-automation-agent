@@ -32,6 +32,7 @@ from qa_agent.run_context import RunContext
 from qa_agent.run_history import RunHistoryService, WorkflowType
 from qa_agent.setup_orchestration import SetupCleanupCoordinator
 from qa_agent.test_case_repository import TestCaseRepository
+from qa_agent.test_case_review import TestCaseReviewService, TestCaseReviewStatus
 from qa_agent.test_plan_validation import validate_executable_plan
 from qa_agent.workflows import (
     AutomationWorkflow,
@@ -83,6 +84,7 @@ class TestCaseExecutionService:
         setup_cleanup_factory: Callable[[], SetupCleanupCoordinator] | None = None,
         automation_workflow: AutomationWorkflow | None = None,
         automation_lifecycle: AutomationLifecycleService | None = None,
+        test_case_review: TestCaseReviewService | None = None,
     ) -> None:
         self._test_cases = test_cases
         self._plan_store = plan_store
@@ -100,6 +102,7 @@ class TestCaseExecutionService:
         )
         self._automation_workflow = automation_workflow
         self._automation_lifecycle = automation_lifecycle
+        self._test_case_review = test_case_review
 
     def workflow_availability(self, test_case_id: UUID) -> WorkflowAvailability:
         test_case = self._test_cases.get(test_case_id)
@@ -199,6 +202,14 @@ class TestCaseExecutionService:
                 raise RunUnavailableError(
                     "TestCase not found.", category="INVALID_TESTCASE"
                 )
+            if (
+                self._test_case_review is not None
+                and self._test_case_review.status(test_case.id) != TestCaseReviewStatus.APPROVED
+            ):
+                raise RunUnavailableError(
+                    "Approve the TestCase before generating automation.",
+                    category="INVALID_TESTCASE",
+                )
             run_context = progress.run_context if progress is not None else RunContext()
             if progress is not None:
                 progress.bind_run_context(run_context)
@@ -225,6 +236,26 @@ class TestCaseExecutionService:
         test_case = self._test_cases.get(test_case_id)
         if test_case is None:
             raise RunUnavailableError("TestCase not found.", category="INVALID_TESTCASE")
+        review_record = (
+            self._test_case_review.record(test_case.id)
+            if self._test_case_review is not None else None
+        )
+        if (
+            self._test_case_review is not None
+            and self._test_case_review.status(test_case.id) != TestCaseReviewStatus.APPROVED
+        ):
+            raise RunUnavailableError(
+                "Approve the TestCase before starting a run.", category="INVALID_TESTCASE"
+            )
+        if (
+            review_record is not None
+            and workflow_type in {WorkflowType.VALIDATION, WorkflowType.REGRESSION}
+            and not self._test_case_review.validation_approved_for(test_case)
+        ):
+            raise RunUnavailableError(
+                "Approve the current saved automation before starting this workflow.",
+                category="MISSING_AUTOMATION",
+            )
         run_context = progress.run_context if progress is not None else RunContext()
         if progress is not None:
             progress.bind_run_context(run_context)
@@ -273,6 +304,15 @@ class TestCaseExecutionService:
             test_case,
             {selection.test_step_id: selection.test_plan_version_id for selection in selections},
         )
+        if (
+            review_record is not None
+            and workflow_type in {WorkflowType.VALIDATION, WorkflowType.REGRESSION}
+            and selected_plan_fingerprint != review_record.approved_plan_fingerprint
+        ):
+            raise RunUnavailableError(
+                "Saved plans changed after approval. Review and approve the current automation again.",
+                category="MISSING_AUTOMATION",
+            )
         try:
             result = workflow.run(
                 test_case,

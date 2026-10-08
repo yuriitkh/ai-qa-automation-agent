@@ -50,7 +50,12 @@ from qa_agent.automation_lifecycle import (
     has_complete_plans,
 )
 from qa_agent.expected_result_coverage import expected_result_coverage
-from qa_agent.drafts import Draft, DraftRepository, InMemoryDraftRepository
+from qa_agent.drafts import Draft, DraftRepository, DraftStatus, InMemoryDraftRepository
+from qa_agent.test_case_review import (
+    InMemoryTestCaseReviewRepository,
+    TestCaseReviewService,
+    TestCaseReviewStatus,
+)
 from qa_agent.test_case_execution import (
     RunUnavailableError,
     TestCaseExecutionService,
@@ -171,6 +176,7 @@ class LocalWebApplication:
         automation_lifecycle: AutomationLifecycleService | None = None,
         automation_lifecycle_repository: AutomationLifecycleRepository | None = None,
         suite_run_service: SuiteRunService | None = None,
+        test_case_review: TestCaseReviewService | None = None,
     ) -> None:
         self._run_history = run_history
         self._reports = reports or RunReportGenerator()
@@ -193,6 +199,9 @@ class LocalWebApplication:
             InMemoryTestSuiteRepository(), test_cases
         )
         self._suite_run_service = suite_run_service
+        self._test_case_review = test_case_review or TestCaseReviewService(
+            InMemoryTestCaseReviewRepository(), plan_store or InMemoryPlanStore()
+        )
         self._testplan_exports = (
             TestPlanExportService(test_cases, plan_store)
             if test_cases is not None and plan_store is not None else None
@@ -295,7 +304,15 @@ class LocalWebApplication:
         if path == "/test-suites":
             return WebResponse.html(200, self._test_suites_page())
         if path == "/test-cases/new":
-            return WebResponse.html(200, self._new_test_case_page())
+            draft_id = _parse_uuid(query.get("draft_id", [""])[0])
+            selected = self._drafts.get(draft_id) if draft_id else None
+            if selected is not None and selected.status != DraftStatus.ACTIVE:
+                selected = None
+            return WebResponse.html(200, self._new_test_case_page(
+                source_draft_id=str(selected.id) if selected else "",
+                base_url=selected.base_url or "" if selected else "",
+                scenario=selected.body if selected else "",
+            ))
         if len(parts) == 3 and parts[0] == "test-cases" and parts[1] == "review":
             return self._draft_review_page(parts[2])
         if path == "/runs":
@@ -407,6 +424,7 @@ class LocalWebApplication:
             return WebResponse.html(200, self._manual_test_case_page(
                 name=values.get("name", ""), base_url=values.get("base_url", ""),
                 scenario=values.get("description", ""),
+                source_draft_id=values.get("source_draft_id", ""),
             ))
         if len(parts) == 3 and parts[0] == "test-cases" and parts[2] == "edit":
             return self._handle_test_case_edit(parts[1], body)
@@ -437,6 +455,12 @@ class LocalWebApplication:
             return self._handle_suite_run_start(parts[1], body)
         if parts == ["test-cases", "generate"]:
             return self._handle_generate_test_case(body)
+        if len(parts) == 3 and parts[0] == "test-cases" and parts[2] in {
+            "approve", "approve-validation"
+        }:
+            return self._handle_test_case_approval(parts[1], parts[2], body)
+        if parts == ["test-cases", "drafts", "save"]:
+            return self._handle_new_test_case_draft_save(body)
         if (
             len(parts) == 4
             and parts[:2] == ["test-cases", "authoring-progress"]
@@ -491,6 +515,26 @@ class LocalWebApplication:
                 "Execution is not available for this application.",
                 503,
             )
+        test_case = self._test_cases.get(test_case_id) if self._test_cases is not None else None
+        review_status = self._test_case_review.status(test_case_id)
+        if review_status != TestCaseReviewStatus.APPROVED:
+            return self._run_error(
+                test_case_id,
+                "Review and approve this TestCase before generating automation or starting a run.",
+                409,
+            )
+        review_record = self._test_case_review.record(test_case_id)
+        if (
+            workflow in {WorkflowType.VALIDATION, WorkflowType.REGRESSION}
+            and review_record is not None
+            and test_case is not None
+            and not self._test_case_review.validation_approved_for(test_case)
+        ):
+            return self._run_error(
+                test_case_id,
+                "Review the current saved automation and approve it for Validation first.",
+                409,
+            )
         progress_id = self._background_runs.start(
             test_case_id,
             workflow,
@@ -498,6 +542,82 @@ class LocalWebApplication:
             cookie_policy=cookie_policy,
         )
         return WebResponse.redirect(f"/runs/progress/{progress_id}")
+
+    def _handle_test_case_approval(
+        self, test_case_id_text: str, action: str, body: bytes | str | None
+    ) -> WebResponse:
+        _form, error = _parse_form_body(body)
+        if error:
+            return self._not_found("TestCase approval request is invalid.")
+        test_case_id = _parse_uuid(test_case_id_text)
+        test_case = (
+            self._test_cases.get(test_case_id)
+            if test_case_id is not None and self._test_cases is not None else None
+        )
+        if test_case is None:
+            return self._not_found("TestCase not found")
+        if action == "approve":
+            record = self._test_case_review.record(test_case.id)
+            if record is not None and record.status == TestCaseReviewStatus.READY_FOR_REVIEW:
+                self._test_case_review.approve_test_case(test_case)
+            return WebResponse.redirect(f"/test-cases/{test_case.id}")
+        try:
+            self._test_case_review.approve_for_validation(test_case)
+        except ValueError as approval_error:
+            return WebResponse.html(409, self._page(
+                "Automation review required",
+                '<div class="error-state"><h1>Automation not approved</h1>'
+                f'<p>{escape_html(approval_error)}</p>'
+                f'<a class="button" href="/test-cases/{test_case.id}">Return to TestCase</a></div>',
+            ))
+        return WebResponse.redirect(f"/test-cases/{test_case.id}")
+
+    def _handle_new_test_case_draft_save(
+        self, body: bytes | str | None
+    ) -> WebResponse:
+        form, error = _parse_form_body(body, max_bytes=_MAX_DRAFT_SAVE_BODY_BYTES)
+        values = {key: items[0] for key, items in form.items()}
+        if error:
+            return WebResponse.html(400, self._new_test_case_page(error, **{
+                "base_url": values.get("base_url", ""),
+                "scenario": values.get("scenario", ""),
+                "source_draft_id": values.get("source_draft_id", ""),
+            }))
+        scenario = values.get("scenario", "").strip()
+        base_url = values.get("base_url", "").strip()
+        source_text = values.get("source_draft_id", "").strip()
+        source = None
+        if source_text:
+            source_id = _parse_uuid(source_text)
+            source = self._drafts.get(source_id) if source_id is not None else None
+            if source is None or source.status != DraftStatus.ACTIVE:
+                return WebResponse.html(409, self._new_test_case_page(
+                    "The selected Draft is no longer active. Choose another Draft.",
+                    base_url=base_url, scenario=scenario,
+                ))
+        if not scenario or len(scenario) > 6000 or len(base_url) > 2048:
+            return WebResponse.html(400, self._new_test_case_page(
+                "Enter a scenario of 1–6,000 characters and a Website of 2,048 characters or fewer.",
+                base_url=base_url, scenario=scenario,
+                source_draft_id=source_text if source is not None else "",
+            ))
+        title = source.title if source is not None else next(
+            (line.strip() for line in scenario.splitlines() if line.strip()), ""
+        )[:200]
+        draft_values = {
+            "id": source.id if source is not None else uuid4(),
+            "title": title,
+            "body": scenario,
+            "base_url": base_url or None,
+            "notes": source.notes if source is not None else None,
+            "status": source.status if source is not None else DraftStatus.ACTIVE,
+            "converted_test_case_id": (source.converted_test_case_id if source is not None else None),
+        }
+        if source is not None:
+            draft_values["created_at"] = source.created_at
+        draft = Draft(**draft_values)
+        self._drafts.save(draft)
+        return WebResponse.redirect(f"/drafts/{draft.id}?saved=1")
 
     def _progress_json(self, progress_id: str) -> WebResponse:
         snapshot = self._progress_store.get(progress_id)
@@ -804,7 +924,7 @@ class LocalWebApplication:
         )
 
     def _recent_drafts_panel(self) -> str:
-        drafts = self._drafts.list(5)
+        drafts = [item for item in self._drafts.list(500) if item.status == DraftStatus.ACTIVE][:5]
         if not drafts:
             summary = '<p class="muted">Save an unfinished idea and return to it later.</p>'
         else:
@@ -823,6 +943,9 @@ class LocalWebApplication:
         rows = "".join(
             '<tr><td><a href="/drafts/' + str(item.id) + '">' + escape_html(item.title) + '</a></td>'
             + f'<td>{escape_html(item.base_url or "—")}</td>'
+            + f'<td>{"Used" if item.status == DraftStatus.USED else "Active"}</td>'
+            + (f'<td><a href="/test-cases/{item.converted_test_case_id}">View TestCase</a></td>'
+               if item.converted_test_case_id else '<td>вЂ”</td>')
             + f'<td>{escape_html(format_timestamp(item.updated_at))}</td>'
             + '<td><form method="post" action="/drafts/' + str(item.id) + '/delete">'
             + '<button class="button" type="submit">Delete</button></form></td></tr>'
@@ -833,7 +956,7 @@ class LocalWebApplication:
             '<p class="lead">Capture unfinished testing ideas without creating a TestCase.</p></header>'
             '<div class="actions"><a class="button primary" href="/drafts/new">New Draft</a></div>'
             + ('<section class="panel"><div class="table-wrap"><table><thead><tr>'
-               '<th>Title</th><th>Base URL</th><th>Updated</th><th>Actions</th></tr></thead>'
+               '<th>Title</th><th>Base URL</th><th>Status</th><th>TestCase</th><th>Updated</th><th>Actions</th></tr></thead>'
                f'<tbody>{rows}</tbody></table></div></section>' if drafts else
                self._empty_state("No Drafts yet.", "Save a testing idea to work on it later."))
         )
@@ -862,10 +985,18 @@ class LocalWebApplication:
         notes = submitted.get("notes", (draft.notes or "") if draft else "")
         error_html = f'<p class="authoring-error" role="alert">{escape_html(error)}</p>' if error else ""
         success_html = '<p class="authoring-success" role="status">Draft saved successfully.</p>' if saved else ""
+        state_html = (
+            '<section class="panel"><h2>Used Draft</h2>'
+            + (f'<p>Linked TestCase: <a href="/test-cases/{draft.converted_test_case_id}">View TestCase</a></p>'
+               if draft.converted_test_case_id else '<p>No linked TestCase is recorded.</p>')
+            + '<p class="muted">This Draft remains saved and can be reused.</p></section>'
+            if draft is not None and draft.status == DraftStatus.USED else ""
+        )
         content = (
             '<header class="page-heading"><h1>' + ("Edit Draft" if editing else "New Draft") + '</h1>'
             '<p class="lead">Drafts stay separate from TestCases, Runs, and Test Suites.</p></header>'
-            + error_html + success_html + f'<form method="post" action="{action}" class="panel" data-inline-validation novalidate>'
+            + error_html + success_html + state_html
+            + f'<form method="post" action="{action}" class="panel" data-inline-validation novalidate>'
             + '<div class="field"><label for="draft-title">Title</label>'
             + f'<input id="draft-title" name="title" maxlength="200" required value="{escape_html(title)}"></div>'
             + '<div class="field"><label for="draft-body">Testing idea / scenario</label>'
@@ -924,16 +1055,19 @@ class LocalWebApplication:
                 if self._test_cases is None:
                     raise TestCaseEditError("TestCase storage is not configured.")
                 self._test_cases.save(test_case)
+                self._test_case_review.mark_ready_for_review(test_case)
+                self._drafts.mark_used(draft.id, test_case.id)
             except (TestCaseEditError, ValueError) as conversion_error:
                 return WebResponse.html(400, self._draft_edit_page(draft, str(conversion_error)))
-            return WebResponse.redirect(f"/test-cases/{test_case.id}/edit")
+            return WebResponse.redirect(f"/test-cases/{test_case.id}")
         if action == "generate":
             if self._background_authoring is None or self._authoring_service is None:
                 return WebResponse.html(503, self._draft_edit_page(draft, "AI generation is unavailable. You can still create a TestCase manually."))
             try:
                 validated = self._authoring_service.validate_input(draft.title, draft.body, draft.base_url or "")
                 progress_id = self._background_authoring.start(
-                    name=validated.name, base_url=validated.base_url, scenario=validated.scenario
+                    name=validated.name, base_url=validated.base_url, scenario=validated.scenario,
+                    source_draft_id=draft.id,
                 )
             except TestCaseAuthoringError as generate_error:
                 return WebResponse.html(400, self._draft_edit_page(draft, str(generate_error)))
@@ -964,6 +1098,8 @@ class LocalWebApplication:
                 "body": scenario,
                 "base_url": base_url or None,
                 "notes": notes or None,
+                "status": existing.status if existing else DraftStatus.ACTIVE,
+                "converted_test_case_id": existing.converted_test_case_id if existing else None,
             }
             if existing is not None:
                 draft_values["created_at"] = existing.created_at
@@ -1023,6 +1159,15 @@ class LocalWebApplication:
         values = {key: items[0] for key, items in form.items()}
         if error:
             return WebResponse.html(400, self._manual_test_case_page(error=error))
+        source_text = values.get("source_draft_id", "").strip()
+        source_id = _parse_uuid(source_text) if source_text else None
+        source_draft = self._drafts.get(source_id) if source_id is not None else None
+        if source_text and (source_draft is None or source_draft.status != DraftStatus.ACTIVE):
+            return WebResponse.html(409, self._manual_test_case_page(
+                name=values.get("name", ""), base_url=values.get("base_url", ""),
+                scenario=values.get("description", ""),
+                error="The selected Draft is no longer active. Choose another Draft.",
+            ))
         try:
             test_case = create_manual_test_case(values)
             if self._test_cases is None:
@@ -1034,6 +1179,9 @@ class LocalWebApplication:
                 scenario=values.get("description", ""),
                 source_draft_id=values.get("source_draft_id", ""), error=str(create_error),
             ))
+        self._test_case_review.mark_ready_for_review(test_case)
+        if source_draft is not None:
+            self._drafts.mark_used(source_draft.id, test_case.id)
         return WebResponse.redirect(f"/test-cases/{test_case.id}")
 
     def _test_case_edit_page_response(self, test_case_id: UUID) -> WebResponse:
@@ -1100,6 +1248,7 @@ class LocalWebApplication:
             edited = edit_test_case(test_case, submitted, submitted.get("operation", "save"))
             self._test_cases.save(edited)
             self._automation_lifecycle.mark_test_case_changed(edited)
+            self._test_case_review.mark_ready_for_review(edited)
         except (TestCaseEditError, ValueError) as edit_error:
             return WebResponse.html(400, self._test_case_edit_page(test_case, str(edit_error), submitted))
         return WebResponse.redirect(f"/test-cases/{edited.id}")
@@ -1153,6 +1302,13 @@ class LocalWebApplication:
         test_case = self._test_cases.get(test_case_id) if self._test_cases is not None else None
         if test_case is None:
             return self._not_found("TestCase not found")
+        if self._test_case_review.status(test_case.id) != TestCaseReviewStatus.APPROVED:
+            return WebResponse.html(409, self._page(
+                "TestCase review required",
+                '<div class="error-state"><h1>TestCase review required</h1>'
+                '<p>Approve the TestCase before editing automation.</p>'
+                f'<a class="button" href="/test-cases/{test_case.id}">Review TestCase</a></div>',
+            ))
         if self._plan_store is None:
             return WebResponse.html(503, self._page(
                 "Automation editor unavailable",
@@ -1165,20 +1321,9 @@ class LocalWebApplication:
         complete = has_complete_plans(test_case, self._plan_store)
         notice = ""
         if query.get("saved") == ["1"]:
-            detail = (
-                "Validation required before this TestCase is Automation ready."
-                if complete else "Automation for the remaining steps is required before Validation can run."
-            )
-            validation_button = (
-                f'<form method="post" action="/test-cases/{test_case.id}/run" class="inline-form">'
-                '<input type="hidden" name="workflow" value="VALIDATION">'
-                '<button class="button primary" type="submit">Run Validation</button></form>'
-                if self._background_runs is not None and complete else ""
-            )
             notice = (
                 '<div class="success-state" role="status"><strong>Automation saved.</strong> '
-                + detail
-                + validation_button
+                'Review the current TestPlan and approve these saved versions for Validation. '
                 + f' <a href="/test-cases/{test_case.id}">Back to TestCase</a></div>'
             )
         if error_message:
@@ -1326,6 +1471,13 @@ class LocalWebApplication:
         test_case = self._test_cases.get(test_case_id) if test_case_id and self._test_cases is not None else None
         if test_case is None or step_id is None:
             return self._not_found("TestCase or TestStep not found")
+        if self._test_case_review.status(test_case.id) != TestCaseReviewStatus.APPROVED:
+            return WebResponse.html(409, self._page(
+                "TestCase review required",
+                '<div class="error-state"><h1>TestCase review required</h1>'
+                '<p>Approve the TestCase before editing automation.</p>'
+                f'<a class="button" href="/test-cases/{test_case.id}">Review TestCase</a></div>',
+            ))
         step = next((item for item in test_case.steps if item.id == step_id), None)
         if step is None:
             return self._not_found("TestStep not found")
@@ -1411,8 +1563,12 @@ class LocalWebApplication:
             key: form.get(key, [""])[0]
             for key in ("name", "base_url", "scenario")
         }
+        source_draft_text = form.get("source_draft_id", [""])[0].strip()
+        source_draft_id = _parse_uuid(source_draft_text) if source_draft_text else None
+        source_draft = self._drafts.get(source_draft_id) if source_draft_id else None
 
         dashboard_entry = form.get("authoring_entry", [""])[0] == "dashboard"
+        require_name = not dashboard_entry and form.get("authoring_entry", [""])[0] != "new"
         field_errors: dict[str, str] = {}
 
         def error_response(status: int, message: str) -> WebResponse:
@@ -1424,26 +1580,33 @@ class LocalWebApplication:
                     field_errors=field_errors,
                 ))
             return WebResponse.html(status, self._new_test_case_page(
-                message, field_errors=field_errors, **values
+                message or field_errors.get("name") or field_errors.get("base_url")
+                or field_errors.get("scenario"),
+                field_errors=field_errors,
+                source_draft_id=source_draft_text, **values
             ))
 
         if form_error is not None:
             return error_response(400, form_error)
+        if source_draft_text and (
+            source_draft is None or source_draft.status != DraftStatus.ACTIVE
+        ):
+            return error_response(409, "The selected Draft is no longer active. Choose another Draft.")
         field_errors = _authoring_field_errors(
             values["name"], values["base_url"], values["scenario"],
-            require_name=not dashboard_entry,
+            require_name=require_name,
         )
         if field_errors:
             return error_response(400, "")
         try:
             validated = TestCaseAuthoringService.validate_input(
                 **values,
-                require_name=not dashboard_entry,
+                require_name=require_name,
             )
         except TestCaseAuthoringError as error:
             return error_response(400, str(error))
         except Exception:
-            return error_response(400, "Enter a valid name, Website, and scenario.")
+            return error_response(400, "Enter a valid Website and scenario.")
         if self._test_cases is None:
             return error_response(503, "TestCase storage is not configured.")
         if self._authoring_service is None or self._background_authoring is None:
@@ -1455,6 +1618,7 @@ class LocalWebApplication:
                 name=validated.name,
                 base_url=validated.base_url,
                 scenario=validated.scenario,
+                source_draft_id=source_draft.id if source_draft is not None else None,
             )
         except Exception:
             logger.error("Could not start authoring request")
@@ -1478,17 +1642,20 @@ class LocalWebApplication:
                 '<div class="error-state"><p>AI generation is unavailable. Try again later.</p></div>',
             ))
         name, base_url, scenario, source_draft_token = retry_data
+        source_draft_id = self._progress_store.get_authoring_source_draft_id(progress_id)
         try:
             validated = self._authoring_service.validate_input(name, scenario, base_url)
         except TestCaseAuthoringError as error:
             return WebResponse.html(400, self._new_test_case_page(
-                str(error), name=name, base_url=base_url, scenario=scenario
+                str(error), name=name, base_url=base_url, scenario=scenario,
+                source_draft_id=str(source_draft_id or ""),
             ))
         new_progress_id = self._background_authoring.start(
             name=validated.name,
             base_url=validated.base_url,
             scenario=validated.scenario,
             source_draft_token=source_draft_token,
+            source_draft_id=source_draft_id,
         )
         return WebResponse.redirect(
             f"/test-cases/authoring-progress/{new_progress_id}"
@@ -1504,6 +1671,7 @@ class LocalWebApplication:
         if retry_data is None:
             return self._not_found("Authoring progress is no longer available.")
         name, base_url, scenario, _source_draft_token = retry_data
+        source_draft_id = self._progress_store.get_authoring_source_draft_id(progress_id)
         if action == "save-draft":
             draft = Draft(title=name or "Untitled testing idea", body=scenario, base_url=base_url or None)
             self._drafts.save(draft)
@@ -1523,11 +1691,14 @@ class LocalWebApplication:
                     error="TestCase storage is not configured.",
                 ))
             self._test_cases.save(test_case)
+            self._test_case_review.mark_ready_for_review(test_case)
         except (TestCaseEditError, ValueError) as create_error:
             return WebResponse.html(400, self._manual_test_case_page(
                 name=name, base_url=base_url, scenario=scenario, error=str(create_error),
             ))
-        return WebResponse.redirect(f"/test-cases/{test_case.id}/edit")
+        if source_draft_id is not None:
+            self._drafts.mark_used(source_draft_id, test_case.id)
+        return WebResponse.redirect(f"/test-cases/{test_case.id}")
 
     def _handle_draft_action(
         self, token: str, action: str, body: bytes | str | None
@@ -1572,6 +1743,7 @@ class LocalWebApplication:
                 base_url=validated.base_url,
                 scenario=validated.scenario,
                 source_draft_token=token,
+                source_draft_id=draft.source_draft_id,
             )
             return WebResponse.redirect(f"/test-cases/authoring-progress/{progress_id}")
         if action != "save":
@@ -1606,6 +1778,9 @@ class LocalWebApplication:
                 '<p>The reviewed TestCase could not be saved. Generate a new draft and try again.</p>'
                 '<a class="button" href="/test-cases">Return to TestCases</a></div>',
             ))
+        self._test_case_review.mark_ready_for_review(edits.test_case)
+        if consumed.source_draft_id is not None:
+            self._drafts.mark_used(consumed.source_draft_id, edits.test_case.id)
         if self._llm_usage is not None:
             for workflow_id in consumed.usage_workflow_ids:
                 self._llm_usage.associate_workflow(
@@ -1701,7 +1876,7 @@ class LocalWebApplication:
         )
         content = (
             '<header class="page-heading"><h1>Review TestCase</h1>'
-            '<p class="lead">Review and edit the generated definition before saving it. '
+            '<p class="lead">Review and edit the generated definition before saving it as Ready for review. Saving does not approve it. '
             + edited_badge + '</p></header>'
             + error_html
             + form_error_html
@@ -1716,7 +1891,7 @@ class LocalWebApplication:
             + '</section><section class="panel"><h2>Steps</h2>'
             + "".join(segments)
             + '</section><div class="actions">'
-            + '<button class="button primary" type="submit">Save Test Case</button></div></form>'
+            + '<button class="button primary" type="submit">Save TestCase for review</button></div></form>'
             + '<div class="actions">'
             + f'<form method="post" action="/test-cases/review/{escape_html(token)}/regenerate" data-authoring-form>'
             + '<button class="button" type="submit">Generate Again</button></form>'
@@ -1839,51 +2014,83 @@ class LocalWebApplication:
         name: str = "",
         base_url: str = "",
         scenario: str = "",
+        source_draft_id: str = "",
         field_errors: dict[str, str] | None = None,
     ) -> str:
         field_errors = field_errors or {}
+        selected_id = _parse_uuid(source_draft_id) if source_draft_id else None
+        selected = self._drafts.get(selected_id) if selected_id else None
+        if selected is not None and selected.status != DraftStatus.ACTIVE:
+            selected = None
         error_html = (
             f'<p class="authoring-error" id="new-case-authoring-error" role="alert">{escape_html(error)}</p>'
             if error else ""
         )
-        name_invalid = _inline_invalid_attrs("case-name-error", field_errors.get("name"))
         website_invalid = _inline_invalid_attrs("case-website-error", field_errors.get("base_url"))
         scenario_invalid = _inline_invalid_attrs("case-scenario-error", field_errors.get("scenario"))
+        selected_html = (
+            f'<p class="draft-selection-status" data-draft-selection-status role="status" aria-live="polite">'
+            f'Loaded Draft: <strong>{escape_html(selected.title)}</strong>. Changes here are saved only when you choose Save Draft.</p>'
+            if selected is not None else
+            '<p class="draft-selection-status muted" data-draft-selection-status role="status" aria-live="polite">Choose a Draft to load its Website and Scenario.</p>'
+        )
+        manual_name = name or next(
+            (line.strip() for line in scenario.splitlines() if line.strip()), ""
+        )[:200]
         content = (
             '<header class="page-heading"><h1>New Test Case</h1>'
-            '<p class="lead">Describe the scenario for AI authoring, or create a TestCase yourself.</p></header>'
-            + '<section class="panel authoring-entry"><form method="post" action="/test-cases/generate" data-authoring-form data-inline-validation novalidate>'
-            + '<input type="hidden" name="authoring_entry" value="new">'
-            + error_html
-            + '<div class="field"><label for="case-name">Name</label>'
-            + f'<input id="case-name" name="name" maxlength="200" required value="{escape_html(name)}"{name_invalid}></div>'
-            + _inline_error_html("case-name-error", "case-name", field_errors.get("name"))
-            + '<div class="field"><label for="case-base-url">Base URL</label>'
+            '<p class="lead">Describe what you want to verify, then review the generated TestCase.</p></header>'
+            '<div class="new-testcase-layout"><section class="panel authoring-entry">'
+            '<h2>What do you want to test?</h2>'
+            '<form method="post" action="/test-cases/generate" data-authoring-form data-inline-validation novalidate>'
+            '<input type="hidden" name="authoring_entry" value="new">'
+            f'<input type="hidden" name="source_draft_id" value="{escape_html(source_draft_id)}" data-source-draft-id>'
+            + error_html + selected_html
+            + '<div class="field"><label for="case-base-url">Website</label>'
             + f'<input id="case-base-url" name="base_url" type="url" maxlength="2048" required value="{escape_html(base_url)}" placeholder="https://example.com"{website_invalid}></div>'
             + _inline_error_html("case-website-error", "case-base-url", field_errors.get("base_url"))
             + '<div class="field"><label for="case-scenario">Scenario</label>'
-            + f'<textarea id="case-scenario" name="scenario" rows="8" maxlength="6000" required placeholder="Describe the behavior you want to verify…"{scenario_invalid}>{escape_html(scenario)}</textarea></div>'
+            + f'<textarea id="case-scenario" name="scenario" rows="8" maxlength="6000" required placeholder="Describe the behavior you want to verify\u2026"{scenario_invalid}>{escape_html(scenario)}</textarea></div>'
             + _inline_error_html("case-scenario-error", "case-scenario", field_errors.get("scenario"))
             + self._authoring_voice_controls("case-scenario")
-            + '<button class="button primary" type="submit">Generate Test with AI</button>'
-            + '</form></section>'
-            + '<section class="panel"><h2>Create without AI</h2>'
-            + '<p class="muted">Manual creation and editing remain available when providers are unconfigured or unavailable.</p>'
+            + '<div class="actions"><button class="button primary" type="submit">Generate TestCase</button>'
+            + '<button class="button" type="submit" formaction="/test-cases/drafts/save" formnovalidate>Save Draft</button></div>'
+            + '</form><p class="muted">The TestCase name is suggested from your scenario and can be edited during review.</p>'
+            + '</section>' + self._draft_selection_panel(selected.id if selected else None) + '</div>'
+            + '<div class="muted manual-authoring-link"><span>Prefer to create it yourself?</span>'
             + '<form method="post" action="/test-cases/manual/prepare">'
-            + f'<input type="hidden" name="name" value="{escape_html(name)}">'
+            + f'<input type="hidden" name="name" value="{escape_html(manual_name)}">'
             + f'<input type="hidden" name="base_url" value="{escape_html(base_url)}">'
             + f'<input type="hidden" name="description" value="{escape_html(scenario)}">'
-            + '<button class="button" type="submit">Create manually with these details</button></form> '
-            + '<form method="post" action="/drafts">'
-            + f'<input type="hidden" name="title" value="{escape_html(name)}">'
-            + f'<input type="hidden" name="body" value="{escape_html(scenario)}">'
-            + f'<input type="hidden" name="base_url" value="{escape_html(base_url)}">'
-            + '<button class="button" type="submit">Save as Draft</button></form></section>'
-            + self._recent_drafts_panel()
+            + f'<input type="hidden" name="source_draft_id" value="{escape_html(source_draft_id)}">'
+            + '<button class="text-button" type="submit">Create manually with these details</button></form></div>'
         )
         return self._page(
             "New Test Case", content, current="Test Cases",
             breadcrumbs=[("Dashboard", "/"), ("Test Cases", "/test-cases")],
+        )
+
+    def _draft_selection_panel(self, selected_draft_id: UUID | None = None) -> str:
+        active = [item for item in self._drafts.list(500) if item.status == DraftStatus.ACTIVE][:5]
+        if not active:
+            rows = '<p class="muted">No active Drafts yet. Save an unfinished idea to reuse it here.</p>'
+        else:
+            rows = '<ul class="draft-sidebar-list">' + "".join(
+                f'<li><button class="draft-select-button" type="button" data-draft-select '
+                f'data-draft-id="{item.id}" data-title="{escape_html(item.title)}" '
+                f'data-website="{escape_html(item.base_url or "")}" '
+                f'data-scenario="{escape_html(item.body)}" '
+                f'aria-pressed="{"true" if item.id == selected_draft_id else "false"}">'
+                f'<strong>{escape_html(item.title)}</strong>'
+                + (f'<span>{escape_html(item.base_url)}</span>' if item.base_url else '')
+                + '</button></li>'
+                for item in active
+            ) + '</ul>'
+        return (
+            '<aside class="panel drafts-sidebar" aria-labelledby="new-case-drafts-title">'
+            '<div class="section-heading"><h2 id="new-case-drafts-title">Drafts</h2>'
+            '<a class="button" href="/drafts">View all</a></div>'
+            + rows + '<a class="button" href="/drafts/new">New Draft</a></aside>'
         )
 
     def _test_case_list(self) -> str:
@@ -2999,6 +3206,7 @@ class LocalWebApplication:
             source_note = "Definition loaded from the saved TestCase."
             steps = "".join(
                 f'<li><strong>{escape_html(step.name)}</strong>'
+                f'<div>{escape_html(step.description)}</div>'
                 f'<div class="muted">Expected: {escape_html(step.expected)}</div></li>'
                 for step in test_case.steps
             )
@@ -3066,7 +3274,10 @@ class LocalWebApplication:
             )
         )
         run_form = ""
-        if self._run_service is not None and test_case is not None:
+        if (
+            self._run_service is not None and test_case is not None
+            and self._test_case_review.status(test_case.id) == TestCaseReviewStatus.APPROVED
+        ):
             availability = self._workflow_availability(test_case_id)
             if availability is not None:
                 run_form = self._workflow_panel(test_case_id, test_case, availability)
@@ -3111,13 +3322,49 @@ class LocalWebApplication:
             f'<p>{badge(lifecycle_label, "workflow")}</p><p class="muted">{escape_html(lifecycle_note)}</p></section>'
             if test_case is not None else ""
         )
+        run_status_panel = (
+            '<section class="panel"><h2>Run status</h2>'
+            + (f'<p>{badge(latest.status.value)} {_outcome_badge(latest)}</p>'
+               f'<p class="muted">{escape_html(latest.workflow_type.value.title())} · '
+               f'{escape_html(format_timestamp(latest.started_at))}</p>'
+               if latest is not None else '<p class="muted">Not run yet.</p>')
+            + '</section>'
+            if test_case is not None else ""
+        )
+        review_status = (
+            self._test_case_review.status(test_case.id)
+            if test_case is not None else TestCaseReviewStatus.APPROVED
+        )
+        review_panel = (
+            '<section class="panel review-status-panel"><h2>Review status</h2>'
+            + f'<p>{badge("Ready for review" if review_status == TestCaseReviewStatus.READY_FOR_REVIEW else "Approved", "workflow")}</p>'
+            + ('<p>Please review the TestCase content below before approving it.</p>'
+               if review_status == TestCaseReviewStatus.READY_FOR_REVIEW else
+               '<p class="muted">TestCase content is approved.</p>')
+            + '</section>'
+            if test_case is not None else ""
+        )
+        review_action_panel = (
+            f'<section class="panel review-action-panel"><h2>Review TestCase</h2>'
+            '<p>Review the scenario, preconditions, steps, and expected results above.</p>'
+            f'<form method="post" action="/test-cases/{test_case_id}/approve">'
+            '<button class="button primary" type="submit">Approve TestCase</button></form></section>'
+            if test_case is not None and review_status == TestCaseReviewStatus.READY_FOR_REVIEW else
+            ('<section class="panel review-action-panel"><h2>Next step</h2>'
+             '<p>TestCase approved. Generate automation when you are ready.</p></section>'
+             if test_case is not None else "")
+        )
         edit_links = (
             f'<div class="actions"><a class="button" href="/test-cases/{test_case_id}/edit">Edit TestCase</a>'
             f'<a class="button" href="/test-cases/{test_case_id}/plans">View TestPlan</a></div>'
             if test_case is not None else ""
         )
-        if test_case is not None and self._plan_store is not None and any(
+        if (
+            test_case is not None
+            and review_status == TestCaseReviewStatus.APPROVED
+            and self._plan_store is not None and any(
             self._plan_store.find(step.id) is not None for step in test_case.steps
+            )
         ):
             edit_links = edit_links.replace(
                 '</div>',
@@ -3142,18 +3389,20 @@ class LocalWebApplication:
             + f'<details class="technical-details"><summary>Technical IDs</summary>'
             + f'<p>TestCase UUID: <code>{escape_html(test_case_id)}</code></p></details>'
             + f'<div class="summary-grid">{cards}</div>'
+            + review_panel
             + lifecycle_panel
-            + run_form
-            + export_panel
-            + usage_panel
+            + run_status_panel
             + '<section class="panel"><h2>Preconditions</h2>'
             + (f"<ul>{conditions}</ul>" if conditions else '<p class="muted">No preconditions recorded.</p>')
             + '</section><section class="panel"><h2>Steps</h2>'
             + (f"<ol>{steps}</ol>" if steps else '<p class="muted">No steps recorded.</p>')
             + '</section><section class="panel"><h2>Execution segments</h2>'
             + (f"<ul>{segments}</ul>" if segments else '<p class="muted">No segment data recorded.</p>')
-            + '</section><section class="panel"><h2>Run History</h2>'
-            + history_table + '</section>'
+            + '</section>'
+            + review_action_panel
+            + run_form
+            + '<section class="panel"><h2>Run History</h2>' + history_table + '</section>'
+            + export_panel + usage_panel
         )
         return WebResponse.html(
             200,
@@ -3404,15 +3653,20 @@ class LocalWebApplication:
         test_case,
         availability: WorkflowAvailability,
     ) -> str:
-        forms = []
-        if availability.automation_available:
-            forms.append(
-                f'<form method="post" action="/test-cases/{test_case_id}/run" data-run-form>'
-                '<input type="hidden" name="workflow" value="AUTOMATION">'
-                + self._evidence_controls(f"automation-{test_case_id}")
-                + self._cookie_consent_controls(f"automation-{test_case_id}")
-                + '<button class="button primary" type="submit">Generate &amp; Run Automation</button></form>'
+        review_status = self._test_case_review.status(test_case.id)
+        if review_status != TestCaseReviewStatus.APPROVED:
+            return (
+                '<section class="panel"><h2>Automation</h2>'
+                '<p>Approve the TestCase before generating automation.</p></section>'
             )
+        forms: list[str] = []
+        review_record = self._test_case_review.record(test_case.id)
+        legacy_case = review_record is None
+        complete = (
+            availability.regression_available
+            and availability.usable_plan_count == availability.total_step_count
+        )
+        current_plan_approval = self._test_case_review.validation_approved_for(test_case)
         plan_by_step = {
             step_id: (version, version_id)
             for step_id, version, version_id in availability.plan_versions
@@ -3420,65 +3674,134 @@ class LocalWebApplication:
         version_rows = []
         for step in sorted(test_case.steps, key=lambda item: item.order):
             selected = plan_by_step.get(step.id)
-            if selected is not None:
-                version, version_id = selected
-                saved_version = (
-                    self._plan_store.get_version(version_id)
-                    if self._plan_store is not None else None
-                )
-                origin_label = _plan_origin_label(
-                    saved_version.origin if saved_version is not None else None
-                )
-                created = (
-                    f'<p>Created: {escape_html(format_timestamp(saved_version.created_at))}</p>'
-                    if saved_version is not None else ""
-                )
-                previous = f'<p>Previous version: v{version - 1}</p>' if version > 1 else ""
-                version_rows.append(
-                    f'<li><span>Step {step.order + 1}: {escape_html(step.name)}</span> '
-                    f'<details class="plan-version-details"><summary>v{version} '
-                    f'{badge(origin_label, "workflow")}</summary>'
-                    f'<p>Automation version v{version}</p>{created}{previous}'
-                    f'<p>Internal ID: <code>{escape_html(version_id)}</code></p></details></li>'
-                )
+            if selected is None:
+                continue
+            version, version_id = selected
+            saved_version = (
+                self._plan_store.get_version(version_id)
+                if self._plan_store is not None else None
+            )
+            origin_label = _plan_origin_label(
+                saved_version.origin if saved_version is not None else None
+            )
+            created = (
+                f'<p>Created: {escape_html(format_timestamp(saved_version.created_at))}</p>'
+                if saved_version is not None else ""
+            )
+            previous = f'<p>Previous version: v{version - 1}</p>' if version > 1 else ""
+            version_rows.append(
+                f'<li><span>Step {step.order + 1}: {escape_html(step.name)}</span> '
+                f'<details class="plan-version-details"><summary>v{version} '
+                f'{badge(origin_label, "workflow")}</summary>'
+                f'<p>Automation version v{version}</p>{created}{previous}'
+                f'<p>Internal ID: <code>{escape_html(version_id)}</code></p></details></li>'
+            )
         plan_status = (
             f'{availability.usable_plan_count} / {availability.total_step_count} steps have executable plans.'
         )
-        validation = availability.validation_available
-        regression = availability.regression_available
-        for workflow, label, available in (
-            (WorkflowType.VALIDATION, "Validation", validation),
-            (WorkflowType.REGRESSION, "Regression", regression),
-        ):
-            if available:
+        if complete:
+            if legacy_case and availability.automation_available:
+                forms.append(self._workflow_form(
+                    test_case_id, WorkflowType.AUTOMATION, "Generate Automation", primary=True
+                ))
+            lifecycle_status = self._automation_lifecycle.status(test_case)
+            if current_plan_approval:
+                status_message = (
+                    "Automation Ready. The saved plans passed Validation."
+                    if lifecycle_status == AutomationStatus.AUTOMATION_READY else
+                    "Automation is approved for Validation. Run Validation to confirm it is ready."
+                )
+            else:
+                status_message = "Automation is ready for review."
+            links = (
+                f'<div class="actions"><a class="button" href="/test-cases/{test_case_id}/plans">View TestPlan</a>'
+                f'<a class="button" href="/test-cases/{test_case_id}/automation/edit">Edit Automation</a></div>'
+            )
+            if not current_plan_approval and availability.validation_available:
+                forms.append(
+                    f'<form method="post" action="/test-cases/{test_case_id}/approve-validation">'
+                    '<button class="button primary" type="submit">Approve for Validation</button></form>'
+                )
+            if current_plan_approval:
+                if availability.validation_available:
+                    forms.append(self._workflow_form(test_case_id, WorkflowType.VALIDATION, "Run Validation", primary=True))
+                if availability.regression_available:
+                    forms.append(self._workflow_form(test_case_id, WorkflowType.REGRESSION, "Run Regression"))
+            review_copy = (
+                '<p>Review saved plan versions, then approve this exact set for Validation. '
+                'Automation stays in Needs validation until Validation passes.</p>'
+                if not current_plan_approval else
+                '<p>Validation is the gate to Automation Ready. The approved plan versions are checked again when the run starts.</p>'
+            )
+            reason = (
+                f'<p class="muted">{escape_html(availability.reason)}</p>'
+                if not availability.validation_available and availability.reason else ""
+            )
+            plan_review = (
+                '<div class="automation-review-state"><h3>Automation review</h3>'
+                f'<p>{escape_html(status_message)}</p>{review_copy}{links}'
+                f'<ol class="compact-list">{"".join(version_rows)}</ol>{reason}'
+                + ('<div class="actions">' + ''.join(forms) + '</div>' if forms else '')
+                + '</div>'
+            )
+        else:
+            status_message = (
+                "Automation is incomplete. Review saved versions and retry generation."
+                if availability.usable_plan_count > 0
+                else "Automation has not been generated yet."
+            )
+            versions = (
+                f'<ol class="compact-list">{"".join(version_rows)}</ol>'
+                if version_rows else '<p class="muted">No executable plan versions have been generated.</p>'
+            )
+            links = (
+                f'<div class="actions"><a class="button" href="/test-cases/{test_case_id}/plans">View TestPlan</a>'
+                + (f'<a class="button" href="/test-cases/{test_case_id}/automation/edit">Edit Automation</a>'
+                   if version_rows else '')
+                + '</div>'
+            )
+            if availability.automation_available:
                 forms.append(
                     f'<form method="post" action="/test-cases/{test_case_id}/run" data-run-form>'
-                    f'<input type="hidden" name="workflow" value="{workflow.value}">'
-                    + self._evidence_controls(f"{workflow.value.casefold()}-{test_case_id}")
-                    + self._cookie_consent_controls(f"{workflow.value.casefold()}-{test_case_id}")
-                    + f'<button class="button" type="submit">Run {label}</button></form>'
+                    '<input type="hidden" name="workflow" value="AUTOMATION">'
+                    + self._evidence_controls(f"automation-{test_case_id}")
+                    + self._cookie_consent_controls(f"automation-{test_case_id}")
+                    + '<button class="button primary" type="submit">Generate Automation</button></form>'
                 )
-        status_rows = (
-            '<li>Automation <strong>'
-            + ("Available" if availability.automation_available else "Not configured")
-            + '</strong> — generates and runs executable plans.</li>'
-            + '<li>Validation <strong>' + ("Available" if validation else "Not ready") + '</strong></li>'
-            + '<li>Regression <strong>' + ("Available" if regression else "Not ready") + '</strong></li>'
-        )
-        reason = (
-            f'<p class="muted">{escape_html(availability.reason)}</p>'
-            if not validation and availability.reason else ""
-        )
-        versions = (
-            f'<ol class="compact-list">{"".join(version_rows)}</ol>'
-            if version_rows else '<p class="muted">No executable plan versions have been generated.</p>'
-        )
+            if legacy_case:
+                if availability.validation_available:
+                    forms.append(self._workflow_form(
+                        test_case_id, WorkflowType.VALIDATION, "Run Validation"
+                    ))
+                if availability.regression_available:
+                    forms.append(self._workflow_form(
+                        test_case_id, WorkflowType.REGRESSION, "Run Regression"
+                    ))
+            run_note = (
+                '<p class="muted">This creates and runs an initial automation attempt. '
+                'Validation is still required before Automation Ready.</p>'
+            )
+            plan_review = (
+                f'<p>{escape_html(status_message)}</p><p>{escape_html(plan_status)}</p>'
+                f'{versions}{links}{run_note}'
+                + ('<div class="actions">' + ''.join(forms) + '</div>' if forms else '')
+            )
         return (
             '<section class="panel"><h2>Automation</h2>'
-            f'<p>{escape_html(plan_status)}</p>{versions}'
-            f'<ul class="compact-list">{status_rows}</ul>{reason}'
-            + ('<div class="actions">' + ''.join(forms) + '</div>' if forms else '')
+            + f'<p>{escape_html(plan_status)}</p>'
+            + plan_review
             + '</section>'
+        )
+
+    def _workflow_form(
+        self, test_case_id: UUID, workflow: WorkflowType, label: str, *, primary: bool = False
+    ) -> str:
+        return (
+            f'<form method="post" action="/test-cases/{test_case_id}/run" data-run-form>'
+            f'<input type="hidden" name="workflow" value="{workflow.value}">'
+            + self._evidence_controls(f"{workflow.value.casefold()}-{test_case_id}")
+            + self._cookie_consent_controls(f"{workflow.value.casefold()}-{test_case_id}")
+            + f'<button class="button{" primary" if primary else ""}" type="submit">{label}</button></form>'
         )
 
     def _serve_evidence(self, run_id_text: str, execution_id_text: str, index_text: str) -> WebResponse:
@@ -3878,6 +4201,9 @@ def create_application(
     automation_lifecycle = AutomationLifecycleService(
         storage.automation_lifecycle_repository, storage.plan_store
     )
+    test_case_review = TestCaseReviewService(
+        storage.test_case_review_repository, storage.plan_store
+    )
     llm_usage = LLMUsageService(storage.llm_usage_repository)
     evidence_root = (
         Path(evidence_directory).expanduser().resolve()
@@ -3906,6 +4232,7 @@ def create_application(
         evidence_directory=evidence_root,
         automation_workflow=automation_workflow,
         automation_lifecycle=automation_lifecycle,
+        test_case_review=test_case_review,
     )
     test_suites = TestSuiteService(
         SQLiteTestSuiteRepository(storage.database_path),
@@ -3933,6 +4260,7 @@ def create_application(
         automation_lifecycle_repository=storage.automation_lifecycle_repository,
         test_suites=test_suites,
         suite_run_service=suite_run_service,
+        test_case_review=test_case_review,
     )
 
 
@@ -4702,6 +5030,25 @@ _UI_JAVASCRIPT = r"""
     url: 'URL', selector: 'Selector', value: 'Value', expected: 'Expected value',
     expected_text: 'Expected text', option_label: 'Option label'
   };
+  const draftSource = document.querySelector('[data-source-draft-id]');
+  const draftStatus = document.querySelector('[data-draft-selection-status]');
+  document.querySelectorAll('[data-draft-select]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const website = document.getElementById('case-base-url');
+      const scenario = document.getElementById('case-scenario');
+      if (!website || !scenario || !draftSource || !draftStatus) return;
+      website.value = button.dataset.website || '';
+      scenario.value = button.dataset.scenario || '';
+      draftSource.value = button.dataset.draftId || '';
+      website.dispatchEvent(new Event('input', { bubbles: true }));
+      scenario.dispatchEvent(new Event('input', { bubbles: true }));
+      document.querySelectorAll('[data-draft-select]').forEach((item) => {
+        item.setAttribute('aria-pressed', String(item === button));
+      });
+      draftStatus.textContent = `Loaded Draft: ${button.dataset.title || 'Draft'}. Changes here are saved only when you choose Save Draft.`;
+      draftStatus.classList.remove('muted');
+    });
+  });
   document.querySelectorAll('[data-automation-form]').forEach((form) => {
     const actions = form.querySelector('[data-automation-actions]');
     const makeButton = (label, attribute, value) => {
@@ -4895,13 +5242,13 @@ _UI_JAVASCRIPT = r"""
   });
 
   document.querySelectorAll('[data-authoring-form]').forEach((form) => {
-    form.addEventListener('submit', () => {
-      form.querySelectorAll('button[type="submit"]').forEach((button) => {
-        button.disabled = true;
-        button.classList.add('is-disabled');
-        button.setAttribute('aria-busy', 'true');
-        button.textContent = 'Starting…';
-      });
+    form.addEventListener('submit', (event) => {
+      const button = event.submitter;
+      if (!button) return;
+      button.disabled = true;
+      button.classList.add('is-disabled');
+      button.setAttribute('aria-busy', 'true');
+      button.textContent = button.formAction.includes('/drafts/save') ? 'Saving...' : 'Starting...';
     }, { once: true });
   });
 

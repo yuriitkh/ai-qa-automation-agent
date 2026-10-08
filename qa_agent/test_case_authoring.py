@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Mapping
 from urllib.parse import urlsplit
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -82,6 +83,7 @@ class TestCaseDraft:
     authoring_scenario: str | None = None
     authoring_base_url: str | None = None
     usage_workflow_ids: tuple[str, ...] = ()
+    source_draft_id: UUID | None = None
 
 
 @dataclass(frozen=True)

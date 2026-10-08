@@ -679,8 +679,8 @@ class ProductDemoSliceTests(unittest.TestCase):
                     "GET", f"/test-cases/{test_case.id}"
                 ).body.decode("utf-8")
                 self.assertIn("2 / 4 steps have executable plans", testcase_page)
-                self.assertIn("Validation <strong>Not ready", testcase_page)
-                self.assertIn("Regression <strong>Not ready", testcase_page)
+                self.assertIn("Automation status", testcase_page)
+                self.assertIn("Automation is incomplete", testcase_page)
                 self.assertEqual(
                     application.handle("GET", f"/runs/{UUID(int=0)}/report.json").status,
                     404,
@@ -798,6 +798,7 @@ class ProductDemoSliceTests(unittest.TestCase):
                 evidence_root=evidence_root,
                 test_cases=storage.test_case_repository,
                 run_service=run_service,
+                plan_store=storage.plan_store,
                 authoring_service=TestCaseAuthoringService(LLMRouter([provider])),
             )
             server = create_http_server(application, host="127.0.0.1", port=0)
@@ -829,24 +830,23 @@ class ProductDemoSliceTests(unittest.TestCase):
                 )
                 self.assertEqual(saved.status, 303)
                 case_id = UUID(saved.headers["Location"].rsplit("/", 1)[1])
+                approved = application.handle(
+                    "POST", f"/test-cases/{case_id}/approve", b""
+                )
+                self.assertEqual(approved.status, 303)
                 case = storage.test_case_repository.get(case_id)
                 self.assertIsNotNone(case)
                 self.assertEqual(storage.run_history.list_for_test_case(case_id), [])
                 before_run = application.handle("GET", saved.headers["Location"])
                 self.assertIn(b"NOT RUN", before_run.body)
                 self.assertIn(b"Never", before_run.body)
-                self.assertIn(b"Validation", before_run.body)
-                self.assertIn(b"Regression", before_run.body)
-                self.assertEqual(before_run.body.count(b"Not ready"), 2)
+                self.assertIn(b"Generate Automation", before_run.body)
+                self.assertIn(b"TestCase approved", before_run.body)
 
                 unavailable = application.handle(
                     "POST", f"/test-cases/{case_id}/run", b"workflow=VALIDATION"
                 )
-                self.assertEqual(unavailable.status, 303)
-                unavailable_progress = _wait_for_progress(
-                    application, unavailable.headers["Location"]
-                )
-                self.assertEqual(unavailable_progress["error_category"], "MISSING_AUTOMATION")
+                self.assertEqual(unavailable.status, 409)
                 self.assertEqual(storage.run_history.list_for_test_case(case_id), [])
 
                 automation = application.handle(
@@ -867,7 +867,9 @@ class ProductDemoSliceTests(unittest.TestCase):
                 self.assertEqual(len(storage.run_history.list_for_test_case(case_id)), 1)
                 self.assertEqual(run_service.workflow_availability(case_id).usable_plan_count, 1)
                 after_automation = application.handle("GET", saved.headers["Location"])
-                self.assertEqual(after_automation.body.count(b"Available"), 3)
+                self.assertIn(b"Automation is ready for review.", after_automation.body)
+                self.assertIn(b"Approve for Validation", after_automation.body)
+                self.assertNotIn(b"Automation Ready", after_automation.body)
                 self.assertIn(b"v1", after_automation.body)
                 plan_version = storage.plan_store.find(case.steps[0].id)
                 self.assertIn(str(plan_version.id)[:8].encode(), after_automation.body)
@@ -889,6 +891,17 @@ class ProductDemoSliceTests(unittest.TestCase):
                 self.assertEqual(parsed_report["workflow_type"], WorkflowType.AUTOMATION.value)
                 self.assertEqual(parsed_report["steps"][0]["attempts"][0]["test_plan_version_id"],
                                  str(automation_record.executions[0].test_plan_version_id))
+
+                approved_for_validation = application.handle(
+                    "POST", f"/test-cases/{case_id}/approve-validation", b""
+                )
+                self.assertEqual(
+                    approved_for_validation.status, 303,
+                    approved_for_validation.body.decode("utf-8"),
+                )
+                self.assertIn(b"Needs validation", application.handle(
+                    "GET", saved.headers["Location"]
+                ).body)
 
                 regression = application.handle(
                     "POST", f"/test-cases/{case_id}/run", b"workflow=REGRESSION"
@@ -1037,6 +1050,10 @@ class ProductDemoSliceTests(unittest.TestCase):
                 )
                 self.assertEqual(saved.status, 303)
                 case_id = UUID(saved.headers["Location"].rsplit("/", 1)[1])
+                approved = application.handle(
+                    "POST", f"/test-cases/{case_id}/approve", b""
+                )
+                self.assertEqual(approved.status, 303)
 
                 run_response = application.handle(
                     "POST", f"/test-cases/{case_id}/run", b"workflow=AUTOMATION"

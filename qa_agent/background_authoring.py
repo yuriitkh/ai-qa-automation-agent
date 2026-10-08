@@ -6,6 +6,7 @@ import logging
 from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 from threading import BoundedSemaphore, Lock
+from uuid import UUID
 
 from qa_agent.execution_progress import (
     AuthoringEventType,
@@ -74,12 +75,14 @@ class BackgroundAuthoringService:
         base_url: str,
         scenario: str,
         source_draft_token: str | None = None,
+        source_draft_id: UUID | None = None,
     ) -> str:
         progress_id = self._progress_store.create_authoring(
             name=name,
             base_url=base_url,
             scenario=scenario,
             source_draft_token=source_draft_token,
+            source_draft_id=source_draft_id,
         )
         reporter = AuthoringProgressReporter(self._progress_store, progress_id)
         reporter.emit(AuthoringEventType.AUTHORING_REQUESTED)
@@ -101,6 +104,7 @@ class BackgroundAuthoringService:
                     base_url,
                     scenario,
                     source_draft_token,
+                    source_draft_id,
                 )
         except Exception as error:
             self._capacity.release()
@@ -125,6 +129,7 @@ class BackgroundAuthoringService:
         base_url: str,
         scenario: str,
         source_draft_token: str | None,
+        source_draft_id: UUID | None,
     ) -> None:
         try:
             self._execute(
@@ -133,6 +138,7 @@ class BackgroundAuthoringService:
                 base_url,
                 scenario,
                 source_draft_token,
+                source_draft_id,
             )
         finally:
             self._capacity.release()
@@ -144,6 +150,7 @@ class BackgroundAuthoringService:
         base_url: str,
         scenario: str,
         source_draft_token: str | None,
+        source_draft_id: UUID | None,
     ) -> None:
         reporter = AuthoringProgressReporter(self._progress_store, progress_id)
         try:
@@ -167,6 +174,7 @@ class BackgroundAuthoringService:
             )
             draft = replace(
                 draft,
+                source_draft_id=source_draft_id,
                 usage_workflow_ids=tuple(dict.fromkeys(
                     (*prior_workflows, *draft.usage_workflow_ids)
                 )),
