@@ -103,14 +103,14 @@ class DemoSeedTests(unittest.TestCase):
         self.assertEqual(dashboard.status, 200)
         self.assertIn(b"User registration", dashboard.body)
         self.assertIn(b"Checkout flow", dashboard.body)
-        self.assertIn(b"PRODUCT FAILURE", dashboard.body)
+        self.assertIn(b">Failed</span>", dashboard.body)
 
         registration_id = registration_records[0].test_case_id
         testcase_page = self.application.handle("GET", f"/test-cases/{registration_id}")
         self.assertEqual(testcase_page.status, 200)
         self.assertIn(b"Run History", testcase_page.body)
         self.assertIn(b"User registration", testcase_page.body)
-        self.assertIn(b"PRODUCT FAILURE", testcase_page.body)
+        self.assertIn(b">Failed</span>", testcase_page.body)
 
         cases_page = self.application.handle("GET", "/test-cases")
         self.assertIn(b"Local registration demo", cases_page.body)

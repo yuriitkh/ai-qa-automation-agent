@@ -157,7 +157,7 @@ class TestSuiteWebTests(unittest.TestCase):
         self.assertNotIn("Select visible", list_html)
         self.assertNotIn("Export selected", list_html)
         self.assertIn("Needs validation", list_html)
-        self.assertIn("Latest status:", list_html)
+        self.assertIn("Latest result:", list_html)
         self.assertIn(f'href="/test-cases/{self.case.id}/edit"', list_html)
         self.assertIn(f'href="/export?mode=testcases&amp;case={self.case.public_id}"', list_html)
         self.assertIn(f'href="/test-cases/{self.case.id}"', list_html)

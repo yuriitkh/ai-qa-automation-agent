@@ -488,7 +488,7 @@ class SuiteRunStorageTests(unittest.TestCase):
 
             self.assertEqual(response.status, 200)
             self.assertIn("TC-0001", html)
-            self.assertIn("PASSED AFTER RETRY", html)
+            self.assertIn("Passed after retry", html)
             self.assertIn("2.4 s", html)
             self.assertIn("PRODUCT_FAILURE", html)
             self.assertIn("Attempt 1", html)

@@ -493,7 +493,7 @@ class ProductDemoSliceTests(unittest.TestCase):
                 str(failed.test_run.executions[1].test_plan_version_id),
             )
             self.assertNotIn(secret, report_json.__str__())
-            self.assertIn("BLOCKED", report_html)
+            self.assertIn("Blocked", report_html)
             self.assertEqual(dashboard.status, 200)
             self.assertIn(str(failed.test_run.id), dashboard.body.decode("utf-8"))
             self.assertEqual(run_page.status, 200)
@@ -650,7 +650,7 @@ class ProductDemoSliceTests(unittest.TestCase):
                 )
                 first = _wait_for_progress(application, first_response.headers["Location"])
                 self.assertEqual(first["state"], "FINISHED")
-                self.assertEqual(first["phase"], "Finished")
+                self.assertEqual(first["phase"], "Stopped \u2014 Generation Error")
                 self.assertEqual(first["outcome"], "AUTOMATION_GENERATION_ERROR")
                 self.assertIsNone(first["final_run_id"])
                 self.assertEqual(
@@ -689,10 +689,10 @@ class ProductDemoSliceTests(unittest.TestCase):
                 failed_page = application.handle(
                     "GET", f"/runs/progress/{first['progress_id']}"
                 ).body.decode("utf-8")
-                self.assertIn("AUTOMATION GENERATION ERROR", failed_page)
-                self.assertIn("Automation stopped at Step 3 of 4", failed_page)
+                self.assertIn("Generation Error", failed_page)
+                self.assertIn("Stopped at Step 3 of 4", failed_page)
                 self.assertIn("Submit registration", failed_page)
-                self.assertIn("Remaining: 1 steps not attempted", failed_page)
+                self.assertIn("2 of 4 steps verified", failed_page)
                 self.assertIn("Retry Automation", failed_page)
                 self.assertNotIn("LEAK_MARKER", failed_page)
                 self.assertNotIn("C:\\private", failed_page)
@@ -1117,7 +1117,7 @@ class ProductDemoSliceTests(unittest.TestCase):
                 ]
                 self.assertEqual(failed_execution.status, ExecutionStatus.FAILED)
                 self.assertEqual(
-                    PlanExecutionService._classify(failed_execution, None),
+                    failed_execution.runner_result["qa_classification"],
                     PlanExecutionClassification.PRODUCT_FAILURE,
                 )
                 self.assertIn(
@@ -1137,7 +1137,7 @@ class ProductDemoSliceTests(unittest.TestCase):
                     [step["status"] for step in report_json["steps"]],
                     ["PASSED", "PASSED", "PASSED", "FAILED"],
                 )
-                self.assertIn("PRODUCT FAILURE", RunReportGenerator().to_html(report))
+                self.assertIn("PRODUCT_FAILURE", RunReportGenerator().to_html(report))
 
                 evidence = application.handle(
                     "GET", f"/runs/{run_id}/evidence/{failed_execution.id}/0"

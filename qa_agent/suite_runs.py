@@ -22,6 +22,7 @@ from qa_agent.evidence_policy import DEFAULT_EVIDENCE_POLICY, EvidencePolicy, ev
 from qa_agent.models import TestCase
 from qa_agent.pinned_execution import PlanVersionSet, StepPlanSelection
 from qa_agent.run_history import RunHistoryService, WorkflowType
+from qa_agent.result_semantics import result_outcome, result_label
 from qa_agent.test_case_execution import TestCaseExecutionService
 from qa_agent.test_case_repository import TestCaseRepository
 from qa_agent.test_suites import TestSuite, TestSuiteService
@@ -82,7 +83,7 @@ class SuiteRunAttempt(BaseModel):
     run_id: UUID | None = None
     run_public_id: str | None = None
     run_status: str
-    outcome: str
+    outcome: str | None = None
     started_at: datetime
     finished_at: datetime
     duration_ms: int
@@ -126,15 +127,28 @@ class SuiteRun(BaseModel):
 
     @property
     def flaky_count(self) -> int:
-        return sum(item.status == SuiteRunItemStatus.PASSED_AFTER_RETRY for item in self.items)
+        return sum(item.status == SuiteRunItemStatus.PASSED_AFTER_RETRY and suite_item_outcome(item) == "PASSED" for item in self.items)
 
     @property
     def passed_count(self) -> int:
-        return sum(item.status in {SuiteRunItemStatus.PASSED, SuiteRunItemStatus.PASSED_AFTER_RETRY} for item in self.items)
+        return self.outcome_counts["passed"]
 
     @property
     def failed_count(self) -> int:
-        return sum(item.status == SuiteRunItemStatus.FAILED for item in self.items)
+        return self.outcome_counts["product_failures"]
+
+    @property
+    def outcome_counts(self) -> dict[str, int]:
+        counts = dict.fromkeys(("passed", "product_failures", "automation_errors", "generation_errors", "infrastructure_errors", "blocked", "inconclusive", "pending"), 0)
+        categories = {
+            "PASSED": "passed", "PRODUCT_FAILURE": "product_failures",
+            "AUTOMATION_EXECUTION_ERROR": "automation_errors", "AUTOMATION_DRIFT": "automation_errors",
+            "AUTOMATION_GENERATION_ERROR": "generation_errors", "INFRASTRUCTURE_ERROR": "infrastructure_errors",
+            "BLOCKED": "blocked", "INCONCLUSIVE": "inconclusive",
+        }
+        for item in self.items:
+            counts[categories.get(suite_item_outcome(item), "pending")] += 1
+        return counts
 
 
 class SuiteRunRepository:
@@ -511,11 +525,7 @@ class SuiteRunService:
                 else SuiteRunItemStatus.FAILED
             ),
             "attempts": attempts,
-            "classification": (
-                last_attempt.failure_classifications[-1]
-                if last_attempt.failure_classifications
-                else last_attempt.outcome
-            ),
+            "classification": last_attempt.outcome,
             "finished_at": item_finished_at,
             "duration_ms": max(0, int((item_finished_at - started_at).total_seconds() * 1000)),
             "error_category": None if succeeded else (attempts[-1].error_category or attempts[-1].outcome),
@@ -534,6 +544,51 @@ class SuiteRunService:
 def suite_run_report_json(run: SuiteRun) -> str:
     """Return a stable JSON representation of the persisted run snapshot."""
     payload = json.loads(run.model_dump_json())
-    for item in payload.get("items", []):
+    payload["outcome_counts"] = run.outcome_counts
+    payload["display_status"] = suite_status_label(run)
+    for item, source in zip(payload.get("items", []), run.items):
         item.pop("test_case_snapshot", None)
+        item["display_outcome"] = suite_item_outcome(source)
+        item["display_status"] = suite_item_label(source)
+        for attempt, recorded_attempt in zip(item["attempts"], source.attempts):
+            attempt["display_status"] = result_label(suite_attempt_outcome(recorded_attempt))
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+
+
+def suite_attempt_outcome(attempt: SuiteRunAttempt) -> str:
+    return result_outcome(
+        attempt.run_status, attempt.outcome,
+        complete=attempt.run_id is not None and attempt.error_category is None,
+    )
+
+
+def suite_item_outcome(item: SuiteRunItem) -> str:
+    if item.status in {SuiteRunItemStatus.QUEUED, SuiteRunItemStatus.RUNNING, SuiteRunItemStatus.RETRYING}:
+        return item.status.value
+    if item.status == SuiteRunItemStatus.BLOCKED:
+        return "BLOCKED"
+    if item.status in {SuiteRunItemStatus.NOT_RUN, SuiteRunItemStatus.INTERRUPTED}:
+        return "INCONCLUSIVE"
+    attempt = item.attempts[-1] if item.attempts else None
+    if attempt is None:
+        return result_outcome(item.status, item.classification, complete=False)
+    return result_outcome(
+        attempt.run_status, attempt.outcome,
+        complete=(
+            item.status in {SuiteRunItemStatus.PASSED, SuiteRunItemStatus.PASSED_AFTER_RETRY}
+            and attempt.run_id is not None and attempt.error_category is None
+        ),
+    )
+
+
+def suite_status_label(run: SuiteRun) -> str:
+    if run.status in {SuiteRunStatus.QUEUED, SuiteRunStatus.RUNNING}:
+        return run.status.value.title()
+    if run.status in {SuiteRunStatus.INTERRUPTED, SuiteRunStatus.FAILED}:
+        return "Stopped — Inconclusive" if run.status == SuiteRunStatus.INTERRUPTED else "Stopped — Infrastructure Error"
+    return "Completed — Passed" if run.items and run.passed_count == len(run.items) else "Completed with issues"
+
+
+def suite_item_label(item: SuiteRunItem) -> str:
+    outcome = suite_item_outcome(item)
+    return "Passed after retry" if outcome == "PASSED" and item.status == SuiteRunItemStatus.PASSED_AFTER_RETRY else result_label(outcome)

@@ -55,6 +55,7 @@ th{font-size:.84rem;color:#4e5b6c;background:#f8fafc;font-weight:700}tr:last-chi
 footer{color:var(--muted);font-size:.85rem;padding:1rem 0;border-top:1px solid var(--line)}
 @media(max-width:640px){.shell{padding:0 .8rem}.topbar-inner{padding:.55rem 0}.main{padding-top:1rem}.panel{padding:.85rem}.card-value{font-size:1.25rem}}
 @media(max-width:640px){.voice-controls{align-items:flex-start}.product-flow{gap:.3rem}.product-flow li{padding:.2rem .45rem}}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;max-width:100%}figure{margin:.7rem 0}figcaption{font-size:.9rem;color:var(--muted)}
 .progress-event{display:flex;gap:.65rem;align-items:baseline;padding:.42rem 0;border-bottom:1px solid #eef1f5}
 .is-disabled{opacity:.65;cursor:wait}
 .progress-steps{list-style:none;padding:0;margin:0}
@@ -63,8 +64,8 @@ footer{color:var(--muted);font-size:.85rem;padding:1rem 0;border-top:1px solid v
 .progress-symbol{font-size:1.1rem;font-weight:700}
 .progress-step-state,.progress-step .muted{display:block;margin-top:.2rem;font-size:.9rem}
 .progress-result[hidden]{display:none}
-[data-progress-result-content]{display:flex;align-items:center;gap:1rem;flex-wrap:wrap}
-[data-progress-result-content] p{margin:0}
+[data-progress-result-content]{display:block}
+[data-progress-result-content] p{margin:.6rem 0}
 .progress-evidence{display:block;margin-top:.2rem;font-size:.9rem;color:var(--muted)}
 .field-error{display:block;color:#8d2519;font-size:.88rem;margin-top:.15rem}.field-error[hidden]{display:none}
 .is-invalid{border-color:#ba3425!important;box-shadow:0 0 0 2px rgba(186,52,37,.12)}
@@ -184,3 +185,15 @@ def badge(label: str, tone: str | None = None, *, title: str | None = None) -> s
         f'<span class="badge {escape_html(color)}"{title_attribute}>'
         f"{escape_html(display)}</span>"
     )
+
+
+def result_badge(outcome: str) -> str:
+    from qa_agent.result_semantics import result_label, result_tone
+
+    return badge(result_label(outcome), result_tone(outcome))
+
+
+def safe_local_url(value: str | None) -> str | None:
+    if value and value.startswith("/") and not value.startswith("//") and "\\" not in value and all(ord(char) > 32 for char in value):
+        return value
+    return None

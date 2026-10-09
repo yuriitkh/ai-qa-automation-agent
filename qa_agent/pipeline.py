@@ -339,6 +339,7 @@ class QATestPipeline:
                     step=test_step,
                     plan_origin=cached_version.origin.value if cached_version.origin is not None else "SAVED",
                     plan_version=cached_version.version,
+                    plan_version_id=cached_version.id,
                     message="Saved automation loaded.",
                 )
             else:
@@ -506,6 +507,7 @@ class QATestPipeline:
                                  if generated_plan.test_plan_version.origin is not None
                                  else "AI_GENERATED"),
                     plan_version=generated_plan.test_plan_version.version,
+                    plan_version_id=generated_plan.test_plan_version.id,
                     message="Automation generated for this step.",
                 )
 
@@ -653,6 +655,7 @@ class QATestPipeline:
                     step=test_step,
                     plan_origin=PlanVersionOrigin.REPAIRED.value,
                     plan_version=repaired_version.version,
+                    plan_version_id=repaired_version.id,
                     message="Saved automation repaired using current page evidence.",
                 )
                 repaired_outcome = self._execute_plan(
@@ -867,7 +870,8 @@ def _generation_failure_details(error: Exception) -> tuple[str, str]:
 
 
 def _automation_run_outcome(test_run: TestRun) -> str:
-    """Preserve product-failure classification in completed Automation runs."""
+    """Retain the classification made against each attempt's exact plan."""
+    from qa_agent.result_semantics import execution_classification
     if test_run.status == ExecutionStatus.PASSED:
         return "PASSED"
 
@@ -877,7 +881,7 @@ def _automation_run_outcome(test_run: TestRun) -> str:
         if execution.status == ExecutionStatus.FAILED
     ]
     classifications = {
-        PlanExecutionService._classify(execution, None)
+        execution_classification(execution)
         for execution in failed_executions
     }
     if PlanExecutionClassification.INFRASTRUCTURE_ERROR in classifications:
@@ -888,7 +892,7 @@ def _automation_run_outcome(test_run: TestRun) -> str:
         return PlanExecutionClassification.AUTOMATION_EXECUTION_ERROR.value
     if PlanExecutionClassification.PRODUCT_FAILURE in classifications:
         return PlanExecutionClassification.PRODUCT_FAILURE.value
-    return "FAILED"
+    return "INCONCLUSIVE"
 
 
 def _emit_blocked_steps(steps: list[TestStep]) -> None:

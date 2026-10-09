@@ -215,6 +215,7 @@ class PinnedExecutionService:
                              if selected.plan_version.origin is not None
                              else "PINNED"),
                 plan_version=selected.plan_version.version,
+                plan_version_id=selected.plan_version.id,
                 message="Pinned automation loaded.",
             )
             try:

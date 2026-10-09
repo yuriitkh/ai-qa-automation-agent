@@ -129,7 +129,7 @@ class RunReportTests(unittest.TestCase):
 
         self.assertIn("<!doctype html>", html.lower())
         self.assertIn("<style>", html)
-        self.assertIn("BLOCKED", html)
+        self.assertIn("Blocked", html)
         self.assertIn("Plan version", html)
         self.assertIn("failure-view.png", html)
         self.assertIn("Registration &lt;script&gt;alert(1)&lt;/script&gt;", html)

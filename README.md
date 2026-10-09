@@ -1,5 +1,78 @@
 # AI QA Agent
 
+## Run outcomes and reports
+
+Run Progress, Run Details, TestCase history, suite summaries and dashboard counts
+use outcome classification to interpret the internal execution status:
+
+| Stored outcome | Public result |
+| --- | --- |
+| `PASSED`, with all steps verified | Passed |
+| `PRODUCT_FAILURE` | Failed |
+| `AUTOMATION_EXECUTION_ERROR` or `AUTOMATION_DRIFT` | Automation Error |
+| `AUTOMATION_GENERATION_ERROR` | Generation Error |
+| `INFRASTRUCTURE_ERROR` | Infrastructure Error |
+| `SETUP_FAILURE`, missing automation or unmet prerequisites | Blocked |
+| Missing, unknown or unclassified `FAILED` outcome | Inconclusive |
+
+The internal `FAILED` status still describes an unsuccessful operation. It does
+not establish a product defect. New executions retain the classification made
+against their exact plan and assertion grounding in the existing runner JSON
+payload (`qa_classification`). Safe history snapshots also retain the attempt
+classification and redacted diagnostics. No SQLite table migration is needed,
+and reading or regenerating a report does not rewrite historical records.
+
+JSON reports preserve existing status, outcome, IDs and evidence fields and add
+`display_status`, classifications and a structured result summary. Consumers
+should use those presentation fields for user-facing results. For older runs,
+a known aggregate outcome can classify a single unsuccessful attempt. Multiple
+historical attempts without their own classification remain inconclusive at the
+attempt level; the stored aggregate result remains visible. Suite reports add
+`outcome_counts`, separating product failures, technical errors, blocked,
+inconclusive and pending items. The public suite progress `failed` count is a
+compatibility alias for `product_failures`. A passed item without a completed,
+linked successful attempt is not counted as passed. Workflow counts on the
+dashboard are separate from result counts; automation execution errors and
+automation drift have separate counters.
+
+Progress shows the current operation, meaningful terminal stage, verified step
+count, stopping step, explanation and recommended action. Generation may stop
+before Run History is saved; in that case there is no invented Run ID. Existing
+partial diagnostics and Retry Automation remain available. Progress no longer
+redirects automatically, so the summary can be reviewed. Its existing in-memory
+retention still applies (24 hours and up to 500 finished requests by default).
+Developer details group recorded events chronologically by stage, collapse
+consecutive duplicate events, and show attempt numbers and durations only when
+the corresponding events exist. Repair stages appear only when recorded.
+Existing trace provider attempts show provider, model, outcome and duration when
+recorded, without additional requests or reconstructed timestamps. Raw provider
+responses and error messages are not added to progress.
+
+Plan links resolve the exact persisted version used by an execution, including
+after a newer version is saved. Run-linked plan pages are read-only and remain
+available independently of the current TestCase definition. Unverifiable or
+unsaved versions say **No saved TestPlan available.** Screenshots stay inside
+their step and attempt with full-size links. Suite summaries link to individual
+runs rather than collecting their screenshots. Evidence capture policies and
+stored evidence associations are unchanged.
+
+**View HTML Report** opens a clearly titled **HTML Test Report**, identifying the
+Run and TestCase, with result summary, steps, attempts, evidence and **Back to
+Run Details** navigation. Existing report URLs continue working. Actual
+observations use recorded values or one complete explicit Playwright
+`Actual value:` header; call-log fragments are not interpreted as product state.
+Raw diagnostics remain expandable, escaped and redacted for credentials,
+sensitive input calls and local paths. Recommended actions never alter expected
+results, approve definitions, bypass validation or change saved plan versions.
+
+To check the reporting flow locally, open a saved technical-error run and verify
+that its dashboard/history label is Automation Error or Infrastructure Error.
+Open Run Details, then its HTML and JSON reports. Follow each attempt's plan
+link, check the version against its recorded pin, and open its evidence. Review
+a partial generation request on Run Progress and confirm that its stopping step,
+Retry Automation action and absence of a Run History link agree. Compare suite
+category counts with the linked individual runs.
+
 ## LLM providers
 
 The agent supports OpenAI, Google Gemini, OpenRouter, and Groq. Environment-only use gets its default order from `LLM_PROVIDER_ORDER`:

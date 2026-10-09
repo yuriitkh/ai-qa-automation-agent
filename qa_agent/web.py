@@ -20,7 +20,9 @@ from qa_agent.presentation import (
     failure_message,
     outcome_label,
     outcome_tone,
+    result_badge,
 )
+from qa_agent.result_semantics import history_outcome, result_label, result_outcome, terminal_phase
 from qa_agent.cookie_consent import (
     DEFAULT_COOKIE_CONSENT_POLICY,
     CookieConsentPolicy,
@@ -111,6 +113,10 @@ from qa_agent.suite_runs import (
     SuiteRunService,
     SuiteRunStatus,
     suite_run_report_json,
+    suite_item_outcome,
+    suite_status_label,
+    suite_item_label,
+    suite_attempt_outcome,
 )
 from qa_agent.suite_run_storage import SQLiteSuiteRunRepository
 from qa_agent.readiness import (
@@ -133,10 +139,12 @@ _MAX_AUTHORING_FORM_BODY_BYTES = 80_000
 _MAX_DRAFT_SAVE_BODY_BYTES = 256 * 1024
 _MAX_MANUAL_FORM_BODY_BYTES = 1024 * 1024
 _WORKFLOWS = {item.value for item in WorkflowType}
-_STATUSES = {"PASSED", "FAILED"}
+_STATUSES = {"PASSED", "FAILED", "PRODUCT_FAILURE", "AUTOMATION_EXECUTION_ERROR", "AUTOMATION_DRIFT", "AUTOMATION_GENERATION_ERROR", "INFRASTRUCTURE_ERROR", "BLOCKED", "INCONCLUSIVE"}
 _FAILURE_TYPES = {
     "PRODUCT_FAILURE",
     "AUTOMATION_DRIFT",
+    "AUTOMATION_EXECUTION_ERROR",
+    "AUTOMATION_GENERATION_ERROR",
     "INFRASTRUCTURE_ERROR",
     "SETUP_FAILURE",
 }
@@ -378,7 +386,7 @@ class LocalWebApplication:
             detail = self._run_history.get_detail(run_id) if run_id else None
             if detail is None:
                 return self._not_found("Run report not found")
-            report = self._reports.generate_history(detail)
+            report = self._run_report(detail)
             if parts[2] == "report.json":
                 return WebResponse.json(200, report.to_json())
             return WebResponse.html(
@@ -397,16 +405,20 @@ class LocalWebApplication:
             detail = self._run_history.get_detail(run_id) if run_id else None
             if detail is None:
                 return self._not_found("Run not found")
-            report = self._reports.generate_history(detail)
+            report = self._run_report(detail)
             return WebResponse.html(
                 200,
                 self._reports.to_html(
                     report,
+                    report_view=False,
                     evidence_url=lambda step, attempt, evidence, index: self._evidence_url_if_available(
                         detail, run_id, step, attempt, evidence, index
                     ),
                 ),
             )
+        if len(parts) == 4 and parts[0] == "runs" and parts[2] == "plans":
+            run_id, version_id = _parse_uuid(parts[1]), _parse_uuid(parts[3])
+            return self._run_plan_view(run_id, version_id) if run_id and version_id else self._not_found("TestPlan version not found")
         if len(parts) == 2 and parts[0] == "test-cases":
             test_case_id = _parse_uuid(parts[1])
             if test_case_id is None:
@@ -691,14 +703,119 @@ class LocalWebApplication:
         self._drafts.save(draft)
         return WebResponse.redirect(f"/drafts/{draft.id}?saved=1")
 
+    def _saved_version(self, step_id: UUID, version_id: UUID | None):
+        if self._plan_store is None or version_id is None:
+            return None
+        version = self._plan_store.get_version(version_id)
+        plan = self._plan_store.find_test_plan(step_id)
+        return version if version is not None and plan is not None and version.test_plan_id == plan.id else None
+
+    def _run_report(self, detail: RunHistoryDetail):
+        report = self._reports.generate_history(detail)
+        steps = []
+        for step in report.steps:
+            attempts = []
+            for attempt in step.attempts:
+                version = self._saved_version(step.step_id, attempt.test_plan_version_id)
+                attempts.append(attempt.model_copy(update={
+                    "plan_url": f"/runs/{report.run_id}/plans/{version.id}" if version else None,
+                    "plan_version_number": version.version if version else attempt.plan_version_number,
+                    "plan_version_origin": version.origin if version else attempt.plan_version_origin,
+                }))
+            steps.append(step.model_copy(update={"attempts": attempts}))
+        return report.model_copy(update={"steps": steps})
+
+    def _run_plan_view(self, run_id: UUID, version_id: UUID) -> WebResponse:
+        detail = self._run_history.get_detail(run_id)
+        reference = next((item for item in detail.record.executions if item.test_plan_version_id == version_id), None) if detail else None
+        version = self._saved_version(reference.test_step_id, version_id) if reference else None
+        if version is None:
+            return self._not_found("Saved TestPlan version not found for this Run")
+        actions = ''.join(
+            '<li><strong>' + escape_html(ACTION_LABELS.get(action.action, action.action)) + '</strong><dl>'
+            + ''.join(
+                f'<dt>{escape_html(FIELD_LABELS.get(key, key))}</dt>'
+                f'<dd><code>{escape_html("[REDACTED]" if action.action == "fill" and key == "value" else _safe_automation_url_display(str(value)) if key == "url" else redact_secrets(str(value)))}</code></dd>'
+                for key, value in sorted(action.parameters.items())
+            ) + '</dl></li>' for action in version.qa_test_plan.steps
+        )
+        content = (
+            f'<header class="page-heading"><h1>Saved TestPlan version v{version.version}</h1>'
+            f'<p>{escape_html(detail.record.public_id or "Run")} · {_plan_origin_label(version.origin)}</p></header>'
+            '<p class="notice">Read-only version pinned to this execution. This page cannot edit the saved plan.</p>'
+            f'<section class="panel"><ol>{actions}</ol></section>'
+            f'<a class="button" href="/runs/{run_id}">Back to Run Details</a>'
+        )
+        return WebResponse.html(200, self._page("Saved TestPlan", content))
+
+    def _progress_payload(self, snapshot) -> dict:
+        payload = snapshot.to_public_dict()
+        persisted = self._run_history.get(snapshot.final_run_id) if snapshot.final_run_id else None
+        payload["final_run_id"] = str(persisted.run_id) if persisted else None
+        payload["final_run_url"] = f"/runs/{persisted.run_id}" if persisted else None
+        detail = self._run_history.get_detail(persisted.run_id) if persisted else None
+        report = self._run_report(detail) if detail else None
+        report_steps = {step.step_id: step for step in report.steps} if report else {}
+        if report:
+            payload["summary"] = {**report.result_summary, "history_note": None}
+            payload["display_status"] = report.display_status
+            payload["phase"] = terminal_phase(report.display_outcome)
+        elif payload["finished"]:
+            payload["summary"]["history_note"] = "No persisted Run was created. Partial progress diagnostics are available for this request."
+        for step in payload["steps"]:
+            saved_step = report_steps.get(UUID(step["id"]))
+            step["evidence_links"] = []
+            step["observation"] = None
+            if saved_step:
+                step["display_status"] = saved_step.display_status
+                if saved_step.attempts:
+                    last = saved_step.attempts[-1]
+                    step["plan_version_id"] = str(last.test_plan_version_id)
+                    step["plan_version"] = last.plan_version_number
+                    step["plan_origin"] = last.plan_version_origin.value if last.plan_version_origin else None
+                    step["observation"] = last.observation
+                for attempt_number, attempt in enumerate(saved_step.attempts, start=1):
+                    for index, evidence in enumerate(attempt.evidence):
+                        url = self._evidence_url_if_available(detail, persisted.run_id, saved_step, attempt, evidence, index)
+                        if url:
+                            step["evidence_links"].append({
+                                "url": url, "label": f"Attempt {attempt_number}: {evidence.name}",
+                                "execution_id": str(attempt.execution_id), "event": evidence.event,
+                            })
+            version_id = _parse_uuid(step["plan_version_id"] or "")
+            version = self._saved_version(UUID(step["id"]), version_id)
+            if version and persisted and any(
+                item.test_step_id == UUID(step["id"]) and item.test_plan_version_id == version.id
+                for item in persisted.executions
+            ):
+                step["plan_url"] = f"/runs/{persisted.run_id}/plans/{version.id}"
+            elif version and self._test_cases is not None:
+                case = self._test_cases.get(snapshot.test_case_id)
+                step["plan_url"] = (
+                    f"/test-cases/{snapshot.test_case_id}/automation/steps/{step['id']}/versions/{version.id}"
+                    if case and any(item.id == UUID(step["id"]) for item in case.steps) else None
+                )
+            else:
+                step["plan_url"] = None
+        payload["actions"] = [{"label": "Open TestCase", "url": f"/test-cases/{snapshot.test_case_id}"}]
+        if persisted:
+            payload["actions"].insert(0, {"label": "View Run Details", "url": f"/runs/{persisted.run_id}"})
+        if payload["summary"]["outcome"] == "INFRASTRUCTURE_ERROR":
+            payload["actions"].append({"label": "Open System Health", "url": "/system/health"})
+        if payload["summary"]["outcome"] == "AUTOMATION_GENERATION_ERROR":
+            payload["actions"].append({"label": "Edit TestCase", "url": f"/test-cases/{snapshot.test_case_id}/edit"})
+        if payload["summary"]["outcome"] in {"AUTOMATION_EXECUTION_ERROR", "AUTOMATION_DRIFT"}:
+            payload["actions"].append({"label": "Edit Automation", "url": f"/test-cases/{snapshot.test_case_id}/automation/edit"})
+        payload["redirect_after_ms"] = None
+        return payload
+
     def _progress_json(self, progress_id: str) -> WebResponse:
         snapshot = self._progress_store.get(progress_id)
         if snapshot is None:
             return WebResponse.json(404, json.dumps({
                 "error": "Execution progress is no longer available."
             }))
-        payload = snapshot.to_public_dict()
-        payload["redirect_after_ms"] = 1200 if snapshot.final_run_url else None
+        payload = self._progress_payload(snapshot)
         return WebResponse.json(
             200,
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
@@ -808,192 +925,124 @@ class LocalWebApplication:
         snapshot = self._progress_store.get(progress_id)
         if snapshot is None:
             return self._not_found("Execution progress is no longer available.")
-
-        case_name = snapshot.test_case_name or "TestCase run"
-        result = ""
-        retry = ""
-        if snapshot.state.value == "FINISHED":
-            category = snapshot.outcome or snapshot.error_category or "FAILED"
-            failure = snapshot.automation_generation_failure
-            if category == "AUTOMATION_GENERATION_ERROR" and failure is not None:
-                generated_count = sum(
-                    step.order < failure.step_order
-                    and step.automation_state in {"Generated", "Reused", "Repaired"}
-                    for step in snapshot.steps
-                )
-                remaining_count = sum(
-                    step.state.value == "NOT_ATTEMPTED"
-                    for step in snapshot.steps
-                )
-                saved_automation = (
-                    "Available from a previous attempt."
-                    if failure.prior_plan_exists
-                    else "Not available for this step."
-                )
-                new_plan = "Yes" if failure.new_plan_saved else "No"
-                result = (
-                    f'<p data-result-summary>{badge(outcome_label(category), outcome_tone(category))} '
-                    f'Automation stopped at Step {failure.step_order + 1} of {len(snapshot.steps)}.</p>'
-                    f'<p>Generated successfully: {generated_count} steps.</p>'
-                    f'<p>Remaining: {remaining_count} steps not attempted.</p>'
-                    f'<p>Not attempted because automation generation stopped at Step {failure.step_order + 1}.</p>'
-                    f'<p>Reason: {escape_html(failure.safe_reason)}</p>'
-                    f'<p>Saved automation: {escape_html(saved_automation)}</p>'
-                    f'<p>New plan saved: {new_plan}.</p>'
-                    '<details class="technical-details"><summary>Developer details</summary>'
-                    f'<p>Classification: <code>{escape_html(failure.technical_classification)}</code></p>'
-                    + (
-                        '<ul class="validation-issues">' + ''.join(
-                            '<li><code>' + escape_html(issue.code) + '</code> at '
-                            '<code>' + escape_html(issue.path) + '</code>: '
-                            + escape_html(issue.message) + '</li>'
-                            for issue in failure.validation_issues
-                        ) + '</ul>'
-                        if failure.validation_issues else ''
-                    )
-                    + '</details>'
-                )
-            else:
-                result = (
-                    f'<p data-result-summary>{badge(outcome_label(category), outcome_tone(category))} '
-                    f'{escape_html(snapshot.error_message or failure_message(category))}</p>'
-                )
-            result += (
-                f'<a class="button primary" data-final-run-link href="{escape_html(snapshot.final_run_url)}">'
-                "View Run Details</a>"
-                if snapshot.final_run_url else ""
-            )
-            if snapshot.error_category in {
-                "INFRASTRUCTURE_ERROR",
-                "AUTOMATION_EXECUTION_ERROR",
-                "EXECUTION_ERROR",
-                "AUTOMATION_GENERATION_ERROR",
-                "SETUP_FAILURE",
-            }:
-                retry = (
-                    f'<form method="post" action="/test-cases/{snapshot.test_case_id}/run" '
-                    'data-run-form data-progress-retry><input type="hidden" name="workflow" '
-                    f'value="{escape_html(snapshot.workflow_type)}">'
-                    f'<button class="button" type="submit">{"Retry Automation" if snapshot.error_category == "AUTOMATION_GENERATION_ERROR" else "Retry Run"}</button></form>'
-                )
-
-        state_symbols = {
-            "PENDING": ("○", "Pending"),
-            "PREPARING_AUTOMATION": ("◌", "Preparing automation"),
-            "READY": ("✓", "Automation ready"),
-            "RUNNING": ("◉", "Running"),
-            "PASSED": ("✓", "Passed"),
-            "FAILED": ("✕", "Failed"),
-            "BLOCKED": ("⊘", "Blocked"),
-            "NOT_ATTEMPTED": ("○", "Not attempted"),
-        }
+        payload = self._progress_payload(snapshot)
+        summary = payload["summary"]
+        esc = escape_html
         step_rows = []
-        for step in snapshot.steps:
-            symbol, label = state_symbols.get(step.state.value, ("○", step.state.value))
-            execution_state = (
-                f'<span class="progress-step-state">Execution {escape_html(step.execution_state.value.replace("_", " ").title())}</span>'
+        for number, step in enumerate(payload["steps"], start=1):
+            version_label = (
+                f'{_plan_origin_display(step["plan_origin"])} v{step["plan_version"]}'
+                if step["plan_version"] is not None else 'Saved TestPlan'
             )
-            automation_state = (
-                f'<span class="muted">Automation {escape_html(step.automation_state.casefold())}</span>'
-                if step.automation_state else '<span class="muted">Automation not prepared</span>'
+            plan = (
+                f'<a href="{esc(step["plan_url"])}">{esc(version_label)}</a>' if step["plan_url"]
+                else '<span class="muted">No saved TestPlan available.</span>'
             )
-            version_label = f" v{step.plan_version}" if step.plan_version is not None else ""
-            provenance = (
-                f'<span class="muted">Plan {escape_html(_plan_origin_display(step.plan_origin))}'
-                f'{version_label}</span>'
-                if step.plan_origin else ""
-            )
-            failure = (
-                f'<span class="progress-failure">{escape_html(step.failure_classification.replace("_", " ").title())}: '
-                f'{escape_html(step.message or "Step failed.")}</span>'
-                if step.failure_classification else ""
-            )
-            evidence = (
-                f'<span class="progress-evidence">Screenshot evidence captured ({step.evidence_count})</span>'
-                if step.evidence_count else ""
+            evidence = ''.join(
+                f'<a href="{esc(item["url"])}" target="_blank" rel="noopener">Open full-size evidence · {esc(item["label"])}</a><br>'
+                for item in step["evidence_links"]
             )
             step_rows.append(
-                f'<li class="progress-step state-{escape_html(step.state.value.casefold())}">'
-                f'<span class="progress-symbol" aria-hidden="true">{symbol}</span>'
-                f'<span><strong>Step {step.order + 1}: {escape_html(step.name)}</strong>'
-                f'<span class="progress-step-state">{escape_html(label)}</span>{execution_state}'
-                f'{automation_state}{provenance}{failure}{evidence}</span></li>'
+                '<li class="progress-step"><span class="progress-symbol" aria-hidden="true">'
+                + ('✓' if step["display_status"] == 'Passed' else '○') + '</span><span>'
+                + f'<strong>Step {number}: {esc(step["name"])}</strong>'
+                + f'<span class="progress-step-state">{esc(step["display_status"])}</span>'
+                + (f'<span class="muted">Automation {esc(step["automation_state"].lower())}</span>' if step["automation_state"] and step["automation_state"] != 'Failed' else '')
+                + f'<span class="muted">{plan}</span>'
+                + (f'<span>Observed: {esc(step["observation"])}</span>' if step["observation"] else '')
+                + (f'<span class="progress-evidence">Screenshot evidence captured ({step["evidence_count"]})</span>' if step["evidence_count"] else '')
+                + evidence + '</span></li>'
             )
-
-        events = snapshot.events
-        developer_events = self._progress_event_list(
-            events, {event.event_type.value for event in events}, "all"
-        )
-        finished = snapshot.state.value == "FINISHED"
-        phase = escape_html(snapshot.phase)
-        body = (
-            '<header class="page-heading"><p class="eyebrow">Live execution</p>'
-            f'<h1>{escape_html(case_name)}</h1>'
-            f'<p class="lead">{badge(snapshot.workflow_type, "workflow")} '
-            f'<span data-progress-phase>{phase}</span></p></header>'
+        result = self._progress_summary_html(payload) if payload["finished"] else ''
+        retry = ''
+        if payload["finished"] and summary["outcome"] in {
+            'AUTOMATION_EXECUTION_ERROR', 'AUTOMATION_DRIFT', 'AUTOMATION_GENERATION_ERROR', 'INFRASTRUCTURE_ERROR',
+        }:
+            retry = (
+                f'<form method="post" action="/test-cases/{snapshot.test_case_id}/run" data-run-form data-progress-retry>'
+                f'<input type="hidden" name="workflow" value="{esc(snapshot.workflow_type)}">'
+                f'<button class="button" type="submit">{"Retry Automation" if summary["outcome"] == "AUTOMATION_GENERATION_ERROR" else "Retry Run"}</button></form>'
+            )
+        content = (
+            '<header class="page-heading"><p class="eyebrow">Run Progress</p>'
+            f'<h1>{esc(snapshot.test_case_name or "TestCase run")}</h1>'
+            f'<p class="lead">Current operation: {badge(snapshot.workflow_type, "workflow")}</p></header>'
             '<div class="summary-grid">'
-            + _summary_card(
-                "Current phase",
-                f'<span data-progress-phase>{phase}</span>',
-                raw=True,
-            )
-            + _summary_card(
-                "Elapsed",
-                f'<span data-progress-elapsed>{escape_html(format_duration(snapshot.elapsed_ms))}</span>',
-                raw=True,
-            )
-            + _summary_card(
-                "Execution",
-                f'<span data-progress-state>{escape_html(snapshot.state.value.title())}</span>',
-                raw=True,
-            )
+            + _summary_card('Current stage', f'<span data-progress-phase>{esc(payload["phase"])}</span>', raw=True)
+            + _summary_card('Elapsed', f'<span data-progress-elapsed>{esc(format_duration(snapshot.elapsed_ms))}</span>', raw=True)
             + '</div>'
-            + f'<div class="progress-live" data-progress-id="{escape_html(progress_id)}">'
-            + '<section class="panel"><h2>TestCase progress</h2>'
-            + (
-                f'<ol class="progress-steps" id="progress-steps">{"".join(step_rows)}</ol>'
-                if step_rows else '<ol class="progress-steps" id="progress-steps"></ol>'
-            )
-            + '</section><details class="panel technical-details" data-progress-developer-details>'
-            + '<summary>Developer details</summary>'
-            + (developer_events if developer_events else '<ul class="compact-list" data-progress-events="all"></ul>')
-            + '</details></div>'
-            + '<section class="panel progress-result" data-progress-result'
-            + ('' if finished else ' hidden')
-            + '><h2>Result</h2><div data-progress-result-content>' + result + '</div></section>'
-            + (f'<div class="actions">{retry}</div>' if retry else "")
+            + '<section class="panel progress-result" data-progress-result' + ('' if payload['finished'] else ' hidden')
+            + '><h2>Result summary</h2><div data-progress-result-content>' + result + '</div>' + retry + '</section>'
+            + f'<div class="progress-live" data-progress-id="{esc(progress_id)}">'
+            + '<section class="panel"><h2>Completed and pending steps</h2><ol class="progress-steps" id="progress-steps">'
+            + ''.join(step_rows) + '</ol></section>'
+            + '<details class="panel technical-details" data-progress-developer-details><summary>Developer details</summary>'
+            + '<div data-progress-diagnostics>' + self._progress_diagnostics_html(payload['diagnostic_stages'], payload['provider_diagnostics']) + '</div></details></div>'
             + '<p class="muted" data-progress-notice aria-live="polite"></p>'
         )
-        return WebResponse.html(
-            200,
-            self._page(
-                f"{case_name} progress",
-                body,
-                breadcrumbs=[("Dashboard", "/"), ("Test Cases", "/test-cases")],
-            ),
-        )
+        return WebResponse.html(200, self._page(
+            'Run Progress', content, breadcrumbs=[('Dashboard', '/'), ('Test Cases', '/test-cases')],
+        ))
 
     @staticmethod
-    def _progress_event_list(events, event_types: set[str], group: str) -> str:
-        rows = []
-        for event in events:
-            if event.event_type.value not in event_types:
-                continue
-            label = event.message or event.event_type.value.replace("_", " ").title()
-            event_type = event.event_type.value
-            symbol = (
-                "✕" if event_type.endswith("FAILED")
-                else "◉" if event_type.endswith("STARTED")
-                else "✓"
-            )
-            rows.append(
-                f'<li class="progress-event"><span aria-hidden="true">{symbol}</span>'
-                f'<span>{escape_html(label)}</span></li>'
-            )
-        return (
-            f'<ul class="compact-list" data-progress-events="{group}">{"".join(rows)}</ul>'
-            if rows else ""
-        )
+    def _progress_summary_html(payload: dict) -> str:
+        summary = payload['summary']
+        text = result_badge(summary['outcome'])
+        text += f'<p>{summary["completed_steps"]} of {summary["total_steps"]} steps verified.</p>'
+        if summary['stopping_detail']:
+            text += f'<p>{escape_html(summary["stopping_detail"])}</p>'
+        text += f'<p>{escape_html(summary["explanation"])}</p>'
+        position = summary['stopping_step']
+        if position and payload['steps'][position - 1].get('observation'):
+            text += f'<p><strong>Observed:</strong> {escape_html(payload["steps"][position - 1]["observation"])}</p>'
+        text += f'<p><strong>Recommended action:</strong> {escape_html(summary["recommended_action"])}</p>'
+        if summary.get('history_note'):
+            text += f'<p>{escape_html(summary["history_note"])}</p>'
+        text += '<div class="actions">' + ''.join(
+            f'<a class="button" href="{escape_html(item["url"])}">{escape_html(item["label"])}</a>' for item in payload['actions']
+        ) + '</div>'
+        return text
+
+    @staticmethod
+    def _progress_diagnostics_html(stages: list[dict], provider_attempts: list[dict] | None = None) -> str:
+        sections = []
+        for stage in stages:
+            rows = []
+            for event in stage['events']:
+                fields = [event['display_status']]
+                if event['step_order'] is not None:
+                    fields.append(f'Step {event["step_order"] + 1}')
+                if event['attempt_number'] is not None:
+                    fields.append(f'Attempt {event["attempt_number"]}')
+                if event['duration_ms'] is not None:
+                    fields.append(format_duration(event['duration_ms']))
+                rows.append(
+                    '<li class="progress-event"><div>'
+                    + f'<time>{escape_html(event["timestamp"])}</time> · {escape_html(" · ".join(fields))}'
+                    + f'<p>{escape_html(event["reason"])}</p>'
+                    + '<details><summary>Raw details</summary>'
+                    + f'<pre>{escape_html(json.dumps(event, ensure_ascii=False, indent=2))}</pre></details></div></li>'
+                )
+            sections.append(f'<section><h3>{escape_html(stage["stage"])}</h3><ol>{"".join(rows)}</ol></section>')
+        if provider_attempts:
+            rows = []
+            for attempt in provider_attempts:
+                fields = [
+                    f'Step {attempt["step_number"]}', f'Attempt {attempt["attempt_number"]}',
+                    attempt['request_kind'], attempt['provider'], attempt['status'],
+                ]
+                if attempt.get('model'):
+                    fields.append(attempt['model'])
+                if attempt.get('duration_ms') is not None:
+                    fields.append(format_duration(attempt['duration_ms']))
+                rows.append(
+                    '<li class="progress-event"><div>' + escape_html(' · '.join(fields))
+                    + (f'<p>{escape_html(attempt["reason"])}</p>' if attempt.get('reason') else '')
+                    + '<details><summary>Raw details</summary>'
+                    + f'<pre>{escape_html(json.dumps(attempt, ensure_ascii=False, indent=2))}</pre></details></div></li>'
+                )
+            sections.append('<section><h3>Recorded provider attempts</h3><ol>' + ''.join(rows) + '</ol></section>')
+        return ''.join(sections)
 
     def _drafts_page(self) -> str:
         drafts = self._drafts.list(500)
@@ -1992,14 +2041,17 @@ class LocalWebApplication:
         records = self._run_history.list_recent(_PAGE_LIMIT)
         counts = {
             "Total runs": len(records),
-            "Passed": sum(record.status.value == "PASSED" for record in records),
-            "Failed": sum(record.status.value == "FAILED" for record in records),
-            "Automation": sum(record.workflow_type == WorkflowType.AUTOMATION for record in records),
-            "Validation": sum(record.workflow_type == WorkflowType.VALIDATION for record in records),
-            "Regression": sum(record.workflow_type == WorkflowType.REGRESSION for record in records),
-            "Product failures": sum(record.outcome == "PRODUCT_FAILURE" for record in records),
+            "Passed": sum(history_outcome(record) == "PASSED" for record in records),
+            "Automation runs": sum(record.workflow_type == WorkflowType.AUTOMATION for record in records),
+            "Validation runs": sum(record.workflow_type == WorkflowType.VALIDATION for record in records),
+            "Regression runs": sum(record.workflow_type == WorkflowType.REGRESSION for record in records),
+            "Product failures": sum(history_outcome(record) == "PRODUCT_FAILURE" for record in records),
+            "Automation execution errors": sum(history_outcome(record) == "AUTOMATION_EXECUTION_ERROR" for record in records),
+            "Generation errors": sum(history_outcome(record) == "AUTOMATION_GENERATION_ERROR" for record in records),
+            "Blocked": sum(history_outcome(record) == "BLOCKED" for record in records),
+            "Inconclusive": sum(history_outcome(record) == "INCONCLUSIVE" for record in records),
             "Automation drift": sum(record.outcome == "AUTOMATION_DRIFT" for record in records),
-            "Infrastructure errors": sum(record.outcome == "INFRASTRUCTURE_ERROR" for record in records),
+            "Infrastructure errors": sum(history_outcome(record) == "INFRASTRUCTURE_ERROR" for record in records),
         }
         cards = "".join(
             f'<article class="card"><div class="card-label">{escape_html(label)}</div>'
@@ -2150,12 +2202,11 @@ class LocalWebApplication:
                 test_case_id = test_case.id
                 history = grouped.get(test_case_id, [])
                 latest = latest_by_case.get(test_case_id)
-                status = badge(latest.status.value) if latest else badge("NOT RUN")
+                status = _outcome_badge(latest) if latest else badge("NOT RUN")
                 automation_status = badge(
                     _automation_status_label(self._automation_lifecycle.status(test_case)),
                     "workflow",
                 )
-                outcome = _outcome_badge(latest) if latest else '<span class="muted">No result</span>'
                 last_run = (
                     f'<time datetime="{escape_html(latest.started_at.isoformat())}">'
                     f'{escape_html(format_timestamp(latest.started_at))}</time>'
@@ -2172,9 +2223,9 @@ class LocalWebApplication:
                     f'<a href="/test-cases/{test_case_id}">{escape_html(test_case.name)}</a></div>'
                     f'<details><summary>Technical ID</summary><code>{escape_html(test_case_id)}</code></details></td>'
                     f'<td class="test-case-state-cell"><div class="test-case-state">{automation_status}'
-                    f'<span class="test-case-latest-status"><span class="muted">Latest status:</span> {status}</span></div>'
+                    f'<span class="test-case-latest-status"><span class="muted">Latest result:</span> {status}</span></div>'
                     f'<div class="test-case-meta"><span>Last run: {last_run}</span>'
-                    f'<span>Latest result: {outcome}</span><span>{run_count}</span>'
+                    f'<span>{run_count}</span>'
                     f'<span>Latest workflow: {latest_workflow}</span></div></td>'
                     '<td class="test-case-actions-cell"><div class="test-case-actions">'
                     + f'<a class="button" href="/test-cases/{test_case_id}">Open</a>'
@@ -2194,9 +2245,8 @@ class LocalWebApplication:
                     f'<a href="/test-cases/{test_case_id}">{escape_html(latest.test_case_name)}</a></div>'
                     f'<details><summary>Technical ID</summary><code>{escape_html(test_case_id)}</code></details></td>'
                     f'<td class="test-case-state-cell"><div class="test-case-state"><span class="badge neutral">Automation unavailable</span>'
-                    f'<span class="test-case-latest-status"><span class="muted">Latest status:</span> {badge(latest.status.value)}</span></div>'
+                    f'<span class="test-case-latest-status"><span class="muted">Latest result:</span> {_outcome_badge(latest)}</span></div>'
                     f'<div class="test-case-meta"><span>Last run: <time datetime="{escape_html(latest.started_at.isoformat())}">{escape_html(format_timestamp(latest.started_at))}</time></span>'
-                    f'<span>Latest result: {_outcome_badge(latest)}</span>'
                     f'<span>{len(history)} {"run" if len(history) == 1 else "runs"}</span>'
                     f'<span>Latest workflow: {badge(latest.workflow_type.value, "workflow")}</span></div></td>'
                     f'<td class="test-case-actions-cell"><div class="test-case-actions"><a class="button" href="/test-cases/{test_case_id}">Open</a></div></td>'
@@ -3202,7 +3252,6 @@ class LocalWebApplication:
         for item in run.items:
             attempt_rows = []
             for attempt in item.attempts:
-                classification = ", ".join(attempt.failure_classifications) or attempt.outcome
                 duration = escape_html(format_duration(attempt.duration_ms))
                 run_link = (
                     f'<a href="/runs/{attempt.run_id}">'
@@ -3210,18 +3259,19 @@ class LocalWebApplication:
                     if attempt.run_id else "No Run History record"
                 )
                 attempt_rows.append(
-                    f'<li>Attempt {attempt.attempt_number} — {escape_html(attempt.run_status)}'
-                    f' · {escape_html(classification)} · {duration} → {run_link}</li>'
+                    f'<li>Attempt {attempt.attempt_number} — {escape_html(result_label(suite_attempt_outcome(attempt)))}'
+                    f' · {duration} → {run_link}'
+                    '<details class="technical-details"><summary>Developer details</summary>'
+                    f'<p>Stored outcome: {escape_html(attempt.outcome)} · Classifications: {escape_html(", ".join(attempt.failure_classifications) or "Unknown")}</p></details></li>'
                 )
             attempts = "".join(attempt_rows)
             item_rows.append(
                 f'<li class="suite-run-item" data-suite-item="{item.order_index}">'
                 f'<div><strong>{escape_html(item.test_case_public_id or "")} — '
-                f'{escape_html(item.test_case_name)}</strong> {badge(item.status.value)}'
+                f'{escape_html(item.test_case_name)}</strong> {badge(suite_item_label(item), "success" if suite_item_outcome(item) == "PASSED" else outcome_tone(suite_item_outcome(item)))}'
                 f'<span class="muted">{escape_html(format_duration(item.duration_ms))}'
-                + (f' · {escape_html(item.classification)}' if item.classification else '')
                 + '</span></div>'
-                + (f'<ul>{attempts}</ul>' if attempts else '<p class="muted">Waiting to start</p>')
+                + (f'<ul>{attempts}</ul>' if attempts else f'<p class="muted">{escape_html(result_label(suite_item_outcome(item)))}</p>')
                 + '</li>'
             )
         report_url = f"/suite-runs/{escape_html(run.public_id or public_id)}/report.json"
@@ -3229,15 +3279,15 @@ class LocalWebApplication:
         content = (
             '<header class="page-heading"><p class="eyebrow">Suite Run</p>'
             f'<h1>{escape_html(run.public_id or public_id)} — {escape_html(run.suite_name)}</h1>'
-            f'<p class="lead">{badge(run.status.value)} Workflow: Regression · Execution: Sequential · '
+            f'<p class="lead">{badge(suite_status_label(run))} Workflow: Regression · Execution: Sequential · '
             f'AI policy: {escape_html(run.config.ai_policy.value)} · Retries: {run.config.retry_count}</p></header>'
             + f'<p class="muted">Cookie consent: {escape_html(cookie_consent_policy_label(run.config.cookie_policy))}</p>'
             + f'<p class="muted">Evidence: {escape_html(evidence_mode_label(run.config.evidence_policy.mode))} · '
             f'{escape_html(screenshot_mode_label(run.config.evidence_policy.screenshot_mode))}</p>'
             + f'<section class="panel" data-suite-run-progress="/api/suite-runs/{escape_html(run.public_id or public_id)}">'
             '<h2>Progress</h2>'
-            f'<p data-suite-run-summary>{run.passed_count} passed · {run.failed_count} failed · {run.flaky_count} flaky · {len(run.items)} total</p>'
-            + ('<p data-suite-run-live>Refreshing saved progress…</p>' if live else '<p data-suite-run-live>Run finished.</p>')
+            f'<p data-suite-run-summary>{_suite_counts_text(run)}</p>'
+            + ('<p data-suite-run-live>Refreshing saved progress…</p>' if live else f'<p data-suite-run-live>{escape_html(suite_status_label(run))}.</p>')
             + '<ol data-suite-run-items>' + "".join(item_rows) + '</ol></section>'
             + f'<p><a class="button" href="{report_url}" download>Download JSON report</a> '
             + f'<a class="button" href="/test-suites/{run.suite_id}">Back to Test Suite</a></p>'
@@ -3340,7 +3390,7 @@ class LocalWebApplication:
         filtered = [
             record for record in records
             if (workflow == "ALL" or record.workflow_type.value == workflow)
-            and (status == "ALL" or record.status.value == status)
+            and (status == "ALL" or history_outcome(record) == ("PRODUCT_FAILURE" if status == "FAILED" else status))
             and (failure_type == "ALL" or record.outcome == failure_type)
         ]
         content = (
@@ -3349,7 +3399,7 @@ class LocalWebApplication:
             '<section class="panel"><h2>Filter runs</h2>'
             f'<form class="filters" method="get" action="/runs">'
             f'{_select("workflow", "Workflow", workflow, ["ALL", *_sort_values(_WORKFLOWS)])}'
-            f'{_select("status", "Status", status, ["ALL", "PASSED", "FAILED"])}'
+            f'{_select("status", "Result", status, ["ALL", *_sort_values(_STATUSES - {"FAILED"})])}'
             f'{_select("failure_type", "Failure type", failure_type, ["ALL", *_sort_values(_FAILURE_TYPES)])}'
             '<button class="button primary" type="submit">Apply filters</button>'
             '<a class="button" href="/runs">Clear</a></form></section>'
@@ -3366,8 +3416,8 @@ class LocalWebApplication:
             return ""
         rows = []
         for record in records:
-            status_html = badge(record.status.value)
-            outcome_html = _outcome_badge(record, stacked=True)
+            status_html = _outcome_badge(record)
+            outcome_html = ""
             rows.append(
                 "<tr>"
                 f"<td>{status_html}{outcome_html}</td>"
@@ -3396,18 +3446,19 @@ class LocalWebApplication:
         if self._test_cases is None and not records:
             return self._not_found("TestCase not found")
         latest = records[0] if records else None
-        passed = sum(record.status.value == "PASSED" for record in records)
-        failed = sum(record.status.value == "FAILED" for record in records)
+        passed = sum(history_outcome(record) == "PASSED" for record in records)
+        failed = sum(history_outcome(record) == "PRODUCT_FAILURE" for record in records)
         cards = (
             _summary_card(
                 "Latest result",
-                badge(latest.status.value) + _outcome_badge(latest, stacked=True)
+                _outcome_badge(latest)
                 if latest else badge("NOT RUN"),
                 raw=True,
             )
             + _summary_card("Last run", format_timestamp(latest.started_at) if latest else "Never")
             + _summary_card("Total runs", str(len(records)))
-            + _summary_card("Passed / failed", f"{passed} / {failed}")
+            + _summary_card("Passed / product failures", f"{passed} / {failed}")
+            + _summary_card("Technical / inconclusive", str(len(records) - passed - failed))
             + _summary_card(
                 "Latest workflow",
                 badge(latest.workflow_type.value, "workflow") if latest else "—",
@@ -3469,7 +3520,6 @@ class LocalWebApplication:
             )
         history_rows = "".join(
             "<tr>"
-            f'<td>{badge(record.status.value)}</td>'
             f'<td>{_outcome_badge(record)}</td>'
             f'<td>{badge(record.workflow_type.value, "workflow")}</td>'
             f'<td><time datetime="{escape_html(record.started_at.isoformat())}">'
@@ -3480,7 +3530,7 @@ class LocalWebApplication:
             for record in records
         )
         history_table = (
-            '<div class="table-wrap"><table><thead><tr><th>Status</th><th>Result</th><th>Workflow</th>'
+            '<div class="table-wrap"><table><thead><tr><th>Result</th><th>Workflow</th>'
             '<th>Last run</th><th>Duration</th><th>Run</th></tr></thead><tbody>'
             + history_rows
             + '</tbody></table></div>'
@@ -3539,7 +3589,7 @@ class LocalWebApplication:
         )
         run_status_panel = (
             '<section class="panel"><h2>Run status</h2>'
-            + (f'<p>{badge(latest.status.value)} {_outcome_badge(latest)}</p>'
+            + (f'<p>{_outcome_badge(latest)}</p>'
                f'<p class="muted">{escape_html(latest.workflow_type.value.title())} · '
                f'{escape_html(format_timestamp(latest.started_at))}</p>'
                if latest is not None else '<p class="muted">Not run yet.</p>')
@@ -4705,10 +4755,23 @@ def _parse_uuid(value: str) -> UUID | None:
         return None
 
 
+def _suite_counts_text(run: SuiteRun) -> str:
+    counts = run.outcome_counts
+    return (
+        f"{counts['passed']} passed · {counts['product_failures']} product failures · "
+        f"{counts['automation_errors']} automation errors · {counts['generation_errors']} generation errors · "
+        f"{counts['infrastructure_errors']} infrastructure errors · {counts['blocked']} blocked · "
+        f"{counts['inconclusive']} inconclusive · {counts['pending']} pending · "
+        f"{run.flaky_count} passed after retry · {len(run.items)} total"
+    )
+
+
 def _suite_run_public_dict(run: SuiteRun) -> dict:
     return {
         "public_id": run.public_id,
         "status": run.status.value,
+        "display_status": suite_status_label(run),
+        "summary_text": _suite_counts_text(run),
         "workflow_type": run.config.workflow_type.value,
         "execution_type": run.config.execution_type,
         "ai_policy": run.config.ai_policy.value,
@@ -4719,7 +4782,7 @@ def _suite_run_public_dict(run: SuiteRun) -> dict:
             "screenshot_mode": run.config.evidence_policy.screenshot_mode.value,
         },
         "counts": {
-            "passed": run.passed_count,
+            **run.outcome_counts,
             "failed": run.failed_count,
             "flaky": run.flaky_count,
             "total": len(run.items),
@@ -4731,6 +4794,7 @@ def _suite_run_public_dict(run: SuiteRun) -> dict:
                 "test_case_public_id": item.test_case_public_id,
                 "test_case_name": item.test_case_name,
                 "status": item.status.value,
+                "display_status": suite_item_label(item),
                 "classification": item.classification,
                 "duration_ms": item.duration_ms,
                 "error_category": item.error_category,
@@ -4740,6 +4804,7 @@ def _suite_run_public_dict(run: SuiteRun) -> dict:
                         "run_id": str(attempt.run_id) if attempt.run_id else None,
                         "run_public_id": attempt.run_public_id,
                         "run_status": attempt.run_status,
+                        "display_status": result_label(suite_attempt_outcome(attempt)),
                         "outcome": attempt.outcome,
                         "duration_ms": attempt.duration_ms,
                         "failure_classifications": attempt.failure_classifications,
@@ -5112,9 +5177,7 @@ def _automation_status_label(status: AutomationStatus) -> str:
 
 
 def _outcome_badge(record: RunHistoryRecord, *, stacked: bool = False) -> str:
-    if record.outcome in {record.status.value, "PASSED", "FAILED"}:
-        return '<span class="muted">—</span>'
-    shown = badge(record.outcome, outcome_tone(record.outcome))
+    shown = result_badge(history_outcome(record))
     return f'<div class="row-sub-badge">{shown}</div>' if stacked else shown
 
 
@@ -5773,193 +5836,111 @@ _UI_JAVASCRIPT = r"""
   const result = document.querySelector('[data-progress-result]');
   const resultContent = document.querySelector('[data-progress-result-content]');
   let stopped = false;
-  let redirectScheduled = false;
 
-  const eventGroups = {
-    all: new Set(['RUN_REQUESTED', 'RUN_STARTED', 'TESTCASE_LOADED', 'SETUP_STARTED', 'SETUP_SUCCEEDED', 'SETUP_FAILED', 'AUTOMATION_PREPARATION_STARTED', 'PLAN_REUSED', 'PLAN_GENERATION_STARTED', 'PLAN_REPAIR_STARTED', 'PLAN_REPAIR_SUCCEEDED', 'PLAN_REPAIR_FAILED', 'PLAN_GENERATED', 'PLAN_GENERATION_FAILED', 'STEP_STARTED', 'STEP_PASSED', 'STEP_FAILED', 'STEP_BLOCKED', 'EVIDENCE_CAPTURED', 'CLEANUP_STARTED', 'CLEANUP_SUCCEEDED', 'CLEANUP_FAILED', 'RUN_FINISHED'])
-  };
-  const stepStates = {
-    PENDING: ['○', 'Pending'], PREPARING_AUTOMATION: ['◌', 'Preparing automation'],
-    READY: ['✓', 'Automation ready'], RUNNING: ['◉', 'Running'], PASSED: ['✓', 'Passed'],
-    FAILED: ['✕', 'Failed'], BLOCKED: ['⊘', 'Blocked'], NOT_ATTEMPTED: ['○', 'Not attempted']
-  };
+  function textNode(tag, text, className = '') {
+    const node = document.createElement(tag);
+    node.textContent = text;
+    if (className) node.className = className;
+    return node;
+  }
 
-  function appendEvent(list, event) {
-    const row = document.createElement('li');
-    row.className = 'progress-event';
-    const symbol = document.createElement('span');
-    symbol.setAttribute('aria-hidden', 'true');
-    symbol.textContent = event.type.endsWith('FAILED') ? '✕' :
-      (event.type.endsWith('STARTED') ? '◉' : '✓');
-    const text = document.createElement('span');
-    text.textContent = event.message || event.type.replaceAll('_', ' ').toLowerCase();
-    row.append(symbol, text);
-    list.append(row);
+  function localLink(url, label) {
+    const node = textNode('a', label);
+    if (url && url.startsWith('/') && !url.startsWith('//') && !url.includes('\\')) node.href = url;
+    return node;
   }
 
   function render(snapshot) {
     document.querySelectorAll('[data-progress-phase]').forEach((node) => {
       node.textContent = snapshot.phase;
     });
-    document.querySelectorAll('[data-progress-state]').forEach((node) => {
-      node.textContent = snapshot.state.toLowerCase().replaceAll('_', ' ')
-        .replace(/(^|\s)\S/g, (letter) => letter.toUpperCase());
-    });
     const elapsed = document.querySelector('[data-progress-elapsed]');
     if (elapsed) elapsed.textContent = `${(snapshot.elapsed_ms / 1000).toFixed(1)} s`;
-
-    Object.entries(eventGroups).forEach(([name, types]) => {
-      const list = document.querySelector(`[data-progress-events="${name}"]`);
-      if (!list) return;
-      list.replaceChildren();
-      snapshot.events.filter((event) => types.has(event.type)).forEach((event) => appendEvent(list, event));
+    const diagnostics = document.querySelector('[data-progress-diagnostics]');
+    diagnostics.replaceChildren();
+    snapshot.diagnostic_stages.forEach((stage) => {
+      const section = document.createElement('section');
+      section.append(textNode('h3', stage.stage));
+      const list = document.createElement('ol');
+      stage.events.forEach((event) => {
+        const row = document.createElement('li');
+        row.className = 'progress-event';
+        const detail = document.createElement('div');
+        const fields = [event.display_status];
+        if (event.step_order != null) fields.push(`Step ${event.step_order + 1}`);
+        if (event.attempt_number != null) fields.push(`Attempt ${event.attempt_number}`);
+        if (event.duration_ms != null) fields.push(`${(event.duration_ms / 1000).toFixed(1)} s`);
+        detail.append(textNode('time', event.timestamp), document.createTextNode(` \u00b7 ${fields.join(' \u00b7 ')}`), textNode('p', event.reason));
+        const raw = document.createElement('details');
+        raw.append(textNode('summary', 'Raw details'), textNode('pre', JSON.stringify(event, null, 2)));
+        detail.append(raw); row.append(detail); list.append(row);
+      });
+      section.append(list); diagnostics.append(section);
     });
+    if ((snapshot.provider_diagnostics || []).length) {
+      const section = document.createElement('section');
+      section.append(textNode('h3', 'Recorded provider attempts'));
+      const list = document.createElement('ol');
+      snapshot.provider_diagnostics.forEach((attempt) => {
+        const row = document.createElement('li'); row.className = 'progress-event';
+        const detail = document.createElement('div');
+        const fields = [`Step ${attempt.step_number}`, `Attempt ${attempt.attempt_number}`, attempt.request_kind, attempt.provider, attempt.status];
+        if (attempt.model) fields.push(attempt.model);
+        if (attempt.duration_ms != null) fields.push(`${(attempt.duration_ms / 1000).toFixed(1)} s`);
+        detail.append(textNode('p', fields.join(' \u00b7 ')));
+        if (attempt.reason) detail.append(textNode('p', attempt.reason));
+        const raw = document.createElement('details');
+        raw.append(textNode('summary', 'Raw details'), textNode('pre', JSON.stringify(attempt, null, 2)));
+        detail.append(raw); row.append(detail); list.append(row);
+      });
+      section.append(list); diagnostics.append(section);
+    }
 
     stepsList.replaceChildren();
-    snapshot.steps.forEach((step) => {
-      const item = document.createElement('li');
-      item.className = `progress-step state-${step.state.toLowerCase()}`;
-      const icon = document.createElement('span');
-      icon.className = 'progress-symbol';
+    snapshot.steps.forEach((step, index) => {
+      const row = document.createElement('li'); row.className = 'progress-step';
+      const icon = textNode('span', step.display_status === 'Passed' ? '\u2713' : '\u25cb', 'progress-symbol');
       icon.setAttribute('aria-hidden', 'true');
-      const state = stepStates[step.state] || ['○', step.state];
-      icon.textContent = state[0];
       const content = document.createElement('span');
-      const name = document.createElement('strong');
-      name.textContent = `Step ${step.order + 1}: ${step.name}`;
-      const label = document.createElement('span');
-      label.className = 'progress-step-state';
-      label.textContent = state[1];
-      const execution = document.createElement('span');
-      execution.className = 'progress-step-state';
-      const executionState = step.execution_state || 'PENDING';
-      execution.textContent = `Execution ${executionState.toLowerCase().replaceAll('_', ' ')}`;
-      content.append(name, label, execution);
-      if (step.automation_state) {
-        const automation = document.createElement('span');
-        automation.className = 'muted';
-        automation.textContent = `Automation ${step.automation_state.toLowerCase()}`;
-        content.append(automation);
-      } else {
-        const automation = document.createElement('span');
-        automation.className = 'muted';
-        automation.textContent = 'Automation not prepared';
-        content.append(automation);
-      }
-      if (step.plan_origin) {
-        const provenance = document.createElement('span');
-        provenance.className = 'muted';
-        provenance.textContent = `Plan ${step.plan_origin.toLowerCase().replaceAll('_', ' ')}${step.plan_version ? ` v${step.plan_version}` : ''}`;
-        content.append(provenance);
-      }
-      if (step.failure_classification) {
-        const failure = document.createElement('span');
-        failure.className = 'progress-failure';
-        failure.textContent = `${step.failure_classification.toLowerCase().replaceAll('_', ' ')}: ${step.message || 'Step failed.'}`;
-        content.append(failure);
-      }
-      const evidenceCount = step.evidence_count || 0;
-      if (evidenceCount) {
-        const evidence = document.createElement('span');
-        evidence.className = 'progress-evidence';
-        evidence.textContent = `Screenshot evidence captured (${evidenceCount})`;
-        content.append(evidence);
-      }
-      item.append(icon, content);
-      stepsList.append(item);
+      content.append(textNode('strong', `Step ${index + 1}: ${step.name}`), textNode('span', step.display_status, 'progress-step-state'));
+      if (step.automation_state && step.automation_state !== 'Failed') content.append(textNode('span', `Automation ${step.automation_state.toLowerCase()}`, 'muted'));
+      if (step.plan_url) {
+        const plan = localLink(step.plan_url, `Plan version v${step.plan_version}`);
+        const line = document.createElement('span'); line.className = 'muted'; line.append(plan); content.append(line);
+      } else content.append(textNode('span', 'No saved TestPlan available.', 'muted'));
+      if (step.observation) content.append(textNode('p', `Observed: ${step.observation}`));
+      if (step.evidence_count) content.append(textNode('span', `Screenshot evidence captured (${step.evidence_count})`, 'progress-evidence'));
+      (step.evidence_links || []).forEach((evidence) => {
+        const link = localLink(evidence.url, `Open full-size evidence \u00b7 ${evidence.label}`);
+        link.target = '_blank'; link.rel = 'noopener'; content.append(link, document.createElement('br'));
+      });
+      row.append(icon, content); stepsList.append(row);
     });
 
     if (snapshot.finished) {
       result.hidden = false;
-      const category = snapshot.outcome || snapshot.error_category || 'FAILED';
-      const failure = snapshot.automation_generation_failure;
-      if (category === 'AUTOMATION_GENERATION_ERROR' && failure) {
-        const summary = document.createElement('p');
-        summary.dataset.resultSummary = '';
-        const strong = document.createElement('strong');
-        strong.textContent = 'AUTOMATION GENERATION ERROR';
-        summary.append(strong, document.createTextNode(
-          ` Automation stopped at Step ${failure.step_order + 1} of ${snapshot.steps.length}.`));
-        const generatedCount = snapshot.steps.filter((step) =>
-          step.order < failure.step_order && ['Generated', 'Reused', 'Repaired'].includes(step.automation_state)).length;
-        const remainingCount = snapshot.steps.filter((step) => step.state === 'NOT_ATTEMPTED').length;
-        const generated = document.createElement('p');
-        generated.textContent = `Generated successfully: ${generatedCount} steps.`;
-        const remaining = document.createElement('p');
-        remaining.textContent = `Remaining: ${remainingCount} steps not attempted.`;
-        const stopped = document.createElement('p');
-        stopped.textContent = `Not attempted because automation generation stopped at Step ${failure.step_order + 1}.`;
-        const reason = document.createElement('p');
-        reason.textContent = `Reason: ${failure.safe_reason}`;
-        const saved = document.createElement('p');
-        saved.textContent = `Saved automation: ${failure.prior_plan_exists ? 'Available from a previous attempt.' : 'Not available for this step.'}`;
-        const newPlan = document.createElement('p');
-        newPlan.textContent = `New plan saved: ${failure.new_plan_saved ? 'Yes.' : 'No.'}`;
-        const technical = document.createElement('details');
-        technical.className = 'technical-details';
-        const technicalSummary = document.createElement('summary');
-        technicalSummary.textContent = 'Developer details';
-        const classification = document.createElement('p');
-        classification.textContent = `Classification: ${failure.technical_classification}`;
-        technical.append(technicalSummary, classification);
-        if (failure.validation_issues && failure.validation_issues.length) {
-          const issueList = document.createElement('ul');
-          issueList.className = 'validation-issues';
-          failure.validation_issues.forEach((issue) => {
-            const item = document.createElement('li');
-            item.textContent = `${issue.code} at ${issue.path}: ${issue.message}`;
-            issueList.append(item);
-          });
-          technical.append(issueList);
-        }
-        resultContent.replaceChildren(summary, generated, remaining, stopped, reason, saved, newPlan, technical);
-      } else {
-        const summary = document.createElement('p');
-        summary.dataset.resultSummary = '';
-        const strong = document.createElement('strong');
-        strong.textContent = category.replaceAll('_', ' ');
-        const explanation = document.createTextNode(` ${snapshot.error_message || 'The run has finished.'}`);
-        summary.append(strong, explanation);
-        resultContent.replaceChildren(summary);
-      }
-      if (snapshot.final_run_url) {
-        const link = document.createElement('a');
-        link.className = 'button primary';
-        link.href = snapshot.final_run_url;
-        link.textContent = 'View Run Details';
-        resultContent.append(link);
-        if (!redirectScheduled) {
-          redirectScheduled = true;
-          window.setTimeout(() => window.location.assign(snapshot.final_run_url), snapshot.redirect_after_ms || 1200);
-        }
-      } else if (notice) {
-        notice.textContent = 'No completed Run History record is available for this request.';
-      }
-      const retryable = ['INFRASTRUCTURE_ERROR', 'AUTOMATION_EXECUTION_ERROR', 'EXECUTION_ERROR', 'AUTOMATION_GENERATION_ERROR', 'SETUP_FAILURE'];
-      if (retryable.includes(snapshot.error_category) && !document.querySelector('[data-progress-retry]')) {
-        const form = document.createElement('form');
-        form.method = 'post';
-        form.action = `/test-cases/${snapshot.test_case_id}/run`;
-        form.dataset.runForm = '';
-        form.dataset.progressRetry = '';
-        const workflow = document.createElement('input');
-        workflow.type = 'hidden';
-        workflow.name = 'workflow';
-        workflow.value = snapshot.workflow;
-        const button = document.createElement('button');
-        button.className = 'button';
-        button.type = 'submit';
-        button.textContent = snapshot.error_category === 'AUTOMATION_GENERATION_ERROR'
-          ? 'Retry Automation' : 'Retry Run';
-        form.append(workflow, button);
-        const actions = document.createElement('div');
-        actions.className = 'actions';
-        actions.append(form);
-        result.after(actions);
-        form.addEventListener('submit', () => {
-          button.disabled = true;
-          button.classList.add('is-disabled');
-        }, { once: true });
+      resultContent.replaceChildren();
+      const summary = snapshot.summary;
+      resultContent.append(textNode('strong', summary.status), textNode('p', `${summary.completed_steps} of ${summary.total_steps} steps verified.`));
+      if (summary.stopping_detail) resultContent.append(textNode('p', summary.stopping_detail));
+      resultContent.append(textNode('p', summary.explanation));
+      const issue = summary.stopping_step ? snapshot.steps[summary.stopping_step - 1] : null;
+      if (issue && issue.observation) resultContent.append(textNode('p', `Observed: ${issue.observation}`));
+      resultContent.append(textNode('p', `Recommended action: ${summary.recommended_action}`));
+      if (summary.history_note) resultContent.append(textNode('p', summary.history_note));
+      const actions = document.createElement('div'); actions.className = 'actions';
+      snapshot.actions.forEach((action) => {
+        const link = localLink(action.url, action.label); link.className = 'button'; actions.append(link);
+      });
+      resultContent.append(actions);
+      if (['AUTOMATION_EXECUTION_ERROR', 'AUTOMATION_DRIFT', 'AUTOMATION_GENERATION_ERROR', 'INFRASTRUCTURE_ERROR'].includes(summary.outcome) && !document.querySelector('[data-progress-retry]')) {
+        const form = document.createElement('form'); form.method = 'post';
+        form.action = `/test-cases/${encodeURIComponent(snapshot.test_case_id)}/run`;
+        form.dataset.runForm = ''; form.dataset.progressRetry = '';
+        const workflow = document.createElement('input'); workflow.type = 'hidden'; workflow.name = 'workflow'; workflow.value = snapshot.workflow;
+        const button = textNode('button', summary.outcome === 'AUTOMATION_GENERATION_ERROR' ? 'Retry Automation' : 'Retry Run', 'button'); button.type = 'submit';
+        form.append(workflow, button); result.append(form);
+        form.addEventListener('submit', () => { button.disabled = true; }, {once: true});
       }
       stopped = true;
     }
@@ -5996,35 +5977,33 @@ _UI_JAVASCRIPT = r"""
   const list = root.querySelector('[data-suite-run-items]');
   const terminal = new Set(['COMPLETED', 'COMPLETED_WITH_FAILURES', 'INTERRUPTED', 'FAILED']);
   const render = (run) => {
-    summary.textContent = `${run.counts.passed} passed · ${run.counts.failed} failed · ${run.counts.flaky} flaky · ${run.counts.total} total`;
-    live.textContent = terminal.has(run.status) ? `Run finished: ${run.status}.` : `Run ${run.status.toLowerCase()}…`;
+    summary.textContent = run.summary_text;
+    live.textContent = terminal.has(run.status) ? `${run.display_status}.` : `Run ${run.status.toLowerCase()}…`;
     list.replaceChildren();
     run.items.forEach((item) => {
       const row = document.createElement('li'); row.className = 'suite-run-item';
       const heading = document.createElement('strong');
       const itemDuration = item.duration_ms == null ? '' : ` · ${(item.duration_ms / 1000).toFixed(1)} s`;
-      const itemClassification = item.classification ? ` · ${item.classification}` : '';
-      heading.textContent = `${item.order_index + 1}. ${item.test_case_public_id || ''} — ${item.test_case_name} — ${item.status}${itemDuration}${itemClassification}`;
+      heading.textContent = `${item.order_index + 1}. ${item.test_case_public_id || ''} — ${item.test_case_name} — ${item.display_status}${itemDuration}`;
       row.append(heading);
       if (item.attempts.length) {
         const attempts = document.createElement('ul');
         item.attempts.forEach((attempt) => {
           const line = document.createElement('li');
-          const attemptClassifications = (attempt.failure_classifications || []).join(', ') || attempt.outcome;
           const attemptDuration = attempt.duration_ms == null ? '' : ` · ${(attempt.duration_ms / 1000).toFixed(1)} s`;
-          line.append(document.createTextNode(`Attempt ${attempt.attempt_number} — ${attempt.run_status} · ${attemptClassifications}${attemptDuration} → `));
+          line.append(document.createTextNode(`Attempt ${attempt.attempt_number} — ${attempt.display_status}${attemptDuration} → `));
           if (attempt.run_id) {
             const link = document.createElement('a'); link.href = `/runs/${encodeURIComponent(attempt.run_id)}`;
             link.textContent = attempt.run_public_id || 'Open TestCase Run'; line.append(link);
           } else {
-            line.append(document.createTextNode(`${attempt.outcome} (${attempt.error_category || 'no Run History record'})`));
+            line.append(document.createTextNode('No persisted Run record'));
           }
           attempts.append(line);
         });
         row.append(attempts);
       } else {
         const waiting = document.createElement('p'); waiting.className = 'muted';
-        waiting.textContent = item.status === 'RUNNING' ? 'Running…' : 'Waiting to start'; row.append(waiting);
+        waiting.textContent = item.display_status; row.append(waiting);
       }
       list.append(row);
     });

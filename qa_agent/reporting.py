@@ -35,9 +35,14 @@ from qa_agent.presentation import (
     escape_html,
     format_duration,
     format_timestamp,
-    outcome_tone,
+    result_badge,
+    safe_local_url,
 )
-from qa_agent.redaction import redact_secrets
+from qa_agent.redaction import redact_secrets, redact_diagnostic
+from qa_agent.result_semantics import (
+    execution_classification, history_outcome, result_outcome, result_label,
+    result_summary,
+)
 from qa_agent.run_history import (
     HistoryExecutionReference,
     HistoryPrecondition,
@@ -76,6 +81,8 @@ class TestAttemptReport(BaseModel):
     execution_id: UUID
     test_plan_version_id: UUID
     status: ExecutionStatus
+    classification: str = "INCONCLUSIVE"
+    display_status: str = "Inconclusive"
     started_at: datetime
     finished_at: datetime | None
     actual_result: Any
@@ -88,6 +95,8 @@ class TestAttemptReport(BaseModel):
             execution_id=execution.id,
             test_plan_version_id=execution.test_plan_version_id,
             status=execution.status,
+            classification=result_outcome(execution.status, execution_classification(execution), complete=execution.finished_at is not None),
+            display_status=result_label(result_outcome(execution.status, execution_classification(execution), complete=execution.finished_at is not None)),
             started_at=execution.started_at,
             finished_at=execution.finished_at,
             actual_result=execution.actual_result,
@@ -100,6 +109,8 @@ class TestStepReport(BaseModel):
     step_id: UUID
     name: str
     status: ExecutionStatus | None
+    classification: str = "INCONCLUSIVE"
+    display_status: str = "Inconclusive"
     attempts: list[TestAttemptReport]
 
 
@@ -109,6 +120,8 @@ class TestReport(BaseModel):
     run_id: UUID
     test_case_id: UUID
     status: ExecutionStatus
+    display_outcome: str = "INCONCLUSIVE"
+    display_status: str = "Inconclusive"
     started_at: datetime
     finished_at: datetime | None
     steps: list[TestStepReport]
@@ -133,10 +146,17 @@ class TestReportGenerator:
         steps = []
         for step_id, name in zip(test_run.test_step_ids, names):
             attempts = executions_by_step[step_id]
+            classification = (
+                "BLOCKED" if step_id in blocked_ids
+                else result_outcome(attempts[-1].status, execution_classification(attempts[-1]), complete=attempts[-1].finished_at is not None) if attempts
+                else "NOT_RUN"
+            )
             steps.append(
                 TestStepReport(
                     step_id=step_id,
                     name=name,
+                    classification=classification,
+                    display_status=result_label(classification),
                     status=(
                         ExecutionStatus.BLOCKED
                         if step_id in blocked_ids
@@ -149,10 +169,17 @@ class TestReportGenerator:
                 )
             )
 
+        outcomes = {step.classification for step in steps}
+        outcome = next((item for item in (
+            "INFRASTRUCTURE_ERROR", "AUTOMATION_DRIFT", "AUTOMATION_EXECUTION_ERROR",
+            "PRODUCT_FAILURE", "BLOCKED", "INCONCLUSIVE", "NOT_RUN",
+        ) if item in outcomes), "PASSED" if outcomes == {"PASSED"} else "INCONCLUSIVE")
         return TestReport(
             run_id=test_run.id,
             test_case_id=test_run.test_case_id,
             status=test_run.overall_status,
+            display_outcome=outcome,
+            display_status=result_label(outcome),
             started_at=test_run.started_at,
             finished_at=test_run.finished_at,
             steps=steps,
@@ -163,7 +190,7 @@ class TestReportGenerator:
         attempt = TestAttemptReport.from_execution(execution)
         return attempt.model_copy(update={
             "actual_result": _safe_report_value(attempt.actual_result, test_run),
-            "error": _safe_report_value(attempt.error, test_run),
+            "error": _redact_report_value(_safe_report_value(attempt.error, test_run)),
             "evidence": [
                 item.model_copy(update={
                     "path": _safe_report_value(item.path, test_run),
@@ -192,12 +219,17 @@ class RunAttemptReport(BaseModel):
     test_plan_version_id: UUID
     plan_version_number: int | None = None
     plan_version_origin: PlanVersionOrigin | None = None
+    plan_url: str | None = None
     status: ExecutionStatus
+    classification: str = "INCONCLUSIVE"
+    display_status: str = "Inconclusive"
+    observation: str | None = None
     started_at: datetime
     finished_at: datetime | None = None
     duration_ms: int | None = None
     actual_result: Any = None
     error: str | None = None
+    diagnostics: str | None = None
     evidence: list[RunEvidenceReport] = Field(default_factory=list)
 
 
@@ -208,6 +240,8 @@ class RunStepReport(BaseModel):
     description: str
     expected: str
     status: str
+    classification: str = "INCONCLUSIVE"
+    display_status: str = "Inconclusive"
     attempts: list[RunAttemptReport] = Field(default_factory=list)
 
 
@@ -224,8 +258,11 @@ class RunReport(BaseModel):
     workflow_type: WorkflowType
     evidence_policy: EvidencePolicy | None = None
     cookie_consent: CookieConsentRecord | None = None
-    outcome: str
+    outcome: str | None = None
     status: ExecutionStatus
+    display_outcome: str = "INCONCLUSIVE"
+    display_status: str = "Inconclusive"
+    result_summary: dict[str, Any] = Field(default_factory=dict)
     started_at: datetime
     finished_at: datetime | None = None
     duration_ms: int | None = None
@@ -292,11 +329,23 @@ class RunReportGenerator:
             references_by_step.setdefault(reference.test_step_id, []).append(reference)
 
         step_reports: list[RunStepReport] = []
+        public_outcome = history_outcome(record)
+        failed_references = [item for item in record.executions if item.status == ExecutionStatus.FAILED]
+        legacy_classification = (
+            public_outcome if len(failed_references) == 1 and public_outcome in {
+                "PRODUCT_FAILURE", "AUTOMATION_EXECUTION_ERROR", "AUTOMATION_DRIFT", "INFRASTRUCTURE_ERROR",
+            } else None
+        )
         for step in sorted(record.steps, key=lambda item: item.order):
             attempts = [
-                self._attempt_report(reference, execution_map.get(reference.execution_id))
+                self._attempt_report(reference, execution_map.get(reference.execution_id), legacy_classification)
                 for reference in references_by_step.get(step.id, [])
             ]
+            classification = (
+                "BLOCKED" if step.status == ExecutionStatus.BLOCKED
+                else attempts[-1].classification if attempts
+                else "NOT_RUN"
+            )
             step_reports.append(RunStepReport(
                 step_id=step.id,
                 order=step.order,
@@ -305,6 +354,8 @@ class RunReportGenerator:
                 expected=step.expected,
                 status=(step.status.value if step.status is not None else "NOT_RUN"),
                 attempts=attempts,
+                classification=classification,
+                display_status=result_label(classification),
             ))
 
         return RunReport(
@@ -319,6 +370,11 @@ class RunReportGenerator:
             cookie_consent=record.cookie_consent,
             outcome=record.outcome,
             status=record.status,
+            display_outcome=public_outcome,
+            display_status=result_label(public_outcome),
+            result_summary=result_summary(public_outcome, [
+                {"name": step.name, "outcome": step.classification} for step in step_reports
+            ]),
             started_at=record.started_at,
             finished_at=record.finished_at,
             duration_ms=record.duration_ms,
@@ -339,6 +395,7 @@ class RunReportGenerator:
     def _attempt_report(
         reference: HistoryExecutionReference,
         execution: Execution | None,
+        legacy_classification: str | None = None,
     ) -> RunAttemptReport:
         started_at = execution.started_at if execution is not None else reference.started_at
         finished_at = execution.finished_at if execution is not None else reference.finished_at
@@ -358,17 +415,27 @@ class RunReportGenerator:
             )
             for item in reference.evidence
         ]
+        classification = result_outcome(reference.status, (
+            reference.classification
+            or (execution_classification(execution) if execution is not None else None)
+            or ("PASSED" if reference.status == ExecutionStatus.PASSED else legacy_classification)
+        ), complete=reference.finished_at is not None)
+        observation = _actual_observation(reference.safe_actual_result, reference.safe_diagnostics or reference.safe_error)
         return RunAttemptReport(
             execution_id=reference.execution_id,
             test_plan_version_id=reference.test_plan_version_id,
             plan_version_number=reference.plan_version_number,
             plan_version_origin=reference.plan_version_origin,
             status=reference.status,
+            classification=classification,
+            display_status=result_label(classification),
+            observation=observation,
             started_at=started_at,
             finished_at=finished_at,
             duration_ms=duration_ms,
-            actual_result=reference.safe_actual_result,
-            error=reference.safe_error,
+            actual_result=_redact_report_value(reference.safe_actual_result),
+            error=redact_diagnostic(reference.safe_error) if reference.safe_error else None,
+            diagnostics=redact_diagnostic(reference.safe_diagnostics or reference.safe_error) if reference.safe_diagnostics or reference.safe_error else None,
             evidence=evidence,
         )
 
@@ -379,255 +446,157 @@ class RunReportGenerator:
         evidence_url: Callable[
             [RunStepReport, RunAttemptReport, RunEvidenceReport, int], str | None
         ] | None = None,
+        plan_url: Callable[[RunStepReport, RunAttemptReport], str | None] | None = None,
         show_html_report_link: bool = True,
         run_details_url: str | None = None,
+        report_view: bool = True,
     ) -> str:
-        """Render a standalone, safe HTML report; evidence URLs come from the host."""
+        """Render shared result content with explicit report or Run Details navigation."""
         esc = escape_html
-        special_outcomes = {
-            "PRODUCT_FAILURE": (
-                "The automation executed the check and detected unexpected product behavior."
-            ),
-            "AUTOMATION_DRIFT": "The automation no longer matches the UI.",
-            "INFRASTRUCTURE_ERROR": "The test could not be reliably executed.",
-            "SETUP_FAILURE": "Setup failed, so product execution did not begin.",
-        }
-        steps_html: list[str] = []
+        steps_html = []
         for number, step in enumerate(report.steps, start=1):
-            attempts_html: list[str] = []
-            evidence_available = False
-            for attempt in step.attempts:
-                details: list[str] = []
-                if attempt.status == ExecutionStatus.FAILED:
-                    details.append(
-                        '<div class="detail-grid">'
-                        f'<div class="detail-box"><h4>Expected</h4><p>{esc(step.expected)}</p></div>'
-                        f'<div class="detail-box"><h4>Actual</h4><p>{esc(_display_value(attempt.actual_result))}</p></div>'
-                        "</div>"
-                    )
-                    if attempt.error:
-                        details.append(
-                            f'<div class="notice danger"><strong>Error:</strong> {esc(attempt.error)}</div>'
+            attempts_html = []
+            for attempt_number, attempt in enumerate(step.attempts, start=1):
+                observed = attempt.observation or (
+                    "Expected result could not be verified."
+                    if attempt.classification != "PASSED" else "The recorded verification passed."
+                )
+                url = safe_local_url(plan_url(step, attempt) if plan_url else attempt.plan_url)
+                version = esc(_plan_version_label(attempt))
+                version_html = (
+                    f'<a href="{esc(url)}">Plan version {version}</a>' if url
+                    else '<span class="muted">No saved TestPlan available.</span>'
+                )
+                evidence_items = []
+                for index, evidence in enumerate(attempt.evidence):
+                    url = safe_local_url(evidence_url(step, attempt, evidence, index) if evidence_url else None)
+                    label = esc(_evidence_label(evidence))
+                    name = esc(evidence.name)
+                    description = esc(redact_diagnostic(evidence.description or ""))
+                    if url:
+                        evidence_items.append(
+                            f'<figure><a href="{esc(url)}" target="_blank" rel="noopener">'
+                            f'<img class="evidence-preview" src="{esc(url)}" alt="{label}: {name}">'
+                            f'Open full-size evidence: {name}</a>'
+                            f'<figcaption>{label}' + (f' · {description}' if description else '') + '</figcaption></figure>'
                         )
-                elif attempt.actual_result is not None:
-                    details.append(
-                        f'<p class="muted"><strong>Observed:</strong> '
-                        f'{esc(_display_value(attempt.actual_result))}</p>'
-                    )
-
-                if attempt.status == ExecutionStatus.FAILED:
-                    version_value = (
-                        f'<code title="{esc(attempt.test_plan_version_id)}">'
-                        f'{esc(_plan_version_label(attempt))}</code>'
-                    )
-                else:
-                    version_value = (
-                        f'<code title="{esc(attempt.test_plan_version_id)}">'
-                        f'{esc(_plan_version_label(attempt))}</code>'
-                    )
-                details.append(
-                    f'<p class="muted"><strong>Automation · Plan version:</strong> {version_value}</p>'
+                    else:
+                        evidence_items.append(f'<p class="muted">{label}: {name} · image link unavailable.</p>')
+                raw = (
+                    (f'<p>{esc(attempt.error)}</p>' if attempt.error else '')
+                    + f'<pre>{esc(attempt.diagnostics)}</pre>' if attempt.diagnostics else '<p>No error details recorded.</p>'
                 )
-                details.append(
-                    '<details class="plan-version-details"><summary>Version details</summary>'
-                    f'<p>Plan version ID: <code>{esc(attempt.test_plan_version_id)}</code></p>'
-                    '</details>'
-                )
-                if attempt.duration_ms is not None:
-                    details.append(
-                        f'<p class="muted">Attempt duration: {esc(format_duration(attempt.duration_ms))}</p>'
-                    )
-                if attempt.evidence:
-                    evidence_items = []
-                    for evidence_index, evidence in enumerate(attempt.evidence):
-                        name = esc(evidence.name)
-                        label = esc(_evidence_label(evidence))
-                        url = evidence_url(step, attempt, evidence, evidence_index) if evidence_url else None
-                        if url:
-                            safe_url = esc(url)
-                            evidence_items.append(
-                                f'<a href="{safe_url}" target="_blank" rel="noopener">'
-                                f'<img class="evidence-preview" src="{safe_url}" alt="{label}: {name}">'
-                                f"{label}: Open {name}</a>"
-                            )
-                            evidence_available = True
-                        elif evidence_url is None:
-                            evidence_items.append(
-                                f'<span>{label}: {name} (local image link unavailable in exported file)</span>'
-                            )
-                        else:
-                            evidence_items.append(f'<span class="muted">{label}: {name} — unavailable</span>')
-                    details.append(
-                        '<div class="detail-box"><h4>Evidence</h4>'
-                        + "<br>".join(evidence_items)
-                        + "</div>"
-                    )
-                elif not evidence_available:
-                    details.append('<p class="muted">No evidence available.</p>')
-
                 attempts_html.append(
-                    '<div class="detail-box"><div class="status-line">'
-                    + presentation_badge(attempt.status.value)
-                    + f'<span class="muted">Attempt · {esc(format_timestamp(attempt.started_at))}</span>'
-                    + "</div>"
-                    + "".join(details)
-                    + "</div>"
+                    f'<section class="detail-box" data-execution-id="{attempt.execution_id}">'
+                    '<div class="status-line">' + result_badge(attempt.classification)
+                    + f'<strong>Attempt {attempt_number}</strong></div>'
+                    + f'<p><strong>Actual observation:</strong> {esc(observed)}</p>'
+                    + f'<p>{version_html}</p>'
+                    + (f'<p class="muted">Attempt duration: {esc(format_duration(attempt.duration_ms))}</p>' if attempt.duration_ms is not None else '')
+                    + '<div class="attempt-evidence"><h4>Evidence</h4>'
+                    + (''.join(evidence_items) or '<p class="muted">No evidence available.</p>') + '</div>'
+                    + '<details class="technical-details"><summary>Developer details</summary>'
+                    + f'<p>{esc(format_timestamp(attempt.started_at))} · {esc(attempt.classification)}</p>'
+                    + f'<p>Plan version: <code>{esc(attempt.test_plan_version_id)}</code> · {version}</p>'
+                    + raw + '</details></section>'
                 )
-
-            status_class = "passed" if step.status == "PASSED" else "failed" if step.status == "FAILED" else "blocked" if step.status == "BLOCKED" else ""
-            if step.status == "BLOCKED":
-                outcome_detail = (
-                    '<div class="notice warning">Not executed because a previous step '
-                    "blocked continuation.</div>"
-                )
+            if step.classification == "BLOCKED":
+                detail = '<div class="notice warning">Not executed because a prerequisite or preceding step blocked continuation.</div>'
             elif not step.attempts:
-                outcome_detail = '<p class="muted">No execution attempt was recorded.</p>'
+                detail = '<p class="muted">No execution attempt was recorded. No saved TestPlan available.</p>'
             else:
-                outcome_detail = "".join(attempts_html)
+                detail = ''.join(attempts_html)
+            tone = {"PASSED": "passed", "PRODUCT_FAILURE": "failed", "BLOCKED": "blocked"}.get(step.classification, "")
             steps_html.append(
-                f'<article class="step-card {status_class}"><div class="step-heading">'
-                + presentation_badge(step.status, title=f"Step status: {step.status}")
-                + f"<h3>Step {number} — {esc(step.name)}</h3></div>"
-                + (f'<p class="muted">{esc(step.description)}</p>' if step.description else "")
-                + (f'<p><strong>Expected:</strong> {esc(step.expected)}</p>' if step.status != "FAILED" else "")
-                + outcome_detail
-                + "</article>"
+                f'<article class="step-card {tone}"><div class="step-heading">'
+                + result_badge(step.classification) + f'<h3>Step {number} · {esc(step.name)}</h3></div>'
+                + (f'<p class="muted">{esc(step.description)}</p>' if step.description else '')
+                + f'<p><strong>Expected:</strong> {esc(step.expected)}</p>' + detail + '</article>'
             )
-
-        setup_html = ""
-        if report.preconditions or report.setup_status is not None or report.cookie_consent is not None:
-            rows = []
-            for condition in report.preconditions:
-                rows.append(
-                    "<li>"
-                    + (presentation_badge(condition.status) + " " if condition.status else "")
-                    + esc(condition.description)
-                    + (f'<p class="muted">{esc(condition.error)}</p>' if condition.error else "")
-                    + "</li>"
-                )
-            if report.cookie_consent is not None:
-                consent = report.cookie_consent
-                detail = cookie_consent_reason_label(consent.reason)
-                rows.append(
-                    "<li><strong>Cookie consent:</strong> "
-                    + esc(cookie_consent_policy_label(consent.policy))
-                    + " · " + esc(cookie_consent_label(consent))
-                    + (" · " + esc(detail) if detail else "")
-                    + "</li>"
-                )
-            status = report.setup_status
-            summary = presentation_badge(status) if status else '<span class="muted">Not recorded</span>'
-            no_execution = (
-                '<div class="notice danger">Setup did not succeed; product execution did not begin.</div>'
-                if status and status != "SUCCEEDED"
-                else ""
+        summary = report.result_summary
+        issue = report.steps[summary["stopping_step"] - 1] if summary.get("stopping_step") else None
+        observation = issue.attempts[-1].observation if issue and issue.attempts else None
+        summary_html = (
+            '<section class="panel result-summary"><h2>Result summary</h2>'
+            + result_badge(report.display_outcome)
+            + f'<p>{summary.get("completed_steps", 0)} of {len(report.steps)} steps verified.</p>'
+            + (f'<p>{esc(summary["stopping_detail"])}</p>' if summary.get("stopping_detail") else '')
+            + f'<p>{esc(summary.get("explanation", ""))}</p>'
+            + (f'<p><strong>Observed:</strong> {esc(observation)}</p>' if observation else '')
+            + f'<p><strong>Recommended action:</strong> {esc(summary.get("recommended_action", ""))}</p>'
+            + (
+                '<a class="button" href="/system/health">Open System Health</a>'
+                if report.display_outcome == "INFRASTRUCTURE_ERROR" else ''
             )
-            setup_html = (
-                '<section class="panel"><h2>Preconditions and setup</h2>'
-                f'<p>Setup: {summary}</p>{no_execution}'
-                + ("<ul>" + "".join(rows) + "</ul>" if rows else '<p class="muted">No preconditions recorded.</p>')
-                + "</section>"
-            )
-
-        cleanup_html = ""
-        if report.cleanup_succeeded is not None:
-            cleanup_key = "SUCCEEDED" if report.cleanup_succeeded else "CLEANUP_FAILURE"
-            failures = "".join(
-                f'<div class="notice warning"><strong>{esc(item.get("label", "Cleanup"))}:</strong> '
-                f'{esc(item.get("message", "Cleanup failed."))}</div>'
-                for item in report.cleanup_failures
-            )
-            cleanup_html = (
-                '<section class="panel"><h2>Cleanup</h2>'
-                + presentation_badge(cleanup_key)
-                + ("<p>Cleanup completed successfully.</p>" if report.cleanup_succeeded else "<p>Cleanup had failures; the primary run result remains shown above.</p>")
-                + failures
-                + "</section>"
-            )
-
-        result_heading = presentation_badge(report.status.value)
-        outcome_badge = presentation_badge(report.outcome, outcome_tone(report.outcome))
-        outcome_text = special_outcomes.get(report.outcome)
-        if not outcome_text and report.cleanup_succeeded is False:
-            outcome_text = "Cleanup failed after the primary test result was recorded."
-        actions = [
-            f'<a class="button" href="/test-cases/{esc(report.test_case_id)}">Back to TestCase</a>',
-            f'<a class="button" href="/runs/{esc(report.run_id)}/report.json">View JSON</a>',
-        ]
-        if show_html_report_link:
-            actions.append(
-                f'<a class="button" href="/runs/{esc(report.run_id)}/report.html" '
-                'target="_blank" rel="noopener">View HTML Report</a>'
-            )
-        if run_details_url is not None:
-            actions.insert(
-                0,
-                f'<a class="button" href="{esc(run_details_url)}">Back to Run</a>',
-            )
-        summary = (
-            '<section class="panel"><div class="status-line">'
-            + result_heading
-            + presentation_badge(report.workflow_type.value, "workflow")
-            + outcome_badge
-            + "</div>"
-            + (f'<div class="notice {"danger" if report.outcome == "PRODUCT_FAILURE" else "warning" if report.outcome in {"SETUP_FAILURE", "CLEANUP_FAILURE"} else ""}">{esc(outcome_text)}</div>' if outcome_text else "")
-            + '<div class="meta-grid">'
+            + '</section>'
+        )
+        metadata = (
+            '<section class="panel"><h2>TestCase and workflow</h2><div class="meta-grid">'
+            + _report_meta("Run", report.run_public_id or "Unknown")
+            + _report_meta("TestCase", report.test_case_public_id or "Unknown")
+            + _report_meta("Workflow", report.workflow_type.value)
             + _report_meta("Started", format_timestamp(report.started_at))
             + _report_meta("Finished", format_timestamp(report.finished_at))
             + _report_meta("Duration", format_duration(report.duration_ms))
-            + _report_meta("Run", report.run_public_id or "Unknown")
             + _report_meta("Base URL", report.base_url or "Unavailable")
-            + _report_meta("TestCase", report.test_case_public_id or "Unknown")
-            + _report_meta(
-                "Evidence mode",
-                evidence_mode_label(
-                    (report.evidence_policy or DEFAULT_EVIDENCE_POLICY).mode
-                ),
-            )
-            + _report_meta(
-                "Screenshot scope",
-                screenshot_mode_label(
-                    (report.evidence_policy or DEFAULT_EVIDENCE_POLICY).screenshot_mode
-                ),
-            )
-            + "</div></section>"
+            + _report_meta("Evidence mode", evidence_mode_label((report.evidence_policy or DEFAULT_EVIDENCE_POLICY).mode))
+            + _report_meta("Screenshot scope", screenshot_mode_label((report.evidence_policy or DEFAULT_EVIDENCE_POLICY).screenshot_mode))
+            + '</div></section>'
         )
-        technical_ids = (
-            '<details class="technical-details"><summary>Technical IDs</summary>'
-            f'<p>Run UUID: <code>{esc(report.run_id)}</code></p>'
-            f'<p>TestCase UUID: <code>{esc(report.test_case_id)}</code></p>'
+        setup_rows = ''.join(
+            '<li>' + (presentation_badge(condition.status) + ' ' if condition.status else '')
+            + esc(condition.description)
+            + (f'<p>{esc(redact_diagnostic(condition.error))}</p>' if condition.error else '') + '</li>'
+            for condition in report.preconditions
+        )
+        if report.cookie_consent:
+            consent = report.cookie_consent
+            setup_rows += '<li>Cookie consent: ' + esc(cookie_consent_policy_label(consent.policy)) + ' · ' + esc(cookie_consent_label(consent)) + ' · ' + esc(cookie_consent_reason_label(consent.reason)) + '</li>'
+        setup_html = (
+            '<section class="panel"><h2>Preconditions and setup</h2>'
+            + (f'<p>Setup: {presentation_badge(report.setup_status)}</p>' if report.setup_status else '')
+            + ('<p>Setup did not succeed; product execution did not begin.</p>' if report.setup_status and report.setup_status != 'SUCCEEDED' else '')
+            + f'<ul>{setup_rows}</ul></section>'
+            if setup_rows or report.setup_status else ''
+        )
+        cleanup_html = (
+            '<section class="panel"><h2>Cleanup</h2>'
+            + ('<p>Cleanup completed successfully.</p>' if report.cleanup_succeeded else '<p>Cleanup had failures; the primary run result remains shown above.</p>')
+            + ''.join(f'<p>{esc(item.get("label", "Cleanup"))}: {esc(redact_diagnostic(item.get("message", "")))}</p>' for item in report.cleanup_failures)
+            + '</section>' if report.cleanup_succeeded is not None else ''
+        )
+        actions = [
+            f'<a class="button" href="/test-cases/{report.test_case_id}">Back to TestCase</a>',
+            f'<a class="button" href="/runs/{report.run_id}/report.json">View JSON</a>',
+        ]
+        if not report_view and show_html_report_link:
+            actions.append(f'<a class="button" href="/runs/{report.run_id}/report.html">View HTML Report</a>')
+        if report_view:
+            actions.insert(0, f'<a class="button" href="{esc(safe_local_url(run_details_url) or f"/runs/{report.run_id}")}">Back to Run Details</a>')
+        heading = 'HTML Test Report' if report_view else 'Run Details'
+        technical = (
+            '<details class="panel technical-details"><summary>Developer details · Technical IDs</summary>'
+            f'<p>Run UUID: <code>{report.run_id}</code></p><p>TestCase UUID: <code>{report.test_case_id}</code></p>'
+            f'<p>Internal execution status: {esc(report.status.value)} · Stored outcome: {esc(report.outcome or "Unknown")}</p>'
             '</details>'
         )
-        navigation = (
-            '<header class="topbar"><div class="shell topbar-inner">'
-            '<a class="brand" href="/">AI QA Agent</a><nav class="nav-links" aria-label="Main navigation">'
-            '<a href="/">Dashboard</a><a href="/test-cases">Test Cases</a><a href="/runs">Runs</a>'
-            "</nav></div></header>"
-        )
-        title = f"{esc(report.test_case_name)} — Run report"
         return (
-            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
-            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-            f"<title>{title}</title><style>{UI_CSS}</style></head><body>"
-            + navigation
-            + '<main class="shell main">'
-            + f'<p class="breadcrumbs"><a href="/">Dashboard</a><span>›</span>'
-            f'<a href="/test-cases/{esc(report.test_case_id)}">'
-            f'{esc(report.test_case_public_id or report.test_case_name)} — {esc(report.test_case_name)}</a>'
-            f'<span>›</span>{esc(report.run_public_id or "Run")}</p>'
-            + '<header class="page-heading"><h1>' + esc(report.test_case_name) + '</h1>'
-            + f'<p class="lead">{esc(report.test_case_description)}</p></header>'
-            + '<div class="actions"><a class="button" href="/">Back to Dashboard</a>'
-            + "".join(actions)
-            + "</div>"
-            + summary
-            + technical_ids
-            + setup_html
-            + '<section class="panel"><h2>Test steps</h2>'
-            + ("".join(steps_html) if steps_html else '<div class="empty-state">No steps recorded.</div>')
-            + "</section>"
-            + cleanup_html
-            + '</main><footer class="shell">AI QA Agent · Local run report</footer></body></html>'
+            '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            f'<title>{heading} · {esc(report.run_public_id or "Run")} · {esc(report.test_case_name)}</title>'
+            f'<style>{UI_CSS}</style></head><body>'
+            '<header class="topbar"><div class="shell topbar-inner"><a class="brand" href="/">AI QA Agent</a>'
+            '<nav class="nav-links" aria-label="Main navigation"><a href="/">Dashboard</a><a href="/test-cases">Test Cases</a><a href="/runs">Runs</a></nav></div></header>'
+            '<main class="shell main"><header class="page-heading">'
+            f'<p class="eyebrow">{heading} · {esc(report.run_public_id or "Run")}</p>'
+            f'<h1>{heading}</h1><p class="lead">{esc(report.test_case_name)}</p>'
+            f'<p>{esc(report.test_case_description)}</p></header>'
+            + '<div class="actions">' + ''.join(actions) + '</div>'
+            + summary_html + metadata + setup_html
+            + '<section class="panel"><h2>Steps and attempts</h2>'
+            + (''.join(steps_html) or '<p>No steps recorded.</p>') + '</section>'
+            + cleanup_html + technical
+            + f'</main><footer class="shell">AI QA Agent · {heading}</footer></body></html>'
         )
 
     def write_json(self, report: RunReport, path: str | Path) -> None:
@@ -643,6 +612,36 @@ def _display_value(value: Any) -> str:
 
         return json.dumps(value, ensure_ascii=False, sort_keys=True)
     return str(value)
+
+
+def _redact_report_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact_diagnostic(value)
+    if isinstance(value, dict):
+        return {
+            str(key): "[REDACTED]" if str(key).casefold() in {
+                "password", "token", "access_token", "api_key", "authorization", "secret",
+            } else _redact_report_value(child)
+            for key, child in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_report_value(child) for child in value]
+    return value
+
+
+def _actual_observation(value: Any, error: str | None) -> str | None:
+    if value is not None and (not isinstance(value, str) or value.casefold() not in {
+        "passed", "failed", "running", "pending", "blocked", "",
+    }):
+        return _display_value(_redact_report_value(value))
+    # Only accept one complete, explicit Playwright actual-value header. Call
+    # logs and incomplete error fragments are not observations of application state.
+    import re
+
+    matches = re.findall(r"(?m)^Actual value: ([^\r\n]+)$", (error or "").replace("\r\n", "\n"))
+    if len(matches) == 1 and matches[0].strip() not in {"None", "null", "undefined"}:
+        return redact_diagnostic(matches[0].strip())
+    return None
 
 
 def _plan_origin_label(origin: PlanVersionOrigin | None) -> str:
@@ -675,7 +674,7 @@ def _evidence_label(evidence: RunEvidenceReport) -> str:
     scope = {
         EvidenceScope.ELEMENT: "Element",
         EvidenceScope.PAGE: "Page",
-    }.get(evidence.scope, "Screenshot")
+    }.get(evidence.scope, "Recorded")
     event = (evidence.event or "").split(":", 1)[0]
     if event == "FAILURE":
         return f"Failure · {scope} screenshot"

@@ -119,7 +119,7 @@ class PersistedTestCaseBrowserFlowTests(unittest.TestCase):
                 detail_body = detail_response.read().decode("utf-8")
                 self.assertEqual(detail_response.status, 200)
                 self.assertIn("FAILED", detail_body)
-                self.assertIn("BLOCKED", detail_body)
+                self.assertIn("Blocked", detail_body)
                 self.assertIn(f"/runs/{record.run_id}/evidence/", detail_body)
                 self.assertNotIn(str(evidence_root), detail_body)
 
@@ -148,7 +148,7 @@ class PersistedTestCaseBrowserFlowTests(unittest.TestCase):
                 case_body = case_response.read().decode("utf-8")
                 self.assertEqual(case_response.status, 200)
                 self.assertIn("Run History", case_body)
-                self.assertIn("FAILED", case_body)
+                self.assertIn("Automation Error", case_body)
 
                 connection.request("GET", f"/runs/{record.run_id}/report.html")
                 html_report_response = connection.getresponse()
@@ -227,15 +227,15 @@ class ProgressLifecycleBrowserTests(unittest.TestCase):
                 browser = playwright.chromium.launch(headless=True)
                 page = browser.new_page()
                 page.goto(f"http://127.0.0.1:{port}/runs/progress/{progress_id}")
-                expect(page.locator("[data-progress-state]")).to_have_text(
-                    "Running", timeout=5000
+                expect(page.locator("[data-progress-phase]")).to_have_text(
+                    "TestCase loaded", timeout=5000
                 )
                 release.set()
-                expect(page.locator("[data-progress-phase]").first).to_have_text(
-                    "Finished", timeout=8000
+                expect(page.locator("[data-progress-phase]")).to_have_text(
+                    "Stopped \u2014 Inconclusive", timeout=8000
                 )
-                expect(page.locator("[data-progress-state]")).to_have_text(
-                    "Finished", timeout=8000
+                expect(page.locator("[data-progress-result-content]")).to_contain_text(
+                    "No persisted Run was created", timeout=8000
                 )
                 browser.close()
 
@@ -243,7 +243,7 @@ class ProgressLifecycleBrowserTests(unittest.TestCase):
                 application.handle("GET", f"/api/progress/{progress_id}").body
             )
             self.assertEqual(snapshot["state"], "FINISHED")
-            self.assertEqual(snapshot["phase"], "Finished")
+            self.assertEqual(snapshot["phase"], "Stopped \u2014 Inconclusive")
             self.assertTrue(snapshot["finished"])
             self.assertEqual(snapshot["outcome"], "PASSED")
             self.assertIsNone(snapshot["run_status"])

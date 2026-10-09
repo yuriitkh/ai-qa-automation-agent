@@ -137,6 +137,9 @@ class PlanExecutionService:
             ExecutionEventType.STEP_STARTED,
             step=test_step,
             status=ExecutionStatus.RUNNING.value,
+            plan_version=plan_version.version,
+            plan_version_id=plan_version.id,
+            plan_origin=plan_version.origin.value if plan_version.origin is not None else None,
             message="Running step.",
         )
         runner_result: dict[str, Any] | None = None
@@ -194,6 +197,11 @@ class PlanExecutionService:
             # This static explanation intentionally replaces runner text that
             # can contain sensitive expected/actual page values.
             execution = execution.model_copy(update={"error": grounding_reason})
+        # Keep the exact attempt's grounded classification in the existing JSON
+        # storage payload. Report generation must not reclassify without its plan.
+        execution.runner_result = {
+            **(execution.runner_result or {}), "qa_classification": classification.value,
+        }
         try:
             self._execution_repository.save(execution)
         except Exception as error:
@@ -260,16 +268,17 @@ class PlanExecutionService:
 
         failed_action = _failed_action(execution.runner_result)
         if failed_action is not None and failed_action.startswith("assert_"):
-            if plan_version is not None:
-                grounding = _assertion_grounding(execution, plan_version)
-                if plan_version.origin is not None and plan_version.origin.value == "HUMAN_EDITED":
-                    pass
-                elif grounding == AssertionGrounding.REQUIREMENT_GROUNDED:
-                    pass
-                elif grounding == AssertionGrounding.OBSERVATION_GROUNDED:
-                    return PlanExecutionClassification.AUTOMATION_DRIFT
-                else:
-                    return PlanExecutionClassification.AUTOMATION_EXECUTION_ERROR
+            if plan_version is None:
+                return PlanExecutionClassification.AUTOMATION_EXECUTION_ERROR
+            grounding = _assertion_grounding(execution, plan_version)
+            if plan_version.origin is not None and plan_version.origin.value == "HUMAN_EDITED":
+                pass
+            elif grounding == AssertionGrounding.REQUIREMENT_GROUNDED:
+                pass
+            elif grounding == AssertionGrounding.OBSERVATION_GROUNDED:
+                return PlanExecutionClassification.AUTOMATION_DRIFT
+            else:
+                return PlanExecutionClassification.AUTOMATION_EXECUTION_ERROR
             return PlanExecutionClassification.PRODUCT_FAILURE
         if failed_action is not None:
             return PlanExecutionClassification.AUTOMATION_EXECUTION_ERROR

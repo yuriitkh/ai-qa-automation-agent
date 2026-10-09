@@ -245,7 +245,7 @@ class PlanExecutionServiceTests(unittest.TestCase):
         self.assertIs(outcome.error, runner_error)
         self.assertEqual(outcome.execution.status, ExecutionStatus.FAILED)
         self.assertEqual(outcome.execution.error, "browser launch failed")
-        self.assertIsNone(outcome.execution.runner_result)
+        self.assertEqual(outcome.execution.runner_result, {"qa_classification": "INFRASTRUCTURE_ERROR"})
         self.assertEqual(
             self.repository.list_for_test_step(self.test_step.id), [outcome.execution]
         )

@@ -128,6 +128,10 @@ class _PinnedTestCaseWorkflow:
                 failed_execution = failed_execution.model_copy(update={
                     "status": ExecutionStatus.FAILED,
                     "error": str(coverage_error),
+                    "runner_result": {
+                        **(failed_execution.runner_result or {}),
+                        "qa_classification": "AUTOMATION_EXECUTION_ERROR",
+                    },
                 })
                 test_run = execution_result.test_run.model_copy(update={
                     "executions": [

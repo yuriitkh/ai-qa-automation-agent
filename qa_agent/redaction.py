@@ -5,6 +5,7 @@ error messages, execution traces, and reports never leak configured secrets.
 """
 
 import os
+import re
 import threading
 
 _SECRET_ENV_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET")
@@ -38,3 +39,14 @@ def safe_failure_reason(error: Exception) -> str:
     reason = " ".join(str(error).split())
     reason = redact_secrets(reason)
     return (reason or type(error).__name__)[:_MAX_FAILURE_REASON_CHARS]
+
+
+def redact_diagnostic(text: str) -> str:
+    """Redact credentials, input call values and local paths in report diagnostics."""
+    text = redact_secrets(text)
+    text = re.sub(r'(?i)(\b(?:password|api[_-]?key|access[_-]?token|token|secret|authorization)\s*[=:]\s*)([^\s,;<>]+)', r'\1[REDACTED]', text)
+    text = re.sub(r'(?i)(https?://)[^/\s@]+@', r'\1[REDACTED]@', text)
+    text = re.sub(r'(?i)(\b(?:fill|type)\()(.*?)(\))', r'\1[REDACTED]\3', text)
+    text = re.sub(r'(?i)\b[A-Z]:[\\/][^\r\n<>"\']*', '[PATH]', text)
+    text = re.sub(r'(?<![:/\w<])/(?!/)[^\s<>"\']+', '[PATH]', text)
+    return text

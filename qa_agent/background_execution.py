@@ -176,6 +176,7 @@ class BackgroundRunService:
                 )
                 return
             except PipelineStageError as error:
+                reporter.capture_provider_diagnostics(error.trace)
                 category = _pipeline_error_category(error)
                 snapshot = self.progress_store.get(progress_id)
                 failure = (
@@ -207,6 +208,7 @@ class BackgroundRunService:
                 return
 
             try:
+                reporter.capture_provider_diagnostics(getattr(result, "trace", None))
                 test_run = getattr(result, "test_run", None)
                 run_id = getattr(test_run, "id", None)
                 record = self._run_history.get(run_id) if isinstance(run_id, UUID) else None
@@ -229,7 +231,7 @@ class BackgroundRunService:
                 if outcome is None:
                     outcome = "PASSED" if run_status == "PASSED" else "FAILED"
                 reporter.finish(
-                    run_id=run_id if isinstance(run_id, UUID) else None,
+                    run_id=record.run_id if record is not None else None,
                     run_status=run_status,
                     outcome=outcome,
                     duration_ms=record.duration_ms if record is not None else None,

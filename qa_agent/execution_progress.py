@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import unicodedata
 from contextlib import contextmanager
@@ -19,10 +20,13 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from qa_agent.models import TestCase, TestStep
 from qa_agent.presentation import failure_message
-from qa_agent.redaction import redact_secrets
+from qa_agent.result_semantics import result_outcome, result_label, terminal_phase, result_summary
+from qa_agent.redaction import redact_secrets, redact_diagnostic
 from qa_agent.llm.errors import ProviderFailureDetail, SAFE_FAILURE_DETAILS
 from qa_agent.run_context import RunContext
 from qa_agent.test_plan_validation import PlanValidationIssue
+
+logger = logging.getLogger(__name__)
 
 
 class ExecutionEventType(str, Enum):
@@ -97,6 +101,7 @@ class ProgressStep(BaseModel):
     automation_state: str | None = None
     plan_origin: str | None = None
     plan_version: int | None = None
+    plan_version_id: UUID | None = None
     failure_classification: str | None = None
     message: str | None = None
     evidence_count: int = 0
@@ -135,6 +140,7 @@ class ExecutionProgressEvent(BaseModel):
     classification: str | None = None
     plan_origin: str | None = None
     plan_version: int | None = None
+    plan_version_id: UUID | None = None
     failure_code: str | None = None
     prior_plan_exists: bool | None = None
     new_plan_saved: bool | None = None
@@ -164,6 +170,7 @@ class ExecutionProgressEvent(BaseModel):
             "classification": self.classification,
             "plan_origin": self.plan_origin,
             "plan_version": self.plan_version,
+            "plan_version_id": str(self.plan_version_id) if self.plan_version_id else None,
             "failure_code": self.failure_code,
             "prior_plan_exists": self.prior_plan_exists,
             "new_plan_saved": self.new_plan_saved,
@@ -197,6 +204,7 @@ class ExecutionProgressSnapshot(BaseModel):
     finished_at: datetime | None = None
     steps: tuple[ProgressStep, ...] = ()
     events: tuple[ExecutionProgressEvent, ...] = ()
+    provider_diagnostics: tuple[dict[str, Any], ...] = ()
     final_run_id: UUID | None = None
     run_status: str | None = None
     outcome: str | None = None
@@ -208,7 +216,7 @@ class ExecutionProgressSnapshot(BaseModel):
     @model_validator(mode="after")
     def terminal_snapshot_is_coherent(self) -> "ExecutionProgressSnapshot":
         if self.state == ProgressState.FINISHED:
-            if self.phase != "Finished" or self.finished_at is None:
+            if self.finished_at is None:
                 raise ValueError("Finished progress must have a terminal phase and timestamp.")
             if self.run_status == "RUNNING":
                 raise ValueError("Finished progress cannot contain a running TestRun.")
@@ -226,6 +234,26 @@ class ExecutionProgressSnapshot(BaseModel):
 
     def to_public_dict(self) -> dict[str, Any]:
         """Return an allowlisted JSON view; internal state and paths stay private."""
+        complete = bool(self.steps) and all(step.execution_state == ProgressStepState.PASSED for step in self.steps)
+        public_outcome = result_outcome(
+            self.run_status if self.state == ProgressState.FINISHED else self.state,
+            self.outcome or self.error_category, complete=complete,
+        )
+        summary = result_summary(public_outcome, [
+            {
+                "name": step.name,
+                "outcome": result_outcome(step.state, step.failure_classification or (
+                    "PASSED" if step.execution_state == ProgressStepState.PASSED else None
+                )) if step.state in {ProgressStepState.PASSED, ProgressStepState.FAILED, ProgressStepState.BLOCKED}
+                else step.state.value,
+            } for step in self.steps
+        ])
+        if self.automation_generation_failure:
+            summary["explanation"] = self.automation_generation_failure.safe_reason
+        summary["history_note"] = (
+            "No persisted Run was created. Partial progress diagnostics are available for this request."
+            if self.state == ProgressState.FINISHED and self.final_run_id is None else None
+        )
         return {
             "progress_id": self.progress_id,
             "kind": self.kind,
@@ -234,6 +262,10 @@ class ExecutionProgressSnapshot(BaseModel):
             "workflow": self.workflow_type,
             "state": self.state.value,
             "phase": self.phase,
+            "display_status": result_label(public_outcome),
+            "summary": summary,
+            "diagnostic_stages": _diagnostic_stages(self.events),
+            "provider_diagnostics": list(self.provider_diagnostics),
             "requested_at": self.requested_at.isoformat(),
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "finished_at": self.finished_at.isoformat() if self.finished_at else None,
@@ -247,6 +279,10 @@ class ExecutionProgressSnapshot(BaseModel):
                 "automation_state": step.automation_state,
                 "plan_origin": step.plan_origin,
                 "plan_version": step.plan_version,
+                "plan_version_id": str(step.plan_version_id) if step.plan_version_id else None,
+                "display_status": result_label(result_outcome(
+                    step.state, step.failure_classification or ("PASSED" if step.state == ProgressStepState.PASSED else None),
+                )) if step.state in {ProgressStepState.PASSED, ProgressStepState.FAILED, ProgressStepState.BLOCKED} else step.state.value.replace("_", " ").title(),
                 "failure_classification": step.failure_classification,
                 "message": step.message,
                 "evidence_count": step.evidence_count,
@@ -264,6 +300,48 @@ class ExecutionProgressSnapshot(BaseModel):
             ),
             "finished": self.state == ProgressState.FINISHED,
         }
+
+
+def _diagnostic_stages(events) -> list[dict[str, Any]]:
+    """Group consecutive stages while preserving recorded chronology and attempts."""
+    groups: list[dict[str, Any]] = []
+    attempts: dict[tuple[str, UUID | None], int] = {}
+    starts: dict[tuple[str, UUID | None], datetime] = {}
+    previous = None
+    for event in events:
+        name = event.event_type.value
+        stage = (
+            "TestCase loading" if name == "TESTCASE_LOADED"
+            else "Repair attempt" if name.startswith("PLAN_REPAIR")
+            else "Plan validation" if name == "PLAN_GENERATED" or event.validation_issues
+            else "Automation generation" if name.startswith("PLAN_GENERATION")
+            else "Browser execution" if name.startswith(("STEP_", "EVIDENCE_"))
+            else "Reporting and completion" if name.startswith("CLEANUP_") or name == "RUN_FINISHED"
+            else "Preparation"
+        )
+        signature = (stage, name, event.step_id, event.status, event.classification, event.message, event.evidence_execution_id, event.evidence_index)
+        if signature == previous:
+            continue
+        previous = signature
+        attempt_stage = "Automation generation" if name in {"PLAN_GENERATED", "PLAN_GENERATION_FAILED"} else stage
+        key = (attempt_stage, event.step_id)
+        if name in {"STEP_STARTED", "PLAN_GENERATION_STARTED", "PLAN_REPAIR_STARTED"}:
+            attempts[key] = attempts.get(key, 0) + 1
+            starts[key] = event.timestamp
+        row = event.to_public_dict()
+        row["reason"] = redact_diagnostic(event.message or name.replace("_", " ").title())
+        row["attempt_number"] = attempts.get(key)
+        row["display_status"] = (
+            result_label(result_outcome(event.status or event.run_status, event.classification or event.outcome))
+            if event.classification or event.outcome else
+            "Error" if name.endswith("FAILED") else "Started" if name.endswith("STARTED") else "Recorded"
+        )
+        if event.duration_ms is None and key in starts and name in {"STEP_PASSED", "STEP_FAILED", "PLAN_GENERATED", "PLAN_GENERATION_FAILED", "PLAN_REPAIR_SUCCEEDED", "PLAN_REPAIR_FAILED"}:
+            row["duration_ms"] = max(0, int((event.timestamp - starts.pop(key)).total_seconds() * 1000))
+        if not groups or groups[-1]["stage"] != stage:
+            groups.append({"stage": stage, "events": []})
+        groups[-1]["events"].append(row)
+    return groups
 
 
 class AuthoringProgressEvent(BaseModel):
@@ -388,6 +466,7 @@ class _ProgressRecord:
     finished_at: datetime | None = None
     steps: dict[UUID, ProgressStep] = field(default_factory=dict)
     events: list[ExecutionProgressEvent] = field(default_factory=list)
+    provider_diagnostics: tuple[dict[str, Any], ...] = ()
     final_run_id: UUID | None = None
     run_status: str | None = None
     outcome: str | None = None
@@ -620,6 +699,7 @@ class ExecutionProgressStore:
         classification: str | None = None,
         plan_origin: str | None = None,
         plan_version: int | None = None,
+        plan_version_id: UUID | None = None,
         failure_code: str | None = None,
         prior_plan_exists: bool | None = None,
         new_plan_saved: bool | None = None,
@@ -649,6 +729,7 @@ class ExecutionProgressStore:
                 classification=classification,
                 plan_origin=plan_origin,
                 plan_version=plan_version,
+                plan_version_id=plan_version_id,
                 failure_code=failure_code,
                 prior_plan_exists=prior_plan_exists,
                 new_plan_saved=new_plan_saved,
@@ -665,6 +746,10 @@ class ExecutionProgressStore:
             )
             self._append_to_record(record, event)
             return event
+
+    def set_provider_diagnostics(self, progress_id: str, diagnostics: tuple[dict[str, Any], ...]) -> None:
+        with self._lock:
+            self._require_record(progress_id).provider_diagnostics = diagnostics
 
     def finish_for(
         self,
@@ -753,6 +838,7 @@ class ExecutionProgressStore:
                 automation_state="Repaired",
                 plan_origin=event.plan_origin or "REPAIRED",
                 plan_version=event.plan_version,
+                plan_version_id=event.plan_version_id,
                 message=event.message,
             )
         elif event.event_type == ExecutionEventType.PLAN_REPAIR_FAILED:
@@ -769,6 +855,7 @@ class ExecutionProgressStore:
                 automation_state="Reused",
                 plan_origin=event.plan_origin,
                 plan_version=event.plan_version,
+                plan_version_id=event.plan_version_id,
                 message=event.message,
             )
             record.phase = "Preparing automation"
@@ -783,6 +870,7 @@ class ExecutionProgressStore:
                 automation_state=automation_state,
                 plan_origin=event.plan_origin,
                 plan_version=event.plan_version,
+                plan_version_id=event.plan_version_id,
                 message=event.message,
             )
             record.phase = "Preparing automation"
@@ -825,6 +913,9 @@ class ExecutionProgressStore:
                 state=ProgressStepState.RUNNING,
                 execution_state=ProgressStepState.RUNNING,
                 clear_failure=True,
+                plan_version=event.plan_version,
+                plan_version_id=event.plan_version_id,
+                plan_origin=event.plan_origin,
                 message=event.message,
             )
             record.phase = "Running test"
@@ -875,12 +966,14 @@ class ExecutionProgressStore:
                     record.steps[step_id] = step.model_copy(update={
                         "state": ProgressStepState.FAILED,
                         "execution_state": ProgressStepState.FAILED,
+                        "failure_classification": event.outcome or "INCONCLUSIVE",
                     })
                 elif step.state == ProgressStepState.PREPARING_AUTOMATION:
                     record.steps[step_id] = step.model_copy(update={
                         "state": ProgressStepState.FAILED,
                         "automation_state": "Failed",
                         "execution_state": ProgressStepState.NOT_ATTEMPTED,
+                        "failure_classification": event.outcome or "INCONCLUSIVE",
                     })
                 elif step.state in {ProgressStepState.PENDING, ProgressStepState.READY}:
                     record.steps[step_id] = step.model_copy(update={
@@ -901,7 +994,10 @@ class ExecutionProgressStore:
                         })
             record.state = ProgressState.FINISHED
             record.finished_at = event.timestamp
-            record.phase = "Finished"
+            record.phase = terminal_phase(result_outcome(
+                event.run_status, event.outcome,
+                complete=bool(record.steps) and all(step.execution_state == ProgressStepState.PASSED for step in record.steps.values()),
+            ))
             record.final_run_id = event.run_id
             record.run_status = event.run_status
             record.outcome = event.outcome
@@ -919,6 +1015,7 @@ class ExecutionProgressStore:
         execution_state: ProgressStepState | None = None,
         plan_origin: str | None = None,
         plan_version: int | None = None,
+        plan_version_id: UUID | None = None,
         failure_classification: str | None = None,
         clear_failure: bool = False,
         message: str | None = None,
@@ -937,6 +1034,7 @@ class ExecutionProgressStore:
             "execution_state": execution_state or current.execution_state,
             "plan_origin": plan_origin if plan_origin is not None else current.plan_origin,
             "plan_version": plan_version if plan_version is not None else current.plan_version,
+            "plan_version_id": plan_version_id if plan_version_id is not None else current.plan_version_id,
             "failure_classification": None if clear_failure else (
                 failure_classification
                 if failure_classification is not None
@@ -976,6 +1074,7 @@ class ExecutionProgressStore:
             finished_at=record.finished_at,
             steps=tuple(sorted(record.steps.values(), key=lambda item: item.order)),
             events=tuple(record.events),
+            provider_diagnostics=record.provider_diagnostics,
             final_run_id=record.final_run_id,
             run_status=record.run_status,
             outcome=record.outcome,
@@ -1189,6 +1288,7 @@ class ExecutionProgressReporter:
         classification: str | None = None,
         plan_origin: str | None = None,
         plan_version: int | None = None,
+        plan_version_id: UUID | None = None,
         failure_code: str | None = None,
         prior_plan_exists: bool | None = None,
         new_plan_saved: bool | None = None,
@@ -1212,6 +1312,7 @@ class ExecutionProgressReporter:
             classification=classification,
             plan_origin=plan_origin,
             plan_version=plan_version,
+            plan_version_id=plan_version_id,
             failure_code=failure_code,
             prior_plan_exists=prior_plan_exists,
             new_plan_saved=new_plan_saved,
@@ -1232,6 +1333,31 @@ class ExecutionProgressReporter:
             evidence_execution_id=evidence_execution_id,
             evidence_index=evidence_index,
         )
+
+    def capture_provider_diagnostics(self, trace) -> None:
+        """Reuse recorded provider attempts without invoking or changing routing."""
+        try:
+            diagnostics = []
+            for step in getattr(trace, "steps", ()):
+                for number, attempt in enumerate(step.provider_attempts, start=1):
+                    row = {
+                        "step_id": str(step.test_step_id),
+                        "step_number": step.order + 1,
+                        "attempt_number": number,
+                        "provider": self.safe_text(attempt.provider_name),
+                        "request_kind": attempt.request_kind.value,
+                        "status": attempt.outcome.value,
+                    }
+                    if attempt.model:
+                        row["model"] = self.safe_text(attempt.model)
+                    if attempt.duration_ms is not None:
+                        row["duration_ms"] = attempt.duration_ms
+                    if attempt.error_class:
+                        row["reason"] = self.safe_text(attempt.error_class)
+                    diagnostics.append(row)
+            self._store.set_provider_diagnostics(self.progress_id, tuple(diagnostics))
+        except Exception:
+            logger.warning("Recorded provider diagnostics could not be displayed.")
 
     def finish(
         self,
@@ -1271,10 +1397,7 @@ class ExecutionProgressReporter:
         text = str(value)
         for secret in sorted(_sensitive_values(self.run_context), key=len, reverse=True):
             text = text.replace(secret, "[REDACTED]")
-        text = redact_secrets(text)
-        text = re.sub(r'(?i)\b[A-Z]:[\\/][^\r\n<>"\']*', "[PATH]", text)
-        text = re.sub(r'(?<![:/\w])/(?!/)[^\s<>"\']+', "[PATH]", text)
-        return text[:500]
+        return redact_diagnostic(text)[:500]
 
 
 _ACTIVE_PROGRESS: ContextVar[ExecutionProgressReporter | None] = ContextVar(
@@ -1305,6 +1428,7 @@ def emit_progress_event(
     classification: str | None = None,
     plan_origin: str | None = None,
     plan_version: int | None = None,
+    plan_version_id: UUID | None = None,
     failure_code: str | None = None,
     prior_plan_exists: bool | None = None,
     new_plan_saved: bool | None = None,
@@ -1322,6 +1446,7 @@ def emit_progress_event(
             classification=classification,
             plan_origin=plan_origin,
             plan_version=plan_version,
+            plan_version_id=plan_version_id,
             failure_code=failure_code,
             prior_plan_exists=prior_plan_exists,
             new_plan_saved=new_plan_saved,

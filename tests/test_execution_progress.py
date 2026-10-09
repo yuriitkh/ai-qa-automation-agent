@@ -5,6 +5,7 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from uuid import uuid4
 
 from qa_agent.execution_progress import (
@@ -17,6 +18,7 @@ from qa_agent.execution_progress import (
     get_active_execution_progress,
 )
 from qa_agent.background_execution import BackgroundRunService
+from qa_agent.execution_trace import ProviderAttemptOutcome, ProviderAttemptTrace, RequestKind, StepTrace
 from qa_agent.models import TestCase as DomainTestCase, TestStep as DomainTestStep
 from qa_agent.pipeline import PipelineStageError
 from qa_agent.presentation import failure_message
@@ -219,7 +221,7 @@ class ExecutionProgressStoreTests(unittest.TestCase):
 
         snapshot = self.store.get(self.progress_id)
         self.assertEqual(snapshot.state, ProgressState.FINISHED)
-        self.assertEqual(snapshot.phase, "Finished")
+        self.assertEqual(snapshot.phase, "Stopped \u2014 Generation Error")
         self.assertIsNone(snapshot.run_status)
         self.assertEqual(
             [step.state for step in snapshot.steps],
@@ -268,7 +270,7 @@ class ExecutionProgressStoreTests(unittest.TestCase):
         self.reporter.finish(outcome="PASSED", run_status="RUNNING")
         snapshot = self.store.get(self.progress_id)
         self.assertEqual(snapshot.state, ProgressState.FINISHED)
-        self.assertEqual(snapshot.phase, "Finished")
+        self.assertEqual(snapshot.phase, "Stopped \u2014 Automation Error")
         self.assertEqual(snapshot.outcome, "EXECUTION_ERROR")
         self.assertEqual(snapshot.error_category, "EXECUTION_ERROR")
         self.assertIsNone(snapshot.run_status)
@@ -376,7 +378,7 @@ class ExecutionProgressWebTests(unittest.TestCase):
                 error_category="PRODUCT_FAILURE",
             )
             product_page = app.handle("GET", f"/runs/progress/{product_id}").body.decode()
-            self.assertIn("PRODUCT FAILURE", product_page)
+            self.assertIn(">Failed</span>", product_page)
             self.assertNotIn("Retry Run", product_page)
 
             infra_id = store.create(uuid4(), WorkflowType.VALIDATION)
@@ -437,25 +439,23 @@ class ExecutionProgressWebTests(unittest.TestCase):
             page = app.handle("GET", f"/runs/progress/{progress_id}").body.decode("utf-8")
             script = app.handle("GET", "/assets/ui.js").body.decode("utf-8")
             payload = json.loads(app.handle("GET", f"/api/progress/{progress_id}").body)
-            self.assertIn('class="card-label">Execution</div>', page)
-            self.assertIn('data-progress-state>Finished</span>', page)
-            self.assertIn("AUTOMATION GENERATION ERROR", page)
-            self.assertIn("Automation stopped at Step 2 of 3", page)
+            self.assertIn('class="card-label">Current stage</div>', page)
+            self.assertIn("Stopped \u2014 Generation Error", page)
+            self.assertIn("Generation Error", page)
+            self.assertIn("Stopped at Step 2 of 3", page)
             self.assertIn("Submit registration", page)
-            self.assertIn("Generated successfully: 1 steps", page)
-            self.assertIn("Remaining: 1 steps not attempted", page)
+            self.assertIn("1 of 3 steps verified", page)
             self.assertIn("Retry Automation", page)
             self.assertIn("PLAN_VALIDATION_FAILED", page)
             self.assertIn("MISSING_LOCATOR", page)
             self.assertIn("steps[0].parameters.selector", page)
             self.assertIn("CLICK action requires a locator.", page)
             self.assertIn("Developer details", page)
-            self.assertIn('data-progress-events="all"', page)
-            self.assertNotIn('<h2>Preparation</h2>', page)
-            self.assertIn("data-progress-state", script)
-            self.assertIn("snapshot.state.toLowerCase()", script)
+            self.assertIn('data-progress-diagnostics', page)
+            self.assertIn("snapshot.diagnostic_stages", script)
+            self.assertNotIn("snapshot.state.toLowerCase()", script[script.index("const root = document.querySelector('.progress-live"):])
             self.assertEqual(payload["state"], "FINISHED")
-            self.assertEqual(payload["phase"], "Finished")
+            self.assertEqual(payload["phase"], "Stopped \u2014 Generation Error")
             self.assertEqual(payload["run_status"], None)
             self.assertEqual(payload["steps"][2]["state"], "NOT_ATTEMPTED")
             self.assertEqual(payload["steps"][2]["execution_state"], "NOT_ATTEMPTED")
@@ -513,7 +513,7 @@ class BackgroundExecutionTests(unittest.TestCase):
                         service, test_case_id, WorkflowType.REGRESSION
                     )
                     self.assertEqual(run_service.calls, [(test_case_id, WorkflowType.REGRESSION)])
-                    self.assertEqual(snapshot.final_run_id, run_id)
+                    self.assertIsNone(snapshot.final_run_id)
                     self.assertEqual(snapshot.run_status, "FAILED")
                     self.assertEqual(snapshot.outcome, category)
                     self.assertEqual(snapshot.error_category, category)
@@ -555,6 +555,30 @@ class BackgroundExecutionTests(unittest.TestCase):
                     self.assertIsNone(snapshot.final_run_id)
                 finally:
                     service.close()
+
+    def test_provider_diagnostics_survive_pipeline_error_without_changing_outcome(self) -> None:
+        error = PipelineStageError("plan generation", "Generation stopped.")
+        error.trace = SimpleNamespace(steps=[StepTrace(
+            test_step_id=uuid4(), order=0, name="Confirm", description="Check result.", expected="Confirmed.",
+            provider_attempts=[ProviderAttemptTrace(
+                provider_name="Recorded provider", request_kind=RequestKind.TEST_PLAN,
+                outcome=ProviderAttemptOutcome.UNAVAILABLE, model="recorded-model", duration_ms=17,
+            )],
+        )])
+
+        class FailingRunService:
+            def run(self, _case_id, _workflow):
+                raise error
+
+        service = BackgroundRunService(FailingRunService(), RunHistoryService(InMemoryRunHistoryRepository()))
+        try:
+            snapshot = self._run_until_finished(service, uuid4(), WorkflowType.AUTOMATION)
+            self.assertEqual(snapshot.outcome, "AUTOMATION_GENERATION_ERROR")
+            self.assertIsNone(snapshot.final_run_id)
+            self.assertEqual(snapshot.provider_diagnostics[0]["model"], "recorded-model")
+            self.assertEqual(snapshot.provider_diagnostics[0]["duration_ms"], 17)
+        finally:
+            service.close()
 
     def test_context_bound_reporter_is_scoped_to_background_worker(self) -> None:
         observed = []
