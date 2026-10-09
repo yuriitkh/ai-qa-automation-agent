@@ -431,6 +431,8 @@ class ExecutionStatus(str, Enum):
     # step's BLOCK_REST failure policy prevented continuation. A blocked
     # step carries no Execution; FAILED always means "executed and failed".
     BLOCKED = "BLOCKED"
+    CANCELLED = "CANCELLED"
+    NOT_ATTEMPTED = "NOT_ATTEMPTED"
 
 
 class EvidenceType(str, Enum):
@@ -502,6 +504,8 @@ class TestRun(BaseModel):
     # Steps that never executed because an earlier step's BLOCK_REST failure
     # policy prevented continuation. Blocked steps never carry an Execution.
     blocked_step_ids: list[UUID] = Field(default_factory=list)
+    cancelled: bool = False
+    not_attempted_step_ids: list[UUID] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_execution_steps(self) -> "TestRun":
@@ -519,6 +523,11 @@ class TestRun(BaseModel):
         if any(execution.test_step_id in set(self.blocked_step_ids)
                for execution in self.executions):
             raise ValueError("A blocked TestStep must not have an Execution.")
+        pending = set(self.not_attempted_step_ids)
+        if len(pending) != len(self.not_attempted_step_ids) or not pending <= known_step_ids:
+            raise ValueError("Not attempted steps must name unique known TestSteps.")
+        if pending & set(self.blocked_step_ids) or any(e.test_step_id in pending for e in self.executions):
+            raise ValueError("Not attempted steps cannot have executions or be blocked.")
         return self
 
     @classmethod
@@ -528,6 +537,7 @@ class TestRun(BaseModel):
         executions: list[Execution],
         blocked_step_ids: list[UUID] | None = None,
         run_context: RunContext | None = None,
+        *, cancelled: bool = False,
     ) -> "TestRun":
         ordered_steps = sorted(test_case.steps, key=lambda step: step.order)
         if executions:
@@ -554,6 +564,8 @@ class TestRun(BaseModel):
             run_context=run_context if run_context is not None else RunContext(),
             executions=executions,
             blocked_step_ids=list(blocked_step_ids or []),
+            cancelled=cancelled,
+            not_attempted_step_ids=[step.id for step in ordered_steps if cancelled and step.id not in {e.test_step_id for e in executions} and step.id not in (blocked_step_ids or [])],
         )
 
     @property
@@ -602,6 +614,7 @@ class TestRun(BaseModel):
             step_id
             for step_id in self.test_step_ids
             if step_id not in blocked
+            and (not self.cancelled or (self.final_execution_for_step(step_id) is not None and self.final_execution_for_step(step_id).status == ExecutionStatus.FAILED))
             and (
                 (execution := self.final_execution_for_step(step_id)) is None
                 or execution.status != ExecutionStatus.PASSED
@@ -612,6 +625,8 @@ class TestRun(BaseModel):
     def status(self) -> ExecutionStatus:
         # Blocked steps also fail the run: a TestCase that did not execute
         # to completion has not passed.
+        if self.cancelled:
+            return ExecutionStatus.CANCELLED
         if self.failed_steps or self.blocked_step_ids:
             return ExecutionStatus.FAILED
         return ExecutionStatus.PASSED

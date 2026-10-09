@@ -1,10 +1,13 @@
 """Exact plan-version selection and execution for non-learning workflows."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Iterable
 from uuid import UUID
 
+from qa_agent.execution_control import (
+    current_cancellation,
+)
 from qa_agent.models import (
     Execution,
     ExecutionStatus,
@@ -71,6 +74,7 @@ class ResolvedPlanVersionSet:
 
 
 class WorkflowOutcome(str, Enum):
+    CANCELLED = "CANCELLED"
     PASSED = "PASSED"
     PRODUCT_FAILURE = "PRODUCT_FAILURE"
     AUTOMATION_DRIFT = "AUTOMATION_DRIFT"
@@ -93,6 +97,7 @@ class PinnedExecutionResult:
     test_run: TestRun
     step_executions: tuple[PinnedStepExecution, ...]
     error: Exception | None = field(default=None, repr=False, compare=False)
+    cleanup_error: Exception | None = field(default=None, repr=False, compare=False)
 
     @property
     def executions(self) -> list[Execution]:
@@ -192,7 +197,14 @@ class PinnedExecutionService:
             case_runner.close(primary_error=error)
             raise
         else:
-            case_runner.close()
+            try:
+                case_runner.close()
+            except Exception as error:
+                # Cleanup must finish on the owning thread. Even a cleanup
+                # error must not lose already persisted execution references.
+                if current_cancellation() is None or not current_cancellation().requested:
+                    raise
+                result = replace(result, cleanup_error=error)
             return result
 
     def _execute_steps(
@@ -208,6 +220,8 @@ class PinnedExecutionService:
         error: Exception | None = None
 
         for index, selected in enumerate(resolved.steps):
+            if current_cancellation() is not None and current_cancellation().requested:
+                break
             emit_progress_event(
                 ExecutionEventType.PLAN_REUSED,
                 step=selected.test_step,
@@ -236,6 +250,8 @@ class PinnedExecutionService:
                 classification=result.classification,
                 execution=execution,
             ))
+            if execution.status == ExecutionStatus.CANCELLED or (current_cancellation() is not None and current_cancellation().requested):
+                break
             if result.error is not None:
                 error = result.error
                 break
@@ -279,8 +295,9 @@ class PinnedExecutionService:
             executions,
             blocked_step_ids=blocked_step_ids,
             run_context=run_context,
+            cancelled=current_cancellation() is not None and current_cancellation().requested,
         )
-        outcome = _workflow_outcome(step_executions, error)
+        outcome = WorkflowOutcome.CANCELLED if test_run.cancelled else _workflow_outcome(step_executions, error)
         return PinnedExecutionResult(
             outcome=outcome,
             test_run=test_run,

@@ -299,7 +299,7 @@ def test_suite_breakdown_retry_links_and_incomplete_passes():
     run = SuiteRun(suite_id=uuid4(), suite_name="Smoke", config=SuiteRunConfig(), status=SuiteRunStatus.COMPLETED_WITH_FAILURES, items=items)
     assert run.outcome_counts == {
         "passed": 1, "product_failures": 1, "automation_errors": 1, "generation_errors": 0,
-        "infrastructure_errors": 1, "blocked": 1, "inconclusive": 2, "pending": 0,
+        "infrastructure_errors": 1, "blocked": 1, "inconclusive": 2, "pending": 0, "cancelled": 0, "not_attempted": 0,
     }
     assert run.failed_count == 1 and run.flaky_count == 1
     payload = json.loads(suite_run_report_json(run))

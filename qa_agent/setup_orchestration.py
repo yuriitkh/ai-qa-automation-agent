@@ -5,6 +5,7 @@ from enum import Enum
 from typing import Any, Callable, Mapping, Protocol
 from uuid import UUID
 
+from qa_agent.execution_control import check_cancelled
 from qa_agent.execution_progress import ExecutionEventType, emit_progress_event
 from qa_agent.models import Precondition, TestCase
 from qa_agent.redaction import redact_secrets, safe_failure_reason
@@ -179,6 +180,7 @@ class SetupCoordinator:
 
             registered_before = cleanup.registered_count
             try:
+                check_cancelled()
                 result = operation.execute(
                     precondition,
                     run_context,

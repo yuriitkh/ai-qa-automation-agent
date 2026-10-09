@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from qa_agent.execution_control import is_cancelled
 from qa_agent.browser_runner import BrowserRunner
 from qa_agent.automation_lifecycle import (
     AutomationLifecycleService,
@@ -273,12 +274,12 @@ class TestCaseExecutionService:
             try:
                 result = self._automation_workflow.run_test_case(test_case, run_context)
             except Exception as error:
-                if self._automation_lifecycle is not None:
+                if self._automation_lifecycle is not None and not is_cancelled(error):
                     self._lifecycle_update(
                         self._automation_lifecycle.mark_automation_completed if isinstance(error.__cause__, AutomationReviewRequired) else self._automation_lifecycle.mark_automation_failed, test_case
                     )
                 raise
-            if self._automation_lifecycle is not None:
+            if self._automation_lifecycle is not None and not result.test_run.cancelled:
                 self._lifecycle_update(
                     self._automation_lifecycle.mark_automation_completed, test_case
                 )
@@ -375,7 +376,7 @@ class TestCaseExecutionService:
                 PlanVersionSet(tuple(selections)),
                 run_context,
             )
-            if workflow_type == WorkflowType.VALIDATION and self._automation_lifecycle is not None:
+            if workflow_type == WorkflowType.VALIDATION and self._automation_lifecycle is not None and not result.test_run.cancelled:
                 self._lifecycle_update(
                     self._automation_lifecycle.mark_validation_completed,
                     test_case,

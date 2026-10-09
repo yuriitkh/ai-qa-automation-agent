@@ -14,6 +14,7 @@ import time
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
+from qa_agent.execution_control import current_cancellation, is_cancelled
 from qa_agent.llm.errors import NonRetryableLLMError, RetryableLLMError, category_for_error
 from qa_agent.llm_usage import current_llm_usage_context, OP_GENERATE_AUTOMATION_PLAN
 from qa_agent.redaction import redact_diagnostic
@@ -174,6 +175,8 @@ class AutomationReviewRequired(RuntimeError):
 
 
 def classify_failure(error: BaseException) -> str:
+    if is_cancelled(error):
+        return "CANCELLED"
     if isinstance(error, ReliabilityStopped):
         return error.category
     if isinstance(error, PlanValidationError):
@@ -234,7 +237,7 @@ def current_reliability_operation():
 
 def provider_timeout(default: float) -> float:
     operation = current_reliability_operation()
-    return max(0.001, min(default, operation.remaining_seconds, PROVIDER_TIMEOUT_SECONDS)) if operation else default
+    return max(0.001, min(default, operation.remaining_seconds, PROVIDER_TIMEOUT_SECONDS)) if operation else min(default, PROVIDER_TIMEOUT_SECONDS) if current_cancellation() is not None else default
 
 
 def _safe_metadata(value: str | None) -> str | None:
@@ -249,6 +252,8 @@ def _safe_metadata(value: str | None) -> str | None:
 class ReliabilityOperation:
     def __init__(self, supervisor, record: ReliabilityRecord, cancellation: Event):
         self.supervisor, self.record, self.cancellation = supervisor, record, cancellation
+        self.control = current_cancellation()
+        self.completion_lock = self.control.lock if self.control is not None else RLock()
         self.started = time.monotonic()
         self.deadline = self.started + supervisor.timeout_seconds
         self.request_action = "INITIAL_GENERATION"
@@ -267,6 +272,8 @@ class ReliabilityOperation:
             raise ReliabilityStopped("ATTEMPT_LIMIT")
 
     def ensure_active(self):
+        if current_cancellation() is not None and current_cancellation().requested:
+            raise ReliabilityStopped("CANCELLED")
         if self.cancellation.is_set():
             raise ReliabilityStopped("CANCELLED")
         if self.remaining_seconds <= 0:
@@ -389,7 +396,7 @@ class AutomationReliabilitySupervisor:
         self.repository = repository or InMemoryReliabilityRepository()
         self.timeout_seconds = timeout_seconds
         self._capacity = BoundedSemaphore(max_inflight)
-        self._active: dict[UUID, tuple[Event, Any]] = {}
+        self._active: dict[UUID, tuple[ReliabilityOperation, Any]] = {}
         self._lock = RLock()
 
     def active_step(self, operation_id):
@@ -399,14 +406,28 @@ class AutomationReliabilitySupervisor:
     def cancel(self, operation_id: UUID) -> bool:
         with self._lock:
             active = self._active.get(operation_id)
-            if active:
-                active[0].set()
-            return active is not None
+        if active is None:
+            return False
+        operation = active[0]
+        with operation.completion_lock:
+            if operation.record.outcome != "RUNNING":
+                return False
+            if operation.control is not None:
+                if not operation.control.request():
+                    return False
+                # The requesting HTTP thread has no progress context. The
+                # reporter captured by generation acknowledges the correct job.
+                reporter = getattr(operation, "progress", None)
+                if reporter is not None:
+                    reporter.request_cancellation()
+            operation.cancellation.set()
+            return True
 
     def cancel_all(self) -> None:
         with self._lock:
-            for cancellation, _ in self._active.values():
-                cancellation.set()
+            operation_ids = list(self._active)
+        for operation_id in operation_ids:
+            self.cancel(operation_id)
 
     def requires_review(self, version_id: UUID) -> ReliabilityRecord | None:
         return next((record for record in self.repository.list_records() if record.candidate_version_id == version_id and record.repaired), None)
@@ -425,9 +446,12 @@ class AutomationReliabilitySupervisor:
             settings=self.repository.settings(), started_at=datetime.now(timezone.utc),
         )
         self.repository.save(record)
-        operation = ReliabilityOperation(self, record, cancellation or Event())
+        control = current_cancellation()
+        operation = ReliabilityOperation(self, record, cancellation or (control.event if control is not None and control.parent is None else Event()))
+        from qa_agent.execution_progress import get_active_execution_progress
+        operation.progress = get_active_execution_progress()
         with self._lock:
-            self._active[record.id] = (operation.cancellation, step)
+            self._active[record.id] = (operation, step)
         token = _ACTIVE_OPERATION.set(operation)
         repair_error = None
         try:
@@ -442,6 +466,7 @@ class AutomationReliabilitySupervisor:
                     if len(record.attempts) == previous_count:
                         raise ReliabilityStopped("UNKNOWN_ERROR")
                     operation.emit("RELIABILITY_CHECKING", "Checking automation quality using the mandatory gates.")
+                    operation.ensure_active()
                     validated = validate(value)
                     operation.ensure_active()
                 except Exception as error:
@@ -465,12 +490,14 @@ class AutomationReliabilitySupervisor:
                         continue
                     operation.decision("HUMAN_REVIEW_REQUIRED" if category in {"ASSERTION_NOT_GROUNDED", "LOCATOR_IDENTITY_UNCERTAIN", "INSUFFICIENT_TESTCASE_REQUIREMENTS", "UNSAFE_REPAIR"} else "STOP", category, safe_reason(category))
                     raise
-                record.attempts[-1].status = "ACCEPTED"
-                record.attempts[-1].quality_gates = dict.fromkeys(QUALITY_GATES, "PASSED")
-                record.outcome = "READY_FOR_REVIEW"
-                operation.decision("HUMAN_REVIEW_REQUIRED", None, "Quality gates accepted the candidate; generation is not Browser Validation or a product PASS.")
-                operation.emit("RELIABILITY_READY_FOR_REVIEW", "The automation candidate passed quality checks and is ready for review.")
-                return validated, record.id, record.repaired
+                with operation.completion_lock:
+                    operation.ensure_active()
+                    record.attempts[-1].status = "ACCEPTED"
+                    record.attempts[-1].quality_gates = dict.fromkeys(QUALITY_GATES, "PASSED")
+                    record.outcome = "READY_FOR_REVIEW"
+                    operation.decision("HUMAN_REVIEW_REQUIRED", None, "Quality gates accepted the candidate; generation is not Browser Validation or a product PASS.")
+                    operation.emit("RELIABILITY_READY_FOR_REVIEW", "The automation candidate passed quality checks and is ready for review.")
+                    return validated, record.id, record.repaired
         except BaseException as error:
             category = "CANCELLED" if isinstance(error, (KeyboardInterrupt, SystemExit)) else classify_failure(error)
             record.final_category = category

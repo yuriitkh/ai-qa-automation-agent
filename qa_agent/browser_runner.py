@@ -1,3 +1,4 @@
+from qa_agent.execution_control import current_cancellation, check_cancelled
 from contextlib import contextmanager
 from pathlib import Path
 import re
@@ -50,6 +51,7 @@ class BrowserSession:
         self._closed = False
 
     def start(self) -> None:
+        check_cancelled()
         if self._closed or self._playwright_manager is not None:
             raise RuntimeError("BrowserSession has already been started or closed.")
         self._playwright_manager = sync_playwright()
@@ -59,6 +61,7 @@ class BrowserSession:
         self._context = self._browser.new_context()
 
     def new_page(self) -> Any:
+        check_cancelled()
         if self._closed or self._context is None:
             raise RuntimeError("BrowserSession is not open.")
         page = self._context.new_page()
@@ -168,6 +171,7 @@ class TestCaseBrowserSession:
             raise RuntimeError("TestCase browser session is closed.")
         if segment_order not in self._segment_orders:
             raise ValueError("ExecutionSegment does not belong to this TestCase.")
+        check_cancelled()
         if self._session is None:
             self._session = BrowserSession(
                 self._runner.evidence_directory,
@@ -201,6 +205,7 @@ def _run_plan_on_page(
     page: Any,
     evidence_directory: str | Path | None = None,
 ) -> dict[str, Any]:
+    check_cancelled()
     result: dict[str, Any] = {
         "status": "passed",
         "url": plan.url,
@@ -233,6 +238,9 @@ def _run_plan_on_page(
             return result
 
     for step_index, step in enumerate(plan.steps):
+        if current_cancellation() is not None and current_cancellation().requested:
+            result["status"] = "cancelled"
+            break
         step_result = {
             "action": step.action,
             "status": "passed",
@@ -428,6 +436,11 @@ def _run_plan_on_page(
             else:
                 raise ValueError(f"Unsupported test action: {step.action!r}")
         except Exception as error:
+            if current_cancellation() is not None and current_cancellation().requested:
+                step_result["status"] = "cancelled"
+                result["status"] = "cancelled"
+                result["steps"].append(step_result)
+                break
             step_result["status"] = "failed"
             step_result["error"] = str(error)
             result["status"] = "failed"
@@ -443,7 +456,8 @@ def _run_plan_on_page(
             break
 
         if (
-            current_evidence_policy().mode == EvidenceMode.EVERY_VERIFICATION
+            not (current_cancellation() is not None and current_cancellation().requested)
+            and current_evidence_policy().mode == EvidenceMode.EVERY_VERIFICATION
             and step.action in verification_actions
         ):
             _capture_screenshots(
@@ -455,6 +469,9 @@ def _run_plan_on_page(
                 event_kind="VERIFICATION",
             )
         result["steps"].append(step_result)
+        if current_cancellation() is not None and current_cancellation().requested:
+            result["status"] = "cancelled"
+            break
 
     if (
         result["status"] == "passed"
@@ -535,6 +552,8 @@ def _capture_screenshots(
     """Capture configured scopes without changing the browser action result."""
     if evidence_directory is None:
         return
+    if current_cancellation() is not None and current_cancellation().requested:
+        return
     policy = current_evidence_policy()
     selector = action.parameters.get("selector")
     has_locator = isinstance(selector, str) and bool(selector.strip())
@@ -551,6 +570,8 @@ def _capture_screenshots(
     directory = Path(evidence_directory)
 
     for scope in scopes:
+        if current_cancellation() is not None and current_cancellation().requested:
+            break
         if scope == EvidenceScope.ELEMENT and not has_locator:
             continue
         try:

@@ -1,3 +1,4 @@
+from qa_agent.execution_control import check_cancelled, cancellable_call, is_cancelled
 import logging
 import re
 import time
@@ -128,13 +129,16 @@ class LLMRouter:
         usage_context: LLMUsageContext,
         fallback_from_provider: str | None,
     ):
+        check_cancelled()
         started_at = datetime.now(timezone.utc)
         started = time.perf_counter()
         usage: ProviderTokenUsage | None = None
         try:
             with capture_provider_usage() as captured:
                 try:
-                    result = operation()
+                    check_cancelled()
+                    result = operation() if current_reliability_operation() is not None else cancellable_call(operation)
+                    check_cancelled()
                 finally:
                     usage = captured.usage
         except Exception as error:
@@ -146,7 +150,7 @@ class LLMRouter:
                 started_at,
                 started,
                 usage,
-                "FAILED",
+                "CANCELLED" if is_cancelled(error) else "FAILED",
                 error,
                 fallback_from_provider,
             )
@@ -167,7 +171,7 @@ class LLMRouter:
 
     def _capture_reliability_usage(self, provider, usage) -> None:
         operation = current_reliability_operation()
-        if operation is not None:
+        if operation is not None and operation.record.outcome == "RUNNING":
             try:
                 pricing = getattr(self._usage_recorder, "pricing", None)
                 model = getattr(provider, "model", None) or getattr(provider, "_model", None)
@@ -240,6 +244,7 @@ class LLMRouter:
         usage_context = current_llm_usage_context(OP_GENERATE_AUTOMATION_PLAN)
         fallback_from_provider: str | None = None
         for index, provider in enumerate(providers):
+            check_cancelled()
             provider_name = (
                 self._provider_observability_name(provider)
                 if getattr(provider, "is_custom", False)
@@ -292,6 +297,8 @@ class LLMRouter:
                 )
                 raise
             except Exception as error:
+                if is_cancelled(error):
+                    raise
                 # P2-2 (Choice D): an unclassified failure stays unclassified
                 # — no fallback, no wrapping, the SAME exception propagates —
                 # but the attempted provider must be observable in the trace.
@@ -358,6 +365,8 @@ class LLMRouter:
                     action=action, reason=reason,
                 )
             except Exception as error:
+                if is_cancelled(error):
+                    raise
                 self._record_provider_attempt(
                     provider, RequestKind.TEST_PLAN,
                     ProviderAttemptOutcome.NON_RETRYABLE_ERROR if isinstance(error, NonRetryableLLMError) else ProviderAttemptOutcome.RETRYABLE_ERROR if isinstance(error, RetryableLLMError) else ProviderAttemptOutcome.UNCLASSIFIED_ERROR,
@@ -388,6 +397,7 @@ class LLMRouter:
         usage_context = current_llm_usage_context(OP_DISCOVERY)
         fallback_from_provider: str | None = None
         for index, provider in enumerate(providers):
+            check_cancelled()
             name = (
                 self._provider_observability_name(provider)
                 if getattr(provider, "is_custom", False)
@@ -439,6 +449,8 @@ class LLMRouter:
             except NotImplementedError as error:
                 raise RuntimeError(f"{name} does not support Discovery output.") from error
             except Exception as error:
+                if is_cancelled(error):
+                    raise
                 # P2-2 (Choice D): same contract as create_test_plan — record
                 # the attempted provider, then re-raise the original
                 # exception unchanged with no fallback to the next provider.
@@ -493,6 +505,7 @@ class LLMRouter:
             progress_callback = None
         fallback_from_provider: str | None = None
         for index, provider in enumerate(providers):
+            check_cancelled()
             name = self._provider_name(provider)
             if not provider.is_available:
                 unavailable.append(self._provider_observability_name(provider))
@@ -621,6 +634,8 @@ class LLMRouter:
                     f"{self._provider_observability_name(provider)} does not support structured output."
                 ) from error
             except Exception as error:
+                if is_cancelled(error):
+                    raise
                 failure = failure_detail_for(display_name, error)
                 _notify_authoring_progress(
                     progress_callback, "failed", display_name,

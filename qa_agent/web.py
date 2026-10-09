@@ -3,6 +3,7 @@
 import argparse
 import json
 import logging
+from secrets import token_urlsafe, compare_digest
 import mimetypes
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -11,6 +12,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urlsplit
 from uuid import UUID, uuid4
 
+from qa_agent.execution_preferences import SQLiteExecutionPreferences, InMemoryExecutionPreferences, PreferencesConflict
 from qa_agent.presentation import (
     UI_CSS,
     badge,
@@ -140,7 +142,7 @@ _MAX_AUTHORING_FORM_BODY_BYTES = 80_000
 _MAX_DRAFT_SAVE_BODY_BYTES = 256 * 1024
 _MAX_MANUAL_FORM_BODY_BYTES = 1024 * 1024
 _WORKFLOWS = {item.value for item in WorkflowType}
-_STATUSES = {"PASSED", "FAILED", "PRODUCT_FAILURE", "AUTOMATION_EXECUTION_ERROR", "AUTOMATION_DRIFT", "AUTOMATION_GENERATION_ERROR", "INFRASTRUCTURE_ERROR", "BLOCKED", "INCONCLUSIVE"}
+_STATUSES = {"CANCELLED", "PASSED", "FAILED", "PRODUCT_FAILURE", "AUTOMATION_EXECUTION_ERROR", "AUTOMATION_DRIFT", "AUTOMATION_GENERATION_ERROR", "INFRASTRUCTURE_ERROR", "BLOCKED", "INCONCLUSIVE"}
 _FAILURE_TYPES = {
     "PRODUCT_FAILURE",
     "AUTOMATION_DRIFT",
@@ -197,7 +199,10 @@ class LocalWebApplication:
         database_path: str | Path | None = None,
         readiness_service: SystemReadinessService | None = None,
         reliability: AutomationReliabilitySupervisor | None = None,
+        execution_preferences=None,
     ) -> None:
+        self._csrf_token = token_urlsafe(32)
+        self._execution_preferences = execution_preferences or (SQLiteExecutionPreferences(database_path) if database_path is not None else InMemoryExecutionPreferences())
         self._run_history = run_history
         self._reports = reports or RunReportGenerator()
         self._evidence_root = Path(evidence_root).expanduser() if evidence_root else None
@@ -275,12 +280,114 @@ class LocalWebApplication:
         if self._background_authoring is not None:
             self._background_authoring.close()
 
-    def handle(self, method: str, target: str, body: bytes | str | None = None) -> WebResponse:
+    def _valid_control_request(self, body, headers) -> bool:
+        request_headers = {key.lower(): value for key, value in (headers or {}).items()}
+        form, error = _parse_form_body(body)
+        if error:
+            return False
+        token = request_headers.get("x-qa-csrf", form.get("_csrf", [""])[0])
+        if not isinstance(token, str) or not token.isascii() or not compare_digest(token, self._csrf_token):
+            return False
+        if request_headers.get("sec-fetch-site") == "cross-site":
+            return False
+        host = request_headers.get("host")
+        if host:
+            try:
+                if urlsplit("http://" + host).hostname not in {"localhost", "127.0.0.1", "::1"}:
+                    return False
+            except ValueError:
+                return False
+        origin = request_headers.get("origin")
+        if origin and (not host or origin != "http://" + host):
+            return False
+        return True
+
+    def _handle_preferences(self, raw_id, body) -> WebResponse:
+        case_id = _parse_uuid(raw_id)
+        if case_id is None or self._test_cases is None or self._test_cases.get(case_id) is None:
+            return WebResponse.json(404, json.dumps({"error": "TestCase not found."}))
+        form, error = _parse_form_body(body)
+        try:
+            if error or set(form) - {"field", "value", "revision", "_csrf"} or any(len(values) != 1 for values in form.values()):
+                raise ValueError("Invalid preferences request.")
+            revision = form.get("revision", [""])[0]
+            if not revision.isascii() or not revision.isdecimal():
+                raise ValueError("A valid preferences revision is required.")
+            saved = self._execution_preferences.update(case_id, form.get("field", [""])[0], form.get("value", [""])[0], int(revision))
+            return WebResponse.json(200, saved.model_dump_json())
+        except PreferencesConflict as conflict:
+            return WebResponse.json(409, json.dumps({"error": str(conflict), "preferences": conflict.current.model_dump(mode="json")}))
+        except (ValueError, TypeError):
+            return WebResponse.json(400, json.dumps({"error": "Choose a valid execution preference and revision."}))
+
+    def _handle_stop(self, parts) -> WebResponse:
+        accepted = False
+        if len(parts) == 4 and parts[:2] == ["runs", "progress"]:
+            snapshot = self._progress_store.get(parts[2])
+            if snapshot is None:
+                return WebResponse.json(404, '{"error":"Run progress not found."}')
+            accepted = self._background_runs is not None and self._background_runs.cancel(parts[2])
+        elif len(parts) == 4 and parts[:2] == ["test-cases", "authoring-progress"]:
+            snapshot = self._progress_store.get_authoring(parts[2])
+            if snapshot is None:
+                return WebResponse.json(404, '{"error":"Authoring progress not found."}')
+            accepted = self._background_authoring is not None and self._background_authoring.cancel(parts[2])
+        elif len(parts) == 3 and parts[0] == "suite-runs":
+            if self._suite_run_service is None or self._suite_run_service.get(parts[1]) is None:
+                return WebResponse.json(404, '{"error":"Suite Run not found."}')
+            accepted = self._suite_run_service.cancel(parts[1])
+        else:
+            return WebResponse.json(404, '{"error":"Operation not found."}')
+        return WebResponse.json(202 if accepted else 409, json.dumps({
+            "cancellation_requested": bool(accepted),
+            "message": "Cancellation requested. Waiting for safe cleanup." if accepted else "The operation has already finished or cannot be stopped.",
+        }))
+
+    def _stop_control(self, url, finished, state) -> str:
+        if finished:
+            return ""
+        stopping = state == "CANCELLATION_REQUESTED"
+        return (
+            f'<form method="post" action="{escape_html(url)}" data-stop-form class="actions">'
+            f'<input type="hidden" name="_csrf" value="{escape_html(self._csrf_token)}">'
+            + '<button class="button" type="submit" data-stop-button'
+            + (' disabled' if stopping else '') + '>' + ('Stopping…' if stopping else 'Stop')
+            + '</button><span data-stop-notice role="status">'
+            + ('Cancellation requested. Waiting for safe cleanup.' if stopping else '') + '</span></form>'
+        )
+
+    def _preferences_panel(self, case_id) -> str:
+        preferences = self._execution_preferences.get(case_id)
+        controls = self._evidence_controls(f"preferences-{case_id}") + self._cookie_consent_controls(f"preferences-{case_id}")
+        # Existing controls share enum values; only selected attributes change.
+        controls = controls.replace(' selected', '')
+        for value in (preferences.evidence_mode.value, preferences.screenshot_mode.value, preferences.cookie_policy.value):
+            controls = controls.replace(f'value="{value}"', f'value="{value}" selected')
+        return (
+            f'<section class="panel" data-execution-preferences="/test-cases/{case_id}/preferences" data-revision="{preferences.revision}">'
+            '<h2>Execution preferences</h2><p class="muted">Changes are saved immediately for future operations. Active Runs keep their recorded policy.</p>'
+            + controls + '<p role="status" data-preferences-status>Saved</p>'
+            '<button class="button" type="button" data-preferences-retry hidden>Retry</button>'
+            f'<form method="post" action="/test-cases/{case_id}/readiness" data-run-form class="actions">'
+            '<div class="field"><label for="readiness-workflow">Check workflow</label>'
+            '<select id="readiness-workflow" name="workflow"><option value="AUTOMATION">Automation</option>'
+            '<option value="VALIDATION">Validation</option><option value="REGRESSION">Regression</option></select></div>'
+            '<button class="button" type="submit">Check readiness</button></form></section>'
+        )
+
+    def handle(self, method: str, target: str, body: bytes | str | None = None, *, headers=None) -> WebResponse:
         parsed = urlsplit(target)
         path = parsed.path
         query = parse_qs(parsed.query)
         parts = path.strip("/").split("/")
         if method.upper() == "POST":
+            protected = parts[-1:] in (["stop"], ["preferences"]) or (parts[:2] == ["settings", "reliability"] and parts[-1:] == ["cancel"])
+            if protected and not self._valid_control_request(body, headers):
+                return WebResponse.json(403, json.dumps({"error": "Request validation failed. Refresh this page and retry."}))
+            if parts[-1:] == ["stop"]:
+                return self._handle_stop(parts)
+            if len(parts) == 3 and parts[0] == "test-cases" and parts[2] == "preferences":
+                return self._handle_preferences(parts[1], body)
             return self._handle_post(parts, body)
         if method.upper() != "GET":
             return WebResponse.html(405, self._page(
@@ -584,16 +691,17 @@ class LocalWebApplication:
             return self._run_error(test_case_id, "Choose Automation, Validation, or Regression before starting a run.", 400)
         if workflow not in {WorkflowType.AUTOMATION, WorkflowType.VALIDATION, WorkflowType.REGRESSION}:
             return self._run_error(test_case_id, "Choose Automation, Validation, or Regression before starting a run.", 400)
+        preferences = self._execution_preferences.get(test_case_id)
         try:
             evidence_policy = EvidencePolicy(
-                mode=EvidenceMode(form.get("evidence_mode", [EvidenceMode.FAILURES_ONLY.value])[0]),
-                screenshot_mode=ScreenshotMode(form.get("screenshot_mode", [ScreenshotMode.PAGE.value])[0]),
+                mode=EvidenceMode(form.get("evidence_mode", [preferences.evidence_mode.value])[0]),
+                screenshot_mode=ScreenshotMode(form.get("screenshot_mode", [preferences.screenshot_mode.value])[0]),
             )
         except ValueError:
             return self._run_error(test_case_id, "Choose a valid evidence mode and screenshot scope.", 400)
         try:
             cookie_policy = CookieConsentPolicy(
-                form.get("cookie_policy", [DEFAULT_COOKIE_CONSENT_POLICY.value])[0]
+                form.get("cookie_policy", [preferences.cookie_policy.value])[0]
             )
         except ValueError:
             return self._run_error(test_case_id, "Choose a valid cookie consent policy.", 400)
@@ -767,6 +875,7 @@ class LocalWebApplication:
 
     def _progress_payload(self, snapshot) -> dict:
         payload = snapshot.to_public_dict()
+        payload["stop_url"] = f"/runs/progress/{snapshot.progress_id}/stop" if not payload["finished"] and self._background_runs is not None else None
         persisted = self._run_history.get(snapshot.final_run_id) if snapshot.final_run_id else None
         payload["final_run_id"] = str(persisted.run_id) if persisted else None
         payload["final_run_url"] = f"/runs/{persisted.run_id}" if persisted else None
@@ -850,7 +959,7 @@ class LocalWebApplication:
             }))
         return WebResponse.json(
             200,
-            json.dumps(snapshot.to_public_dict(), ensure_ascii=False, separators=(",", ":")),
+            json.dumps({**snapshot.to_public_dict(), "stop_url": f"/test-cases/authoring-progress/{progress_id}/stop" if not snapshot.finished else None}, ensure_ascii=False, separators=(",", ":")),
         )
 
     def _authoring_progress_page(self, progress_id: str) -> WebResponse:
@@ -928,6 +1037,7 @@ class LocalWebApplication:
             + _summary_card("Status", f'<span data-authoring-state>{escape_html(snapshot.state.value.title())}</span>', raw=True)
             + _summary_card("Provider", f'<span data-authoring-provider>{escape_html(snapshot.provider_name or "—")}</span>', raw=True)
             + '</div>'
+            + self._stop_control(f"/test-cases/authoring-progress/{progress_id}/stop", snapshot.finished, snapshot.state.value)
             + f'<div class="authoring-progress" data-authoring-progress-id="{escape_html(progress_id)}">'
             + '<section class="panel"><h2>Progress</h2>'
             + f'<ul class="compact-list" data-authoring-events>{events}</ul></section>'
@@ -992,6 +1102,7 @@ class LocalWebApplication:
             + _summary_card('Current stage', f'<span data-progress-phase>{esc(payload["phase"])}</span>', raw=True)
             + _summary_card('Elapsed', f'<span data-progress-elapsed>{esc(format_duration(snapshot.elapsed_ms))}</span>', raw=True)
             + '</div>'
+            + self._stop_control(f"/runs/progress/{progress_id}/stop", payload["finished"], snapshot.state.value)
             + '<section class="panel progress-result" data-progress-result' + ('' if payload['finished'] else ' hidden')
             + '><h2>Result summary</h2><div data-progress-result-content>' + result + '</div>' + retry + '</section>'
             + f'<div class="progress-live" data-progress-id="{esc(progress_id)}">'
@@ -2027,7 +2138,7 @@ class LocalWebApplication:
             + '</section><section class="panel"><h2>Steps</h2>'
             + "".join(segments)
             + '</section><div class="actions">'
-            + '<button class="button primary" type="submit">Save TestCase for review</button></div></form>'
+            + '<button class="button primary" type="submit">Save TestCase</button></div></form>'
             + '<div class="actions">'
             + f'<button class="button" type="submit" form="testcase-review-form" '
             f'formaction="/test-cases/review/{escape_html(token)}/regenerate" formnovalidate data-regenerate-testcase>Generate Again</button>'
@@ -3067,16 +3178,17 @@ class LocalWebApplication:
         form, error = _parse_form_body(body)
         if error:
             return self._run_error(test_case.id, error, 400)
+        preferences = self._execution_preferences.get(test_case.id)
         try:
             workflow = WorkflowType(form.get("workflow", [""])[0])
             if workflow not in {WorkflowType.AUTOMATION, WorkflowType.VALIDATION, WorkflowType.REGRESSION}:
                 raise ValueError
             evidence_policy = EvidencePolicy(
-                mode=EvidenceMode(form.get("evidence_mode", [EvidenceMode.FAILURES_ONLY.value])[0]),
-                screenshot_mode=ScreenshotMode(form.get("screenshot_mode", [ScreenshotMode.PAGE.value])[0]),
+                mode=EvidenceMode(form.get("evidence_mode", [preferences.evidence_mode.value])[0]),
+                screenshot_mode=ScreenshotMode(form.get("screenshot_mode", [preferences.screenshot_mode.value])[0]),
             )
             cookie_policy = CookieConsentPolicy(
-                form.get("cookie_policy", [DEFAULT_COOKIE_CONSENT_POLICY.value])[0]
+                form.get("cookie_policy", [preferences.cookie_policy.value])[0]
             )
         except (ValueError, TypeError):
             return self._run_error(test_case.id, "Choose a valid workflow, evidence mode, and cookie policy.", 400)
@@ -3296,7 +3408,7 @@ class LocalWebApplication:
                 + '</li>'
             )
         report_url = f"/suite-runs/{escape_html(run.public_id or public_id)}/report.json"
-        live = run.status in {SuiteRunStatus.QUEUED, SuiteRunStatus.RUNNING}
+        live = run.status in {SuiteRunStatus.QUEUED, SuiteRunStatus.RUNNING, SuiteRunStatus.CANCELLATION_REQUESTED}
         content = (
             '<header class="page-heading"><p class="eyebrow">Suite Run</p>'
             f'<h1>{escape_html(run.public_id or public_id)} — {escape_html(run.suite_name)}</h1>'
@@ -3305,6 +3417,7 @@ class LocalWebApplication:
             + f'<p class="muted">Cookie consent: {escape_html(cookie_consent_policy_label(run.config.cookie_policy))}</p>'
             + f'<p class="muted">Evidence: {escape_html(evidence_mode_label(run.config.evidence_policy.mode))} · '
             f'{escape_html(screenshot_mode_label(run.config.evidence_policy.screenshot_mode))}</p>'
+            + self._stop_control(f"/suite-runs/{run.public_id or public_id}/stop", not live, run.status.value)
             + f'<section class="panel" data-suite-run-progress="/api/suite-runs/{escape_html(run.public_id or public_id)}">'
             '<h2>Progress</h2>'
             f'<p data-suite-run-summary>{_suite_counts_text(run)}</p>'
@@ -3570,6 +3683,8 @@ class LocalWebApplication:
             else:
                 # Compatibility for lightweight adapters that only implement run().
                 run_form = self._run_form(test_case_id)
+        if test_case is not None:
+            run_form = self._preferences_panel(test_case_id) + run_form
         usage_summary = (
             self._llm_usage.test_case_summary(test_case_id)
             if self._llm_usage is not None else None
@@ -3881,8 +3996,6 @@ class LocalWebApplication:
             '<option value="VALIDATION">Validation</option>'
             '<option value="REGRESSION">Regression</option>'
             '</select></div>'
-            + LocalWebApplication._evidence_controls(f"run-{test_case_id}")
-            + LocalWebApplication._cookie_consent_controls(f"run-{test_case_id}")
             + '<button class="button primary" type="submit">Start run</button></form>'
             '</section>'
         )
@@ -3949,7 +4062,7 @@ class LocalWebApplication:
         review_record = self._test_case_review.record(test_case.id)
         legacy_case = review_record is None
         complete = (
-            availability.regression_available
+            availability.total_step_count > 0
             and availability.usable_plan_count == availability.total_step_count
         )
         current_plan_approval = self._test_case_review.validation_approved_for(test_case)
@@ -4003,7 +4116,7 @@ class LocalWebApplication:
                 f'<div class="actions"><a class="button" href="/test-cases/{test_case_id}/plans">View TestPlan</a>'
                 f'<a class="button" href="/test-cases/{test_case_id}/automation/edit">Edit Automation</a></div>'
             )
-            if not current_plan_approval and availability.validation_available:
+            if not current_plan_approval and all(expected_result_coverage(step, self._plan_store.find(step.id).qa_test_plan if self._plan_store is not None and self._plan_store.find(step.id) is not None else None).is_sufficient for step in test_case.steps):
                 forms.append(
                     f'<form method="post" action="/test-cases/{test_case_id}/approve-validation">'
                     '<button class="button primary" type="submit">Approve for Validation</button></form>'
@@ -4050,9 +4163,6 @@ class LocalWebApplication:
                 forms.append(
                     f'<form method="post" action="/test-cases/{test_case_id}/run" data-run-form>'
                     '<input type="hidden" name="workflow" value="AUTOMATION">'
-                    + self._evidence_controls(f"automation-{test_case_id}")
-                    + self._cookie_consent_controls(f"automation-{test_case_id}")
-                    + f'<button class="button" type="submit" formaction="/test-cases/{test_case_id}/readiness">Check readiness</button>'
                     + '<button class="button primary" type="submit">Generate Automation</button></form>'
                 )
             if legacy_case:
@@ -4086,9 +4196,6 @@ class LocalWebApplication:
         return (
             f'<form method="post" action="/test-cases/{test_case_id}/run" data-run-form>'
             f'<input type="hidden" name="workflow" value="{workflow.value}">'
-            + self._evidence_controls(f"{workflow.value.casefold()}-{test_case_id}")
-            + self._cookie_consent_controls(f"{workflow.value.casefold()}-{test_case_id}")
-            + f'<button class="button" type="submit" formaction="/test-cases/{test_case_id}/readiness">Check readiness</button>'
             + f'<button class="button{" primary" if primary else ""}" type="submit">{label}</button></form>'
         )
 
@@ -4521,7 +4628,7 @@ class LocalWebApplication:
             if version:
                 actions += f'<a class="button" href="/test-cases/{record.test_case_id}/automation/steps/{record.test_step_id}/versions/{version.id}">View saved candidate v{version.version}</a>'
         if record.outcome == "RUNNING":
-            actions += f'<form method="post" action="/settings/reliability/{record.id}/cancel"><button class="button" type="submit">Cancel generation</button></form>'
+            actions += f'<form method="post" action="/settings/reliability/{record.id}/cancel"><input type="hidden" name="_csrf" value="{self._csrf_token}"><button class="button" type="submit">Cancel generation</button></form>'
         content = (
             '<header class="page-heading"><h1>Automation generation operation</h1>' + f'<p>{esc(record.id)}</p><p>{esc(record.outcome.replace("_", " ").title())}</p></header>'
             + '<p>Generation quality is separate from human approval and Browser Validation. No product PASS is inferred.</p>'
@@ -4560,7 +4667,8 @@ class LocalWebApplication:
         return (
             '<!doctype html><html lang="en"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1">'
-            '<script src="/assets/ui.js" defer></script>'
+            + f'<meta name="qa-csrf-token" content="{escape_html(self._csrf_token)}">'
+            + '<script src="/assets/ui.js" defer></script>'
             f'<title>{escape_html(title)} · AI QA Agent</title><style>{UI_CSS}</style></head><body>'
             '<header class="topbar"><div class="shell topbar-inner">'
             '<a class="brand" href="/">AI QA Agent</a>'
@@ -4734,7 +4842,7 @@ def create_http_server(
                 body = b"x" * (max_body_bytes + 1)
             else:
                 body = self.rfile.read(content_length)
-            self._send(application.handle("POST", self.path, body))
+            self._send(application.handle("POST", self.path, body, headers=dict(self.headers)))
 
         def _send(self, response: WebResponse) -> None:
             self._response_status = response.status
@@ -5316,6 +5424,7 @@ def _authoring_error_label(category: str | None) -> str:
         "AI_GENERATION_ERROR": "AI GENERATION ERROR",
         "AI_OUTPUT_VALIDATION_ERROR": "AI GENERATION ERROR",
         "INVALID_AUTHORING_INPUT": "INVALID INPUT",
+        "CANCELLED": "Stopped by user",
         "AUTHORING_EXECUTION_ERROR": "AUTHORING ERROR",
     }.get(category or "", "AI GENERATION ERROR")
 
@@ -5424,6 +5533,85 @@ def _inline_invalid_attrs(error_id: str, error: str | None) -> str:
 
 
 _UI_JAVASCRIPT = r"""
+(() => {
+  const csrf = document.querySelector('meta[name="qa-csrf-token"]')?.content || '';
+  window.qaRenderStop = (snapshot) => {
+    document.querySelectorAll('[data-stop-form]').forEach((form) => {
+      if (snapshot.finished) { form.hidden = true; return; }
+      const stopping = snapshot.state === 'CANCELLATION_REQUESTED' || form.dataset.requested === 'true';
+      const button = form.querySelector('[data-stop-button]');
+      button.disabled = stopping;
+      button.textContent = stopping ? 'Stopping…' : 'Stop';
+      if (stopping) form.querySelector('[data-stop-notice]').textContent = 'Cancellation requested. Waiting for safe cleanup.';
+    });
+  };
+  document.querySelectorAll('[data-stop-form]').forEach((form) => {
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      if (form.dataset.requested === 'true') return;
+      form.dataset.requested = 'true';
+      const button = form.querySelector('[data-stop-button]');
+      const notice = form.querySelector('[data-stop-notice]');
+      button.disabled = true; button.textContent = 'Stopping…';
+      notice.textContent = 'Sending cancellation request…';
+      try {
+        const response = await fetch(form.action, {
+          method: 'POST', headers: {'X-QA-CSRF': csrf, 'Content-Type': 'application/x-www-form-urlencoded'},
+          body: new URLSearchParams({_csrf: csrf})
+        });
+        const result = await response.json();
+        if (!response.ok && response.status !== 409) throw new Error('Stop unavailable');
+        notice.textContent = result.message;
+      } catch (_error) {
+        form.dataset.requested = 'false'; button.disabled = false; button.textContent = 'Stop';
+        notice.textContent = 'Stop request could not be confirmed. Retry.';
+      }
+    });
+  });
+
+  const panel = document.querySelector('[data-execution-preferences]');
+  if (!panel) return;
+  const status = panel.querySelector('[data-preferences-status]');
+  const retry = panel.querySelector('[data-preferences-retry]');
+  const pending = new Map();
+  let saving = false, failed = false, revision = Number(panel.dataset.revision);
+  const dirty = () => saving || failed || pending.size > 0;
+  const setRunButtons = () => {
+    document.querySelectorAll('[data-run-form] button[type="submit"]').forEach((button) => { button.disabled = dirty(); });
+  };
+  document.addEventListener('submit', (event) => {
+    if (event.target.matches('[data-run-form]') && dirty()) {
+      event.preventDefault(); event.stopImmediatePropagation();
+      status.textContent = failed ? 'Save failed — Retry' : 'Saving…';
+    }
+  }, true);
+  const save = async () => {
+    if (saving || failed || !pending.size) return;
+    saving = true; status.textContent = 'Saving…'; retry.hidden = true; setRunButtons();
+    try {
+      while (pending.size) {
+        const [field, value] = pending.entries().next().value;
+        const response = await fetch(panel.dataset.executionPreferences, {
+          method: 'POST', headers: {'X-QA-CSRF': csrf, 'Content-Type': 'application/x-www-form-urlencoded'},
+          body: new URLSearchParams({field, value, revision: String(revision)})
+        });
+        const result = await response.json();
+        if (response.status === 409 && result.preferences) revision = result.preferences.revision;
+        if (!response.ok) throw new Error('Save failed');
+        revision = result.revision; panel.dataset.revision = String(revision);
+        if (pending.get(field) === value) pending.delete(field);
+      }
+      status.textContent = 'Saved';
+    } catch (_error) {
+      failed = true; status.textContent = 'Save failed — Retry'; retry.hidden = false;
+    } finally { saving = false; setRunButtons(); }
+  };
+  panel.querySelectorAll('select[name="cookie_policy"], select[name="evidence_mode"], select[name="screenshot_mode"]').forEach((select) => {
+    select.addEventListener('change', () => { pending.set(select.name, select.value); setRunButtons(); save(); });
+  });
+  retry.addEventListener('click', () => { failed = false; save(); });
+})();
+
 (() => {
   const actionFields = {
     navigate: ['url'],
@@ -5807,7 +5995,7 @@ _UI_JAVASCRIPT = r"""
     let elapsedTimer = null;
 
     const renderAuthoringElapsed = (elapsedMs) => {
-      const elapsed = authoringRoot.querySelector('[data-authoring-elapsed]');
+      const elapsed = document.querySelector('[data-authoring-elapsed]');
       if (elapsed) elapsed.textContent = `${(elapsedMs / 1000).toFixed(1)} s`;
     };
 
@@ -5825,7 +6013,8 @@ _UI_JAVASCRIPT = r"""
     };
 
     const renderAuthoring = (snapshot) => {
-      authoringRoot.querySelectorAll('[data-authoring-phase]').forEach((node) => {
+      window.qaRenderStop(snapshot);
+      document.querySelectorAll('[data-authoring-phase]').forEach((node) => {
         node.textContent = snapshot.phase;
       });
       if (snapshot.finished) {
@@ -5845,9 +6034,9 @@ _UI_JAVASCRIPT = r"""
           }, 100);
         }
       }
-      const provider = authoringRoot.querySelector('[data-authoring-provider]');
+      const provider = document.querySelector('[data-authoring-provider]');
       if (provider) provider.textContent = snapshot.provider_name || '—';
-      const state = authoringRoot.querySelector('[data-authoring-state]');
+      const state = document.querySelector('[data-authoring-state]');
       if (state) state.textContent = snapshot.state.toLowerCase().replaceAll('_', ' ')
         .replace(/(^|\s)\S/g, (letter) => letter.toUpperCase());
 
@@ -5888,6 +6077,7 @@ _UI_JAVASCRIPT = r"""
           AI_OUTPUT_VALIDATION_ERROR: 'AI GENERATION ERROR',
           AI_GENERATION_ERROR: 'AI GENERATION ERROR',
           INVALID_AUTHORING_INPUT: 'INVALID INPUT',
+          CANCELLED: 'Stopped by user',
           AUTHORING_EXECUTION_ERROR: 'AUTHORING ERROR'
         };
         strong.textContent = labels[snapshot.error_category] || 'AI GENERATION ERROR';
@@ -5978,6 +6168,7 @@ _UI_JAVASCRIPT = r"""
   }
 
   function render(snapshot) {
+    window.qaRenderStop(snapshot);
     document.querySelectorAll('[data-progress-phase]').forEach((node) => {
       node.textContent = snapshot.phase;
     });
@@ -6102,8 +6293,9 @@ _UI_JAVASCRIPT = r"""
   const summary = root.querySelector('[data-suite-run-summary]');
   const live = root.querySelector('[data-suite-run-live]');
   const list = root.querySelector('[data-suite-run-items]');
-  const terminal = new Set(['COMPLETED', 'COMPLETED_WITH_FAILURES', 'INTERRUPTED', 'FAILED']);
+  const terminal = new Set(['COMPLETED', 'COMPLETED_WITH_FAILURES', 'INTERRUPTED', 'FAILED', 'CANCELLED']);
   const render = (run) => {
+    window.qaRenderStop({finished: terminal.has(run.status), state: run.status});
     summary.textContent = run.summary_text;
     live.textContent = terminal.has(run.status) ? `${run.display_status}.` : `Run ${run.status.toLowerCase()}…`;
     list.replaceChildren();

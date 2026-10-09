@@ -14,7 +14,6 @@ def result_outcome(status: Any, outcome: Any = None, *, complete: bool | None = 
     status, outcome = enum_value(status), enum_value(outcome)
     aliases = {
         "AUTOMATION_REVIEW_REQUIRED": "BLOCKED",
-        "CANCELLED": "BLOCKED",
         "SETUP_FAILURE": "BLOCKED",
         "MISSING_AUTOMATION": "BLOCKED",
         "INVALID_TESTCASE": "BLOCKED",
@@ -26,15 +25,17 @@ def result_outcome(status: Any, outcome: Any = None, *, complete: bool | None = 
     }
     outcome = aliases.get(outcome, outcome)
     if outcome in {
-        "PRODUCT_FAILURE", "AUTOMATION_EXECUTION_ERROR", "AUTOMATION_DRIFT",
+        "CANCELLED", "PRODUCT_FAILURE", "AUTOMATION_EXECUTION_ERROR", "AUTOMATION_DRIFT",
         "AUTOMATION_GENERATION_ERROR", "INFRASTRUCTURE_ERROR", "BLOCKED", "INCONCLUSIVE",
     }:
         return outcome
     if outcome == "PASSED":
-        return "PASSED" if status not in {"FAILED", "BLOCKED", "RUNNING", "PENDING"} and complete is not False else "INCONCLUSIVE"
+        return "PASSED" if status not in {"FAILED", "BLOCKED", "RUNNING", "PENDING", "CANCELLED", "CANCELLATION_REQUESTED"} and complete is not False else "INCONCLUSIVE"
+    if status == "CANCELLED":
+        return "CANCELLED"
     if status == "BLOCKED":
         return "BLOCKED"
-    if status in {"PENDING", "QUEUED", "RUNNING", "RETRYING", "NOT_RUN", "NOT_ATTEMPTED"}:
+    if status in {"CANCELLATION_REQUESTED", "PENDING", "QUEUED", "RUNNING", "RETRYING", "NOT_RUN", "NOT_ATTEMPTED"}:
         return status
     return "INCONCLUSIVE"
 
@@ -45,6 +46,7 @@ def result_label(outcome: str) -> str:
         "AUTOMATION_EXECUTION_ERROR": "Automation Error", "AUTOMATION_DRIFT": "Automation Error",
         "AUTOMATION_GENERATION_ERROR": "Generation Error", "INFRASTRUCTURE_ERROR": "Infrastructure Error",
         "BLOCKED": "Blocked", "INCONCLUSIVE": "Inconclusive",
+        "CANCELLED": "Stopped by user", "CANCELLATION_REQUESTED": "Stopping…",
         "NOT_ATTEMPTED": "Not attempted", "NOT_RUN": "Not run",
     }.get(outcome, outcome.replace("_", " ").title())
 
@@ -60,6 +62,7 @@ def result_tone(outcome: str) -> str:
 
 def result_explanation(outcome: str) -> str:
     return {
+        "CANCELLED": "The operation was stopped by user. Completed results and evidence remain available.",
         "PASSED": "All test steps completed and the verified behavior passed.",
         "PRODUCT_FAILURE": "A trustworthy assertion detected unexpected product behavior.",
         "AUTOMATION_DRIFT": "The saved automation no longer matches the current UI.",
@@ -84,6 +87,8 @@ def recommended_action(outcome: str) -> str:
 
 
 def terminal_phase(outcome: str) -> str:
+    if outcome == "CANCELLED":
+        return "Stopped by user"
     if outcome == "PASSED":
         return "Completed — Passed"
     if outcome == "PRODUCT_FAILURE":

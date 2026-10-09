@@ -5,6 +5,7 @@ from google import genai
 from google.genai import types
 from pydantic import ValidationError
 
+from qa_agent.execution_control import current_cancellation, check_cancelled
 from ..models import AIDiscoveryResult, QATestPlan
 from .base import LLMProvider
 from .errors import (
@@ -241,6 +242,7 @@ class GeminiProvider(LLMProvider):
         options = {}
         if self.max_output_tokens is not None:
             options["generation_config"] = {"max_output_tokens": self.max_output_tokens}
-        if current_reliability_operation() is not None:
+        check_cancelled()
+        if current_reliability_operation() is not None or current_cancellation() is not None:
             options["timeout"] = provider_timeout(30.0)
         return options

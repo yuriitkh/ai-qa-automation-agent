@@ -18,6 +18,7 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from qa_agent.execution_control import completion_boundary
 from qa_agent.models import TestCase, TestStep
 from qa_agent.presentation import failure_message
 from qa_agent.result_semantics import result_outcome, result_label, terminal_phase, result_summary
@@ -53,6 +54,7 @@ class ExecutionEventType(str, Enum):
     PLAN_GENERATION_FAILED = "PLAN_GENERATION_FAILED"
     STEP_STARTED = "STEP_STARTED"
     STEP_PASSED = "STEP_PASSED"
+    STEP_CANCELLED = "STEP_CANCELLED"
     STEP_FAILED = "STEP_FAILED"
     STEP_BLOCKED = "STEP_BLOCKED"
     EVIDENCE_CAPTURED = "EVIDENCE_CAPTURED"
@@ -63,6 +65,8 @@ class ExecutionEventType(str, Enum):
 
 
 class ProgressState(str, Enum):
+    CANCELLATION_REQUESTED = "CANCELLATION_REQUESTED"
+    CANCELLED = "CANCELLED"
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
     FINISHED = "FINISHED"
@@ -84,6 +88,7 @@ class AuthoringEventType(str, Enum):
     DRAFT_CREATED = "DRAFT_CREATED"
     AUTHORING_FINISHED = "AUTHORING_FINISHED"
     AUTHORING_FAILED = "AUTHORING_FAILED"
+    AUTHORING_CANCELLED = "AUTHORING_CANCELLED"
 
 
 class ProgressStepState(str, Enum):
@@ -94,6 +99,7 @@ class ProgressStepState(str, Enum):
     PASSED = "PASSED"
     FAILED = "FAILED"
     BLOCKED = "BLOCKED"
+    CANCELLED = "CANCELLED"
     NOT_ATTEMPTED = "NOT_ATTEMPTED"
 
 
@@ -263,8 +269,8 @@ class ExecutionProgressSnapshot(BaseModel):
             summary["explanation"] = "A repaired automation candidate is saved and requires human review before execution."
             summary["recommended_action"] = "Review the saved automation, then explicitly approve it for Validation."
         if self.outcome == "CANCELLED":
-            summary["explanation"] = "Generation was cancelled. No further provider recovery will start."
-            summary["recommended_action"] = "Review any saved candidates before starting another operation."
+            summary["explanation"] = "The operation was stopped by user. Completed results and evidence remain available."
+            summary["recommended_action"] = "Review available results before starting another operation."
         summary["history_note"] = (
             "No persisted Run was created. Partial progress diagnostics are available for this request."
             if self.state == ProgressState.FINISHED and self.final_run_id is None else None
@@ -403,7 +409,7 @@ class AuthoringProgressSnapshot(BaseModel):
 
     @model_validator(mode="after")
     def terminal_state_is_coherent(self) -> "AuthoringProgressSnapshot":
-        terminal = self.state in {ProgressState.FINISHED, ProgressState.FAILED}
+        terminal = self.state in {ProgressState.FINISHED, ProgressState.FAILED, ProgressState.CANCELLED}
         if self.finished != terminal:
             raise ValueError("Authoring finished flag must match its lifecycle state.")
         if self.finished != (self.finished_at is not None):
@@ -593,7 +599,7 @@ class ExecutionProgressStore:
         with self._lock:
             self._prune(now)
             record = self._authoring_records.get(progress_id)
-            if record is None or record.state != ProgressState.FAILED or record.success is not False:
+            if record is None or record.state not in {ProgressState.FAILED, ProgressState.CANCELLED} or record.success is True:
                 return None
             return (
                 record.test_case_name,
@@ -613,7 +619,7 @@ class ExecutionProgressStore:
         now = self._now()
         with self._lock:
             record = self._require_authoring_record(progress_id)
-            if record.state in {ProgressState.FINISHED, ProgressState.FAILED}:
+            if record.state in {ProgressState.FINISHED, ProgressState.FAILED, ProgressState.CANCELLED}:
                 raise RuntimeError("Cannot append events to finished authoring progress.")
             _validate_authoring_event_order(record, event_type)
             timestamp = max(now, record.events[-1].timestamp) if record.events else now
@@ -661,7 +667,7 @@ class ExecutionProgressStore:
     ) -> None:
         with self._lock:
             record = self._require_authoring_record(progress_id)
-            if record.state in {ProgressState.FINISHED, ProgressState.FAILED}:
+            if record.state in {ProgressState.FINISHED, ProgressState.FAILED, ProgressState.CANCELLED}:
                 return
             success = review_url is not None
             if success:
@@ -672,9 +678,10 @@ class ExecutionProgressStore:
             else:
                 if not error_category or not error_message:
                     raise ValueError("Failed authoring requires a safe category and message.")
-                event_type = AuthoringEventType.AUTHORING_FAILED
+                event_type = AuthoringEventType.AUTHORING_CANCELLED if error_category == "CANCELLED" else AuthoringEventType.AUTHORING_FAILED
                 safe_message = error_message
-            _validate_authoring_event_order(record, event_type)
+            if error_category != "CANCELLED":
+                _validate_authoring_event_order(record, event_type)
             now = self._now()
             timestamp = max(now, record.events[-1].timestamp) if record.events else now
             record.events.append(AuthoringProgressEvent(
@@ -682,14 +689,21 @@ class ExecutionProgressStore:
                 timestamp=timestamp,
                 message=redact_secrets(safe_message),
             ))
-            record.state = ProgressState.FINISHED if success else ProgressState.FAILED
+            record.state = ProgressState.CANCELLED if error_category == "CANCELLED" else ProgressState.FINISHED if success else ProgressState.FAILED
             record.finished_at = timestamp
-            record.phase = "Ready for review" if success else "Finished"
-            record.success = success
+            record.phase = "Stopped by user" if error_category == "CANCELLED" else "Ready for review" if success else "Finished"
+            record.success = None if error_category == "CANCELLED" else success
             record.error_category = error_category
             record.error_message = redact_secrets(error_message) if error_message else None
             record.provider_failures = tuple(provider_failures[:8])
             record.review_url = review_url
+
+    def request_cancellation(self, progress_id: str, *, authoring: bool = False) -> None:
+        with self._lock:
+            record = self._require_authoring_record(progress_id) if authoring else self._require_record(progress_id)
+            if record.state not in {ProgressState.FINISHED, ProgressState.FAILED, ProgressState.CANCELLED}:
+                record.state = ProgressState.CANCELLATION_REQUESTED
+                record.phase = "Stopping… Cancellation requested; waiting for safe cleanup."
 
     def register_test_case(
         self,
@@ -769,7 +783,9 @@ class ExecutionProgressStore:
 
     def set_provider_diagnostics(self, progress_id: str, diagnostics: tuple[dict[str, Any], ...]) -> None:
         with self._lock:
-            self._require_record(progress_id).provider_diagnostics = diagnostics
+            record = self._require_record(progress_id)
+            if record.state != ProgressState.FINISHED:
+                record.provider_diagnostics = diagnostics
 
     def finish_for(
         self,
@@ -815,7 +831,8 @@ class ExecutionProgressStore:
             raise RuntimeError("Cannot append events to finished progress.")
         if event.event_type == ExecutionEventType.RUN_FINISHED and record.state == ProgressState.FINISHED:
             raise RuntimeError("Execution progress is already finished.")
-        if event.event_type in {ExecutionEventType.STEP_PASSED, ExecutionEventType.STEP_FAILED}:
+        stopping = record.state == ProgressState.CANCELLATION_REQUESTED
+        if event.event_type in {ExecutionEventType.STEP_PASSED, ExecutionEventType.STEP_FAILED, ExecutionEventType.STEP_CANCELLED}:
             if event.step_id not in record.running_step_ids:
                 raise ValueError("A step cannot finish before it has started.")
         record.events.append(event)
@@ -956,6 +973,10 @@ class ExecutionProgressStore:
                 clear_failure=True,
                 message=event.message,
             )
+        elif event.event_type == ExecutionEventType.STEP_CANCELLED:
+            if event.step_id is not None:
+                record.running_step_ids.discard(event.step_id)
+            self._update_step(record, event.step_id, state=ProgressStepState.CANCELLED, execution_state=ProgressStepState.CANCELLED, failure_classification="CANCELLED", message="Stopped by user.")
         elif event.event_type == ExecutionEventType.STEP_FAILED:
             if event.step_id is not None:
                 record.running_step_ids.discard(event.step_id)
@@ -991,14 +1012,14 @@ class ExecutionProgressStore:
                     ProgressStepState.RUNNING,
                 }:
                     record.steps[step_id] = step.model_copy(update={
-                        "state": ProgressStepState.FAILED,
-                        "execution_state": ProgressStepState.FAILED,
+                        "state": ProgressStepState.CANCELLED if event.outcome == "CANCELLED" else ProgressStepState.FAILED,
+                        "execution_state": ProgressStepState.CANCELLED if event.outcome == "CANCELLED" else ProgressStepState.FAILED,
                         "failure_classification": event.outcome or "INCONCLUSIVE",
                     })
                 elif step.state == ProgressStepState.PREPARING_AUTOMATION:
                     record.steps[step_id] = step.model_copy(update={
-                        "state": ProgressStepState.FAILED,
-                        "automation_state": "Failed",
+                        "state": ProgressStepState.NOT_ATTEMPTED if event.outcome == "CANCELLED" else ProgressStepState.FAILED,
+                        "automation_state": "Cancelled" if event.outcome == "CANCELLED" else "Failed",
                         "execution_state": ProgressStepState.NOT_ATTEMPTED,
                         "failure_classification": event.outcome or "INCONCLUSIVE",
                     })
@@ -1033,6 +1054,10 @@ class ExecutionProgressStore:
             record.error_category = event.error_category
             record.error_message = event.message
             record.duration_ms = event.duration_ms
+
+        if stopping and event.event_type != ExecutionEventType.RUN_FINISHED:
+            record.state = ProgressState.CANCELLATION_REQUESTED
+            record.phase = "Stopping… Cancellation requested; waiting for safe cleanup."
 
     @staticmethod
     def _update_step(
@@ -1134,7 +1159,7 @@ class ExecutionProgressStore:
             finished_at=record.finished_at,
             elapsed_ms=max(0, int((end - start).total_seconds() * 1000)),
             events=tuple(record.events),
-            finished=record.state in {ProgressState.FINISHED, ProgressState.FAILED},
+            finished=record.state in {ProgressState.FINISHED, ProgressState.FAILED, ProgressState.CANCELLED},
             success=record.success,
             error_category=record.error_category,
             error_message=record.error_message,
@@ -1162,7 +1187,7 @@ class ExecutionProgressStore:
             self._records.pop(item.progress_id, None)
         authoring_expired = [
             key for key, item in self._authoring_records.items()
-            if item.state in {ProgressState.FINISHED, ProgressState.FAILED}
+            if item.state in {ProgressState.FINISHED, ProgressState.FAILED, ProgressState.CANCELLED}
             and item.finished_at is not None
             and now - item.finished_at >= self._finished_ttl
         ]
@@ -1171,7 +1196,7 @@ class ExecutionProgressStore:
         finished_authoring = sorted(
             (
                 item for item in self._authoring_records.values()
-                if item.state in {ProgressState.FINISHED, ProgressState.FAILED}
+                if item.state in {ProgressState.FINISHED, ProgressState.FAILED, ProgressState.CANCELLED}
             ),
             key=lambda item: item.finished_at or item.requested_at,
         )
@@ -1266,12 +1291,17 @@ class AuthoringProgressReporter:
         *,
         provider_failures: tuple[ProviderFailureDetail, ...] = (),
     ) -> None:
-        self._store.finish_authoring(
-            self.progress_id,
-            error_category=category,
-            error_message=redact_secrets(message),
-            provider_failures=provider_failures,
-        )
+        with completion_boundary() as token:
+            if token is not None and token.requested:
+                category, message = "CANCELLED", "Stopped by user."
+            self._store.finish_authoring(
+                self.progress_id,
+                error_category=category,
+                error_message=redact_secrets(message),
+                provider_failures=provider_failures,
+            )
+            if token is not None:
+                token.sealed = True
 
 
 class ExecutionProgressReporter:
@@ -1289,6 +1319,9 @@ class ExecutionProgressReporter:
 
     def bind_run_context(self, run_context: RunContext) -> None:
         self.run_context = run_context
+
+    def request_cancellation(self) -> None:
+        self._store.request_cancellation(self.progress_id)
 
     def test_case_loaded(self, test_case: TestCase) -> None:
         name = self.safe_text(test_case.name)
@@ -1412,17 +1445,24 @@ class ExecutionProgressReporter:
                 f"Automation stopped at Step {failure.step_order + 1}: "
                 f"{failure.step_name}. {failure.safe_reason}"
             )
-        self._store.finish_for(
-            self.progress_id,
-            run_id=run_id,
-            run_status=run_status,
-            outcome=outcome,
-            error_category=error_category,
-            duration_ms=duration_ms,
-            status=run_status,
-            classification=outcome,
-            message=self.safe_text(message or failure_message(outcome)),
-        )
+        with completion_boundary() as token:
+            if token is not None and token.requested:
+                outcome = error_category = "CANCELLED"
+                run_status = "CANCELLED"
+                message = "Stopped by user."
+            self._store.finish_for(
+                self.progress_id,
+                run_id=run_id,
+                run_status=run_status,
+                outcome=outcome,
+                error_category=error_category,
+                duration_ms=duration_ms,
+                status=run_status,
+                classification=outcome,
+                message=self.safe_text(message or failure_message(outcome)),
+            )
+            if token is not None:
+                token.sealed = True
 
     def safe_text(self, value: Any) -> str:
         text = str(value)

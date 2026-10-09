@@ -13,6 +13,14 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from qa_agent.execution_control import (
+    CancellationToken,
+    current_cancellation,
+    cancellation_scope,
+    check_cancelled,
+    is_cancelled,
+    OperationCancelled,
+)
 from qa_agent.cookie_consent import (
     DEFAULT_COOKIE_CONSENT_POLICY,
     CookieConsentPolicy,
@@ -39,6 +47,8 @@ class AIPolicy(str, Enum):
 class SuiteRunStatus(str, Enum):
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
+    CANCELLATION_REQUESTED = "CANCELLATION_REQUESTED"
+    CANCELLED = "CANCELLED"
     COMPLETED = "COMPLETED"
     COMPLETED_WITH_FAILURES = "COMPLETED_WITH_FAILURES"
     INTERRUPTED = "INTERRUPTED"
@@ -53,6 +63,8 @@ class SuiteRunItemStatus(str, Enum):
     PASSED_AFTER_RETRY = "PASSED_AFTER_RETRY"
     FAILED = "FAILED"
     BLOCKED = "BLOCKED"
+    CANCELLED = "CANCELLED"
+    NOT_ATTEMPTED = "NOT_ATTEMPTED"
     NOT_RUN = "NOT_RUN"
     INTERRUPTED = "INTERRUPTED"
 
@@ -139,12 +151,12 @@ class SuiteRun(BaseModel):
 
     @property
     def outcome_counts(self) -> dict[str, int]:
-        counts = dict.fromkeys(("passed", "product_failures", "automation_errors", "generation_errors", "infrastructure_errors", "blocked", "inconclusive", "pending"), 0)
+        counts = dict.fromkeys(("passed", "product_failures", "automation_errors", "generation_errors", "infrastructure_errors", "blocked", "inconclusive", "pending", "cancelled", "not_attempted"), 0)
         categories = {
             "PASSED": "passed", "PRODUCT_FAILURE": "product_failures",
             "AUTOMATION_EXECUTION_ERROR": "automation_errors", "AUTOMATION_DRIFT": "automation_errors",
             "AUTOMATION_GENERATION_ERROR": "generation_errors", "INFRASTRUCTURE_ERROR": "infrastructure_errors",
-            "BLOCKED": "blocked", "INCONCLUSIVE": "inconclusive",
+            "BLOCKED": "blocked", "INCONCLUSIVE": "inconclusive", "CANCELLED": "cancelled", "NOT_ATTEMPTED": "not_attempted",
         }
         for item in self.items:
             counts[categories.get(suite_item_outcome(item), "pending")] += 1
@@ -208,6 +220,10 @@ class InMemorySuiteRunRepository(SuiteRunRepository):
         changed = 0
         now = datetime.now(timezone.utc)
         for run in list(self._runs.values()):
+            if run.status == SuiteRunStatus.CANCELLATION_REQUESTED:
+                save(recover_cancelled_suite(run))
+                changed += 1
+                continue
             if run.status not in {SuiteRunStatus.QUEUED, SuiteRunStatus.RUNNING}:
                 continue
             updated_items = []
@@ -276,6 +292,7 @@ class SuiteRunService:
         self._active_jobs = 0
         self._lock = Lock()
         self._closed = False
+        self._controls: dict[UUID, CancellationToken] = {}
         self._repository.interrupt_incomplete()
 
     def readiness_state(self) -> dict[str, int | bool]:
@@ -390,11 +407,13 @@ class SuiteRunService:
                     raise RuntimeError("Suite run service is closed.")
                 self._active_jobs += 1
                 reserved = True
+                self._controls[run.id] = CancellationToken()
                 self._executor.submit(self._execute_with_release, run.id)
         except Exception:
             if reserved:
                 with self._lock:
                     self._active_jobs -= 1
+                    self._controls.pop(run.id, None)
             self._capacity.release()
             logger.exception("Could not submit local Suite Run job")
             failed = run.model_copy(update={
@@ -409,19 +428,46 @@ class SuiteRunService:
     def get(self, public_id: str) -> SuiteRun | None:
         return self._repository.get_by_public_id(public_id)
 
+    def cancel(self, public_id: str) -> bool:
+        run = self.get(public_id)
+        if run is None:
+            return False
+        with self._lock:
+            token = self._controls.get(run.id)
+        if token is None:
+            return False
+        with token.lock:
+            current = self._repository.get(run.id)
+            if current is None or current.status not in {
+                SuiteRunStatus.QUEUED, SuiteRunStatus.RUNNING,
+                SuiteRunStatus.CANCELLATION_REQUESTED,
+            }:
+                return False
+            return token.request(lambda: self._repository.save(
+                current.model_copy(update={"status": SuiteRunStatus.CANCELLATION_REQUESTED})
+            ))
+
     def close(self) -> None:
         with self._lock:
             if self._closed:
                 return
             self._closed = True
+            controls = list(self._controls.values())
+        for token in controls:
+            token.request()
         self._executor.shutdown(wait=True, cancel_futures=False)
 
     def _execute_with_release(self, run_id: UUID) -> None:
+        token = self._controls[run_id]
         try:
-            self._execute(run_id)
+            with cancellation_scope(token):
+                self._execute(run_id)
         finally:
+            with token.lock:
+                token.sealed = True
             with self._lock:
                 self._active_jobs -= 1
+                self._controls.pop(run_id, None)
             self._capacity.release()
 
     def _execute(self, run_id: UUID) -> None:
@@ -432,29 +478,40 @@ class SuiteRunService:
         run = self._save(run.model_copy(update={"status": SuiteRunStatus.RUNNING, "started_at": now}))
         try:
             for index, item in enumerate(run.items):
+                check_cancelled()
                 run = self._run_item(run, index, item)
             final_status = (
                 SuiteRunStatus.COMPLETED_WITH_FAILURES
                 if any(item.status in {SuiteRunItemStatus.FAILED, SuiteRunItemStatus.INTERRUPTED} for item in run.items)
                 else SuiteRunStatus.COMPLETED
             )
-            self._save(run.model_copy(update={"status": final_status, "finished_at": datetime.now(timezone.utc)}))
+            token = current_cancellation()
+            with token.lock:
+                if token.requested:
+                    raise OperationCancelled()
+                self._save(run.model_copy(update={"status": final_status, "finished_at": datetime.now(timezone.utc)}))
+                token.sealed = True
         except Exception as error:
             logger.error("Suite Run stopped safely (%s)", type(error).__name__)
-            current = self._repository.get(run_id) or run
-            now = datetime.now(timezone.utc)
-            items = [
-                item.model_copy(update={"status": SuiteRunItemStatus.NOT_RUN})
-                if item.status in {SuiteRunItemStatus.QUEUED, SuiteRunItemStatus.RETRYING}
-                else item
-                for item in current.items
-            ]
-            self._save(current.model_copy(update={
-                "items": items,
-                "status": SuiteRunStatus.FAILED,
-                "finished_at": now,
-                "error_category": type(error).__name__,
-            }))
+            token = current_cancellation()
+            with token.lock:
+                current = self._repository.get(run_id) or run
+                now = datetime.now(timezone.utc)
+                cancelled = is_cancelled(error) or current_cancellation().requested
+                items = [
+                    item.model_copy(update={"status": SuiteRunItemStatus.NOT_ATTEMPTED if cancelled else SuiteRunItemStatus.NOT_RUN})
+                    if item.status in {SuiteRunItemStatus.QUEUED, SuiteRunItemStatus.RETRYING}
+                    else item.model_copy(update={"status": SuiteRunItemStatus.CANCELLED}) if cancelled and item.status == SuiteRunItemStatus.RUNNING
+                    else item
+                    for item in current.items
+                ]
+                self._save(current.model_copy(update={
+                    "items": items,
+                    "status": SuiteRunStatus.CANCELLED if is_cancelled(error) or current_cancellation().requested else SuiteRunStatus.FAILED,
+                    "finished_at": now,
+                    "error_category": "CANCELLED" if is_cancelled(error) or current_cancellation().requested else type(error).__name__,
+                }))
+                token.sealed = True
 
     def _run_item(self, run: SuiteRun, index: int, item: SuiteRunItem) -> SuiteRun:
         started_at = datetime.now(timezone.utc)
@@ -464,6 +521,7 @@ class SuiteRunService:
         max_attempts = run.config.retry_count + 1
         succeeded = False
         for attempt_number in range(1, max_attempts + 1):
+            check_cancelled()
             attempt_started = datetime.now(timezone.utc)
             run_id: UUID | None = None
             public_id: str | None = None
@@ -479,7 +537,9 @@ class SuiteRunService:
                 ))
                 with cookie_consent_scope(run.config.cookie_policy):
                     with evidence_policy_scope(run.config.evidence_policy):
-                        result = self._execution.run_pinned_regression(test_case, selected)
+                        with cancellation_scope(CancellationToken(parent=current_cancellation())):
+                            check_cancelled()
+                            result = self._execution.run_pinned_regression(test_case, selected)
                 run_id = result.test_run.id
                 record = self._history.get(run_id)
                 if record is None:
@@ -493,7 +553,9 @@ class SuiteRunService:
                 })
                 succeeded = status == "PASSED" and outcome == "PASSED"
             except Exception as error:
-                error_category = type(error).__name__
+                error_category = "CANCELLED" if is_cancelled(error) else type(error).__name__
+                if is_cancelled(error):
+                    status = outcome = "CANCELLED"
                 logger.warning("Suite item attempt failed safely (%s)", error_category)
                 succeeded = False
             finished = datetime.now(timezone.utc)
@@ -509,7 +571,7 @@ class SuiteRunService:
                 failure_classifications=classifications,
                 error_category=error_category,
             ))
-            if succeeded:
+            if succeeded or current_cancellation().requested:
                 break
             if attempt_number < max_attempts:
                 item = item.model_copy(update={"status": SuiteRunItemStatus.RETRYING, "attempts": attempts})
@@ -522,6 +584,7 @@ class SuiteRunService:
                 if succeeded and len(attempts) > 1
                 else SuiteRunItemStatus.PASSED
                 if succeeded
+                else SuiteRunItemStatus.CANCELLED if last_attempt.outcome == "CANCELLED"
                 else SuiteRunItemStatus.FAILED
             ),
             "attempts": attempts,
@@ -538,7 +601,13 @@ class SuiteRunService:
         return self._save(run.model_copy(update={"items": items}))
 
     def _save(self, run: SuiteRun) -> SuiteRun:
-        return self._repository.save(run)
+        token = current_cancellation()
+        if token is None:
+            return self._repository.save(run)
+        with token.lock:
+            if token.requested and run.status in {SuiteRunStatus.QUEUED, SuiteRunStatus.RUNNING}:
+                run = run.model_copy(update={"status": SuiteRunStatus.CANCELLATION_REQUESTED})
+            return self._repository.save(run)
 
 
 def suite_run_report_json(run: SuiteRun) -> str:
@@ -565,6 +634,8 @@ def suite_attempt_outcome(attempt: SuiteRunAttempt) -> str:
 def suite_item_outcome(item: SuiteRunItem) -> str:
     if item.status in {SuiteRunItemStatus.QUEUED, SuiteRunItemStatus.RUNNING, SuiteRunItemStatus.RETRYING}:
         return item.status.value
+    if item.status == SuiteRunItemStatus.NOT_ATTEMPTED:
+        return "NOT_ATTEMPTED"
     if item.status == SuiteRunItemStatus.BLOCKED:
         return "BLOCKED"
     if item.status in {SuiteRunItemStatus.NOT_RUN, SuiteRunItemStatus.INTERRUPTED}:
@@ -582,6 +653,10 @@ def suite_item_outcome(item: SuiteRunItem) -> str:
 
 
 def suite_status_label(run: SuiteRun) -> str:
+    if run.status == SuiteRunStatus.CANCELLATION_REQUESTED:
+        return "Stopping…"
+    if run.status == SuiteRunStatus.CANCELLED:
+        return "Stopped by user"
     if run.status in {SuiteRunStatus.QUEUED, SuiteRunStatus.RUNNING}:
         return run.status.value.title()
     if run.status in {SuiteRunStatus.INTERRUPTED, SuiteRunStatus.FAILED}:
@@ -592,3 +667,9 @@ def suite_status_label(run: SuiteRun) -> str:
 def suite_item_label(item: SuiteRunItem) -> str:
     outcome = suite_item_outcome(item)
     return "Passed after retry" if outcome == "PASSED" and item.status == SuiteRunItemStatus.PASSED_AFTER_RETRY else result_label(outcome)
+
+
+def recover_cancelled_suite(run: SuiteRun) -> SuiteRun:
+    """No completion timestamp is invented for work lost at process exit."""
+    items = [item.model_copy(update={"status": SuiteRunItemStatus.CANCELLED if item.status == SuiteRunItemStatus.RUNNING else SuiteRunItemStatus.NOT_ATTEMPTED}) if item.status in {SuiteRunItemStatus.RUNNING, SuiteRunItemStatus.QUEUED, SuiteRunItemStatus.RETRYING} else item for item in run.items]
+    return run.model_copy(update={"status": SuiteRunStatus.CANCELLED, "items": items, "error_category": "CANCELLED"})

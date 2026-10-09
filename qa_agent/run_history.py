@@ -171,6 +171,7 @@ class RunHistoryRecord(BaseModel):
                     if step.id in test_run.blocked_step_ids
                     else final_execution_by_step[step.id].status
                     if final_execution_by_step[step.id] is not None
+                    else ExecutionStatus.NOT_ATTEMPTED if step.id in test_run.not_attempted_step_ids
                     else None
                 ),
             )

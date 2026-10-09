@@ -457,7 +457,7 @@ def test_settings_and_operation_ui_validate_escape_and_persist(tmp_path):
         detail = app.handle("GET", f"/settings/reliability/{record.id}")
         assert detail.status == 200 and b"Attempt 1" in detail.body and b"Ready For Review" in detail.body
         assert b"Provider &lt;script&gt;" in detail.body and b"<script>" not in detail.body
-        assert app.handle("POST", f"/settings/reliability/{record.id}/cancel", "").status == 409
+        assert app.handle("POST", f"/settings/reliability/{record.id}/cancel", "", headers={"X-QA-CSRF": app._csrf_token}).status == 409
         assert app.handle("GET", f"/settings/reliability/{uuid4()}").status == 404
     finally:
         app.close()

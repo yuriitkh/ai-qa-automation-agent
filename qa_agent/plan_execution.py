@@ -7,6 +7,7 @@ from inspect import getattr_static
 from typing import Any, Callable
 from uuid import uuid4
 
+from qa_agent.execution_control import check_cancelled, OperationCancelled
 from qa_agent.execution_repository import ExecutionRepository
 from qa_agent.evidence_policy import EvidenceExecutionIdentity, EvidenceScope, evidence_execution_scope
 from qa_agent.execution_progress import (
@@ -28,6 +29,7 @@ from qa_agent.presentation import failure_message
 
 
 class PlanExecutionClassification(str, Enum):
+    CANCELLED = "CANCELLED"
     PASSED = "PASSED"
     PRODUCT_FAILURE = "PRODUCT_FAILURE"
     AUTOMATION_DRIFT = "AUTOMATION_DRIFT"
@@ -146,6 +148,7 @@ class PlanExecutionService:
         execution_error: Exception | None = None
         execution_id = uuid4()
         try:
+            check_cancelled()
             active_runner = runner if runner is not None else self._runner
             with evidence_execution_scope(EvidenceExecutionIdentity(execution_id, test_step.id)):
                 runner_output = active_runner(plan_version.qa_test_plan)
@@ -153,15 +156,18 @@ class PlanExecutionService:
                 raise TypeError("Browser runner must return a result dictionary.")
             runner_result = runner_output
             runner_status = runner_result.get("status")
-            if runner_status not in {"passed", "failed"}:
+            if runner_status not in {"passed", "failed", "cancelled"}:
                 raise ValueError(
                     f"Browser runner returned unsupported status {runner_status!r}."
                 )
+        except OperationCancelled:
+            runner_status = "cancelled"
         except Exception as error:
             execution_error = error
             runner_status = "failed"
 
         status = (
+            ExecutionStatus.CANCELLED if runner_status == "cancelled" else
             ExecutionStatus.PASSED
             if runner_status == "passed"
             else ExecutionStatus.FAILED
@@ -222,7 +228,9 @@ class PlanExecutionService:
                 evidence_index=evidence_index,
                 message="Screenshot evidence captured.",
             )
-        if status == ExecutionStatus.PASSED:
+        if status == ExecutionStatus.CANCELLED:
+            emit_progress_event(ExecutionEventType.STEP_CANCELLED, step=test_step, status=status.value, classification="CANCELLED", message="Stopped by user.")
+        elif status == ExecutionStatus.PASSED:
             emit_progress_event(
                 ExecutionEventType.STEP_PASSED,
                 step=test_step,
@@ -250,6 +258,8 @@ class PlanExecutionService:
         execution_error: Exception | None,
         plan_version: TestPlanVersion | None = None,
     ) -> PlanExecutionClassification:
+        if execution.status == ExecutionStatus.CANCELLED:
+            return PlanExecutionClassification.CANCELLED
         if execution_error is not None:
             return PlanExecutionClassification.INFRASTRUCTURE_ERROR
         if execution.status == ExecutionStatus.PASSED:

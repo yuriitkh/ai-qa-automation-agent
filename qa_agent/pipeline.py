@@ -3,12 +3,18 @@ import inspect
 from contextvars import copy_context
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 from uuid import UUID
 
 from pydantic import ValidationError
 
+from qa_agent.execution_control import (
+    check_cancelled,
+    current_cancellation,
+    is_cancelled,
+    completion_boundary,
+)
 from qa_agent.browser_discovery import capture_discovery_result, extract_target_url
 from qa_agent.assertion_grounding import validate_assertion_grounding
 from qa_agent.expected_result_coverage import validate_expected_result_coverage
@@ -80,6 +86,7 @@ class PipelineResult:
     # Step ids a BLOCK_REST failure policy prevented from executing.
     blocked_step_ids: list[UUID] = field(default_factory=list)
     run_context: RunContext = field(default_factory=RunContext, compare=False)
+    cancelled: bool = False
     test_run: TestRun = field(init=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -91,6 +98,7 @@ class PipelineResult:
                 self.executions,
                 blocked_step_ids=self.blocked_step_ids,
                 run_context=self.run_context,
+                cancelled=self.cancelled,
             ),
         )
 
@@ -176,6 +184,7 @@ class QATestPipeline:
         active_run_context = run_context if run_context is not None else RunContext()
         trace = self._create_trace_recorder(task)
         case_runner = self._plan_execution.new_test_case_runner()
+        cleanup_outcome = None
         with active_trace_recorder(trace):
             try:
                 try:
@@ -191,7 +200,13 @@ class QATestPipeline:
                     case_runner.close(primary_error=error)
                     raise
                 else:
-                    case_runner.close()
+                    try:
+                        case_runner.close()
+                    except Exception as error:
+                        if current_cancellation() is None or not current_cancellation().requested:
+                            raise
+                        from qa_agent.setup_orchestration import CleanupOutcome, CleanupFailure
+                        cleanup_outcome = CleanupOutcome((CleanupFailure("Browser cleanup", type(error).__name__, "Browser cleanup did not complete normally."),))
             except PipelineStageError as error:
                 error.trace = record_safely(
                     trace,
@@ -204,16 +219,25 @@ class QATestPipeline:
             except Exception as error:
                 record_safely(trace, "finalize", TraceStatus.ERROR, error=error)
                 raise
-        if self._run_history is not None:
-            self._run_history.record_completed_run(
-                result.test_case,
-                result.test_run,
-                workflow_type=WorkflowType.AUTOMATION,
-                outcome=_automation_run_outcome(result.test_run),
-                trace_id=result.trace.trace_id if result.trace is not None else None,
-                started_at=result.trace.started_at if result.trace is not None else None,
-                finished_at=result.trace.finished_at if result.trace is not None else None,
-            )
+        with completion_boundary() as token:
+            if token is not None and token.requested and not result.cancelled:
+                result = replace(result, cancelled=True)
+            if result.cancelled:
+                from datetime import datetime, timezone
+                object.__setattr__(result, "test_run", result.test_run.model_copy(update={"finished_at": datetime.now(timezone.utc)}))
+            if self._run_history is not None:
+                self._run_history.record_completed_run(
+                    result.test_case,
+                    result.test_run,
+                    workflow_type=WorkflowType.AUTOMATION,
+                    outcome=_automation_run_outcome(result.test_run),
+                    cleanup=cleanup_outcome,
+                    trace_id=result.trace.trace_id if result.trace is not None else None,
+                    started_at=result.trace.started_at if result.trace is not None else None,
+                    finished_at=result.test_run.finished_at if result.cancelled else result.trace.finished_at if result.trace is not None else None,
+                )
+            if token is not None:
+                token.sealed = True
         return result
 
     def _create_trace_recorder(self, task: str) -> ExecutionTraceRecorder:
@@ -221,6 +245,7 @@ class QATestPipeline:
 
     def _discover(self, target_url: str, case_runner=None) -> DiscoveryResult:
         """Keep discovery's Playwright runtime off the active browser thread."""
+        check_cancelled()
         if case_runner is not None and case_runner.browser_session_started:
             with ThreadPoolExecutor(
                 max_workers=1,
@@ -281,430 +306,462 @@ class QATestPipeline:
         generated_plans: list[GeneratedTestPlan] = []
         blocked_step_ids: list[UUID] = []
         ordered_steps = sorted(test_case.steps, key=lambda step: step.order)
+        cancelled = False
         for step_index, test_step in enumerate(ordered_steps):
-            step_target_url = segment_by_step[test_step.id].base_url or target_url
-            record_safely(trace, "begin_step", test_step)
             try:
-                cached_version = self._plan_store.find(test_step.id)
-            except Exception as error:
-                raise PipelineStageError(
-                    f"plan lookup (step {test_step.order}: {test_step.name})",
-                    str(error),
-                ) from error
-
-            record_safely(
-                trace,
-                "record_cache",
-                cached_version is not None,
-                cached_version,
-            )
-
-            if cached_version is not None:
+                check_cancelled()
+                step_target_url = segment_by_step[test_step.id].base_url or target_url
+                record_safely(trace, "begin_step", test_step)
                 try:
-                    cached_plan = self._plan_store.find_test_plan(test_step.id)
-                    if cached_plan is None:
-                        raise ValueError(
-                            "Cached TestPlan is unavailable for the stored TestPlanVersion."
-                        )
-                    generated_plan = GeneratedTestPlan(
-                        test_plan=cached_plan,
-                        test_plan_version=cached_version,
-                    )
-                    if cached_plan.test_step_id != test_step.id:
-                        raise ValueError("Cached TestPlan belongs to a different TestStep.")
-                    if cached_version.test_plan_id != cached_plan.id:
-                        raise ValueError("Cached TestPlanVersion belongs to a different TestPlan.")
-                    cached_executable_plan = validate_executable_plan(
-                        cached_version.qa_test_plan
-                    )
-                    generated_plan = GeneratedTestPlan(
-                        test_plan=cached_plan,
-                        test_plan_version=cached_version.model_copy(update={
-                            "qa_test_plan": cached_executable_plan,
-                        }),
-                    )
+                    cached_version = self._plan_store.find(test_step.id)
                 except Exception as error:
-                    emit_progress_event(
-                        ExecutionEventType.PLAN_GENERATION_FAILED,
-                        step=test_step,
-                        classification="MISSING_AUTOMATION",
-                        failure_code="SAVED_PLAN_INVALID",
-                        prior_plan_exists=True,
-                        new_plan_saved=False,
-                        message="Saved automation could not be loaded.",
-                    )
+                    if is_cancelled(error):
+                        raise
                     raise PipelineStageError(
                         f"plan lookup (step {test_step.order}: {test_step.name})",
                         str(error),
                     ) from error
-                emit_progress_event(
-                    ExecutionEventType.PLAN_REUSED,
-                    step=test_step,
-                    plan_origin=cached_version.origin.value if cached_version.origin is not None else "SAVED",
-                    plan_version=cached_version.version,
-                    plan_version_id=cached_version.id,
-                    message="Saved automation loaded.",
+
+                record_safely(
+                    trace,
+                    "record_cache",
+                    cached_version is not None,
+                    cached_version,
                 )
-            else:
-                emit_progress_event(
-                    ExecutionEventType.PLAN_GENERATION_STARTED,
-                    step=test_step,
-                    message="Preparing automation for this step.",
+
+                if cached_version is not None:
+                    try:
+                        cached_plan = self._plan_store.find_test_plan(test_step.id)
+                        if cached_plan is None:
+                            raise ValueError(
+                                "Cached TestPlan is unavailable for the stored TestPlanVersion."
+                            )
+                        generated_plan = GeneratedTestPlan(
+                            test_plan=cached_plan,
+                            test_plan_version=cached_version,
+                        )
+                        if cached_plan.test_step_id != test_step.id:
+                            raise ValueError("Cached TestPlan belongs to a different TestStep.")
+                        if cached_version.test_plan_id != cached_plan.id:
+                            raise ValueError("Cached TestPlanVersion belongs to a different TestPlan.")
+                        cached_executable_plan = validate_executable_plan(
+                            cached_version.qa_test_plan
+                        )
+                        generated_plan = GeneratedTestPlan(
+                            test_plan=cached_plan,
+                            test_plan_version=cached_version.model_copy(update={
+                                "qa_test_plan": cached_executable_plan,
+                            }),
+                        )
+                    except Exception as error:
+                        if is_cancelled(error):
+                            raise
+                        emit_progress_event(
+                            ExecutionEventType.PLAN_GENERATION_FAILED,
+                            step=test_step,
+                            classification="MISSING_AUTOMATION",
+                            failure_code="SAVED_PLAN_INVALID",
+                            prior_plan_exists=True,
+                            new_plan_saved=False,
+                            message="Saved automation could not be loaded.",
+                        )
+                        raise PipelineStageError(
+                            f"plan lookup (step {test_step.order}: {test_step.name})",
+                            str(error),
+                        ) from error
+                    emit_progress_event(
+                        ExecutionEventType.PLAN_REUSED,
+                        step=test_step,
+                        plan_origin=cached_version.origin.value if cached_version.origin is not None else "SAVED",
+                        plan_version=cached_version.version,
+                        plan_version_id=cached_version.id,
+                        message="Saved automation loaded.",
+                    )
+                else:
+                    emit_progress_event(
+                        ExecutionEventType.PLAN_GENERATION_STARTED,
+                        step=test_step,
+                        message="Preparing automation for this step.",
+                    )
+                    discovery_started = time.perf_counter()
+                    try:
+                        with llm_usage_scope(
+                            operation_type=OP_DISCOVERY,
+                            related_test_case_id=test_case.id,
+                            related_test_case_public_id=test_case.public_id,
+                        ):
+                            discovery_result = self._discover(step_target_url, case_runner)
+                        if (discovery_result.status != DiscoveryStatus.SUCCESS
+                                and self._discovery_fallback is not None):
+                            fallback_started = time.perf_counter()
+                            try:
+                                with llm_usage_scope(
+                                    operation_type=OP_DISCOVERY,
+                                    related_test_case_id=test_case.id,
+                                    related_test_case_public_id=test_case.public_id,
+                                ):
+                                    check_cancelled()
+                                    suggestions = self._discovery_fallback.discover(
+                                        task, step_target_url, test_step, discovery_result
+                                    )
+                            except Exception as fallback_error:
+                                # Evidence-first ordering (same principle as the
+                                # P0-2 fix): the deterministic discovery already
+                                # returned a result and the fallback attempt
+                                # happened, so record both before the failure
+                                # propagates. record_safely is best-effort and
+                                # cannot mask the original error.
+                                record_safely(
+                                    trace,
+                                    "record_discovery",
+                                    discovery_result,
+                                    elapsed_ms(discovery_started),
+                                )
+                                record_safely(
+                                    trace,
+                                    "record_discovery_fallback_failure",
+                                    fallback_error,
+                                    elapsed_ms(fallback_started),
+                                )
+                                raise
+                            record_safely(
+                                trace,
+                                "record_discovery_fallback",
+                                suggestions,
+                                elapsed_ms(fallback_started),
+                            )
+                            discovery_result = discovery_result.model_copy(update={
+                                "status": (DiscoveryStatus.PARTIAL if discovery_result.status == DiscoveryStatus.FAILED
+                                           and (suggestions.navigation_paths or suggestions.direct_navigation_paths
+                                                or suggestions.interactive_elements)
+                                           else discovery_result.status),
+                                "navigation_paths": discovery_result.navigation_paths + suggestions.navigation_paths,
+                                "direct_navigation_paths": discovery_result.direct_navigation_paths + suggestions.direct_navigation_paths,
+                                "interactive_elements": discovery_result.interactive_elements + suggestions.interactive_elements,
+                                "warnings": discovery_result.warnings + suggestions.warnings,
+                            })
+                        record_safely(
+                            trace,
+                            "record_discovery",
+                            discovery_result,
+                            elapsed_ms(discovery_started),
+                        )
+                        if discovery_result.status == DiscoveryStatus.FAILED:
+                            details = "; ".join(discovery_result.warnings) or "No details provided."
+                            raise RuntimeError(f"Browser discovery returned FAILED: {details}")
+                    except Exception as error:
+                        if is_cancelled(error):
+                            raise
+                        emit_progress_event(
+                            ExecutionEventType.PLAN_GENERATION_FAILED,
+                            step=test_step,
+                            classification="INFRASTRUCTURE_ERROR",
+                            failure_code="DISCOVERY_FAILED",
+                            prior_plan_exists=False,
+                            new_plan_saved=False,
+                            message="The browser could not inspect the target page.",
+                        )
+                        raise PipelineStageError(
+                            f"discovery (step {test_step.order}: {test_step.name})",
+                            str(error),
+                        ) from error
+
+                    generation_started = time.perf_counter()
+                    try:
+                        with llm_usage_scope(
+                            related_test_case_id=test_case.id,
+                            related_test_case_public_id=test_case.public_id,
+                        ):
+                            check_cancelled()
+                            generated_plan = self._plan_generator.generate_with_plan(
+                                test_step,
+                                discovery_result,
+                                **_requirement_context_kwargs(
+                                    self._plan_generator, test_case.description
+                                ),
+                            )
+                        generated_plan = _validate_generated_plan(
+                            generated_plan,
+                            test_step,
+                            discovery_result=discovery_result,
+                            requirement_context=test_case.description,
+                            expected_version=1,
+                        )
+                        generated_plan = _with_discovered_locator_identity(
+                            generated_plan, discovery_result
+                        )
+                        generated_plan = _with_plan_origin(
+                            generated_plan, PlanVersionOrigin.AI_GENERATED
+                        )
+                    except Exception as error:
+                        if is_cancelled(error):
+                            raise
+                        failure_code, safe_reason = _generation_failure_details(error)
+                        emit_progress_event(
+                            ExecutionEventType.PLAN_GENERATION_FAILED,
+                            step=test_step,
+                            classification="AUTOMATION_GENERATION_ERROR",
+                            failure_code=failure_code,
+                            prior_plan_exists=False,
+                            new_plan_saved=False,
+                            message=safe_reason,
+                            validation_issues=(error.issues if isinstance(error, PlanValidationError) else ()),
+                        )
+                        raise PipelineStageError(
+                            f"plan generation (step {test_step.order}: {test_step.name})",
+                            str(error),
+                        ) from error
+                    record_safely(
+                        trace,
+                        "record_plan_generation",
+                        generated_plan.test_plan.id,
+                        generated_plan.test_plan_version.id,
+                        generated_plan.test_plan_version.version,
+                        len(generated_plan.test_plan_version.qa_test_plan.steps),
+                        elapsed_ms(generation_started),
+                    )
+
+                    try:
+                        with completion_boundary():
+                            check_cancelled()
+                            self._plan_store.save(
+                                test_step.id,
+                                generated_plan.test_plan_version,
+                                test_plan=generated_plan.test_plan,
+                            )
+                    except Exception as error:
+                        if is_cancelled(error):
+                            raise
+                        emit_progress_event(
+                            ExecutionEventType.PLAN_GENERATION_FAILED,
+                            step=test_step,
+                            classification="INFRASTRUCTURE_ERROR",
+                            failure_code="PLAN_PERSISTENCE_FAILED",
+                            prior_plan_exists=False,
+                            new_plan_saved=False,
+                            message="Generated automation could not be saved.",
+                        )
+                        raise PipelineStageError(
+                            f"plan save (step {test_step.order}: {test_step.name})",
+                            str(error),
+                        ) from error
+                    emit_progress_event(
+                        ExecutionEventType.PLAN_GENERATED,
+                        step=test_step,
+                        plan_origin=(generated_plan.test_plan_version.origin.value
+                                     if generated_plan.test_plan_version.origin is not None
+                                     else "AI_GENERATED"),
+                        plan_version=generated_plan.test_plan_version.version,
+                        plan_version_id=generated_plan.test_plan_version.id,
+                        message="Automation generated for this step.",
+                    )
+
+                plan_version = generated_plan.test_plan_version
+                generated_plans.append(generated_plan)
+                supervisor = getattr(self._plan_generator, "supervisor", None)
+                candidate = supervisor.requires_review(plan_version.id) if supervisor else None
+                if candidate is not None and not self._candidate_review_approved(test_case):
+                    review = AutomationReviewRequired(candidate.id)
+                    emit_progress_event(ExecutionEventType.RELIABILITY_READY_FOR_REVIEW, step=test_step, message=str(review), reliability_operation_id=candidate.id)
+                    raise PipelineStageError("automation review", str(review)) from review
+                execution_outcome = self._execute_plan(
+                    test_step, plan_version, trace,
+                    runner=case_runner.for_step(test_step) if case_runner is not None else None,
                 )
-                discovery_started = time.perf_counter()
+                execution = execution_outcome.execution
+                executions.append(execution)
+                if current_cancellation() is not None and current_cancellation().requested:
+                    cancelled = True
+                    break
+
+                if (
+                    isinstance(execution.runner_result, dict)
+                    and execution.runner_result.get("cookie_consent_requires_attention") is True
+                ):
+                    blocked_step_ids = [
+                        step.id for step in ordered_steps[step_index + 1:]
+                    ]
+                    _emit_blocked_steps(ordered_steps[step_index + 1:])
+                    break
+
+                if execution_outcome.classification != PlanExecutionClassification.AUTOMATION_DRIFT:
+                    # Explicit failure policy: a step whose final outcome is
+                    # FAILED may still continue the TestCase (CONTINUE) or stop
+                    # it entirely (BLOCK_REST); the decision is never implicit.
+                    if _should_block_rest(test_step, execution):
+                        blocked_step_ids = [
+                            step.id for step in ordered_steps[step_index + 1:]
+                        ]
+                        _emit_blocked_steps(ordered_steps[step_index + 1:])
+                        break
+                    continue
+
+                if supervisor is not None:
+                    # Execution drift is outside generation recovery; saved versions stay pinned.
+                    emit_progress_event(ExecutionEventType.PLAN_REPAIR_FAILED, step=test_step, message="Automation drift requires human review; no automatic locator repair was attempted.")
+                    if _should_block_rest(test_step, execution):
+                        blocked_step_ids = [step.id for step in ordered_steps[step_index + 1:]]
+                        _emit_blocked_steps(ordered_steps[step_index + 1:])
+                        break
+                    continue
+
+                rediscovery_started = time.perf_counter()
                 try:
                     with llm_usage_scope(
                         operation_type=OP_DISCOVERY,
                         related_test_case_id=test_case.id,
                         related_test_case_public_id=test_case.public_id,
                     ):
-                        discovery_result = self._discover(step_target_url, case_runner)
-                    if (discovery_result.status != DiscoveryStatus.SUCCESS
-                            and self._discovery_fallback is not None):
-                        fallback_started = time.perf_counter()
-                        try:
-                            with llm_usage_scope(
-                                operation_type=OP_DISCOVERY,
-                                related_test_case_id=test_case.id,
-                                related_test_case_public_id=test_case.public_id,
-                            ):
-                                suggestions = self._discovery_fallback.discover(
-                                    task, step_target_url, test_step, discovery_result
-                                )
-                        except Exception as fallback_error:
-                            # Evidence-first ordering (same principle as the
-                            # P0-2 fix): the deterministic discovery already
-                            # returned a result and the fallback attempt
-                            # happened, so record both before the failure
-                            # propagates. record_safely is best-effort and
-                            # cannot mask the original error.
-                            record_safely(
-                                trace,
-                                "record_discovery",
-                                discovery_result,
-                                elapsed_ms(discovery_started),
-                            )
-                            record_safely(
-                                trace,
-                                "record_discovery_fallback_failure",
-                                fallback_error,
-                                elapsed_ms(fallback_started),
-                            )
-                            raise
-                        record_safely(
-                            trace,
-                            "record_discovery_fallback",
-                            suggestions,
-                            elapsed_ms(fallback_started),
-                        )
-                        discovery_result = discovery_result.model_copy(update={
-                            "status": (DiscoveryStatus.PARTIAL if discovery_result.status == DiscoveryStatus.FAILED
-                                       and (suggestions.navigation_paths or suggestions.direct_navigation_paths
-                                            or suggestions.interactive_elements)
-                                       else discovery_result.status),
-                            "navigation_paths": discovery_result.navigation_paths + suggestions.navigation_paths,
-                            "direct_navigation_paths": discovery_result.direct_navigation_paths + suggestions.direct_navigation_paths,
-                            "interactive_elements": discovery_result.interactive_elements + suggestions.interactive_elements,
-                            "warnings": discovery_result.warnings + suggestions.warnings,
-                        })
+                        rediscovery_result = self._discover(step_target_url, case_runner)
+                except Exception as error:
+                    if is_cancelled(error):
+                        raise
+                    # The rediscovery callable itself failed, so no result object
+                    # exists; record a FAILED attempt anyway so an attempted
+                    # rediscovery is never invisible in the trace. The pipeline
+                    # still aborts before recovery/regeneration, and the AI
+                    # fallback remains unused on this path.
                     record_safely(
                         trace,
                         "record_discovery",
-                        discovery_result,
-                        elapsed_ms(discovery_started),
-                    )
-                    if discovery_result.status == DiscoveryStatus.FAILED:
-                        details = "; ".join(discovery_result.warnings) or "No details provided."
-                        raise RuntimeError(f"Browser discovery returned FAILED: {details}")
-                except Exception as error:
-                    emit_progress_event(
-                        ExecutionEventType.PLAN_GENERATION_FAILED,
-                        step=test_step,
-                        classification="INFRASTRUCTURE_ERROR",
-                        failure_code="DISCOVERY_FAILED",
-                        prior_plan_exists=False,
-                        new_plan_saved=False,
-                        message="The browser could not inspect the target page.",
+                        DiscoveryResult(
+                            status=DiscoveryStatus.FAILED,
+                            url=step_target_url,
+                            warnings=[str(error)],
+                        ),
+                        elapsed_ms(rediscovery_started),
                     )
                     raise PipelineStageError(
-                        f"discovery (step {test_step.order}: {test_step.name})",
+                        f"rediscovery (step {test_step.order}: {test_step.name})",
                         str(error),
                     ) from error
 
-                generation_started = time.perf_counter()
-                try:
-                    with llm_usage_scope(
-                        related_test_case_id=test_case.id,
-                        related_test_case_public_id=test_case.public_id,
-                    ):
-                        generated_plan = self._plan_generator.generate_with_plan(
-                            test_step,
-                            discovery_result,
-                            **_requirement_context_kwargs(
-                                self._plan_generator, test_case.description
-                            ),
-                        )
-                    generated_plan = _validate_generated_plan(
-                        generated_plan,
-                        test_step,
-                        discovery_result=discovery_result,
-                        requirement_context=test_case.description,
-                        expected_version=1,
-                    )
-                    generated_plan = _with_discovered_locator_identity(
-                        generated_plan, discovery_result
-                    )
-                    generated_plan = _with_plan_origin(
-                        generated_plan, PlanVersionOrigin.AI_GENERATED
-                    )
-                except Exception as error:
-                    failure_code, safe_reason = _generation_failure_details(error)
-                    emit_progress_event(
-                        ExecutionEventType.PLAN_GENERATION_FAILED,
-                        step=test_step,
-                        classification="AUTOMATION_GENERATION_ERROR",
-                        failure_code=failure_code,
-                        prior_plan_exists=False,
-                        new_plan_saved=False,
-                        message=safe_reason,
-                        validation_issues=(error.issues if isinstance(error, PlanValidationError) else ()),
-                    )
-                    raise PipelineStageError(
-                        f"plan generation (step {test_step.order}: {test_step.name})",
-                        str(error),
-                    ) from error
-                record_safely(
-                    trace,
-                    "record_plan_generation",
-                    generated_plan.test_plan.id,
-                    generated_plan.test_plan_version.id,
-                    generated_plan.test_plan_version.version,
-                    len(generated_plan.test_plan_version.qa_test_plan.steps),
-                    elapsed_ms(generation_started),
-                )
-
-                try:
-                    self._plan_store.save(
-                        test_step.id,
-                        generated_plan.test_plan_version,
-                        test_plan=generated_plan.test_plan,
-                    )
-                except Exception as error:
-                    emit_progress_event(
-                        ExecutionEventType.PLAN_GENERATION_FAILED,
-                        step=test_step,
-                        classification="INFRASTRUCTURE_ERROR",
-                        failure_code="PLAN_PERSISTENCE_FAILED",
-                        prior_plan_exists=False,
-                        new_plan_saved=False,
-                        message="Generated automation could not be saved.",
-                    )
-                    raise PipelineStageError(
-                        f"plan save (step {test_step.order}: {test_step.name})",
-                        str(error),
-                    ) from error
-                emit_progress_event(
-                    ExecutionEventType.PLAN_GENERATED,
-                    step=test_step,
-                    plan_origin=(generated_plan.test_plan_version.origin.value
-                                 if generated_plan.test_plan_version.origin is not None
-                                 else "AI_GENERATED"),
-                    plan_version=generated_plan.test_plan_version.version,
-                    plan_version_id=generated_plan.test_plan_version.id,
-                    message="Automation generated for this step.",
-                )
-
-            plan_version = generated_plan.test_plan_version
-            generated_plans.append(generated_plan)
-            supervisor = getattr(self._plan_generator, "supervisor", None)
-            candidate = supervisor.requires_review(plan_version.id) if supervisor else None
-            if candidate is not None and not self._candidate_review_approved(test_case):
-                review = AutomationReviewRequired(candidate.id)
-                emit_progress_event(ExecutionEventType.RELIABILITY_READY_FOR_REVIEW, step=test_step, message=str(review), reliability_operation_id=candidate.id)
-                raise PipelineStageError("automation review", str(review)) from review
-            execution_outcome = self._execute_plan(
-                test_step, plan_version, trace,
-                runner=case_runner.for_step(test_step) if case_runner is not None else None,
-            )
-            execution = execution_outcome.execution
-            executions.append(execution)
-
-            if (
-                isinstance(execution.runner_result, dict)
-                and execution.runner_result.get("cookie_consent_requires_attention") is True
-            ):
-                blocked_step_ids = [
-                    step.id for step in ordered_steps[step_index + 1:]
-                ]
-                _emit_blocked_steps(ordered_steps[step_index + 1:])
-                break
-
-            if execution_outcome.classification != PlanExecutionClassification.AUTOMATION_DRIFT:
-                # Explicit failure policy: a step whose final outcome is
-                # FAILED may still continue the TestCase (CONTINUE) or stop
-                # it entirely (BLOCK_REST); the decision is never implicit.
-                if _should_block_rest(test_step, execution):
-                    blocked_step_ids = [
-                        step.id for step in ordered_steps[step_index + 1:]
-                    ]
-                    _emit_blocked_steps(ordered_steps[step_index + 1:])
-                    break
-                continue
-
-            if supervisor is not None:
-                # Execution drift is outside generation recovery; saved versions stay pinned.
-                emit_progress_event(ExecutionEventType.PLAN_REPAIR_FAILED, step=test_step, message="Automation drift requires human review; no automatic locator repair was attempted.")
-                if _should_block_rest(test_step, execution):
-                    blocked_step_ids = [step.id for step in ordered_steps[step_index + 1:]]
-                    _emit_blocked_steps(ordered_steps[step_index + 1:])
-                    break
-                continue
-
-            rediscovery_started = time.perf_counter()
-            try:
-                with llm_usage_scope(
-                    operation_type=OP_DISCOVERY,
-                    related_test_case_id=test_case.id,
-                    related_test_case_public_id=test_case.public_id,
-                ):
-                    rediscovery_result = self._discover(step_target_url, case_runner)
-            except Exception as error:
-                # The rediscovery callable itself failed, so no result object
-                # exists; record a FAILED attempt anyway so an attempted
-                # rediscovery is never invisible in the trace. The pipeline
-                # still aborts before recovery/regeneration, and the AI
-                # fallback remains unused on this path.
+                # Record the attempt BEFORE the FAILED check so a rediscovery
+                # that halts the run is still represented in the trace; a
+                # successful rediscovery is recorded exactly once here, as before.
                 record_safely(
                     trace,
                     "record_discovery",
-                    DiscoveryResult(
-                        status=DiscoveryStatus.FAILED,
-                        url=step_target_url,
-                        warnings=[str(error)],
-                    ),
+                    rediscovery_result,
                     elapsed_ms(rediscovery_started),
                 )
-                raise PipelineStageError(
-                    f"rediscovery (step {test_step.order}: {test_step.name})",
-                    str(error),
-                ) from error
-
-            # Record the attempt BEFORE the FAILED check so a rediscovery
-            # that halts the run is still represented in the trace; a
-            # successful rediscovery is recorded exactly once here, as before.
-            record_safely(
-                trace,
-                "record_discovery",
-                rediscovery_result,
-                elapsed_ms(rediscovery_started),
-            )
-            if rediscovery_result.status == DiscoveryStatus.FAILED:
-                details = "; ".join(rediscovery_result.warnings) or "No details provided."
-                reason = f"Browser rediscovery returned FAILED: {details}"
-                raise PipelineStageError(
-                    f"rediscovery (step {test_step.order}: {test_step.name})",
-                    reason,
-                ) from RuntimeError(reason)
-
-            failed_interaction = execution.planned_interaction(plan_version)
-            recovery = None
-            if failed_interaction is not None and failed_interaction.action in {"click", "check", "uncheck", "fill"}:
-                original_identity = next((
-                    item for item in (plan_version.locator_identity or ())
-                    if item.step_index == execution.planned_step_index
-                ), None)
-                recovery = recover_locator(
-                    failed_interaction, rediscovery_result, original_identity
-                )
-            record_safely(trace, "record_locator_recovery", recovery)
-
-            if recovery is not None and recovery.status in {
-                RecoveryStatus.MATCHED_HIGH_CONFIDENCE,
-                RecoveryStatus.MATCHED_ACCEPTABLE,
-            }:
-                candidate = recovery.candidate
-                if candidate is None:
+                if rediscovery_result.status == DiscoveryStatus.FAILED:
+                    details = "; ".join(rediscovery_result.warnings) or "No details provided."
+                    reason = f"Browser rediscovery returned FAILED: {details}"
                     raise PipelineStageError(
-                        f"locator recovery (step {test_step.order}: {test_step.name})",
-                        "MATCHED result did not contain a candidate.",
+                        f"rediscovery (step {test_step.order}: {test_step.name})",
+                        reason,
+                    ) from RuntimeError(reason)
+
+                failed_interaction = execution.planned_interaction(plan_version)
+                recovery = None
+                if failed_interaction is not None and failed_interaction.action in {"click", "check", "uncheck", "fill"}:
+                    original_identity = next((
+                        item for item in (plan_version.locator_identity or ())
+                        if item.step_index == execution.planned_step_index
+                    ), None)
+                    recovery = recover_locator(
+                        failed_interaction, rediscovery_result, original_identity
                     )
-                if execution.planned_step_index is None:
-                    raise PipelineStageError(
-                        f"locator recovery (step {test_step.order}: {test_step.name})",
-                        "Recovery did not identify the planned interaction.",
-                    )
-                try:
-                    repaired_plan = _replace_interaction_selector(
-                        plan_version.qa_test_plan,
-                        execution.planned_step_index,
-                        candidate.selector,
-                    )
-                    repaired_version = TestPlanVersion(
-                        test_plan_id=generated_plan.test_plan.id,
-                        version=plan_version.version + 1,
-                        origin=PlanVersionOrigin.REPAIRED,
-                        qa_test_plan=repaired_plan,
-                        assertion_grounding=plan_version.assertion_grounding,
-                        locator_identity=_replace_locator_identity(
-                            plan_version.locator_identity,
+                record_safely(trace, "record_locator_recovery", recovery)
+
+                if recovery is not None and recovery.status in {
+                    RecoveryStatus.MATCHED_HIGH_CONFIDENCE,
+                    RecoveryStatus.MATCHED_ACCEPTABLE,
+                }:
+                    candidate = recovery.candidate
+                    if candidate is None:
+                        raise PipelineStageError(
+                            f"locator recovery (step {test_step.order}: {test_step.name})",
+                            "MATCHED result did not contain a candidate.",
+                        )
+                    if execution.planned_step_index is None:
+                        raise PipelineStageError(
+                            f"locator recovery (step {test_step.order}: {test_step.name})",
+                            "Recovery did not identify the planned interaction.",
+                        )
+                    try:
+                        repaired_plan = _replace_interaction_selector(
+                            plan_version.qa_test_plan,
                             execution.planned_step_index,
-                            identity_for_element(
+                            candidate.selector,
+                        )
+                        repaired_version = TestPlanVersion(
+                            test_plan_id=generated_plan.test_plan.id,
+                            version=plan_version.version + 1,
+                            origin=PlanVersionOrigin.REPAIRED,
+                            qa_test_plan=repaired_plan,
+                            assertion_grounding=plan_version.assertion_grounding,
+                            locator_identity=_replace_locator_identity(
+                                plan_version.locator_identity,
                                 execution.planned_step_index,
-                                candidate,
-                                failed_interaction.action,
+                                identity_for_element(
+                                    execution.planned_step_index,
+                                    candidate,
+                                    failed_interaction.action,
+                                ),
                             ),
-                        ),
+                        )
+                        repaired = GeneratedTestPlan(
+                            test_plan=generated_plan.test_plan,
+                            test_plan_version=repaired_version,
+                        )
+                        with completion_boundary():
+                            check_cancelled()
+                            self._plan_store.save(
+                                test_step.id, repaired_version, test_plan=repaired.test_plan
+                            )
+                    except Exception as error:
+                        if is_cancelled(error):
+                            raise
+                        raise PipelineStageError(
+                            f"deterministic repair (step {test_step.order}: {test_step.name})",
+                            str(error),
+                        ) from error
+                    generated_plans.append(repaired)
+                    emit_progress_event(
+                        ExecutionEventType.PLAN_REPAIR_SUCCEEDED,
+                        step=test_step,
+                        plan_origin=PlanVersionOrigin.REPAIRED.value,
+                        plan_version=repaired_version.version,
+                        plan_version_id=repaired_version.id,
+                        message="Saved automation repaired using current page evidence.",
                     )
-                    repaired = GeneratedTestPlan(
-                        test_plan=generated_plan.test_plan,
-                        test_plan_version=repaired_version,
+                    repaired_outcome = self._execute_plan(
+                        test_step, repaired_version, trace,
+                        runner=case_runner.for_step(test_step) if case_runner is not None else None,
                     )
-                    self._plan_store.save(
-                        test_step.id, repaired_version, test_plan=repaired.test_plan
-                    )
-                except Exception as error:
-                    raise PipelineStageError(
-                        f"deterministic repair (step {test_step.order}: {test_step.name})",
-                        str(error),
-                    ) from error
-                generated_plans.append(repaired)
+                    repaired_execution = repaired_outcome.execution
+                    executions.append(repaired_execution)
+                    if _should_block_rest(test_step, repaired_execution):
+                        blocked_step_ids = [
+                            step.id for step in ordered_steps[step_index + 1:]
+                        ]
+                        _emit_blocked_steps(ordered_steps[step_index + 1:])
+                        break
+                    continue
+
                 emit_progress_event(
-                    ExecutionEventType.PLAN_REPAIR_SUCCEEDED,
+                    ExecutionEventType.PLAN_REPAIR_FAILED,
                     step=test_step,
-                    plan_origin=PlanVersionOrigin.REPAIRED.value,
-                    plan_version=repaired_version.version,
-                    plan_version_id=repaired_version.id,
-                    message="Saved automation repaired using current page evidence.",
+                    message=_safe_locator_recovery_message(recovery),
                 )
-                repaired_outcome = self._execute_plan(
-                    test_step, repaired_version, trace,
-                    runner=case_runner.for_step(test_step) if case_runner is not None else None,
-                )
-                repaired_execution = repaired_outcome.execution
-                executions.append(repaired_execution)
-                if _should_block_rest(test_step, repaired_execution):
+                if _should_block_rest(test_step, execution):
                     blocked_step_ids = [
                         step.id for step in ordered_steps[step_index + 1:]
                     ]
                     _emit_blocked_steps(ordered_steps[step_index + 1:])
                     break
+                # Ambiguous, conflicting, or missing evidence is automation drift.
+                # Keep the original failed execution and leave the saved version
+                # untouched for review; do not ask an LLM to choose a replacement.
                 continue
 
-            emit_progress_event(
-                ExecutionEventType.PLAN_REPAIR_FAILED,
-                step=test_step,
-                message=_safe_locator_recovery_message(recovery),
-            )
-            if _should_block_rest(test_step, execution):
-                blocked_step_ids = [
-                    step.id for step in ordered_steps[step_index + 1:]
-                ]
-                _emit_blocked_steps(ordered_steps[step_index + 1:])
+            except Exception as error:
+                if not is_cancelled(error):
+                    raise
+                cancelled = True
                 break
-            # Ambiguous, conflicting, or missing evidence is automation drift.
-            # Keep the original failed execution and leave the saved version
-            # untouched for review; do not ask an LLM to choose a replacement.
-            continue
 
         record_safely(trace, "record_blocked_steps", blocked_step_ids)
         run = TestRun.from_test_case(
@@ -712,8 +769,10 @@ class QATestPipeline:
             executions,
             blocked_step_ids=blocked_step_ids,
             run_context=run_context,
+            cancelled=cancelled or (current_cancellation() is not None and current_cancellation().requested),
         )
         status = (
+            TraceStatus.ERROR if run.cancelled else
             TraceStatus.FAILED
             if run.status == ExecutionStatus.FAILED
             else TraceStatus.PASSED
@@ -726,6 +785,7 @@ class QATestPipeline:
             blocked_step_ids=blocked_step_ids,
             trace=final_trace,
             run_context=run_context,
+            cancelled=cancelled or (current_cancellation() is not None and current_cancellation().requested),
         )
 
 
@@ -895,6 +955,8 @@ def _automation_run_outcome(test_run: TestRun) -> str:
     if test_run.status == ExecutionStatus.PASSED:
         return "PASSED"
 
+    if test_run.cancelled:
+        return "CANCELLED"
     failed_executions = [
         execution
         for execution in test_run.final_executions

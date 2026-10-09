@@ -3,6 +3,10 @@
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
+from qa_agent.execution_control import (
+    check_cancelled,
+    completion_boundary,
+)
 from qa_agent.models import ExecutionStatus, TestCase, TestRun
 from qa_agent.expected_result_coverage import (
     ExpectedResultCoverageError,
@@ -100,6 +104,7 @@ class _PinnedTestCaseWorkflow:
 
         def execute_pinned(received_context: RunContext) -> PinnedExecutionResult:
             nonlocal execution_result
+            check_cancelled()
             execution_result = self._executor.execute(
                 test_case, resolved, received_context
             )
@@ -107,6 +112,9 @@ class _PinnedTestCaseWorkflow:
 
         lifecycle = self._setup_cleanup.run(test_case, context, execute_pinned)
         finished_at = datetime.now(timezone.utc)
+        if execution_result is not None and execution_result.cleanup_error is not None:
+            from qa_agent.setup_orchestration import CleanupOutcome, CleanupFailure
+            lifecycle = replace(lifecycle, cleanup=CleanupOutcome((*lifecycle.cleanup.failures, CleanupFailure("Browser cleanup", type(execution_result.cleanup_error).__name__, "Browser cleanup did not complete normally."))))
         if (
             self.workflow_type == WorkflowType.REGRESSION
             and uncovered_step_ids
@@ -173,23 +181,32 @@ class _PinnedTestCaseWorkflow:
             if execution_result is not None
             else TestRun.from_test_case(test_case, [], run_context=context)
         )
-        result = PinnedWorkflowResult(
-            outcome=outcome,
-            test_run=test_run,
-            lifecycle=lifecycle,
-            execution=execution_result,
-        )
-        if self._run_history is not None:
-            self._run_history.record_completed_run(
-                test_case,
-                result.test_run,
-                workflow_type=self.workflow_type,
-                outcome=result.outcome,
-                setup=result.setup,
-                cleanup=result.cleanup,
-                started_at=started_at,
-                finished_at=finished_at,
+        with completion_boundary() as token:
+            if token is not None and token.requested:
+                outcome = WorkflowOutcome.CANCELLED
+                finished_at = datetime.now(timezone.utc)
+                test_run = TestRun.from_test_case(test_case, test_run.executions, blocked_step_ids=test_run.blocked_step_ids, run_context=context, cancelled=True).model_copy(update={"id": test_run.id, "started_at": started_at, "finished_at": finished_at})
+                if execution_result is not None:
+                    execution_result = replace(execution_result, outcome=outcome, test_run=test_run)
+            result = PinnedWorkflowResult(
+                outcome=outcome,
+                test_run=test_run,
+                lifecycle=lifecycle,
+                execution=execution_result,
             )
+            if self._run_history is not None:
+                self._run_history.record_completed_run(
+                    test_case,
+                    result.test_run,
+                    workflow_type=self.workflow_type,
+                    outcome=result.outcome,
+                    setup=result.setup,
+                    cleanup=result.cleanup,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                )
+            if token is not None:
+                token.sealed = True
         return result
 
 

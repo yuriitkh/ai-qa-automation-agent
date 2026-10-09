@@ -15,6 +15,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from qa_agent.execution_control import is_cancelled
 from qa_agent.llm.errors import (
     AllProvidersFailedError,
     ProviderFailureDetail,
@@ -324,6 +325,8 @@ class TestCaseAuthoringService:
                     response_validator=validate_provider_response,
                 )
         except Exception as error:
+            if is_cancelled(error):
+                raise
             failures = error.attempts if isinstance(error, AllProvidersFailedError) else ()
             failure_categories = {item.category for item in failures}
             only_invalid_responses = bool(failures) and failure_categories == {"INVALID_RESPONSE"}

@@ -72,7 +72,7 @@ class AsyncAuthoringWebIntegrationTests(unittest.TestCase):
                 page.wait_for_url("**/test-cases/review/**", timeout=8000)
                 self.assertIn("Review TestCase", page.locator("h1").inner_text())
                 page.locator("#edit-name").fill("Edited async registration")
-                page.get_by_role("button", name="Save TestCase for review").click()
+                page.get_by_role("button", name="Save TestCase").click()
                 page.wait_for_url("**/test-cases/*")
                 self.assertEqual(len(test_cases.list()), 1)
                 self.assertEqual(test_cases.list()[0].name, "Edited async registration")

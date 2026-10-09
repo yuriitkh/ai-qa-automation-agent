@@ -149,7 +149,7 @@ class TestReportGenerator:
             classification = (
                 "BLOCKED" if step_id in blocked_ids
                 else result_outcome(attempts[-1].status, execution_classification(attempts[-1]), complete=attempts[-1].finished_at is not None) if attempts
-                else "NOT_RUN"
+                else "NOT_ATTEMPTED" if step_id in test_run.not_attempted_step_ids else "NOT_RUN"
             )
             steps.append(
                 TestStepReport(
@@ -174,6 +174,8 @@ class TestReportGenerator:
             "INFRASTRUCTURE_ERROR", "AUTOMATION_DRIFT", "AUTOMATION_EXECUTION_ERROR",
             "PRODUCT_FAILURE", "BLOCKED", "INCONCLUSIVE", "NOT_RUN",
         ) if item in outcomes), "PASSED" if outcomes == {"PASSED"} else "INCONCLUSIVE")
+        if test_run.cancelled:
+            outcome = "CANCELLED"
         return TestReport(
             run_id=test_run.id,
             test_case_id=test_run.test_case_id,
@@ -342,7 +344,8 @@ class RunReportGenerator:
                 for reference in references_by_step.get(step.id, [])
             ]
             classification = (
-                "BLOCKED" if step.status == ExecutionStatus.BLOCKED
+                "NOT_ATTEMPTED" if step.status == ExecutionStatus.NOT_ATTEMPTED
+                else "BLOCKED" if step.status == ExecutionStatus.BLOCKED
                 else attempts[-1].classification if attempts
                 else "NOT_RUN"
             )

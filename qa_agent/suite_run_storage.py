@@ -136,12 +136,17 @@ class SQLiteSuiteRunRepository(SuiteRunRepository):
     def interrupt_incomplete(self) -> int:
         with self._connection() as connection:
             rows = connection.execute(
-                "SELECT run_json FROM suite_runs WHERE status IN (?, ?)",
-                (SuiteRunStatus.QUEUED.value, SuiteRunStatus.RUNNING.value),
+                "SELECT run_json FROM suite_runs WHERE status IN (?, ?, ?)",
+                (SuiteRunStatus.QUEUED.value, SuiteRunStatus.RUNNING.value, SuiteRunStatus.CANCELLATION_REQUESTED.value),
             ).fetchall()
         changed = 0
         for row in rows:
             run = SuiteRun.model_validate_json(row["run_json"])
+            if run.status == SuiteRunStatus.CANCELLATION_REQUESTED:
+                from qa_agent.suite_runs import recover_cancelled_suite
+                self.save(recover_cancelled_suite(run))
+                changed += 1
+                continue
             now = datetime.now(timezone.utc)
             items = []
             for item in run.items:

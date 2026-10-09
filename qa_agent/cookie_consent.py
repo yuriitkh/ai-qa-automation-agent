@@ -9,6 +9,8 @@ import re
 import unicodedata
 from typing import Iterator
 
+from qa_agent.execution_control import check_cancelled
+
 from pydantic import BaseModel, ConfigDict
 
 
@@ -246,6 +248,7 @@ def cookie_consent_reason_label(reason: CookieConsentReason | None) -> str | Non
 
 def handle_cookie_consent(page) -> CookieConsentRecord:
     """Handle one uniquely identified consent dialog, or preserve page state."""
+    check_cancelled()
     policy = current_cookie_consent_policy()
     if policy == CookieConsentPolicy.LEAVE_UNCHANGED:
         result = CookieConsentRecord(
@@ -285,6 +288,7 @@ def handle_cookie_consent(page) -> CookieConsentRecord:
     if not isinstance(candidate_index, int) or candidate_index < 0:
         return _attention(policy, CookieConsentReason.DETECTION_FAILED)
 
+    check_cancelled()
     try:
         container = page.locator(CONSENT_CONTAINER_SELECTOR).nth(candidate_index)
         controls_locator = container.locator(CONSENT_CONTROL_SELECTOR)
@@ -309,6 +313,7 @@ def handle_cookie_consent(page) -> CookieConsentRecord:
     if len(safe_actions) != 1:
         return _attention(policy, CookieConsentReason.MULTIPLE_ACCEPT_ACTIONS)
 
+    check_cancelled()
     try:
         controls_locator.nth(safe_actions[0]["index"]).click(timeout=5_000)
     except Exception:

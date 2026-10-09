@@ -5,6 +5,7 @@ from typing import Any
 import httpx
 from openai import OpenAI
 
+from qa_agent.execution_control import current_cancellation, check_cancelled
 from ..models import AIDiscoveryResult, QATestPlan
 from .base import LLMProvider
 from .errors import (
@@ -67,6 +68,7 @@ class OpenAICompatibleProvider(LLMProvider):
         return os.environ.get(self.api_key_env, "").strip()
 
     def _generate_json(self, prompt: str, schema: dict[str, Any], schema_name: str) -> str:
+        check_cancelled()
         api_key = self._resolved_api_key()
         if not api_key:
             if self._allow_missing_api_key:
@@ -76,7 +78,7 @@ class OpenAICompatibleProvider(LLMProvider):
             else:
                 raise NonRetryableLLMError(f"{self.name}: {self.api_key_env} is not configured.")
         try:
-            limits = {"max_retries": 0} if current_reliability_operation() is not None else {}
+            limits = {"max_retries": 0} if current_reliability_operation() is not None or current_cancellation() is not None else {}
             client = OpenAI(api_key=api_key, base_url=self.base_url, timeout=provider_timeout(self.timeout_seconds), **limits)
             response = client.chat.completions.create(
                 model=self.model,

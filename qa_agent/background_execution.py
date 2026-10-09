@@ -7,6 +7,13 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import BoundedSemaphore, Lock
 from uuid import UUID
 
+from qa_agent.execution_control import (
+    CancellationToken,
+    cancellation_scope,
+    check_cancelled,
+    OperationCancelled,
+    completion_boundary,
+)
 from qa_agent.execution_progress import (
     ExecutionEventType,
     ExecutionProgressReporter,
@@ -57,6 +64,7 @@ class BackgroundRunService:
         self._active_jobs = 0
         self._lock = Lock()
         self._closed = False
+        self._controls: dict[str, CancellationToken] = {}
 
     def readiness_state(self) -> dict[str, int | bool]:
         with self._lock:
@@ -95,6 +103,7 @@ class BackgroundRunService:
                     raise RuntimeError("Background run service is closed.")
                 self._active_jobs += 1
                 reserved = True
+                self._controls[progress_id] = CancellationToken()
                 self._executor.submit(
                     self._execute_with_release,
                     progress_id,
@@ -107,6 +116,7 @@ class BackgroundRunService:
             if reserved:
                 with self._lock:
                     self._active_jobs -= 1
+                    self._controls.pop(progress_id, None)
             self._capacity.release()
             logger.exception("Could not submit TestCase execution job")
             reporter.finish(
@@ -124,20 +134,39 @@ class BackgroundRunService:
         evidence_policy: EvidencePolicy,
         cookie_policy: CookieConsentPolicy,
     ) -> None:
+        token = self._controls[progress_id]
         try:
-            self._execute(
-                progress_id, test_case_id, workflow_type, evidence_policy, cookie_policy
-            )
+            with cancellation_scope(token):
+                self._execute(
+                    progress_id, test_case_id, workflow_type, evidence_policy, cookie_policy
+                )
         finally:
+            with token.lock:
+                token.sealed = True
             with self._lock:
                 self._active_jobs -= 1
+                self._controls.pop(progress_id, None)
             self._capacity.release()
+
+    def cancel(self, progress_id: str) -> bool:
+        with self._lock:
+            token = self._controls.get(progress_id)
+        if token is None:
+            return False
+        with token.lock:
+            snapshot = self.progress_store.get(progress_id)
+            if snapshot is None or snapshot.finished_at is not None:
+                return False
+            return token.request(lambda: self.progress_store.request_cancellation(progress_id, authoring=False))
 
     def close(self) -> None:
         with self._lock:
             if self._closed:
                 return
             self._closed = True
+            controls = list(self._controls.values())
+        for token in controls:
+            token.request()
         self._executor.shutdown(wait=True, cancel_futures=False)
 
     def _execute(
@@ -165,7 +194,14 @@ class BackgroundRunService:
                             related_test_case_id=test_case_id,
                             related_workflow_id=progress_id,
                         ):
+                            check_cancelled()
                             result = self._run_service.run(test_case_id, workflow_type)
+            except OperationCancelled:
+                with completion_boundary() as token:
+                    reporter.finish(outcome="CANCELLED", error_category="CANCELLED", message="Stopped by user.")
+                    if token is not None:
+                        token.sealed = True
+                return
             except RunUnavailableError as error:
                 category = getattr(error, "category", "MISSING_AUTOMATION")
                 logger.info("TestCase run was not available (%s)", category)

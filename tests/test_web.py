@@ -386,7 +386,7 @@ class LocalWebApplicationTests(unittest.TestCase):
         self.assertIn(f"Internal ID: <code>{version.id}</code>", body)
         self.assertIn("Auto handle cookie consent", body)
         self.assertIn("Leave cookie consent unchanged", body)
-        self.assertEqual(body.count('name="cookie_policy"'), 3)
+        self.assertEqual(body.count('name="cookie_policy"'), 1)
 
     def test_setup_failure_and_cleanup_failure_are_presented_separately(self) -> None:
         setup_run = RunHistoryRecord(

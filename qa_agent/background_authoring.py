@@ -8,6 +8,15 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import BoundedSemaphore, Lock
 from uuid import UUID
 
+from qa_agent.execution_control import (
+    CancellationToken,
+    cancellation_scope,
+    current_cancellation,
+    check_cancelled,
+    OperationCancelled,
+    cancellable_call,
+    completion_boundary,
+)
 from qa_agent.execution_progress import (
     AuthoringEventType,
     AuthoringProgressReporter,
@@ -67,6 +76,7 @@ class BackgroundAuthoringService:
         self._capacity = BoundedSemaphore(max_workers + max_pending)
         self._lock = Lock()
         self._closed = False
+        self._controls: dict[str, CancellationToken] = {}
 
     def start(
         self,
@@ -97,6 +107,7 @@ class BackgroundAuthoringService:
             with self._lock:
                 if self._closed:
                     raise RuntimeError("Background authoring service is closed.")
+                self._controls[progress_id] = CancellationToken()
                 self._executor.submit(
                     self._execute_and_release,
                     progress_id,
@@ -107,6 +118,8 @@ class BackgroundAuthoringService:
                     source_draft_id,
                 )
         except Exception as error:
+            with self._lock:
+                self._controls.pop(progress_id, None)
             self._capacity.release()
             logger.error("Could not submit authoring job (%s)", type(error).__name__)
             reporter.finish_failure(
@@ -115,11 +128,25 @@ class BackgroundAuthoringService:
             )
         return progress_id
 
+    def cancel(self, progress_id: str) -> bool:
+        with self._lock:
+            token = self._controls.get(progress_id)
+        if token is None:
+            return False
+        with token.lock:
+            snapshot = self._progress_store.get_authoring(progress_id)
+            if snapshot is None or snapshot.finished_at is not None:
+                return False
+            return token.request(lambda: self._progress_store.request_cancellation(progress_id, authoring=True))
+
     def close(self) -> None:
         with self._lock:
             if self._closed:
                 return
             self._closed = True
+            controls = list(self._controls.values())
+        for token in controls:
+            token.request()
         self._executor.shutdown(wait=True, cancel_futures=False)
 
     def _execute_and_release(
@@ -131,16 +158,22 @@ class BackgroundAuthoringService:
         source_draft_token: str | None,
         source_draft_id: UUID | None,
     ) -> None:
+        token = self._controls[progress_id]
         try:
-            self._execute(
-                progress_id,
-                name,
-                base_url,
-                scenario,
-                source_draft_token,
-                source_draft_id,
-            )
+            with cancellation_scope(token):
+                self._execute(
+                    progress_id,
+                    name,
+                    base_url,
+                    scenario,
+                    source_draft_token,
+                    source_draft_id,
+                )
         finally:
+            with token.lock:
+                token.sealed = True
+            with self._lock:
+                self._controls.pop(progress_id, None)
             self._capacity.release()
 
     def _execute(
@@ -154,20 +187,28 @@ class BackgroundAuthoringService:
     ) -> None:
         reporter = AuthoringProgressReporter(self._progress_store, progress_id)
         try:
+            check_cancelled()
             reporter.emit(AuthoringEventType.AUTHORING_STARTED)
             validated = self._authoring_service.validate_input(name, scenario, base_url)
             source_draft = (
                 self._draft_store.get(source_draft_token)
                 if source_draft_token is not None else None
             )
-            draft = self._authoring_service.generate(
+            token = current_cancellation()
+            def guarded(callback):
+                def emit(*args, **kwargs):
+                    with token.lock:
+                        if not token.requested and not token.sealed:
+                            return callback(*args, **kwargs)
+                return emit
+            draft = cancellable_call(lambda: self._authoring_service.generate(
                 validated.name,
                 validated.scenario,
                 validated.base_url,
-                progress_callback=reporter.emit,
-                provider_progress_callback=reporter.provider_progress,
+                progress_callback=guarded(reporter.emit),
+                provider_progress_callback=guarded(reporter.provider_progress),
                 usage_workflow_id=progress_id,
-            )
+            ))
             prior_workflows = (
                 source_draft.usage_workflow_ids
                 if source_draft is not None else ()
@@ -179,15 +220,20 @@ class BackgroundAuthoringService:
                     (*prior_workflows, *draft.usage_workflow_ids)
                 )),
             )
-            token = self._draft_store.put(draft)
-            try:
-                reporter.emit(AuthoringEventType.DRAFT_CREATED)
-                reporter.finish_success(f"/test-cases/review/{token}")
-            except Exception:
-                self._draft_store.take(token)
-                raise
-            if source_draft_token is not None:
-                self._draft_store.take(source_draft_token)
+            with completion_boundary() as token:
+                check_cancelled()
+                draft_token = self._draft_store.put(draft)
+                try:
+                    reporter.emit(AuthoringEventType.DRAFT_CREATED)
+                    reporter.finish_success(f"/test-cases/review/{draft_token}")
+                except Exception:
+                    self._draft_store.take(draft_token)
+                    raise
+                if source_draft_token is not None:
+                    self._draft_store.take(source_draft_token)
+                token.sealed = True
+        except OperationCancelled:
+            reporter.finish_failure("CANCELLED", "Stopped by user.")
         except TestCaseAuthoringError as error:
             category = error.category
             if category == "INVALID_AUTHORING_INPUT":

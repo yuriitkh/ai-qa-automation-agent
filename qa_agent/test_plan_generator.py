@@ -2,6 +2,7 @@ import json
 import re
 from dataclasses import dataclass
 
+from qa_agent.execution_control import check_cancelled
 from qa_agent.llm.router import LLMRouter
 from qa_agent.models import (
     AssertionGroundingEntry,
@@ -177,17 +178,22 @@ class LLMTestPlanGenerator(TestPlanGenerator):
         *,
         requirement_context: str | None = None,
     ) -> tuple[QATestPlan, tuple[AssertionGroundingEntry, ...]]:
+        check_cancelled()
         executable_plan = validate_executable_plan(value)
+        check_cancelled()
         LLMTestPlanGenerator._validate_discovery_capabilities(
             executable_plan, discovery_result, test_step
         )
+        check_cancelled()
         LLMTestPlanGenerator._validate_locator_identity(executable_plan, discovery_result)
+        check_cancelled()
         grounding = validate_assertion_grounding(
             executable_plan,
             test_step,
             discovery_result,
             requirement_context=requirement_context,
         )
+        check_cancelled()
         validate_expected_result_coverage(test_step, executable_plan)
         return executable_plan, grounding
 
