@@ -1415,11 +1415,16 @@ class ExecutionProgressReporter:
         try:
             diagnostics = []
             for step in getattr(trace, "steps", ()):
-                for number, attempt in enumerate(step.provider_attempts, start=1):
+                number = 0
+                for attempt in step.provider_attempts:
+                    request_sent = attempt.outcome.value != 'UNAVAILABLE'
+                    if request_sent:
+                        number += 1
                     row = {
                         "step_id": str(step.test_step_id),
                         "step_number": step.order + 1,
-                        "attempt_number": number,
+                        "attempt_number": number if request_sent else None,
+                        "request_sent": request_sent,
                         "provider": self.safe_text(attempt.provider_name),
                         "request_kind": attempt.request_kind.value,
                         "status": attempt.outcome.value,

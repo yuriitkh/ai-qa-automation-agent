@@ -324,6 +324,8 @@ def _emit_python(action: str, p: dict, i: int) -> list[str]:
         return lines
     if action == "assert_hidden":
         return [f"expect(page.locator({_python_string(p['selector'])})).to_be_hidden(timeout={ASSERTION_TIMEOUT_MS})"]
+    if action == "assert_value":
+        return [f"expect(page.locator({_python_string(p['selector'])})).to_have_value({_python_string(p['expected'])}, timeout={ASSERTION_TIMEOUT_MS})"]
     if action == "assert_text_contains":
         target = f"page.locator({_python_string(p['selector'])})" if p.get("selector") else "page.locator('body')"
         expected = _python_string(_normalized_expected(p["expected_text"]))
@@ -400,6 +402,8 @@ def _emit_typescript(action: str, p: dict, i: int) -> list[str]:
         return lines
     if action == "assert_hidden":
         return [f"await expect(page.locator({_js_string(p['selector'])})).toBeHidden({{ timeout: {ASSERTION_TIMEOUT_MS} }});"]
+    if action == "assert_value":
+        return [f"await expect(page.locator({_js_string(p['selector'])})).toHaveValue({_js_string(p['expected'])}, {{ timeout: {ASSERTION_TIMEOUT_MS} }});"]
     if action == "assert_text_contains":
         target = f"page.locator({_js_string(p['selector'])})" if p.get("selector") else "page.locator('body')"
         expected = _js_string(_normalized_expected(p["expected_text"]))
@@ -472,6 +476,8 @@ def _emit_csharp(action: str, p: dict, i: int) -> list[str]:
         return lines
     if action == "assert_hidden":
         return [f"await Expect(page.Locator({_csharp_string(p['selector'])})).ToBeHiddenAsync(new() {{ Timeout = {ASSERTION_TIMEOUT_MS} }});"]
+    if action == "assert_value":
+        return [f"await Expect(page.Locator({_csharp_string(p['selector'])})).ToHaveValueAsync({_csharp_string(p['expected'])}, new() {{ Timeout = {ASSERTION_TIMEOUT_MS} }});"]
     if action == "assert_text_contains":
         target = f"page.Locator({_csharp_string(p['selector'])})" if p.get("selector") else 'page.Locator("body")'
         expected = _csharp_string(_normalized_expected(p["expected_text"]))
@@ -530,6 +536,7 @@ ACTION_EXPORT_HANDLERS: dict[str, tuple[Callable, Callable, Callable]] = {
     "assert_url": (_emit_python, _emit_typescript, _emit_csharp),
     "select_option": (_emit_python, _emit_typescript, _emit_csharp),
     "assert_text_contains": (_emit_python, _emit_typescript, _emit_csharp),
+    "assert_value": (_emit_python, _emit_typescript, _emit_csharp),
     "assert_checked": (_emit_python, _emit_typescript, _emit_csharp),
     "assert_unchecked": (_emit_python, _emit_typescript, _emit_csharp),
     "assert_selected": (_emit_python, _emit_typescript, _emit_csharp),
@@ -544,6 +551,7 @@ _ALLOWED_EXPORT_PARAMETERS = {
     "fill": {"selector", "value"}, "assert_hidden": {"selector"},
     "assert_url": {"expected"}, "select_option": {"selector", "option_label"},
     "assert_text_contains": {"selector", "expected_text"}, "assert_checked": {"selector"},
+    "assert_value": {"selector", "expected"},
     "assert_unchecked": {"selector"},
     "assert_selected": {"selector", "expected"}, "assert_enabled": {"selector"},
     "assert_disabled": {"selector"},

@@ -172,6 +172,10 @@ class TestCaseBrowserSession:
         return self._session is not None
 
     def run_plan(self, segment_order: int, plan: QATestPlan) -> dict[str, Any]:
+        page = self._page_for_segment(segment_order, navigate=plan.steps[0].action != 'navigate')
+        return self._session.run_plan(page, plan)
+
+    def _page_for_segment(self, segment_order: int, *, navigate: bool):
         if self._closed:
             raise RuntimeError("TestCase browser session is closed.")
         if segment_order not in self._segment_orders:
@@ -186,12 +190,23 @@ class TestCaseBrowserSession:
         page = self._pages.get(segment_order)
         if page is None:
             page = self._session.new_page()
+            # Discovery's independent probe cannot initialize this execution
+            # page. Establish only the explicitly configured segment URL,
+            # once; an explicit plan navigation supplies its own setup.
+            if navigate:
+                target = self._segment_urls[segment_order]
+                if target == 'about:blank':
+                    raise ValueError('State-dependent execution requires a configured segment URL or an explicit navigation action.')
+                check_cancelled()
+                page.goto(target, wait_until=NAVIGATION_LOAD_STATE, timeout=NAVIGATION_TIMEOUT_MS)
             self._pages[segment_order] = page
-        return self._session.run_plan(page, plan)
+        return page
 
     def capture_discovery(self, segment_order: int):
         from qa_agent.browser_discovery import capture_current_page_discovery
         page = self._pages.get(segment_order)
+        if page is None and self._segment_urls[segment_order] != 'about:blank':
+            page = self._page_for_segment(segment_order, navigate=True)
         if page is None:
             from qa_agent.models import DiscoveryResult, DiscoveryStatus
             return DiscoveryResult(status=DiscoveryStatus.PARTIAL, url=self._segment_urls[segment_order], warnings=["This segment has no observed page. Its configured URL is a navigation target only; an explicit navigation step is required before state-dependent assertions."], strategies_used=["current_page"])
@@ -359,6 +374,10 @@ def _run_plan_on_page(
                         expected_text.replace("\\n", "\n"),
                         timeout=ASSERTION_TIMEOUT_MS,
                     )
+            elif step.action == "assert_value":
+                expect(page.locator(step.parameters['selector'])).to_have_value(
+                    step.parameters['expected'], timeout=ASSERTION_TIMEOUT_MS,
+                )
             elif step.action == "assert_text_contains":
                 expected_text = step.parameters["expected_text"].replace("\\n", "\n")
                 selector = step.parameters.get("selector")
@@ -457,7 +476,8 @@ def _run_plan_on_page(
             step_result["status"] = "failed"
             safe_error = redact_secrets(str(error))
             for item in plan.steps:
-                value = item.parameters.get("value") if item.action == "fill" else None
+                value = (item.parameters.get("value") if item.action == "fill" else
+                         item.parameters.get("expected") if item.action == "assert_value" else None)
                 if isinstance(value, str) and value:
                     safe_error = safe_error.replace(value, "[REDACTED]")
             step_result["error"] = safe_error

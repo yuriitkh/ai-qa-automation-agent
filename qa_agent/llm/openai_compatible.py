@@ -1,5 +1,6 @@
 """Provider for chat-completions APIs that follow the OpenAI SDK interface."""
 import os
+import json
 from typing import Any
 
 import httpx
@@ -91,10 +92,22 @@ class OpenAICompatibleProvider(LLMProvider):
                 }},
             )
             capture_openai_usage(response)
-            content = response.choices[0].message.content
-            if not content:
-                raise ValueError("empty response")
+            choice = response.choices[0] if response.choices else None
+            if choice is not None and getattr(choice, 'finish_reason', None) == 'length':
+                raise RetryableLLMError(f"{self.name}: output token limit reached.", category='INVALID_RESPONSE',
+                    safe_detail='Output token limit reached', provider_error_code='output_token_limit')
+            content = getattr(getattr(choice, 'message', None), 'content', None)
+            if not isinstance(content, str) or not content.strip():
+                raise RetryableLLMError(f"{self.name}: missing structured response.", category='INVALID_RESPONSE',
+                    safe_detail='Missing structured response', provider_error_code='missing_structured_response')
+            try:
+                json.loads(content)
+            except (ValueError, TypeError):
+                raise RetryableLLMError(f"{self.name}: invalid JSON response.", category='INVALID_RESPONSE',
+                    safe_detail='Invalid structured response', provider_error_code='invalid_json') from None
             return content
+        except (RetryableLLMError, NonRetryableLLMError):
+            raise
         except (httpx.TimeoutException, TimeoutError) as error:
             raise RetryableLLMError(
                 f"{self.name}: request timed out.", category="TIMEOUT",
@@ -165,10 +178,11 @@ class OpenAICompatibleProvider(LLMProvider):
             "Use the supplied target URL exactly. Use only these actions: navigate, "
             "assert_page_loaded, assert_title, assert_visible, click, check, uncheck, fill, assert_hidden, "
             "assert_url, select_option, assert_text_contains, assert_checked, assert_unchecked, assert_selected, "
-            "assert_enabled, assert_disabled. Use only selectors and URLs present in the task "
+            "assert_enabled, assert_disabled, assert_value. Use only selectors and URLs present in the task "
             "or page snapshot; never invent or rewrite selectors, parameter names, or URLs. "
             "Use expected for assert_title and assert_url; expected_text for text assertions; "
             "selector for element references; value for fill; option_label for select_option. "
+            "assert_value uses selector and expected to check an input/textarea DOM value, not its text. "
             "Use check and uncheck to set checkbox state; use assert_checked and "
             "assert_unchecked to verify checkbox state. "
             "A human TestStep may require multiple ordered executable actions, such as filling "
@@ -184,17 +198,22 @@ class OpenAICompatibleProvider(LLMProvider):
             "If those records are absent, do not invent a path. Preserve Unicode exactly. "
             f"Target URL: {target_url}\nPage snapshot (JSON): {page_snapshot}\nTask: {task}"
         )
+        raw = None
         try:
-            return QATestPlan.model_validate_json(
-                self._generate_json(prompt, qa_test_plan_schema(), "qa_test_plan")
-            )
+            raw = self._generate_json(prompt, qa_test_plan_schema(), "qa_test_plan")
+            return QATestPlan.model_validate_json(raw)
         except (RetryableLLMError, NonRetryableLLMError):
             raise
         except Exception as error:
-            raise RetryableLLMError(
+            failure = RetryableLLMError(
                 f"{self.name}: returned an invalid QA test plan.",
                 category="INVALID_RESPONSE", safe_detail="Invalid structured response",
-            ) from error
+                provider_error_code='invalid_schema_response',
+            )
+            if raw is not None:
+                from qa_agent.candidate_diagnostics import attach_provider_candidate_summary
+                attach_provider_candidate_summary(failure, raw)
+            raise failure from None
 
     def create_discovery(self, task: str, target_url: str, page_snapshot: str) -> AIDiscoveryResult:
         prompt = (
@@ -207,5 +226,6 @@ class OpenAICompatibleProvider(LLMProvider):
         except (RetryableLLMError, NonRetryableLLMError):
             raise
         except Exception as error:
-            raise RetryableLLMError(f"{self.name}: returned invalid Discovery data.") from error
+            raise RetryableLLMError(f"{self.name}: returned invalid Discovery data.", category='INVALID_RESPONSE',
+                provider_error_code='invalid_schema_response') from error
 

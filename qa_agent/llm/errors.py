@@ -38,6 +38,8 @@ SAFE_DETAIL_MESSAGES = frozenset({
     "Response did not match the TestCase schema",
     "Response did not contain a complete TestCase structure",
     "Structured output is not supported",
+    "Output token limit reached",
+    "Missing structured response",
 })
 
 

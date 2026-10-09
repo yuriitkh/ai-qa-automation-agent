@@ -50,6 +50,8 @@ class ReliabilityAttempt(BaseModel):
     input_tokens: int | None = None
     output_tokens: int | None = None
     estimated_cost_usd: float | None = None
+    candidate_diagnostics: dict[str, Any] | None = None
+    structured_response_code: str | None = None
 
 
 class ReliabilityDecision(BaseModel):
@@ -75,6 +77,7 @@ class ReliabilityRecord(BaseModel):
     candidate_version_id: UUID | None = None
     repaired: bool = False
     final_category: str | None = None
+    effective_provider_order: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class InMemoryReliabilityRepository:
@@ -350,6 +353,22 @@ class ReliabilityOperation:
         except BaseException as error:
             attempt.status = "CANCELLED" if classify_failure(error) == "CANCELLED" else "REJECTED"
             attempt.error_category = classify_failure(error)
+            code = getattr(error, "provider_error_code", None)
+            if attempt.error_category == 'INVALID_RESPONSE' or code in {"output_token_limit", "missing_structured_response", "invalid_json", "invalid_schema_response"}:
+                attempt.structured_response_code = code if code in {"output_token_limit", "missing_structured_response", "invalid_json", "invalid_schema_response"} else None
+                from qa_agent.candidate_diagnostics import rejected_candidate_diagnostics, safe_action_summary, safe_validation_issues
+                step = self.supervisor.active_step(self.record.id)
+                if step is not None:
+                    diagnostics = rejected_candidate_diagnostics(None, step, None, error)
+                    summary = getattr(error, 'rejected_actions', None)
+                    if code == 'invalid_schema_response' and isinstance(summary, dict):
+                        diagnostics.update(safe_action_summary(summary))
+                        diagnostics['validation_issues'] = safe_validation_issues(summary.get('validation_issues'))
+                        diagnostics['failed_gate'] = 'provider_response_schema'
+                    else:
+                        diagnostics['candidate_unavailable'] = True
+                    diagnostics['coverage_evaluated'] = False
+                    attempt.candidate_diagnostics = diagnostics
             raise
         else:
             attempt.status = "QUALITY_PENDING"
@@ -481,6 +500,7 @@ class AutomationReliabilitySupervisor:
                     error.rejected_gate = gate_for_category(category)
                     if record.attempts and record.attempts[-1].status == "QUALITY_PENDING":
                         attempt = record.attempts[-1]
+                        attempt.candidate_diagnostics = getattr(error, 'candidate_diagnostics', None)
                         attempt.status, attempt.error_category = ("CANCELLED" if category == "CANCELLED" else "REJECTED"), category
                         failed_gate = gate_for_category(category)
                         if category == "UNSAFE_REPAIR":

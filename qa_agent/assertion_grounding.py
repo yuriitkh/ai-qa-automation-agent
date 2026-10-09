@@ -37,6 +37,7 @@ _ASSERTION_ACTIONS = frozenset({
     "assert_selected",
     "assert_enabled",
     "assert_disabled",
+    "assert_value",
 })
 
 _EXACT_ASSERTION_VALUES: dict[str, tuple[str, ...]] = {
@@ -45,6 +46,7 @@ _EXACT_ASSERTION_VALUES: dict[str, tuple[str, ...]] = {
     "assert_url": ("expected",),
     "assert_text_contains": ("expected_text",),
     "assert_selected": ("expected",),
+    "assert_value": ("expected",),
 }
 
 _EXAMPLE_TAIL = re.compile(
@@ -91,10 +93,15 @@ def classify_assertions(
             action.parameters.get(field)
             for field in _EXACT_ASSERTION_VALUES.get(action.action, ())
         ]
-        values = [value for value in values if isinstance(value, str) and value.strip()]
+        values = [value for value in values if isinstance(value, str) and (value.strip() or action.action == 'assert_value')]
         if values:
             category = AssertionGrounding.UNKNOWN
-            if any(
+            if action.action == "assert_value":
+                from qa_agent.input_value_assertions import input_value_is_grounded
+                category = (AssertionGrounding.REQUIREMENT_GROUNDED
+                            if input_value_is_grounded(plan, index, discovery, (*requirements, test_step.description))
+                            else AssertionGrounding.INFERRED)
+            elif any(
                 _required_value(action.action, value, requirements)
                 for value in values
             ):

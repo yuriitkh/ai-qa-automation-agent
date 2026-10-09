@@ -34,7 +34,7 @@ from .errors import (
     failure_detail_for,
 )
 from .usage_metadata import ProviderTokenUsage, capture_provider_usage
-from ..reliability import current_reliability_operation, classify_failure, safe_reason, ReliabilityStopped
+from ..reliability import current_reliability_operation, classify_failure, safe_reason, ReliabilityStopped, _safe_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -339,8 +339,15 @@ class LLMRouter:
         """Use this router's configured order with the generation recovery budget."""
         providers = []
         self._selected_provider_name = None
-        for provider in list(self._providers):
-            if provider.is_available:
+        configured = list(self._providers)
+        available = [bool(provider.is_available) for provider in configured]
+        operation.record.effective_provider_order = [
+            {'priority': index, 'provider': _safe_metadata(self._provider_observability_name(provider)), 'available': enabled}
+            for index, (provider, enabled) in enumerate(zip(configured, available), 1)
+        ]
+        operation.supervisor.repository.save(operation.record)
+        for provider, enabled in zip(configured, available):
+            if enabled:
                 providers.append(provider)
             else:
                 self._record_provider_attempt(provider, RequestKind.TEST_PLAN, ProviderAttemptOutcome.UNAVAILABLE)

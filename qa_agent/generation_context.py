@@ -23,6 +23,11 @@ _NAVIGATE = re.compile(r"\b(?:navigate|open|visit|go\s+to|reload|refresh|reset|r
 _EMPTY_FORM = re.compile(r"\b(?:empty\s+(?:\w+\s+){0,2}(?:form|fields)|(?:required\s+)?fields\s+empty)\b", re.I)
 
 
+def _requests_submission(intent):
+    positive = re.sub(r"\b(?:do\s+not|don't|never|without)\s+(?:\w+\s+){0,2}(?:submit|send|register|sign\s*up)\b", '', intent, flags=re.I)
+    return bool(_SUBMIT.search(positive))
+
+
 def observed_controls(discovery: DiscoveryResult) -> dict[str, InteractiveElement]:
     """Use the deterministic snapshot when typed collections may contain AI suggestions."""
     controls = {item.selector: item for item in discovery.interactive_elements} if discovery.status == DiscoveryStatus.SUCCESS else {}
@@ -41,6 +46,14 @@ def validate_step_boundaries(plan: QATestPlan, step: TestStep, discovery: Discov
                              context: StepGenerationContext | None) -> None:
     intent = f"{step.name} {step.description}"
     controls = observed_controls(discovery)
+    if _FILL.search(intent) and not _requests_submission(intent):
+        for index, action in enumerate(plan.steps):
+            control = controls.get(action.parameters.get("selector"))
+            if action.action == "click" and control is not None and control.button_type == "submit":
+                raise PlanValidationError([PlanValidationIssue(
+                    code="TESTSTEP_BOUNDARY_VIOLATION", path=f"steps[{index}]",
+                    message="This fill-only TestStep does not request submission; preserve the prepared form.",
+                )])
     if _SUBMIT.search(intent) and _EMPTY_FORM.search(intent):
         for index, action in enumerate(plan.steps):
             control = controls.get(action.parameters.get("selector"))

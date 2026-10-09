@@ -15,7 +15,7 @@ from typing import Sequence
 from uuid import UUID
 
 from qa_agent.execution_trace import ExecutionTrace, RequestKind
-from qa_agent.llm.registry import create_router
+from qa_agent.provider_settings import ProviderSettingsRepository, ProviderSettingsService, create_default_secret_store
 from qa_agent.models import ExecutionStatus
 from qa_agent.pipeline import PipelineResult, PipelineStageError, QATestPipeline
 from qa_agent.redaction import safe_failure_reason
@@ -43,7 +43,9 @@ def build_pipeline(
     """
     storage = create_sqlite_storage(database_path)
     usage_service = LLMUsageService(storage.llm_usage_repository)
-    router = create_router(usage_recorder=usage_service)
+    settings = ProviderSettingsService(ProviderSettingsRepository(storage.database_path),
+        create_default_secret_store(), usage_recorder=usage_service)
+    router = settings.create_router(usage_recorder=usage_service)
     return QATestPipeline(
         decomposer=TestCaseDecomposer(),
         plan_generator=LLMTestPlanGenerator(router, AutomationReliabilitySupervisor(storage.reliability_repository)),

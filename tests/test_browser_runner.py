@@ -259,6 +259,7 @@ class BrowserRunnerActionTests(unittest.TestCase):
         ]
         test_case = DomainTestCase(
             name="Segmented flow",
+            base_url="https://example.test",
             description="Keep browser state between steps and segments.",
             segments=[
                 ExecutionSegment(order=0, steps=steps[:2]),
@@ -288,6 +289,7 @@ class BrowserRunnerActionTests(unittest.TestCase):
     def test_test_case_session_closes_owned_resources_once_after_failure(self) -> None:
         test_case = DomainTestCase(
             name="Failed flow",
+            base_url="https://example.test",
             description="Exercise session cleanup after a failure.",
             steps=[DomainTestStep(
                 name="Open page", description="Open it.", expected="It opens.", order=0

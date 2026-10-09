@@ -124,9 +124,14 @@ class LLMTestPlanGenerator(TestPlanGenerator):
             nonlocal previous_candidate
             original = previous_candidate
             previous_candidate = value
-            validated = self._validate_generated_plan(value, discovery_result, test_step, requirement_context=requirement_context, step_context=step_context)
-            if repairing and original is not None:
-                self._validate_repair_preserves_actions(original, value)
+            try:
+                validated = self._validate_generated_plan(value, discovery_result, test_step, requirement_context=requirement_context, step_context=step_context)
+                if repairing and original is not None:
+                    self._validate_repair_preserves_actions(original, value)
+            except PlanValidationError as error:
+                from qa_agent.candidate_diagnostics import rejected_candidate_diagnostics
+                error.candidate_diagnostics = rejected_candidate_diagnostics(value, test_step, discovery_result, error)
+                raise
             return validated
 
         (executable_plan, grounding), operation_id, repaired = self.supervisor.generate(
@@ -320,7 +325,11 @@ class LLMTestPlanGenerator(TestPlanGenerator):
             "assert_unchecked to verify checkbox state, click to select a radio, "
             "assert_selected for radio/select state, "
             "assert_enabled/assert_disabled for enabled state, and "
-            "assert_text_contains for substring requirements. Do not invent exact "
+            "assert_text_contains for substring requirements. Use assert_value with selector and expected "
+            "to verify an input/textarea's DOM value; text/visibility assertions do not verify input values. "
+            "A quoted literal chosen from an explicit input instruction (including an example) may "
+            "be filled and then verified on that same observed input. An example never establishes "
+            "a product message, confirmation or other output. Do not invent exact "
             "text, statuses, values, IDs, labels, URLs, or counts that are not "
             "explicitly required or present in deterministic observed page evidence. "
             "Prefer a structural assertion when the requirement asks for a generic "
@@ -336,6 +345,10 @@ class LLMTestPlanGenerator(TestPlanGenerator):
             "Checkbox assertions require a discovered checkbox; never infer one from appearance. "
             "Use interactive_elements input_type/button_type and option_labels to distinguish controls. "
             "For compound expected results, cover every clause with its relevant assertion. "
+            "For a specific displayed page, verify a relevant Discovery-grounded form/control identity; "
+            "navigation and assert_page_loaded alone do not establish that page's expected content. "
+            "Use the smallest action sequence satisfying this step; avoid duplicate actions and "
+            "unrelated or precautionary checkbox checks. Never assert_unchecked on an error container. "
             "For unsupported meaningful outcomes, stop for Needs Attention; action completion cannot prove persistence. "
             "Assertion subjects must match the expected state using the asserted value or that exact Discovery identity, "
             "never action-context overlap or unrelated parent/form text.\n"
@@ -412,12 +425,18 @@ class LLMTestPlanGenerator(TestPlanGenerator):
                         path=path,
                         message="The action must use the deterministic Discovery selector for the requested control.",
                     )])
-            if element is None and step.action in {"select_option", "assert_selected", "check", "uncheck", "assert_checked", "assert_unchecked"}:
+            if element is None and step.action in {"select_option", "assert_selected", "check", "uncheck", "assert_checked", "assert_unchecked", "assert_value"}:
                 raise PlanValidationError([PlanValidationIssue(code="ACTION_TARGET_MISMATCH", path=path,
                     message="This action requires a control type established by deterministic Discovery.")])
             if element is None:
                 continue
             kinds = {element.kind.casefold(), element.tag.casefold(), element.role.casefold(), element.input_type.casefold()}
+            if step.action == "assert_value" and (element.tag not in {"input", "textarea"}
+                    or element.input_type in {"checkbox", "radio", "button", "submit", "hidden", "file"}):
+                raise PlanValidationError([PlanValidationIssue(
+                    code="ACTION_TARGET_MISMATCH", path=path,
+                    message="ASSERT_VALUE must target a discovered text input or textarea.",
+                )])
             if step.action == "select_option" and "select" not in kinds:
                 raise PlanValidationError([PlanValidationIssue(
                     code="ACTION_TARGET_MISMATCH",

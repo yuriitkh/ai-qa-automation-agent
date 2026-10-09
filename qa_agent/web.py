@@ -1173,7 +1173,7 @@ class LocalWebApplication:
             rows = []
             for attempt in provider_attempts:
                 fields = [
-                    f'Step {attempt["step_number"]}', f'Attempt {attempt["attempt_number"]}',
+                    f'Step {attempt["step_number"]}', (f'Attempt {attempt["attempt_number"]}' if attempt.get('request_sent', True) else 'Skipped locally (no API request)'),
                     attempt['request_kind'], attempt['provider'], attempt['status'],
                 ]
                 if attempt.get('model'):
@@ -4572,6 +4572,9 @@ class LocalWebApplication:
                 + (f'<p>Provider: {esc(attempt.provider)}</p>' if attempt.provider else '')
                 + (f'<p>Model: {esc(attempt.model)}</p>' if attempt.model else '')
                 + (f'<p>Provider request duration: {esc(format_duration(attempt.duration_ms))}</p>' if attempt.duration_ms is not None else '')
+                + (f'<p>Structured response: {esc(attempt.structured_response_code)}</p>' if attempt.structured_response_code else '')
+                + ('<h4>Rejected candidate diagnostics</h4><p>Selectors and requirement clauses are represented by hashes; no input values are retained.</p><pre>'
+                   + esc(json.dumps(attempt.candidate_diagnostics, indent=2)) + '</pre>' if attempt.candidate_diagnostics else '')
                 + '<details class="technical-details"><summary>Developer details</summary><pre>' + esc(attempt.model_dump_json(indent=2)) + '</pre></details></li>'
             )
         decisions = ''.join(f'<li>{esc(format_timestamp(item.timestamp))} · {esc(item.action)} · {esc(item.reason)}</li>' for item in record.decisions)
@@ -4589,6 +4592,7 @@ class LocalWebApplication:
             + '<p>Generation quality is separate from human approval and Browser Validation. No product PASS is inferred.</p>'
             + '<div class="actions">' + actions + '</div><section class="panel"><h2>Effective settings for this operation</h2><pre>' + esc(record.settings.model_dump_json(indent=2)) + '</pre></section>'
             + '<section class="panel"><h2>Attempts</h2><ol>' + ''.join(rows) + '</ol></section>'
+            + '<section class="panel"><h2>Effective provider order</h2><pre>' + esc(json.dumps(record.effective_provider_order, indent=2)) + '</pre></section>'
             + '<section class="panel"><h2>Recovery decisions</h2><ol>' + decisions + '</ol></section>'
         )
         return WebResponse.html(200, self._page("Automation generation operation", content, current="Settings"))
@@ -5694,6 +5698,7 @@ _UI_JAVASCRIPT = r"""
     assert_url: ['expected'],
     select_option: ['selector', 'option_label'],
     assert_text_contains: ['expected_text', 'selector'],
+    assert_value: ['selector', 'expected'],
     assert_checked: ['selector'], assert_unchecked: ['selector'],
     assert_selected: ['selector', 'expected'],
     assert_enabled: ['selector'],
@@ -5705,7 +5710,7 @@ _UI_JAVASCRIPT = r"""
     uncheck: ['selector'], fill: ['selector', 'value'],
     assert_hidden: ['selector'], assert_url: ['expected'],
     select_option: ['selector', 'option_label'],
-    assert_text_contains: ['expected_text'], assert_checked: ['selector'],
+    assert_text_contains: ['expected_text'], assert_value: ['selector', 'expected'], assert_checked: ['selector'],
     assert_unchecked: ['selector'],
     assert_selected: ['selector'], assert_enabled: ['selector'], assert_disabled: ['selector']
   };
@@ -5715,6 +5720,7 @@ _UI_JAVASCRIPT = r"""
     check: 'Check checkbox', uncheck: 'Uncheck checkbox',
     fill: 'Fill field', assert_hidden: 'Assert hidden', assert_url: 'Assert URL',
     select_option: 'Select option', assert_text_contains: 'Assert text contains',
+    assert_value: 'Assert input value',
     assert_checked: 'Assert checked', assert_unchecked: 'Assert unchecked',
     assert_selected: 'Assert selected',
     assert_enabled: 'Assert enabled', assert_disabled: 'Assert disabled'
@@ -6276,7 +6282,7 @@ _UI_JAVASCRIPT = r"""
       snapshot.provider_diagnostics.forEach((attempt) => {
         const row = document.createElement('li'); row.className = 'progress-event';
         const detail = document.createElement('div');
-        const fields = [`Step ${attempt.step_number}`, `Attempt ${attempt.attempt_number}`, attempt.request_kind, attempt.provider, attempt.status];
+        const fields = [`Step ${attempt.step_number}`, attempt.request_sent === false ? 'Skipped locally (no API request)' : `Attempt ${attempt.attempt_number}`, attempt.request_kind, attempt.provider, attempt.status];
         if (attempt.model) fields.push(attempt.model);
         if (attempt.duration_ms != null) fields.push(`${(attempt.duration_ms / 1000).toFixed(1)} s`);
         detail.append(textNode('p', fields.join(' \u00b7 ')));

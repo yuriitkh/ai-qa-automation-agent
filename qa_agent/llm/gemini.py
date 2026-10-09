@@ -104,6 +104,7 @@ class GeminiProvider(LLMProvider):
                 "Gemini provider is unavailable: GEMINI_API_KEY is not configured."
             )
 
+        interaction = None
         try:
             response_format = {
                 "type": "text",
@@ -119,7 +120,7 @@ class GeminiProvider(LLMProvider):
                     "Allowed actions are ONLY: navigate, assert_page_loaded, "
                     "assert_title, assert_visible, click, check, uncheck, fill, assert_hidden, "
                     "assert_url, select_option, assert_text_contains, assert_checked, "
-                    "assert_unchecked, assert_selected, assert_enabled, and assert_disabled. "
+                    "assert_unchecked, assert_selected, assert_enabled, assert_disabled, and assert_value. "
                     "Never invent, rename, or substitute action names. Use this "
                     "exact parameter contract: "
                     "navigate uses parameters {url: target URL}; "
@@ -133,6 +134,7 @@ class GeminiProvider(LLMProvider):
                     "fill uses parameters {selector: CSS selector, value: text to fill}; "
                     "select_option uses {selector: CSS selector, option_label: visible option label}; "
                     "assert_text_contains uses {expected_text: required substring} and optional selector. "
+                    "assert_value uses selector and expected to verify an input/textarea DOM value, not text. "
                     "assert_checked and assert_unchecked verify checkbox state. "
                     "assert_selected verifies "
                     "radio selection using only selector (expected must be null or omitted), "
@@ -192,10 +194,13 @@ class GeminiProvider(LLMProvider):
             capture_gemini_usage(interaction)
             return QATestPlan.model_validate_json(interaction.output_text)
         except ValidationError as error:
-            raise RetryableLLMError(
+            failure = RetryableLLMError(
                 "Gemini returned an invalid QA test plan.",
                 category="INVALID_RESPONSE", safe_detail="Invalid structured response",
-            ) from error
+            )
+            from qa_agent.candidate_diagnostics import attach_provider_candidate_summary
+            attach_provider_candidate_summary(failure, getattr(interaction, 'output_text', None))
+            raise failure from None
         except Exception as error:
             _raise_for_gemini_error(error, "request")
 

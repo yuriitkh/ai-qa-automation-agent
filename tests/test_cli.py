@@ -206,7 +206,7 @@ class CliRunTests(unittest.TestCase):
     def test_build_pipeline_wires_all_sqlite_repositories_to_one_database(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "cli.sqlite3"
-            with patch("qa_agent.cli.create_router", return_value=Mock()):
+            with patch("qa_agent.provider_settings.ProviderSettingsService.create_router", return_value=Mock()):
                 pipeline = build_pipeline(database_path=database)
 
             self.assertIsInstance(pipeline._plan_store, SQLitePlanStore)

@@ -23,6 +23,7 @@ class QATestStep(BaseModel):
         "assert_url": ("expected",),
         "select_option": ("selector", "option_label"),
         "assert_text_contains": ("expected_text",),
+        "assert_value": ("selector", "expected"),
         "assert_checked": ("selector",),
         "assert_unchecked": ("selector",),
         "assert_selected": ("selector",),
@@ -43,6 +44,7 @@ class QATestStep(BaseModel):
         "assert_url",
         "select_option",
         "assert_text_contains",
+        "assert_value",
         "assert_checked",
         "assert_unchecked",
         "assert_selected",
@@ -56,7 +58,7 @@ class QATestStep(BaseModel):
         selector = self.parameters.get("selector")
         if self.action in {
             "select_option", "assert_selected", "assert_checked", "assert_unchecked",
-            "check", "uncheck", "assert_enabled", "assert_disabled",
+            "check", "uncheck", "assert_enabled", "assert_disabled", "assert_value",
         }:
             if not isinstance(selector, str) or not selector.strip():
                 raise ValueError(f"{self.action} requires a selector.")
@@ -70,6 +72,8 @@ class QATestStep(BaseModel):
             expected = self.parameters.get("expected")
             if expected is not None and not isinstance(expected, str):
                 raise ValueError("assert_selected expected must be a string or null.")
+        if self.action == "assert_value" and not isinstance(self.parameters.get("expected"), str):
+            raise ValueError("assert_value requires an exact expected input value.")
         return self
 
 

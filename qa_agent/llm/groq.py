@@ -100,7 +100,7 @@ class GroqProvider(LLMProvider):
             "Allowed actions are ONLY: navigate, assert_page_loaded, "
             "assert_title, assert_visible, click, check, uncheck, fill, assert_hidden, and "
             "assert_url, select_option, assert_text_contains, assert_checked, "
-            "assert_unchecked, assert_selected, assert_enabled, and assert_disabled. "
+            "assert_unchecked, assert_selected, assert_enabled, assert_disabled, and assert_value. "
             "Never invent, rename, or substitute action names. Every parameters "
             "object MUST contain exactly these five common keys: url, expected, "
             "selector, expected_text, and value. Include option_label only for "
@@ -116,6 +116,7 @@ class GroqProvider(LLMProvider):
             "fill uses {selector: CSS selector, value: text to fill}. "
             "select_option uses {selector, option_label}; option_label is the visible option text. "
             "For assert_text_contains use expected_text and optionally selector. "
+            "assert_value uses selector and expected to verify an input/textarea DOM value, not text. "
             "assert_checked and assert_unchecked verify checkbox state; assert_selected verifies radio state "
             "using selector with expected null, or select state using selector and expected "
             "option label or value. assert_enabled and assert_disabled use selector. "
@@ -191,6 +192,7 @@ class GroqProvider(LLMProvider):
                 payload=_response_payload(response), headers=response.headers,
             )
 
+        output_text = None
         try:
             response_data = response.json()
             capture_openai_usage(response_data)
@@ -198,11 +200,14 @@ class GroqProvider(LLMProvider):
             plan = QATestPlan.model_validate_json(output_text)
             return plan
         except Exception as error:
-            raise RetryableLLMError(
+            failure = RetryableLLMError(
                 "Groq returned an invalid QA test plan.",
                 category="INVALID_RESPONSE",
                 safe_detail="Invalid structured response",
-            ) from error
+            )
+            from qa_agent.candidate_diagnostics import attach_provider_candidate_summary
+            attach_provider_candidate_summary(failure, output_text)
+            raise failure from None
 
     def create_discovery(self, task: str, target_url: str, page_snapshot: str) -> AIDiscoveryResult:
         api_key = self._resolved_api_key()

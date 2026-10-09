@@ -524,9 +524,13 @@ class LLMProviderContractTests(unittest.TestCase):
                 )
         self.assertEqual(
             str(raised.exception),
-            "openai-compat: returned an invalid QA test plan.",
+            "openai-compat: invalid JSON response.",
         )
-        self.assertIsNotNone(raised.exception.__cause__)
+        self.assertEqual(raised.exception.category, 'INVALID_RESPONSE')
+        self.assertEqual(raised.exception.provider_error_code, 'invalid_json')
+        # Parsing diagnostics do not retain a JSONDecodeError carrying the
+        # raw response document in the public exception chain.
+        self.assertIsNone(raised.exception.__cause__)
 
         # Missing API key: non-retryable, env var named but never echoed.
         with patch.dict(os.environ, {"TEST_COMPAT_API_KEY": "  "}, clear=True):

@@ -71,6 +71,7 @@ _ASSERTION_ACTIONS = frozenset({
     "assert_page_loaded", "assert_title", "assert_visible", "assert_hidden",
     "assert_url", "assert_text_contains", "assert_checked", "assert_unchecked", "assert_selected",
     "assert_enabled", "assert_disabled",
+    "assert_value",
 })
 
 _VERIFICATION_INTENT = re.compile(
@@ -121,7 +122,7 @@ _NO_ERROR = re.compile(
 )
 _INPUT_ACCEPTANCE = re.compile(
     r"(?:all\s+)?(?:the\s+)?(?:(?:entered|provided|input)\s+)?"
-    r"(?:values|inputs?|(?:required\s+)?fields)\s+"
+    r"(?:data|values|inputs?|(?:required\s+)?fields)\s+"
     r"(?:(?:are|is)\s+accepted|accept\s+(?:the\s+)?(?:input|data|values))", re.I,
 )
 _SUBMISSION_BLOCKED = re.compile(
@@ -431,6 +432,10 @@ def _expectation_kind(clause: str) -> str | None:
     # A positive error-message assertion proves the opposite of this result.
     if has_error_absence_requirement(clause):
         return "no_error"
+    unquoted = _QUOTED.sub(' ', clause)
+    if (re.search(r"\b(?:field|input)\b.*\b(?:contains?|value|matches?|equals?)\b", clause, re.I)
+            and not re.search(r'\b(?:error|message|confirmation|notification|alert|warning|notice)\b', unquoted, re.I)):
+        return "input_value"
     if _REQUIRED_FIELD_ERRORS.search(clause):
         return "required_field_errors" if _VISIBLE.search(clause) else None
     if _SUBMISSION_BLOCKED.search(clause):
@@ -496,9 +501,13 @@ def _action_covers(
         "loaded": {"assert_page_loaded", "assert_url"},
         "text": {"assert_text_contains", "assert_visible"},
         "result": {"assert_text_contains", "assert_visible"},
+        "input_value": {"assert_value"},
     }.get(expectation.kind, set())
     if action not in allowed:
         return False
+    if expectation.kind == "input_value":
+        from qa_agent.input_value_assertions import input_value_subject_matches
+        return input_value_subject_matches(expectation.clause, plan, action_index, discovery)
     if expectation.kind == "form_visible":
         record = _observed_records(discovery).get(parameters.get("selector"), {})
         if not (record.get("tag") == "form" or record.get("role") == "form"):

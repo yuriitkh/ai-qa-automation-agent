@@ -537,7 +537,7 @@ class QATestPipeline:
                                            "Review the requirement and observed target; never substitute an unobserved selector. ")
                             if "cookie" in (test_step.description + test_step.expected).casefold():
                                 safe_reason += "Use Leave unchanged and explicit visitor setup for cookie checks. "
-                            safe_reason += f"Requirement: {test_step.description[:80]} Expected Result: {test_step.expected[:80]}"
+                            safe_reason += "Review this TestStep and the value-free generation diagnostics."
                         emit_progress_event(
                             ExecutionEventType.PLAN_GENERATION_FAILED,
                             step=test_step,

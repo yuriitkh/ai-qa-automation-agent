@@ -22,7 +22,7 @@ class ActionFailureDiagnostic(BaseModel):
     model_config = ConfigDict(frozen=True, extra="ignore")
 
     action_index: int = Field(ge=0)
-    action: Literal["navigate", "assert_page_loaded", "assert_title", "assert_visible", "click", "check", "uncheck", "fill", "assert_hidden", "assert_url", "select_option", "assert_text_contains", "assert_checked", "assert_unchecked", "assert_selected", "assert_enabled", "assert_disabled"]
+    action: Literal["navigate", "assert_page_loaded", "assert_title", "assert_visible", "click", "check", "uncheck", "fill", "assert_hidden", "assert_url", "select_option", "assert_text_contains", "assert_checked", "assert_unchecked", "assert_selected", "assert_enabled", "assert_disabled", "assert_value"]
     selector_identity: str | None = None
     exception_category: Literal["TIMEOUT", "ASSERTION_FAILURE", "BROWSER_ERROR", "ACTION_ERROR"]
     exception_type: Literal["TimeoutError", "AssertionError", "Error", "Other"]
@@ -94,7 +94,8 @@ def capture_action_failure(page, action, index, plan, error) -> ActionFailureDia
     category = "BROWSER_ERROR" if infrastructure else "TIMEOUT" if any(type(item).__name__ == "TimeoutError" for item in causes) else "ASSERTION_FAILURE" if action.action.startswith("assert_") and isinstance(error, AssertionError) else "ACTION_ERROR"
     data = dict(action_index=index, action=action.action,
         selector_identity=safe_selector_identity(action.parameters.get("selector"),
-            [item.parameters.get("value") for item in plan.steps if item.action == "fill"]),
+            [item.parameters.get("value") if item.action == "fill" else item.parameters.get("expected")
+             for item in plan.steps if item.action in {"fill", "assert_value"}]),
         exception_category=category, timed_out=timeout,
         exception_type="TimeoutError" if category == "TIMEOUT" else "AssertionError" if isinstance(error, AssertionError) else "Error" if type(error).__name__ == "Error" else "Other")
     # Best-effort boolean/state probes cannot mask the original action failure.
