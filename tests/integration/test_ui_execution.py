@@ -48,6 +48,9 @@ class PersistedTestCaseBrowserFlowTests(unittest.TestCase):
                 case for case in storage.test_case_repository.list()
                 if case.name == "Local registration demo"
             )
+            # Seeded completion coverage is insufficient. Preserve the exact
+            # plans and exercise their evidence/history through no-AI Regression.
+            self.assertFalse(run_service.workflow_availability(test_case.id).validation_available)
             server_thread = threading.Thread(target=server.serve_forever, daemon=True)
             server_thread.start()
             connection = HTTPConnection("127.0.0.1", port, timeout=90)
@@ -55,7 +58,7 @@ class PersistedTestCaseBrowserFlowTests(unittest.TestCase):
                 connection.request(
                     "POST",
                     f"/test-cases/{test_case.id}/run",
-                    body="workflow=VALIDATION",
+                    body="workflow=REGRESSION",
                     headers={"Content-Type": "application/x-www-form-urlencoded"},
                 )
                 response = connection.getresponse()
@@ -93,7 +96,7 @@ class PersistedTestCaseBrowserFlowTests(unittest.TestCase):
 
                 record = storage.run_history.list_for_test_case(test_case.id)[0]
                 self.assertEqual(progress["elapsed_ms"], record.duration_ms)
-                self.assertEqual(record.workflow_type, WorkflowType.VALIDATION)
+                self.assertEqual(record.workflow_type, WorkflowType.REGRESSION)
                 self.assertEqual(record.status.value, "FAILED")
                 self.assertEqual(record.outcome, "AUTOMATION_EXECUTION_ERROR")
                 self.assertEqual(

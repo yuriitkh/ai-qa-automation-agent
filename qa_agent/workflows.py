@@ -93,7 +93,7 @@ class _PinnedTestCaseWorkflow:
             for item in resolved.steps
             if not expected_result_coverage(
                 item.test_step,
-                item.plan_version.qa_test_plan,
+                item.plan_version,
             ).is_sufficient
         )
         coverage_sufficient = not uncovered_step_ids

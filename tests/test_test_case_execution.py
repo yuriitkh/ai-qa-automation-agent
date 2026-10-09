@@ -36,7 +36,7 @@ class TestCaseExecutionServiceTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
-    def test_service_executes_saved_pins_through_workflow_and_records_once(self) -> None:
+    def test_service_executes_uncovered_demo_pins_without_false_pass_and_records_once(self) -> None:
         received_plans = []
 
         def runner(plan):
@@ -54,11 +54,14 @@ class TestCaseExecutionServiceTests(unittest.TestCase):
         result = service.run(self.local_case.id, WorkflowType.REGRESSION)
 
         self.assertEqual(len(received_plans), 3)
-        self.assertEqual(result.outcome.value, "PASSED")
+        # The legacy demo's completion check only asserts "Registration demo".
+        # Running those immutable pins remains possible, but cannot report PASS.
+        self.assertEqual(result.outcome.value, "AUTOMATION_EXECUTION_ERROR")
         self.assertEqual(len(result.test_run.executions), 3)
         record = self.storage.run_history.get(result.test_run.id)
         self.assertIsNotNone(record)
         self.assertEqual(record.workflow_type, WorkflowType.REGRESSION)
+        self.assertEqual(record.outcome, "AUTOMATION_EXECUTION_ERROR")
         self.assertEqual(
             [item.test_plan_version_id for item in record.executions],
             [self.storage.plan_store.find(step.id).id for step in self.local_case.steps],
@@ -104,7 +107,7 @@ class TestCaseExecutionServiceTests(unittest.TestCase):
             service.run(self.local_case.id, WorkflowType.AUTOMATION)
         self.assertEqual(self.storage.run_history.list_for_test_case(self.local_case.id), [])
 
-    def test_complete_plan_set_makes_validation_and_regression_available(self) -> None:
+    def test_complete_but_uncovered_demo_plans_block_validation_and_preserve_regression(self) -> None:
         service = RunCaseService(
             self.storage.test_case_repository,
             self.storage.plan_store,
@@ -115,8 +118,9 @@ class TestCaseExecutionServiceTests(unittest.TestCase):
         availability = service.workflow_availability(self.local_case.id)
 
         self.assertFalse(availability.automation_available)
-        self.assertTrue(availability.validation_available)
+        self.assertFalse(availability.validation_available)
         self.assertTrue(availability.regression_available)
+        self.assertEqual(availability.reason, "Automation does not verify the TestStep expected result.")
         self.assertEqual(availability.usable_plan_count, len(self.local_case.steps))
         self.assertEqual(
             [item[2] for item in availability.plan_versions],

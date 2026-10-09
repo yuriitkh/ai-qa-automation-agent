@@ -935,7 +935,7 @@ def _validate_generated_plan(
         discovery_result,
         requirement_context=requirement_context,
     )
-    validate_expected_result_coverage(test_step, executable_plan)
+    validate_expected_result_coverage(test_step, executable_plan, discovery=discovery_result)
     return GeneratedTestPlan(
         test_plan=generated_plan.test_plan,
         test_plan_version=version.model_copy(update={

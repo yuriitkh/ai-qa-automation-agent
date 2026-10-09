@@ -6,16 +6,18 @@ import pytest
 from playwright.sync_api import sync_playwright
 
 from qa_agent.browser_discovery import capture_current_page_discovery
+from qa_agent.automation_lifecycle import AutomationLifecycleService, AutomationStatus
+from qa_agent.expected_result_coverage import expected_result_coverage
 from qa_agent.browser_runner import BrowserRunner
 from qa_agent.llm.router import LLMRouter
-from qa_agent.models import ExecutionStatus, QATestPlan, TestCase as Case
+from qa_agent.models import ExecutionStatus, QATestPlan, TestCase as Case, TestStep as Step
 from qa_agent.pinned_execution import PinnedExecutionService, PlanVersionSet, StepPlanSelection
 from qa_agent.plan_execution import PlanExecutionService
 from qa_agent.pipeline import QATestPipeline
 from qa_agent.storage import create_sqlite_storage
 from qa_agent.test_plan_generator import LLMTestPlanGenerator
 from qa_agent.web import WebResponse, _local_demo_page
-from qa_agent.workflows import RegressionWorkflow
+from qa_agent.workflows import RegressionWorkflow, ValidationWorkflow, WorkflowOutcome
 from tests.integration.test_test_case_quality_integration import local_server
 from tests.test_registration_coverage import RegistrationProvider, assertion, registration_plan, registration_step
 
@@ -98,3 +100,52 @@ def test_observed_hidden_error_coverage_preserves_requirement_and_runtime_classi
                 saved = regression.run(case, pins)
             assert saved.test_run.status == ExecutionStatus.PASSED
             assert len(provider.calls) == 1 and storage.plan_store.get_version(version.id).model_dump_json() == frozen
+
+
+def test_discovered_semantic_subject_survives_sqlite_validation_and_no_ai_regression(tmp_path):
+    target = RegistrationTarget()
+    target.javascript += "\ndocument.querySelector('#page-status').textContent = 'Registration successful';"
+    with local_server(target) as origin:
+        url = origin + '/demo-target/registration'
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.goto(url)
+                discovery = capture_current_page_discovery(page)
+            finally:
+                browser.close()
+        step = Step(name='Verify registration confirmation', description='Verify the registration confirmation message.',
+                    expected='A confirmation message is displayed.', order=0)
+        case = Case(name='Observed registration confirmation', description=step.description + ' ' + step.expected,
+                    base_url=url, steps=[step])
+        plan = QATestPlan(url=url, steps=[
+            {'action': 'navigate', 'parameters': {'url': url}},
+            {'action': 'assert_visible', 'parameters': {'selector': '#page-status'}},
+        ])
+        provider = RegistrationProvider([plan])
+        generator = LLMTestPlanGenerator(LLMRouter([provider]))
+        storage = create_sqlite_storage(tmp_path / 'semantic-coverage.sqlite3')
+        runner = BrowserRunner(tmp_path / 'evidence')
+        result = QATestPipeline(None, generator, discovery=lambda _: discovery, runner=runner,
+            plan_store=storage.plan_store, execution_repository=storage.execution_repository,
+            run_history=storage.run_history).run_test_case(case)
+        assert result.test_run.status == ExecutionStatus.PASSED
+        version = storage.plan_store.find(step.id)
+        frozen = version.model_dump_json()
+        history = storage.run_history.list_for_test_case(case.id)[0]
+        assert expected_result_coverage(step, version).is_sufficient
+        assert 'Registration successful' not in frozen
+        pins = PlanVersionSet.from_mapping({step.id: version.id})
+        executor = PinnedExecutionService(storage.plan_store, PlanExecutionService(runner, storage.execution_repository))
+        lifecycle = AutomationLifecycleService(storage.automation_lifecycle_repository, storage.plan_store)
+        lifecycle.mark_automation_completed(case)
+        with patch.object(generator.supervisor, 'generate', side_effect=AssertionError('Saved workflows must never generate')):
+            validation = ValidationWorkflow(executor, run_history=storage.run_history).run(case, pins)
+            assert validation.outcome == WorkflowOutcome.PASSED
+            assert lifecycle.mark_validation_completed(case, passed=True) == AutomationStatus.AUTOMATION_READY
+            regression = RegressionWorkflow(executor, run_history=storage.run_history).run(case, pins)
+            assert regression.outcome == WorkflowOutcome.PASSED
+        assert len(provider.calls) == 1
+        assert storage.plan_store.get_version(version.id).model_dump_json() == frozen
+        assert history in storage.run_history.list_for_test_case(case.id)

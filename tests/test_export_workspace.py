@@ -77,7 +77,10 @@ class ExportWorkspaceTests(unittest.TestCase):
                     version=1,
                     qa_test_plan=QATestPlan(
                         url=case.base_url,
-                        steps=[QATestStep(action="navigate", parameters={"url": case.base_url})],
+                        steps=[
+                            QATestStep(action="navigate", parameters={"url": case.base_url}),
+                            QATestStep(action="assert_page_loaded"),
+                        ],
                     ),
                 ),
                 test_plan=plan,

@@ -194,7 +194,7 @@ class LLMTestPlanGenerator(TestPlanGenerator):
             requirement_context=requirement_context,
         )
         check_cancelled()
-        validate_expected_result_coverage(test_step, executable_plan)
+        validate_expected_result_coverage(test_step, executable_plan, discovery=discovery_result)
         return executable_plan, grounding
 
     @staticmethod

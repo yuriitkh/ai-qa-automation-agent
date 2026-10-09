@@ -8,18 +8,23 @@ import pytest
 from qa_agent.assertion_grounding import classify_assertions
 from qa_agent.browser_discovery import MAX_SNAPSHOT_CHARS, _build_snapshot
 from qa_agent.execution_progress import ExecutionProgressReporter, ExecutionProgressStore, active_execution_progress
-from qa_agent.expected_result_coverage import ExpectedResultCoverageStatus, expected_result_coverage, validate_expected_result_coverage
+from qa_agent.expected_result_coverage import ExpectedResultCoverageError, ExpectedResultCoverageStatus, expected_result_coverage, validate_expected_result_coverage
+from qa_agent.automation_lifecycle import AutomationLifecycleService, AutomationStatus
 from qa_agent.llm.base import LLMProvider
 from qa_agent.llm.errors import RetryableLLMError
 from qa_agent.llm.router import LLMRouter
 from qa_agent.llm.usage_metadata import capture_openai_usage
 from qa_agent.llm_usage import LLMUsageRepository, LLMUsageService
-from qa_agent.models import DiscoveryResult, DiscoveryStatus, InteractiveElement, QATestPlan, TestCase as Case, TestStep as Step
+from qa_agent.models import DiscoveryResult, DiscoveryStatus, InteractiveElement, PlanVersionOrigin, QATestPlan, TestCase as Case, TestPlan as Plan, TestPlanVersion as Version, TestStep as Step
 from qa_agent.pipeline import PipelineStageError, QATestPipeline
+from qa_agent.pinned_execution import PinnedExecutionService, PlanVersionSet
+from qa_agent.plan_execution import PlanExecutionService
 from qa_agent.reliability import AutomationReliabilitySupervisor, InMemoryReliabilityRepository, ReliabilitySettings
 from qa_agent.storage import create_sqlite_storage
 from qa_agent.test_plan_generator import LLMTestPlanGenerator
 from qa_agent.test_plan_validation import PlanValidationError
+from qa_agent.test_case_review import TestCaseReviewService as CaseReview
+from qa_agent.workflows import RegressionWorkflow, ValidationWorkflow, WorkflowOutcome
 
 
 URL = "http://127.0.0.1:8000/demo-target/registration"
@@ -47,6 +52,269 @@ def registration_plan(*assertions, url=URL):
 
 def assertion(action="assert_hidden", selector="#form-error"):
     return {"action": action, "parameters": {"selector": selector}}
+
+
+@pytest.mark.parametrize("outcome", ["persistence", "confirmation"])
+def test_full_generation_gates_reject_false_positive_expected_results(outcome):
+    if outcome == "persistence":
+        step = Step(name="Click Save", description="Click the Save button.",
+                    expected="Data is persisted correctly.", order=0)
+        plan = QATestPlan(url=URL, steps=[{"action": "click", "parameters": {"selector": "#save"}}])
+        discovery = DiscoveryResult(status=DiscoveryStatus.SUCCESS, url=URL,
+            interactive_elements=[InteractiveElement(kind="button", tag="button", selector="#save")])
+        context = step.description + " " + step.expected
+    else:
+        step = Step(name="Fill registration form", description="Fill the registration form with valid information.",
+                    expected="A confirmation message is displayed.", order=0)
+        plan = registration_plan(assertion("assert_visible", "#registration-form"))
+        discovery = registration_discovery().model_copy(update={"snapshot": {
+            "visible_text_elements": [{"selector": "#registration-form", "tag": "form", "text": "Registration form"}]
+        }})
+        context = "Fill the registration form and verify that a confirmation message is displayed."
+    frozen = plan.model_dump_json()
+    provider = RegistrationProvider([plan])
+    generator = LLMTestPlanGenerator(LLMRouter([provider]))
+    with pytest.raises(PlanValidationError) as caught:
+        generator.generate_with_plan(step, discovery, requirement_context=context)
+    assert caught.value.issues[0].code == "EXPECTED_RESULT_NOT_COVERED"
+    expected_status = ExpectedResultCoverageStatus.UNKNOWN if outcome == "persistence" else ExpectedResultCoverageStatus.NOT_COVERED
+    assert expected_result_coverage(step, plan, discovery=discovery).status == expected_status
+    assert len(provider.calls) == 1 and plan.model_dump_json() == frozen
+    record = generator.supervisor.repository.list_records()[0]
+    assert record.outcome == "NEEDS_ATTENTION" and record.candidate_version_id is None
+    assert record.attempts[0].quality_gates["expected_result_coverage"] == "FAILED"
+
+
+@pytest.mark.parametrize("name,description,expected,action", [
+    ("Open login", "Navigate to login.", "The login page is opened.", {"action": "navigate", "parameters": {"url": URL}}),
+    ("Enter email", "Enter email into the form.", "The email is entered.", {"action": "fill", "parameters": {"selector": "#email", "value": "local@example.test"}}),
+    ("Click Save", "Click the Save button.", "The button is clicked.", {"action": "click", "parameters": {"selector": "#save"}}),
+    ("Register", "Perform registration.", "The registration action is processed.", {"action": "click", "parameters": {"selector": "#save"}}),
+    ("Click Save", "Click the Save button.", "Done.", {"action": "click", "parameters": {"selector": "#save"}}),
+])
+def test_full_generation_gates_preserve_explicit_action_only_results(name, description, expected, action):
+    step = Step(name=name, description=description, expected=expected, order=0)
+    plan = QATestPlan(url=URL, steps=[action])
+    discovery = registration_discovery().model_copy(update={"snapshot": {"buttons": [{"selector": "#save"}]}})
+    candidate, _ = LLMTestPlanGenerator._validate_generated_plan(plan, discovery, step)
+    assert expected_result_coverage(step, candidate).status == ExpectedResultCoverageStatus.NO_VERIFICATION_REQUIRED
+
+
+def confirmation_discovery():
+    return registration_discovery().model_copy(update={"snapshot": {"visible_text_elements": [
+        {"selector": "#registration-form", "tag": "form", "text": "Registration form"},
+        {"selector": "#node-17", "tag": "p", "role": "status", "text": "Registration successful. Welcome."},
+    ]}})
+
+
+def confirmation_step():
+    return Step(name="Fill registration form", description="Fill the registration form with valid information.",
+                expected="A confirmation message is displayed.", order=0)
+
+
+def test_full_generation_gates_accept_observed_semantic_subject_without_rewriting_plan():
+    step, discovery = confirmation_step(), confirmation_discovery()
+    plan = registration_plan(assertion("assert_visible", "#node-17"))
+    frozen = plan.model_dump_json()
+    generator = LLMTestPlanGenerator(LLMRouter([RegistrationProvider([plan])]))
+    generated = generator.generate_with_plan(step, discovery)
+    version = generated.test_plan_version
+    assert version.qa_test_plan.model_dump_json() == frozen
+    assert expected_result_coverage(step, version).status == ExpectedResultCoverageStatus.COVERED
+    assert version.assertion_grounding[0].category.value == "REQUIREMENT_GROUNDED"
+    assert version.assertion_grounding[0].covered_expectation_indexes == (0,)
+    assert "Registration successful" not in version.model_dump_json()
+    # Pure plan coverage cannot assume what an opaque selector represents.
+    assert not expected_result_coverage(step, plan).is_sufficient
+    changed_step = step.model_copy(update={"expected": "An error message is displayed."})
+    changed_plan = version.model_copy(update={"qa_test_plan": registration_plan(assertion("assert_visible", "#registration-form"))})
+    assert not expected_result_coverage(changed_step, version).is_sufficient
+    assert not expected_result_coverage(step, changed_plan).is_sufficient
+
+
+@pytest.mark.parametrize("text", ["Account created successfully", "Registration successful"])
+@pytest.mark.parametrize("source", ["requirement", "discovery"])
+def test_semantic_confirmation_text_remains_valid_when_required_or_observed(text, source):
+    discovery = registration_discovery()
+    context = None
+    if source == "requirement":
+        context = f'Fill the registration form and verify the exact confirmation text "{text}".'
+    else:
+        discovery.snapshot["visible_text_elements"] = [{"selector": "#node-17", "tag": "p", "text": text}]
+    plan = registration_plan({"action": "assert_text_contains", "parameters": {"expected_text": text}})
+    candidate, _ = LLMTestPlanGenerator._validate_generated_plan(plan, discovery, confirmation_step(), requirement_context=context)
+    assert candidate == plan
+
+
+@pytest.mark.parametrize("included", ["both", "confirmation", "absence"])
+def test_full_generation_gates_preserve_compound_discovered_subjects(included):
+    step = registration_step("A confirmation message is displayed and no errors are displayed.")
+    discovery = confirmation_discovery()
+    discovery.snapshot["state_elements"] = registration_discovery().snapshot["state_elements"]
+    checks = []
+    if included in {"both", "confirmation"}:
+        checks.append(assertion("assert_visible", "#node-17"))
+    if included in {"both", "absence"}:
+        checks.append(assertion())
+    generator = LLMTestPlanGenerator(LLMRouter([RegistrationProvider([registration_plan(*checks)])]))
+    if included == "both":
+        version = generator.generate_with_plan(step, discovery).test_plan_version
+        assert expected_result_coverage(step, version).status == ExpectedResultCoverageStatus.COVERED
+    else:
+        with pytest.raises(PlanValidationError) as caught:
+            generator.generate_with_plan(step, discovery)
+        assert caught.value.issues[0].code == "EXPECTED_RESULT_NOT_COVERED"
+        assert expected_result_coverage(step, registration_plan(*checks), discovery=discovery).status == ExpectedResultCoverageStatus.PARTIALLY_COVERED
+
+
+def test_semantically_named_but_unobserved_confirmation_selector_is_still_rejected():
+    with pytest.raises(PlanValidationError) as caught:
+        LLMTestPlanGenerator._validate_generated_plan(
+            registration_plan(assertion("assert_visible", "#invented-confirmation")), confirmation_discovery(), confirmation_step())
+    assert caught.value.issues[0].code == "DISCOVERY_SELECTOR_MISMATCH"
+
+
+@pytest.mark.parametrize("expected", ["The checkbox is unchecked.", "The checkbox is not checked."])
+def test_negative_checkbox_state_uses_observed_subject_without_negation_token_overlap(expected):
+    step = Step(name="Verify checkbox state", description="Verify the checkbox remains clear.", expected=expected, order=0)
+    discovery = DiscoveryResult(status=DiscoveryStatus.SUCCESS, url=URL,
+        interactive_elements=[InteractiveElement(kind="checkbox", tag="input", selector="#node-17", accessible_name="Accept terms")])
+    plan = QATestPlan(url=URL, steps=[assertion("assert_unchecked", "#node-17")])
+    generator = LLMTestPlanGenerator(LLMRouter([RegistrationProvider([plan])]))
+    version = generator.generate_with_plan(step, discovery).test_plan_version
+    assert expected_result_coverage(step, version).is_sufficient
+    with pytest.raises(PlanValidationError) as caught:
+        LLMTestPlanGenerator._validate_generated_plan(
+            QATestPlan(url=URL, steps=[assertion("assert_checked", "#node-17")]), discovery, step)
+    assert caught.value.issues[0].code == "EXPECTED_RESULT_NOT_COVERED"
+
+
+@pytest.mark.parametrize("parameters", [
+    {"selector": "#registration-form"},
+    {"selector": "#form-message"},
+])
+def test_other_observed_nodes_and_generic_message_tokens_cannot_supply_confirmation(parameters):
+    discovery = confirmation_discovery()
+    discovery.snapshot["visible_text_elements"].append({"selector": "#form-message", "tag": "p", "text": "Fill the registration form."})
+    plan = registration_plan({"action": "assert_visible", "parameters": parameters})
+    with pytest.raises(PlanValidationError) as caught:
+        LLMTestPlanGenerator._validate_generated_plan(plan, discovery, confirmation_step())
+    assert caught.value.issues[0].code == "EXPECTED_RESULT_NOT_COVERED"
+    assert classify_assertions(plan, confirmation_step(), discovery)[0].category.value == "UNKNOWN"
+
+
+def test_text_assertion_cannot_borrow_other_text_from_the_same_element():
+    discovery = confirmation_discovery()
+    discovery.snapshot["visible_text_elements"][0]["text"] = "Registration form. Confirmation message."
+    plan = registration_plan({"action": "assert_text_contains", "parameters": {
+        "selector": "#registration-form", "expected_text": "Registration form"}})
+    with pytest.raises(PlanValidationError) as caught:
+        LLMTestPlanGenerator._validate_generated_plan(plan, discovery, confirmation_step())
+    assert caught.value.issues[0].code == "EXPECTED_RESULT_NOT_COVERED"
+
+
+def test_form_visibility_cannot_borrow_a_child_confirmation_from_aggregate_text():
+    discovery = confirmation_discovery()
+    discovery.snapshot["visible_text_elements"][0].update({
+        "text": "Registration form. Registration successful.",
+        "accessible_name": "Registration form. Registration successful.",
+    })
+    with pytest.raises(PlanValidationError) as caught:
+        LLMTestPlanGenerator._validate_generated_plan(
+            registration_plan(assertion("assert_visible", "#registration-form")), discovery, confirmation_step())
+    assert caught.value.issues[0].code == "EXPECTED_RESULT_NOT_COVERED"
+
+
+@pytest.mark.parametrize("role", ["alert", "ALERT"])
+def test_alert_role_alone_is_not_an_error_subject_for_negative_coverage(role):
+    discovery = registration_discovery()
+    discovery.snapshot["state_elements"].append({"selector": "#node-17", "tag": "p", "role": role, "visible": False})
+    with pytest.raises(PlanValidationError) as caught:
+        LLMTestPlanGenerator._validate_generated_plan(registration_plan(assertion(selector="#node-17")), discovery, registration_step())
+    assert caught.value.issues[0].code == "EXPECTED_RESULT_NOT_COVERED"
+
+
+def test_ai_suggestion_and_generic_status_role_cannot_establish_confirmation_subject():
+    plan = registration_plan(assertion("assert_visible", "#node-17"))
+    for discovery in (
+        registration_discovery().model_copy(update={"snapshot": {"state_elements": [
+            {"selector": "#node-17", "tag": "p", "role": "status", "visible": False}]}}),
+        registration_discovery().model_copy(update={"status": DiscoveryStatus.PARTIAL,
+            "interactive_elements": [*registration_discovery().interactive_elements,
+                InteractiveElement(kind="text", selector="#node-17", text="Confirmation message")]}),
+    ):
+        with pytest.raises(PlanValidationError) as caught:
+            LLMTestPlanGenerator._validate_generated_plan(plan, discovery, confirmation_step())
+        assert caught.value.issues[0].code == "EXPECTED_RESULT_NOT_COVERED"
+
+
+def test_expected_outcome_subject_cannot_be_replaced_by_its_account_modifier():
+    step = confirmation_step().model_copy(update={"expected": "The account confirmation is displayed."})
+    discovery = confirmation_discovery()
+    discovery.snapshot["visible_text_elements"].append({"selector": "#account-form", "tag": "form", "text": "Account profile form"})
+    plan = registration_plan(assertion("assert_visible", "#account-form"))
+    with pytest.raises(PlanValidationError) as caught:
+        LLMTestPlanGenerator._validate_generated_plan(plan, discovery, step)
+    assert caught.value.issues[0].code == "EXPECTED_RESULT_NOT_COVERED"
+
+
+def test_page_load_wording_requires_a_supported_load_assertion():
+    step = Step(name="Open local page", description="Open the local test page.", expected="The page loads.", order=0)
+    navigate = {"action": "navigate", "parameters": {"url": URL}}
+    missing = QATestPlan(url=URL, steps=[navigate])
+    assert expected_result_coverage(step, missing).status == ExpectedResultCoverageStatus.NOT_COVERED
+    complete = QATestPlan(url=URL, steps=[navigate, {"action": "assert_page_loaded"}])
+    LLMTestPlanGenerator._validate_generated_plan(complete, registration_discovery(), step)
+
+
+def test_page_load_assertion_does_not_verify_an_unsupported_server_load_outcome():
+    step = Step(name="Click Save", description="Click Save.", expected="The server load is low.", order=0)
+    plan = QATestPlan(url=URL, steps=[{"action": "assert_page_loaded"}])
+    assert expected_result_coverage(step, plan).status == ExpectedResultCoverageStatus.UNKNOWN
+    with pytest.raises(PlanValidationError) as caught:
+        LLMTestPlanGenerator._validate_generated_plan(plan, registration_discovery(), step)
+    assert caught.value.issues[0].code == "EXPECTED_RESULT_NOT_COVERED"
+
+
+def test_unsupported_compound_outcome_is_unknown_even_when_an_action_is_completed():
+    step = Step(name="Click Save", description="Click Save.",
+                expected="The button is clicked and data is persisted correctly.", order=0)
+    assert expected_result_coverage(step, QATestPlan(url=URL, steps=[assertion("assert_visible", "#save")])).status == ExpectedResultCoverageStatus.UNKNOWN
+
+
+@pytest.mark.parametrize("expected,action", [
+    ("Data is persisted correctly.", {"action": "click", "parameters": {"selector": "#save"}}),
+    ("A confirmation message is displayed.", assertion("assert_visible", "#registration-form")),
+])
+def test_saved_false_positive_plans_cannot_approve_validate_or_become_ready(tmp_path, expected, action):
+    storage = create_sqlite_storage(tmp_path / "coverage.sqlite3")
+    step = Step(name="Click Save", description="Click the registration form Save button.", expected=expected, order=0)
+    case = Case(name="Registration coverage", description=step.description, base_url=URL, steps=[step])
+    plan = Plan(test_step_id=step.id, name=step.name)
+    version = Version(test_plan_id=plan.id, version=1, origin=PlanVersionOrigin.HUMAN_EDITED,
+                      qa_test_plan=QATestPlan(url=URL, steps=[action]))
+    storage.plan_store.save(step.id, version, test_plan=plan)
+    frozen = version.model_dump_json()
+    review = CaseReview(storage.test_case_review_repository, storage.plan_store)
+    review.approve_test_case(case)
+    with pytest.raises(ValueError, match="cover each expected result"):
+        review.approve_for_validation(case)
+    lifecycle = AutomationLifecycleService(storage.automation_lifecycle_repository, storage.plan_store)
+    lifecycle.mark_automation_completed(case)
+    assert lifecycle.mark_validation_completed(case, passed=True) == AutomationStatus.NEEDS_VALIDATION
+    pins = PlanVersionSet.from_mapping({step.id: version.id})
+    executions = []
+    executor = PinnedExecutionService(storage.plan_store, PlanExecutionService(
+        lambda candidate: executions.append(candidate) or {"status": "passed", "steps": []}, storage.execution_repository))
+    with pytest.raises(ExpectedResultCoverageError):
+        ValidationWorkflow(executor).run(case, pins)
+    assert not executions
+    # Old pins remain runnable without AI, but uncovered success is technical,
+    # never PASS or a fabricated product defect.
+    regression = RegressionWorkflow(executor, run_history=storage.run_history).run(case, pins)
+    assert regression.outcome == WorkflowOutcome.AUTOMATION_EXECUTION_ERROR
+    assert len(executions) == 1
+    assert storage.plan_store.get_version(version.id).model_dump_json() == frozen
 
 
 class RegistrationProvider(LLMProvider):

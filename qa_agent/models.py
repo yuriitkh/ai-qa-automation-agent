@@ -374,6 +374,10 @@ class AssertionGroundingEntry(BaseModel):
 
     step_index: int = Field(ge=0)
     category: AssertionGrounding
+    # Bound to the exact requirement and executable actions. These value-free
+    # indexes retain Discovery subject matches without storing page content.
+    coverage_fingerprint: str | None = None
+    covered_expectation_indexes: tuple[int, ...] = ()
 
 
 class TestPlanVersion(BaseModel):

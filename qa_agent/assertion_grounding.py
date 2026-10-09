@@ -9,7 +9,11 @@ read from ``DiscoveryResult``'s typed suggestion fields.
 import re
 from collections.abc import Iterable
 
-from qa_agent.expected_result_coverage import has_error_absence_requirement
+from qa_agent.expected_result_coverage import (
+    assertion_subject_matches,
+    coverage_fingerprint,
+    has_error_absence_requirement,
+)
 from qa_agent.models import (
     AssertionGrounding,
     AssertionGroundingEntry,
@@ -76,6 +80,8 @@ def classify_assertions(
     """Return value-free grounding categories, one entry per assertion action."""
     requirements = _requirement_texts(test_step, requirement_context)
     observation_texts = _deterministic_observation_texts(discovery)
+    subject_matches = assertion_subject_matches(test_step, plan, discovery=discovery)
+    fingerprint = coverage_fingerprint(test_step, plan)
     entries: list[AssertionGroundingEntry] = []
 
     for index, action in enumerate(plan.steps):
@@ -100,11 +106,17 @@ def classify_assertions(
                 category = AssertionGrounding.OBSERVATION_GROUNDED
             else:
                 category = AssertionGrounding.INFERRED
-        elif _structural_assertion_is_required(action.action, requirements):
+        elif _structural_assertion_is_required(action.action, requirements) and subject_matches.get(index):
             category = AssertionGrounding.REQUIREMENT_GROUNDED
         else:
             category = AssertionGrounding.UNKNOWN
-        entries.append(AssertionGroundingEntry(step_index=index, category=category))
+        matches = subject_matches.get(index, ())
+        entries.append(AssertionGroundingEntry(
+            step_index=index,
+            category=category,
+            coverage_fingerprint=fingerprint if matches else None,
+            covered_expectation_indexes=matches,
+        ))
     return tuple(entries)
 
 

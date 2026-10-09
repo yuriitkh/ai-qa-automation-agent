@@ -1518,7 +1518,7 @@ class LocalWebApplication:
             version = self._plan_store.find(step.id)
             coverage_html = _expected_result_coverage_html(
                 expected_result_coverage(
-                    step, version.qa_test_plan if version is not None else None
+                    step, version
                 )
             )
             if version is None:
@@ -1624,7 +1624,7 @@ class LocalWebApplication:
             )
             coverage_html = _expected_result_coverage_html(
                 expected_result_coverage(
-                    step, version.qa_test_plan if version is not None else None
+                    step, version
                 )
             )
             form_errors = "".join(
@@ -1705,7 +1705,7 @@ class LocalWebApplication:
             f'<p class="lead">{escape_html(step.name)} · {_plan_origin_label(version.origin)} · '
             f'{escape_html(format_timestamp(version.created_at))}</p></header>'
             + _expected_result_coverage_html(
-                expected_result_coverage(step, version.qa_test_plan)
+                expected_result_coverage(step, version)
             )
             + f'<section class="panel"><p>Plan URL: <code>{escape_html(_safe_automation_url_display(version.qa_test_plan.url))}</code></p>'
             + f'<ol>{actions}</ol></section>'
@@ -3657,7 +3657,7 @@ class LocalWebApplication:
             and any(
                 not expected_result_coverage(
                     step,
-                    (version.qa_test_plan if (version := self._plan_store.find(step.id)) else None),
+                    self._plan_store.find(step.id),
                 ).is_sufficient
                 for step in test_case.steps
             )
@@ -4063,7 +4063,7 @@ class LocalWebApplication:
                 f'<div class="actions"><a class="button" href="/test-cases/{test_case_id}/plans">View TestPlan</a>'
                 f'<a class="button" href="/test-cases/{test_case_id}/automation/edit">Edit Automation</a></div>'
             )
-            if not current_plan_approval and all(expected_result_coverage(step, self._plan_store.find(step.id).qa_test_plan if self._plan_store is not None and self._plan_store.find(step.id) is not None else None).is_sufficient for step in test_case.steps):
+            if not current_plan_approval and all(expected_result_coverage(step, self._plan_store.find(step.id) if self._plan_store is not None else None).is_sufficient for step in test_case.steps):
                 forms.append(
                     f'<form method="post" action="/test-cases/{test_case_id}/approve-validation">'
                     '<button class="button primary" type="submit">Approve for Validation</button></form>'
