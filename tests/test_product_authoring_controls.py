@@ -333,7 +333,7 @@ class ProductAuthoringControlsTests(unittest.TestCase):
         editor = self.app.handle("GET", f"/test-cases/{case.id}/edit").body.decode()
         self.assertIn("data-structured-editor", editor)
         script = self.app.handle("GET", "/assets/ui.js").body.decode()
-        for label in ("Move up", "Move down", "Insert before", "Insert after", "Delete"):
+        for label in ("Move up", "Move down", "Insert Step before", "Insert Step after", "Delete"):
             self.assertIn(label, script)
 
         moved_down = self.post(f"/test-cases/{case.id}/edit", self.edit_values(case, "down:0:0"))

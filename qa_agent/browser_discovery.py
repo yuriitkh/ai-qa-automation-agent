@@ -18,6 +18,7 @@ MAX_HEADINGS = 8
 MAX_LINKS = 10
 MAX_BUTTONS = 8
 MAX_VISIBLE_TEXT_ELEMENTS = 16
+MAX_STATE_ELEMENTS = 16
 MAX_NAVIGATION_PATHS = 3
 MAX_MENU_CANDIDATES = 12
 MAX_DIRECT_NAVIGATION_PATHS = 3
@@ -232,6 +233,16 @@ _SNAPSHOT_SCRIPT = r"""() => {
     const visibleHeadingElements = Array.from(
         document.querySelectorAll("h1, h2, h3, h4, h5, h6")
     ).filter(isVisible).slice(0, 8);
+    // Hidden alert/status containers are real DOM identities needed for
+    // absence assertions. Keep them separate from interactive controls and
+    // visible text; never collect their hidden text or input values.
+    const stateElements = Array.from(document.querySelectorAll('[role="alert"], [role="status"]'))
+        .slice(0, 16).map((element) => {
+            const selector = verifiedSelector(element);
+            if (!selector || selector.length > 180) return null;
+            return {tag: element.tagName.toLowerCase(), role: element.getAttribute('role'),
+                selector, visible: isVisible(element)};
+        }).filter(Boolean);
   return {
     url: window.location.href,
     title: document.title,
@@ -240,6 +251,7 @@ _SNAPSHOT_SCRIPT = r"""() => {
     buttons: collect("button, input[type=button], input[type=submit], [role=button]", 8),
     interactive_elements: collectInteractive(),
     visible_text_elements: collectVisibleText(),
+    state_elements: stateElements,
   };
 }"""
 
@@ -1070,6 +1082,26 @@ def _normalize_interactive_elements(value: Any) -> list[dict[str, Any]]:
     return result
 
 
+def _normalize_state_elements(value: Any) -> list[dict[str, Any]]:
+    """Retain bounded observed alert/status identities, including hidden ones."""
+    if not isinstance(value, list):
+        return []
+    result = []
+    for entry in value[:MAX_STATE_ELEMENTS]:
+        if not isinstance(entry, dict) or entry.get("role") not in ("alert", "status"):
+            continue
+        selector = entry.get("selector")
+        # Do not truncate a selector into a different DOM identity.
+        if not isinstance(selector, str) or not selector.strip() or len(selector) > MAX_SELECTOR_CHARS:
+            continue
+        result.append({
+            "tag": _bounded_text(entry.get("tag"), MAX_SELECTOR_CHARS),
+            "role": entry["role"], "selector": selector,
+            "visible": entry.get("visible") is True,
+        })
+    return result
+
+
 def _build_snapshot(page_data: Any) -> str:
     if not isinstance(page_data, dict):
         raise ValueError("Browser discovery did not return a page snapshot.")
@@ -1095,6 +1127,7 @@ def _build_snapshot(page_data: Any) -> str:
         "visible_text_elements": _normalize_visible_text_elements(
             page_data.get("visible_text_elements")
         ),
+        "state_elements": _normalize_state_elements(page_data.get("state_elements")),
     }
 
     serialized = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
@@ -1104,6 +1137,7 @@ def _build_snapshot(page_data: Any) -> str:
         "interactive_elements",
         "links",
         "visible_text_elements",
+        "state_elements",
         "headings",
         "direct_navigation_paths",
         "navigation_paths",
@@ -1127,6 +1161,7 @@ def _build_snapshot(page_data: Any) -> str:
             "interactive_elements",
             "links",
             "visible_text_elements",
+            "state_elements",
             "headings",
             "direct_navigation_paths",
             "navigation_paths",

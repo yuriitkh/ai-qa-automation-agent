@@ -18,9 +18,11 @@ from qa_agent.web import LocalWebApplication, create_http_server
 class _AuthoringProvider(LLMProvider):
     def __init__(self) -> None:
         self.calls = 0
+        self.plan_calls = 0
         self.prompts: list[str] = []
 
     def create_test_plan(self, task, target_url, page_snapshot):
+        self.plan_calls += 1
         return QATestPlan(url=target_url, steps=[{"action": "assert_page_loaded"}])
 
     def create_structured_output(self, prompt, schema, schema_name):
@@ -174,12 +176,13 @@ class DashboardVoiceIntegrationTests(unittest.TestCase):
                 self.assertEqual(test_cases.list(), [])
                 page.locator('#edit-name').fill('Summary edited during review')
                 page.locator('#edit-description').fill('Unsaved Scenario edits stay separate.')
-                page.get_by_role("button", name="Generate Again", exact=True).click()
+                page.get_by_role("button", name="Regenerate TestCase with AI", exact=True).click()
                 page.wait_for_url('**/test-cases/authoring-progress/**')
                 page.wait_for_url('**/test-cases/review/**', timeout=8000)
                 self.assertEqual(page.locator('#edit-name').input_value(), 'Summary edited during review')
                 self.assertEqual(page.locator('#edit-description').input_value(), 'Check login')
                 self.assertEqual(provider.calls, 2)
+                self.assertEqual(provider.plan_calls, 0)
                 page.get_by_role("button", name="Save TestCase").click()
                 page.wait_for_url('**/test-cases/*')
                 self.assertEqual(test_cases.list()[0].name, 'Summary edited during review')

@@ -9,6 +9,7 @@ read from ``DiscoveryResult``'s typed suggestion fields.
 import re
 from collections.abc import Iterable
 
+from qa_agent.expected_result_coverage import has_error_absence_requirement
 from qa_agent.models import (
     AssertionGrounding,
     AssertionGroundingEntry,
@@ -322,6 +323,8 @@ def _structural_assertion_is_required(
     terms = _STRUCTURAL_TERMS.get(action, ())
     for requirement in requirements:
         text = _EXAMPLE_TAIL.sub(" ", requirement).casefold()
+        if action == "assert_hidden" and has_error_absence_requirement(text):
+            return True
         if action == "assert_checked" and re.search(
             r"\b(?:unchecked|not\s+(?:be\s+)?(?:checked|ticked))\b", text
         ):

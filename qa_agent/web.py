@@ -1467,9 +1467,9 @@ class LocalWebApplication:
             + '<section class="panel"><h2>Steps</h2><p class="muted">Empty fields can be saved as unfinished work. Approval requires meaningful content. Moves stay within their segment.</p>'
             + f'<div data-structured-steps data-segment-urls="{escape_html(segment_urls)}"></div><noscript>Enable JavaScript to insert or reorder steps.</noscript></section>'
             + '<div class="actions"><button class="button primary" type="submit">Save TestCase</button>'
-            + (f'<button class="button" type="submit" data-regenerate-testcase formnovalidate formaction="{escape_html(action.rsplit("/", 1)[0] + "/regenerate")}">Generate Again</button>' if review else '')
+            + (f'<button class="button" type="submit" data-regenerate-testcase formnovalidate formaction="{escape_html(action.rsplit("/", 1)[0] + "/regenerate")}">Regenerate TestCase with AI</button>' if review else '')
             + f'<a class="button" data-cancel-testcase href="{escape_html(cancel_url)}">Cancel unsaved changes</a></div></form>'
-            + ('<p class="muted">Generate Again keeps your current Summary and uses the original Scenario.</p>' if review else '')
+            + ('<p class="muted">Regenerate TestCase with AI keeps your current Summary and uses the original Scenario.</p>' if review else '')
         )
 
     def _test_case_edit_page(self, test_case: TestCase, error: str | None = None, submitted: dict[str, str] | None = None) -> str:
@@ -5529,11 +5529,11 @@ _UI_JAVASCRIPT = r"""
             input.addEventListener('input', () => { step[key] = input.value; sync(); });
             field.append(label, input); card.append(field);
           });
-          const actions = node('div', '', 'actions');
-          const button = (label, act, disabled = false) => {
-            const control = node('button', label, 'button');
+          const actions = node('div', '', 'actions step-actions');
+          const button = (label, act, disabled = false, destructive = false) => {
+            const control = node('button', label, destructive ? 'button danger-button' : 'button');
             control.type = 'button'; control.disabled = disabled;
-            control.setAttribute('aria-label', `${label} Step ${number}`);
+            control.setAttribute('aria-label', `${label} ${label.startsWith('Insert Step') ? '' : 'Step '}${number}`);
             control.addEventListener('click', () => { if (act() === false) return; sync(); render(step.id); });
             actions.append(control);
           };
@@ -5542,15 +5542,15 @@ _UI_JAVASCRIPT = r"""
             segment.steps.splice(index + offset, 0, added);
             step = added;
           };
-          button('Insert before', () => insert(0));
-          button('Insert after', () => insert(1));
+          button('Insert Step before', () => insert(0));
+          button('Insert Step after', () => insert(1));
           button('Move up', () => { [segment.steps[index - 1], segment.steps[index]] = [step, segment.steps[index - 1]]; }, index === 0);
           button('Move down', () => { [segment.steps[index + 1], segment.steps[index]] = [step, segment.steps[index + 1]]; }, index === segment.steps.length - 1);
           button('Delete', () => {
             if (!window.confirm('Delete this step? Changes are applied only when you save the TestCase.')) return false;
             segment.steps.splice(index, 1);
             step = segment.steps[Math.min(index, segment.steps.length - 1)];
-          }, segment.steps.length === 1);
+          }, segment.steps.length === 1, true);
           card.append(actions); list.append(card);
         });
         group.append(list); root.append(group);

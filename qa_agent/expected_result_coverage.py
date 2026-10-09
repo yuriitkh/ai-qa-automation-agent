@@ -104,6 +104,10 @@ _SELECTED = re.compile(r"\b(?:selected|chosen)\b", re.I)
 _VISIBLE = re.compile(r"\b(?:displayed|visible|shown|appears?|present|exists?)\b", re.I)
 _LOADED = re.compile(r"\b(?:loaded|open|opened|available)\b", re.I)
 _TEXT = re.compile(r"\b(?:text|message|error|success|confirmation|notification|alert|warning|notice|contains?|includes?|says?)\b", re.I)
+_NO_ERROR = re.compile(
+    r"\b(?:without|no)\s+(?:(?:any|client-side|validation)\s+){0,2}errors?\b",
+    re.I,
+)
 _RESULT = re.compile(
     r"\b(?:created|saved|submitted|updated|deleted|removed|added|accepted|rejected|"
     r"authenticated|logged\s+in|signed\s+in|empty|cleared|expanded|collapsed)\b",
@@ -139,6 +143,11 @@ _SYNONYMS = {
     "appeared": "appear", "saved": "save", "created": "create", "submitted": "submit",
     "updated": "update", "deleted": "delete", "removed": "remove", "added": "add",
 }
+
+
+def has_error_absence_requirement(text: str) -> bool:
+    """Recognize supported negative-error wording without interpreting locators."""
+    return bool(_NO_ERROR.search(text))
 
 
 def expected_result_coverage(
@@ -184,6 +193,13 @@ def expected_result_coverage(
             index
             for index, action in assertion_actions
             if _action_covers(expectation, action.action, action.parameters, plan)
+            and (
+                expectation.kind != "no_error"
+                or not any(
+                    later.action not in _ASSERTION_ACTIONS
+                    for later in plan.steps[index + 1:]
+                )
+            )
         ]
         covered.append(bool(matches))
         matching_indexes.update(matches)
@@ -210,11 +226,21 @@ def validate_expected_result_coverage(
     """Reject required expected results that the executable plan does not cover."""
     coverage = expected_result_coverage(test_step, plan)
     if not coverage.is_sufficient:
+        guidance = (
+            "Clarify the observable expected state; the coverage matcher cannot safely interpret this result."
+            if coverage.status == ExpectedResultCoverageStatus.UNKNOWN else
+            "Add a relevant supported assertion for every expected state; successful actions alone are not verification."
+        )
+        if has_error_absence_requirement(test_step.expected):
+            guidance += (
+                " For 'without error', assert_hidden must check an error element established by Discovery"
+                " after the input actions. If none is observed, review Discovery or clarify the check; do not invent a selector."
+            )
         raise PlanValidationError([
             PlanValidationIssue(
                 code="EXPECTED_RESULT_NOT_COVERED",
                 path="steps",
-                message=coverage.safe_message,
+                message=f"{coverage.safe_message} {guidance}",
             )
         ])
     return coverage
@@ -244,6 +270,8 @@ def has_sufficient_test_case_coverage(test_case: TestCase, plan_store) -> bool:
 def _verification_required(test_step: TestStep) -> bool | None:
     combined = " ".join((test_step.name, test_step.description, test_step.expected))
     if _VERIFICATION_INTENT.search(combined):
+        return True
+    if has_error_absence_requirement(test_step.expected):
         return True
     if _OUTPUT_STATE.search(test_step.expected):
         if _action_only_result(test_step):
@@ -290,10 +318,27 @@ def _expectations(test_step: TestStep) -> tuple[_Expectation, ...] | None:
         exact_values = tuple(match.group(1).strip() for match in _QUOTED.finditer(clause))
         tokens = _semantic_tokens(f"{context} {clause}")
         expectations.append(_Expectation(kind, clause, frozenset(tokens), exact_values))
+        if kind == "no_error":
+            absence = _NO_ERROR.search(clause)
+            # 'No errors are displayed' describes only absence. In contrast,
+            # 'Confirmation is displayed without error' also requires the
+            # confirmation assertion; negation must not erase that state.
+            if absence.start() or absence.group().casefold().startswith("without"):
+                remaining = (clause[:absence.start()] + clause[absence.end():]).strip(" ,.;")
+                other_kind = _expectation_kind(remaining)
+                if other_kind is not None:
+                    expectations.append(_Expectation(
+                        other_kind, remaining, frozenset(_semantic_tokens(remaining)),
+                        tuple(match.group(1).strip() for match in _QUOTED.finditer(remaining)),
+                    ))
     return tuple(expectations)
 
 
 def _expectation_kind(clause: str) -> str | None:
+    # Negation takes precedence over words such as 'error' or 'displayed'.
+    # A positive error-message assertion proves the opposite of this result.
+    if has_error_absence_requirement(clause):
+        return "no_error"
     if _HIDDEN.search(clause):
         return "hidden"
     if _DISABLED.search(clause):
@@ -330,6 +375,7 @@ def _action_covers(
     plan: QATestPlan | None,
 ) -> bool:
     allowed = {
+        "no_error": {"assert_hidden"},
         "hidden": {"assert_hidden"},
         "disabled": {"assert_disabled"},
         "enabled": {"assert_enabled"},
@@ -360,6 +406,10 @@ def _action_covers(
         if isinstance(parameters.get(key), str)
     )
     evidence_tokens = _semantic_tokens(evidence)
+    if expectation.kind == "no_error":
+        # Input selectors from the action's context cannot stand in for the
+        # error subject. Locator identity is checked separately by Discovery.
+        return "error" in evidence_tokens
     if any(
         exact.casefold() in evidence.casefold()
         for exact in expectation.exact_values

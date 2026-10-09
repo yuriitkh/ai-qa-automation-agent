@@ -33,6 +33,25 @@ def local_server(app):
         server.shutdown(); server.server_close(); thread.join(3)
 
 
+def assert_step_action_layout(page):
+    actions = page.locator('.structured-step .step-actions').first
+    assert actions.locator('button').all_text_contents() == [
+        "Insert Step before", "Insert Step after", "Move up", "Move down", "Delete"]
+    delete = actions.get_by_role('button', name='Delete Step 1', exact=True)
+    assert 'danger-button' in delete.get_attribute('class').split()
+    assert delete.evaluate("button => getComputedStyle(button).color") == 'rgb(141, 37, 25)'
+    assert delete.evaluate("button => getComputedStyle(button).backgroundColor") == 'rgb(255, 240, 237)'
+    for width in (1280, 390):
+        page.set_viewport_size({"width": width, "height": 900})
+        boxes = [actions.locator('button').nth(i).bounding_box() for i in range(5)]
+        assert max(box['height'] for box in boxes) - min(box['height'] for box in boxes) < 2
+        assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+        assert all(box['x'] >= 0 and box['x'] + box['width'] <= width for box in boxes)
+        if width == 1280:
+            assert max(box['y'] for box in boxes) - min(box['y'] for box in boxes) < 2
+    page.set_viewport_size({"width": 1280, "height": 900})
+
+
 def test_editor_review_insert_move_delete_cancel_save_conflict_and_mobile(tmp_path):
     app, case, repo = application()
     original = deepcopy(case)
@@ -40,7 +59,11 @@ def test_editor_review_insert_move_delete_cancel_save_conflict_and_mobile(tmp_pa
     with local_server(app) as origin, sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
         page = browser.new_page(viewport={"width": 1280, "height": 900})
-        page.on("dialog", lambda dialog: dialog.accept())
+        dialogs = {"accept": True, "messages": []}
+        def answer_dialog(dialog):
+            dialogs["messages"].append(dialog.message)
+            dialog.accept() if dialogs["accept"] else dialog.dismiss()
+        page.on("dialog", answer_dialog)
         try:
             page.goto(f"{origin}/test-cases/{case.id}")
             assert page.locator('body').inner_text().count('0 / 6 steps have executable plans.') == 1
@@ -56,11 +79,22 @@ def test_editor_review_insert_move_delete_cancel_save_conflict_and_mobile(tmp_pa
             expect(page.locator('[data-structured-steps] fieldset')).to_have_count(6)
             expect(page.get_by_label("Description", exact=True).first).to_have_value(case.steps[0].description)
             assert page.locator('input[name$=".name"]').count() == 0
-            page.get_by_role("button", name="Insert before Step 1", exact=True).click()
+            assert_step_action_layout(page)
+            expect(page.get_by_role('button', name='Regenerate TestCase with AI', exact=True)).to_have_count(0)
+            dialogs["accept"] = False
+            page.get_by_role('button', name='Delete Step 1', exact=True).focus()
+            page.keyboard.press('Enter')
+            expect(page.locator('[data-structured-steps] fieldset')).to_have_count(6)
+            assert dialogs["messages"][-1].startswith('Delete this step?')
+            assert repo.get(case.id) == original
+            dialogs["accept"] = True
+            page.get_by_role("button", name="Insert Step before 1", exact=True).focus()
+            page.keyboard.press('Enter')
             expect(page.get_by_label("Description", exact=True).first).to_be_focused()
             page.get_by_label("Description", exact=True).first.fill("Відкрити налаштування облікового запису.\n" + "Довгий опис. " * 90)
             page.get_by_label("Expected Result", exact=True).first.fill("Налаштування доступні.")
-            page.get_by_role("button", name="Move down Step 1", exact=True).click()
+            page.get_by_role("button", name="Move down Step 1", exact=True).focus()
+            page.keyboard.press('Space')
             page.get_by_role("button", name="Delete Step 3", exact=True).click()
             expect(page.locator('[data-structured-steps] fieldset')).to_have_count(6)
             assert repo.get(case.id) == original
@@ -71,7 +105,7 @@ def test_editor_review_insert_move_delete_cancel_save_conflict_and_mobile(tmp_pa
             page.goto(f"{origin}/test-cases/{case.id}/edit")
             other = browser.new_page()
             other.goto(page.url)
-            page.get_by_role("button", name="Insert after Step 3", exact=True).click()
+            page.get_by_role("button", name="Insert Step after 3", exact=True).click()
             page.get_by_label("Description", exact=True).nth(3).fill("Перевірити налаштування профілю.")
             page.get_by_label("Expected Result", exact=True).nth(3).fill("Налаштування профілю видимі.")
             page.get_by_label("Summary", exact=True).fill("Edited local account checks")
@@ -92,7 +126,13 @@ def test_editor_review_insert_move_delete_cancel_save_conflict_and_mobile(tmp_pa
             from qa_agent.test_case_authoring import TestCaseDraft
             token = app._draft_store.put(TestCaseDraft(test_case=case_fixture()))
             page.goto(f"{origin}/test-cases/review/{token}")
-            page.get_by_role("button", name="Insert before Step 1", exact=True).click()
+            assert_step_action_layout(page)
+            expect(page.get_by_role('button', name='Regenerate TestCase with AI', exact=True)).to_be_visible()
+            dialogs["accept"] = False
+            page.get_by_role('button', name='Delete Step 1', exact=True).click()
+            expect(page.locator('[data-structured-steps] fieldset')).to_have_count(6)
+            dialogs["accept"] = True
+            page.get_by_role("button", name="Insert Step before 1", exact=True).click()
             page.get_by_label("Description", exact=True).first.fill("Open the local preferences page.")
             page.get_by_label("Expected Result", exact=True).first.fill("Preferences are visible.")
             page.get_by_role("button", name="Save TestCase", exact=True).click()
