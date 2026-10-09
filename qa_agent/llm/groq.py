@@ -6,6 +6,7 @@ import httpx
 
 from ..models import AIDiscoveryResult, QATestPlan
 from .base import LLMProvider
+from ..reliability import provider_timeout
 from .errors import (
     NonRetryableLLMError,
     RetryableLLMError,
@@ -169,7 +170,7 @@ class GroqProvider(LLMProvider):
                 self._endpoint,
                 headers={"Authorization": f"Bearer {api_key}"},
                 json=request_payload,
-                timeout=self._timeout_seconds,
+                timeout=provider_timeout(self._timeout_seconds),
             )
         except httpx.TimeoutException as error:
             raise RetryableLLMError(
@@ -217,7 +218,7 @@ class GroqProvider(LLMProvider):
         )
         try:
             response = httpx.post(self._endpoint,
-                headers={"Authorization": f"Bearer {api_key}"}, json=payload, timeout=self._timeout_seconds)
+                headers={"Authorization": f"Bearer {api_key}"}, json=payload, timeout=provider_timeout(self._timeout_seconds))
         except httpx.TimeoutException as error:
             raise RetryableLLMError(
                 "Groq request timed out.", category="TIMEOUT",
@@ -259,7 +260,7 @@ class GroqProvider(LLMProvider):
                 self._endpoint,
                 headers={"Authorization": f"Bearer {api_key}"},
                 json=payload,
-                timeout=self._timeout_seconds,
+                timeout=provider_timeout(self._timeout_seconds),
             )
         except httpx.TimeoutException as error:
             raise RetryableLLMError(

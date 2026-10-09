@@ -21,12 +21,19 @@ from qa_agent.models import (
 )
 from qa_agent.test_plan_generator import LLMTestPlanGenerator, TestPlanGenerator
 from qa_agent.test_plan_validation import PlanValidationError
+from qa_agent.reliability import AutomationReliabilitySupervisor, InMemoryReliabilityRepository, ReliabilitySettings
 from qa_agent.execution_progress import (
     ExecutionEventType,
     ExecutionProgressReporter,
     ExecutionProgressStore,
     active_execution_progress,
 )
+
+
+def repair_supervisor(maximum=2):
+    repository = InMemoryReliabilityRepository()
+    repository.save_settings(ReliabilitySettings(automatic_plan_repair=True, max_total_attempts=maximum))
+    return AutomationReliabilitySupervisor(repository)
 
 
 class TestPlanGeneratorTests(unittest.TestCase):
@@ -227,13 +234,13 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
 
         with patch("qa_agent.test_plan_generator.TestPlan") as plan_factory:
             with self.assertRaises(PlanValidationError) as raised:
-                LLMTestPlanGenerator(router).generate(self.make_test_step(), self.make_discovery_result())
+                LLMTestPlanGenerator(router, repair_supervisor()).generate(self.make_test_step(), self.make_discovery_result())
 
         plan_factory.assert_not_called()
         self.assertEqual(len(router.calls), 2)
         self.assertEqual(raised.exception.issues[0].code, "MISSING_TARGET_URL")
 
-    def test_invalid_plan_is_repaired_once_for_multi_field_registration_step(self) -> None:
+    def test_missing_registration_input_stops_without_inventing_values(self) -> None:
         target_url = "http://127.0.0.1:43123/register"
         step = DomainTestStep(
             name="Enter registration details",
@@ -267,13 +274,10 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
             QATestStep(action="assert_text_contains", parameters={"expected_text": "Account created"}),
         ])
         router = _SequencedRouter([invalid, repaired])
-        generated = LLMTestPlanGenerator(router).generate_with_plan(step, discovery)
-
-        self.assertEqual(len(router.calls), 2)
-        self.assertEqual(len(generated.test_plan_version.qa_test_plan.steps), 6)
-        self.assertEqual(generated.test_plan_version.origin, PlanVersionOrigin.REPAIRED)
-        self.assertIn("MISSING_INPUT_VALUE", router.calls[1]["task"])
-        self.assertIn("Enter registration details", router.calls[1]["task"])
+        with self.assertRaises(PlanValidationError) as raised:
+            LLMTestPlanGenerator(router, repair_supervisor()).generate_with_plan(step, discovery)
+        self.assertEqual(len(router.calls), 1)
+        self.assertEqual(raised.exception.issues[0].code, "MISSING_INPUT_VALUE")
 
     def test_missing_expected_result_coverage_is_repaired_before_plan_creation(self) -> None:
         target_url = "http://127.0.0.1:43123/register"
@@ -309,7 +313,7 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
         ])
         router = _SequencedRouter([missing, covered])
 
-        generated = LLMTestPlanGenerator(router).generate_with_plan(step, discovery)
+        generated = LLMTestPlanGenerator(router, repair_supervisor()).generate_with_plan(step, discovery)
 
         self.assertEqual(len(router.calls), 2)
         self.assertEqual(generated.test_plan_version.origin, PlanVersionOrigin.REPAIRED)
@@ -384,7 +388,7 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
 
         with patch("qa_agent.test_plan_generator.TestPlan") as plan_factory:
             with self.assertRaises(PlanValidationError) as raised:
-                LLMTestPlanGenerator(router).generate_with_plan(step, discovery)
+                LLMTestPlanGenerator(router, repair_supervisor()).generate_with_plan(step, discovery)
 
         self.assertEqual(len(router.calls), 2)
         self.assertEqual(raised.exception.issues[0].code, "EXPECTED_RESULT_NOT_COVERED")
@@ -419,12 +423,12 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
                 requirement_context="Register a user and verify that a confirmation state is displayed.",
             )
 
-        self.assertEqual(len(router.calls), 2)
+        self.assertEqual(len(router.calls), 1)
         self.assertEqual(raised.exception.issues[0].code, "UNGROUNDED_ASSERTION")
-        repair_task = router.calls[1]["task"]
-        self.assertIn("Examples introduced by 'e.g.'", repair_task)
-        self.assertIn("Use a structural assertion", repair_task)
-        self.assertNotIn("Unconfirmed", repair_task)
+        task = router.calls[0]["task"]
+        self.assertIn("Examples introduced by 'e.g.'", task)
+        self.assertIn("Prefer a structural assertion", task)
+        self.assertNotIn("Unconfirmed", task)
 
     def test_plan_prompt_preserves_requirement_strength_and_treats_examples_as_illustrative(self) -> None:
         task = LLMTestPlanGenerator._build_task_context(
@@ -440,9 +444,7 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
 
     def test_repair_lifecycle_is_reported_without_exposing_candidate_output(self) -> None:
         step = self.make_test_step()
-        invalid = QATestPlan(url="https://www.dnb.no/", steps=[
-            QATestStep(action="click", parameters={}),
-        ])
+        invalid = {"url": "https://www.dnb.no/", "steps": []}
         valid = QATestPlan(url="https://www.dnb.no/", steps=[
             self.heading_assertion(),
         ])
@@ -452,17 +454,16 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
         reporter = ExecutionProgressReporter(store, progress_id)
 
         with active_execution_progress(reporter):
-            LLMTestPlanGenerator(router).generate(step, self.make_discovery_result())
+            LLMTestPlanGenerator(router, repair_supervisor()).generate(step, self.make_discovery_result())
 
         events = store.get(progress_id).events
         repair_events = [event for event in events if event.event_type in {
-            ExecutionEventType.PLAN_REPAIR_STARTED,
-            ExecutionEventType.PLAN_REPAIR_SUCCEEDED,
-            ExecutionEventType.PLAN_REPAIR_FAILED,
+            ExecutionEventType.RELIABILITY_REPAIR,
+            ExecutionEventType.RELIABILITY_READY_FOR_REVIEW,
         }]
         self.assertEqual(
             [event.event_type for event in repair_events],
-            [ExecutionEventType.PLAN_REPAIR_STARTED, ExecutionEventType.PLAN_REPAIR_SUCCEEDED],
+            [ExecutionEventType.RELIABILITY_REPAIR, ExecutionEventType.RELIABILITY_READY_FOR_REVIEW],
         )
         self.assertNotIn("model output", json.dumps([event.to_public_dict() for event in events]))
 
@@ -478,7 +479,7 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
             def create_test_plan(self, task, target_url, page_snapshot):
                 self.calls += 1
                 if self.calls == 1:
-                    return QATestPlan(url=target_url, steps=[{"action": "click", "parameters": {}}])
+                    return {"url": target_url, "steps": []}
                 raise RetryableLLMError("fake repair provider outage")
 
         class FallbackProvider(LLMProvider):
@@ -500,7 +501,7 @@ class LLMTestPlanGeneratorTests(unittest.TestCase):
         fallback = FallbackProvider()
         router = LLMRouter([first, fallback])
 
-        generated = LLMTestPlanGenerator(router).generate_with_plan(
+        generated = LLMTestPlanGenerator(router, repair_supervisor(3)).generate_with_plan(
             self.make_test_step(), self.make_discovery_result()
         )
 

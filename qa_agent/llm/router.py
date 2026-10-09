@@ -33,6 +33,7 @@ from .errors import (
     failure_detail_for,
 )
 from .usage_metadata import ProviderTokenUsage, capture_provider_usage
+from ..reliability import current_reliability_operation, classify_failure, safe_reason, ReliabilityStopped
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +138,7 @@ class LLMRouter:
                 finally:
                     usage = captured.usage
         except Exception as error:
+            self._capture_reliability_usage(provider, usage)
             self._record_usage_attempt(
                 provider,
                 operation_id,
@@ -149,6 +151,7 @@ class LLMRouter:
                 fallback_from_provider,
             )
             raise
+        self._capture_reliability_usage(provider, usage)
         self._record_usage_attempt(
             provider,
             operation_id,
@@ -161,6 +164,17 @@ class LLMRouter:
             fallback_from_provider,
         )
         return result
+
+    def _capture_reliability_usage(self, provider, usage) -> None:
+        operation = current_reliability_operation()
+        if operation is not None:
+            try:
+                pricing = getattr(self._usage_recorder, "pricing", None)
+                model = getattr(provider, "model", None) or getattr(provider, "_model", None)
+                cost = pricing.estimate(self._provider_id(provider), model, usage) if pricing is not None and isinstance(model, str) else None
+            except Exception:
+                cost = None
+            operation.capture_usage(usage, cost)
 
     def _record_usage_attempt(
         self,
@@ -211,6 +225,9 @@ class LLMRouter:
     def create_test_plan(
         self, task: str, target_url: str, page_snapshot: str
     ) -> QATestPlan:
+        operation = current_reliability_operation()
+        if operation is not None:
+            return self._supervised_test_plan(task, target_url, page_snapshot, operation)
         providers = self._providers
         if not providers:
             raise RuntimeError("No LLM providers are configured.")
@@ -310,6 +327,54 @@ class LLMRouter:
                 _failure_summary(item) for item in failures
             )
         )
+
+    def _supervised_test_plan(self, task, target_url, page_snapshot, operation):
+        """Use this router's configured order with the generation recovery budget."""
+        providers = []
+        self._selected_provider_name = None
+        for provider in list(self._providers):
+            if provider.is_available:
+                providers.append(provider)
+            else:
+                self._record_provider_attempt(provider, RequestKind.TEST_PLAN, ProviderAttemptOutcome.UNAVAILABLE)
+        if not providers:
+            raise ReliabilityStopped("NO_PROVIDER")
+        index = providers.index(operation.last_provider) if operation.request_action == "TARGETED_REPAIR" and operation.last_provider in providers else 0
+        action, reason = operation.request_action, operation.request_reason
+        fallback_from = None
+        self._selected_provider_name = None
+        usage_context = current_llm_usage_context(OP_GENERATE_AUTOMATION_PLAN)
+        while index < len(providers):
+            provider = providers[index]
+            started = time.perf_counter()
+            try:
+                result = operation.invoke(
+                    provider,
+                    lambda: self._invoke_provider_attempt(
+                        provider, lambda: provider.create_test_plan(task, target_url, page_snapshot),
+                        operation_id=str(operation.record.id), usage_context=usage_context,
+                        fallback_from_provider=fallback_from,
+                    ),
+                    action=action, reason=reason,
+                )
+            except Exception as error:
+                self._record_provider_attempt(
+                    provider, RequestKind.TEST_PLAN,
+                    ProviderAttemptOutcome.NON_RETRYABLE_ERROR if isinstance(error, NonRetryableLLMError) else ProviderAttemptOutcome.RETRYABLE_ERROR if isinstance(error, RetryableLLMError) else ProviderAttemptOutcome.UNCLASSIFIED_ERROR,
+                    error=error, started=started,
+                )
+                action = operation.provider_recovery(error, has_fallback=index + 1 < len(providers))
+                if action == "STOP":
+                    raise
+                reason = safe_reason(classify_failure(error))
+                if action == "PROVIDER_FALLBACK":
+                    fallback_from = self._provider_display_name(provider)
+                    index += 1
+                continue
+            self._record_provider_attempt(provider, RequestKind.TEST_PLAN, ProviderAttemptOutcome.SUCCESS, started=started, is_selected=True)
+            self._selected_provider_name = self._provider_name(provider)
+            return result
+        raise ReliabilityStopped("NO_FALLBACK")
 
     def create_discovery(self, task: str, target_url: str, page_snapshot: str) -> AIDiscoveryResult:
         """Route a structured Discovery request through configured providers."""

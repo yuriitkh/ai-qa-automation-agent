@@ -13,6 +13,8 @@ def result_outcome(status: Any, outcome: Any = None, *, complete: bool | None = 
     """FAILED alone is never evidence of a product defect."""
     status, outcome = enum_value(status), enum_value(outcome)
     aliases = {
+        "AUTOMATION_REVIEW_REQUIRED": "BLOCKED",
+        "CANCELLED": "BLOCKED",
         "SETUP_FAILURE": "BLOCKED",
         "MISSING_AUTOMATION": "BLOCKED",
         "INVALID_TESTCASE": "BLOCKED",

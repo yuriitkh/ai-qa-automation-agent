@@ -3,6 +3,7 @@ import os
 import httpx
 from google import genai
 from google.genai import types
+from pydantic import ValidationError
 
 from ..models import AIDiscoveryResult, QATestPlan
 from .base import LLMProvider
@@ -188,6 +189,11 @@ class GeminiProvider(LLMProvider):
             )
             capture_gemini_usage(interaction)
             return QATestPlan.model_validate_json(interaction.output_text)
+        except ValidationError as error:
+            raise RetryableLLMError(
+                "Gemini returned an invalid QA test plan.",
+                category="INVALID_RESPONSE", safe_detail="Invalid structured response",
+            ) from error
         except Exception as error:
             _raise_for_gemini_error(error, "request")
 
@@ -230,7 +236,11 @@ class GeminiProvider(LLMProvider):
         except Exception as error:
             _raise_for_gemini_error(error, f"{schema_name} request")
 
-    def _generation_config_kwargs(self) -> dict[str, dict[str, int]]:
-        if self.max_output_tokens is None:
-            return {}
-        return {"generation_config": {"max_output_tokens": self.max_output_tokens}}
+    def _generation_config_kwargs(self) -> dict:
+        from qa_agent.reliability import current_reliability_operation, provider_timeout
+        options = {}
+        if self.max_output_tokens is not None:
+            options["generation_config"] = {"max_output_tokens": self.max_output_tokens}
+        if current_reliability_operation() is not None:
+            options["timeout"] = provider_timeout(30.0)
+        return options

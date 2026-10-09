@@ -46,6 +46,7 @@ from qa_agent.locator_recovery import (
 from qa_agent.test_case_decomposer import TestCaseDecomposer
 from qa_agent.test_plan_generator import GeneratedTestPlan, TestPlanGenerator
 from qa_agent.test_plan_validation import PlanValidationError, validate_executable_plan
+from qa_agent.reliability import AutomationReviewRequired, ReliabilityStopped
 from qa_agent.discovery_fallback import DiscoveryFallback
 from qa_agent.plan_execution import (
     PlanExecutionClassification,
@@ -118,12 +119,14 @@ class QATestPipeline:
         execution_repository: ExecutionRepository | None = None,
         discovery_fallback: DiscoveryFallback | None = None,
         run_history: RunHistoryService | None = None,
+        candidate_review_approved: Callable[[TestCase], bool] | None = None,
     ) -> None:
         self._decomposer = decomposer
         self._plan_generator = plan_generator
         self._discovery = discovery
         self._discovery_fallback = discovery_fallback
         self._run_history = run_history
+        self._candidate_review_approved = candidate_review_approved or (lambda _: False)
         self._runner = runner if runner is not None else BrowserRunner(evidence_directory)
         self._plan_store = plan_store if plan_store is not None else InMemoryPlanStore()
         self._execution_repository = (
@@ -513,6 +516,12 @@ class QATestPipeline:
 
             plan_version = generated_plan.test_plan_version
             generated_plans.append(generated_plan)
+            supervisor = getattr(self._plan_generator, "supervisor", None)
+            candidate = supervisor.requires_review(plan_version.id) if supervisor else None
+            if candidate is not None and not self._candidate_review_approved(test_case):
+                review = AutomationReviewRequired(candidate.id)
+                emit_progress_event(ExecutionEventType.RELIABILITY_READY_FOR_REVIEW, step=test_step, message=str(review), reliability_operation_id=candidate.id)
+                raise PipelineStageError("automation review", str(review)) from review
             execution_outcome = self._execute_plan(
                 test_step, plan_version, trace,
                 runner=case_runner.for_step(test_step) if case_runner is not None else None,
@@ -538,6 +547,15 @@ class QATestPipeline:
                     blocked_step_ids = [
                         step.id for step in ordered_steps[step_index + 1:]
                     ]
+                    _emit_blocked_steps(ordered_steps[step_index + 1:])
+                    break
+                continue
+
+            if supervisor is not None:
+                # Execution drift is outside generation recovery; saved versions stay pinned.
+                emit_progress_event(ExecutionEventType.PLAN_REPAIR_FAILED, step=test_step, message="Automation drift requires human review; no automatic locator repair was attempted.")
+                if _should_block_rest(test_step, execution):
+                    blocked_step_ids = [step.id for step in ordered_steps[step_index + 1:]]
                     _emit_blocked_steps(ordered_steps[step_index + 1:])
                     break
                 continue
@@ -857,6 +875,8 @@ def _requirement_context_kwargs(generator: TestPlanGenerator, context: str) -> d
 
 def _generation_failure_details(error: Exception) -> tuple[str, str]:
     """Map internal generation exceptions to stable, safe progress diagnostics."""
+    if isinstance(error, ReliabilityStopped):
+        return error.category, str(error)
     if isinstance(error, PlanValidationError):
         reason = error.issues[0].message if error.issues else "Generated automation failed validation."
         return "PLAN_VALIDATION_FAILED", reason

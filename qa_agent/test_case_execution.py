@@ -21,6 +21,7 @@ from qa_agent.execution_repository import ExecutionRepository
 from qa_agent.execution_progress import get_active_execution_progress
 from qa_agent.models import QATestPlan, TestCase
 from qa_agent.pipeline import PipelineResult
+from qa_agent.reliability import AutomationReviewRequired
 from qa_agent.plan_execution import PlanExecutionService
 from qa_agent.pinned_execution import (
     PinnedExecutionService,
@@ -86,6 +87,7 @@ class TestCaseExecutionService:
         automation_workflow: AutomationWorkflow | None = None,
         automation_lifecycle: AutomationLifecycleService | None = None,
         test_case_review: TestCaseReviewService | None = None,
+        candidate_review_required: Callable[[UUID], bool] | None = None,
     ) -> None:
         self._test_cases = test_cases
         self._plan_store = plan_store
@@ -104,6 +106,7 @@ class TestCaseExecutionService:
         self._automation_workflow = automation_workflow
         self._automation_lifecycle = automation_lifecycle
         self._test_case_review = test_case_review
+        self._candidate_review_required = candidate_review_required or (lambda _: False)
 
     def workflow_availability(self, test_case_id: UUID) -> WorkflowAvailability:
         test_case = self._test_cases.get(test_case_id)
@@ -152,6 +155,18 @@ class TestCaseExecutionService:
                 )
             )
         )
+        needs_candidate_review = any(self._candidate_review_required(version_id) for _, _, version_id in versions)
+        if needs_candidate_review and (
+            self._test_case_review is None
+            or self._test_case_review.record(test_case.id) is None
+            or not self._test_case_review.validation_approved_for(test_case)
+        ):
+            return WorkflowAvailability(
+                automation_available=self._automation_workflow is not None,
+                validation_available=False, regression_available=False,
+                usable_plan_count=len(versions), total_step_count=len(steps), plan_versions=tuple(versions),
+                reason="Review repaired automation and explicitly Approve for Validation before execution.",
+            )
         return WorkflowAvailability(
             automation_available=self._automation_workflow is not None,
             validation_available=complete and coverage_sufficient,
@@ -207,6 +222,11 @@ class TestCaseExecutionService:
             AutomationStatus.AUTOMATION_FAILED,
         }:
             return "Generate or repair automation for the current TestCase before adding it to a Suite Run."
+        needs_candidate_review = any(self._candidate_review_required(item.test_plan_version_id) for item in selected_versions.selections)
+        if needs_candidate_review and (
+            self._test_case_review is None or self._test_case_review.record(test_case.id) is None
+        ):
+            return "Review repaired automation and explicitly Approve for Validation before running the suite."
         if self._test_case_review is None:
             return None
         record = self._test_case_review.record(test_case.id)
@@ -252,10 +272,10 @@ class TestCaseExecutionService:
                 progress.test_case_loaded(test_case)
             try:
                 result = self._automation_workflow.run_test_case(test_case, run_context)
-            except Exception:
+            except Exception as error:
                 if self._automation_lifecycle is not None:
                     self._lifecycle_update(
-                        self._automation_lifecycle.mark_automation_failed, test_case
+                        self._automation_lifecycle.mark_automation_completed if isinstance(error.__cause__, AutomationReviewRequired) else self._automation_lifecycle.mark_automation_failed, test_case
                     )
                 raise
             if self._automation_lifecycle is not None:

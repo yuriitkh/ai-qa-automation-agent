@@ -528,3 +528,17 @@ catalog price is configured. Provider names can be changed in Edit without
 changing the stable identity. Compatibility is limited to the supported
 OpenAI-compatible API shape; this is not a universal adapter for every LLM
 service.
+
+### Automation Reliability
+
+Open **Settings → Automation Reliability** at `/settings/reliability` to control
+additional provider retries, configured-provider fallback, one safe candidate
+repair, and a shared limit of 1, 2 or 3 generation attempts. Settings persist;
+each new operation records its own effective settings. Quality gates always run.
+Repaired candidates are saved for explicit human review and approval before
+execution. Generation success does not mean Browser Validation or product PASS.
+
+The page includes persistent generation statistics and individual attempt and
+decision histories. Unknown token usage and unverified cost remain Unknown.
+See [the reliability design and migration policy](docs/reliability.md) for
+scope, limits, metric definitions, compatibility and local verification.

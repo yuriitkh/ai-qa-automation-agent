@@ -195,7 +195,7 @@ class BackgroundRunService:
                 reporter.finish(
                     outcome=category,
                     error_category=category,
-                    message=None,
+                    message=str(error.__cause__) if category in {"AUTOMATION_REVIEW_REQUIRED", "CANCELLED"} else None,
                 )
                 return
             except Exception:
@@ -257,7 +257,12 @@ class BackgroundRunService:
 
 
 def _pipeline_error_category(error: PipelineStageError) -> str:
+    from qa_agent.reliability import classify_failure
+    if classify_failure(error.__cause__) in {"CANCELLED", "INFRASTRUCTURE_ERROR"}:
+        return classify_failure(error.__cause__)
     stage = error.stage.casefold()
+    if stage == "automation review":
+        return "AUTOMATION_REVIEW_REQUIRED"
     if "plan generation" in stage or "regeneration" in stage:
         return "AUTOMATION_GENERATION_ERROR"
     if "plan lookup" in stage:

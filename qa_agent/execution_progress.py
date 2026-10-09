@@ -30,6 +30,13 @@ logger = logging.getLogger(__name__)
 
 
 class ExecutionEventType(str, Enum):
+    RELIABILITY_GENERATING = "RELIABILITY_GENERATING"
+    RELIABILITY_CHECKING = "RELIABILITY_CHECKING"
+    RELIABILITY_RETRY = "RELIABILITY_RETRY"
+    RELIABILITY_FALLBACK = "RELIABILITY_FALLBACK"
+    RELIABILITY_REPAIR = "RELIABILITY_REPAIR"
+    RELIABILITY_READY_FOR_REVIEW = "RELIABILITY_READY_FOR_REVIEW"
+    RELIABILITY_NEEDS_ATTENTION = "RELIABILITY_NEEDS_ATTENTION"
     RUN_REQUESTED = "RUN_REQUESTED"
     RUN_STARTED = "RUN_STARTED"
     TESTCASE_LOADED = "TESTCASE_LOADED"
@@ -141,6 +148,7 @@ class ExecutionProgressEvent(BaseModel):
     plan_origin: str | None = None
     plan_version: int | None = None
     plan_version_id: UUID | None = None
+    reliability_operation_id: UUID | None = None
     failure_code: str | None = None
     prior_plan_exists: bool | None = None
     new_plan_saved: bool | None = None
@@ -171,6 +179,7 @@ class ExecutionProgressEvent(BaseModel):
             "plan_origin": self.plan_origin,
             "plan_version": self.plan_version,
             "plan_version_id": str(self.plan_version_id) if self.plan_version_id else None,
+            "reliability_operation_id": str(self.reliability_operation_id) if self.reliability_operation_id else None,
             "failure_code": self.failure_code,
             "prior_plan_exists": self.prior_plan_exists,
             "new_plan_saved": self.new_plan_saved,
@@ -250,6 +259,12 @@ class ExecutionProgressSnapshot(BaseModel):
         ])
         if self.automation_generation_failure:
             summary["explanation"] = self.automation_generation_failure.safe_reason
+        if self.outcome == "AUTOMATION_REVIEW_REQUIRED":
+            summary["explanation"] = "A repaired automation candidate is saved and requires human review before execution."
+            summary["recommended_action"] = "Review the saved automation, then explicitly approve it for Validation."
+        if self.outcome == "CANCELLED":
+            summary["explanation"] = "Generation was cancelled. No further provider recovery will start."
+            summary["recommended_action"] = "Review any saved candidates before starting another operation."
         summary["history_note"] = (
             "No persisted Run was created. Partial progress diagnostics are available for this request."
             if self.state == ProgressState.FINISHED and self.final_run_id is None else None
@@ -311,7 +326,10 @@ def _diagnostic_stages(events) -> list[dict[str, Any]]:
     for event in events:
         name = event.event_type.value
         stage = (
-            "TestCase loading" if name == "TESTCASE_LOADED"
+            "Plan validation" if name in {"RELIABILITY_CHECKING", "RELIABILITY_READY_FOR_REVIEW"}
+            else "Repair attempt" if name == "RELIABILITY_REPAIR"
+            else "Automation generation" if name.startswith("RELIABILITY_")
+            else "TestCase loading" if name == "TESTCASE_LOADED"
             else "Repair attempt" if name.startswith("PLAN_REPAIR")
             else "Plan validation" if name == "PLAN_GENERATED" or event.validation_issues
             else "Automation generation" if name.startswith("PLAN_GENERATION")
@@ -700,6 +718,7 @@ class ExecutionProgressStore:
         plan_origin: str | None = None,
         plan_version: int | None = None,
         plan_version_id: UUID | None = None,
+        reliability_operation_id: UUID | None = None,
         failure_code: str | None = None,
         prior_plan_exists: bool | None = None,
         new_plan_saved: bool | None = None,
@@ -730,6 +749,7 @@ class ExecutionProgressStore:
                 plan_origin=plan_origin,
                 plan_version=plan_version,
                 plan_version_id=plan_version_id,
+                reliability_operation_id=reliability_operation_id,
                 failure_code=failure_code,
                 prior_plan_exists=prior_plan_exists,
                 new_plan_saved=new_plan_saved,
@@ -799,7 +819,14 @@ class ExecutionProgressStore:
             if event.step_id not in record.running_step_ids:
                 raise ValueError("A step cannot finish before it has started.")
         record.events.append(event)
-        if event.event_type == ExecutionEventType.RUN_STARTED:
+        if event.event_type.value.startswith("RELIABILITY_"):
+            record.phase = {
+                "RELIABILITY_GENERATING": "Generating automation", "RELIABILITY_CHECKING": "Checking automation quality",
+                "RELIABILITY_RETRY": "Retrying provider request", "RELIABILITY_FALLBACK": "Switching provider",
+                "RELIABILITY_REPAIR": "Repairing unapproved candidate", "RELIABILITY_READY_FOR_REVIEW": "Ready for review",
+                "RELIABILITY_NEEDS_ATTENTION": "Needs attention",
+            }[event.event_type.value]
+        elif event.event_type == ExecutionEventType.RUN_STARTED:
             record.state = ProgressState.RUNNING
             record.started_at = event.timestamp
             record.phase = "Loading TestCase"
@@ -998,6 +1025,8 @@ class ExecutionProgressStore:
                 event.run_status, event.outcome,
                 complete=bool(record.steps) and all(step.execution_state == ProgressStepState.PASSED for step in record.steps.values()),
             ))
+            if event.outcome == "AUTOMATION_REVIEW_REQUIRED":
+                record.phase = "Ready for review — Human approval required"
             record.final_run_id = event.run_id
             record.run_status = event.run_status
             record.outcome = event.outcome
@@ -1289,6 +1318,7 @@ class ExecutionProgressReporter:
         plan_origin: str | None = None,
         plan_version: int | None = None,
         plan_version_id: UUID | None = None,
+        reliability_operation_id: UUID | None = None,
         failure_code: str | None = None,
         prior_plan_exists: bool | None = None,
         new_plan_saved: bool | None = None,
@@ -1313,6 +1343,7 @@ class ExecutionProgressReporter:
             plan_origin=plan_origin,
             plan_version=plan_version,
             plan_version_id=plan_version_id,
+            reliability_operation_id=reliability_operation_id,
             failure_code=failure_code,
             prior_plan_exists=prior_plan_exists,
             new_plan_saved=new_plan_saved,
@@ -1429,6 +1460,7 @@ def emit_progress_event(
     plan_origin: str | None = None,
     plan_version: int | None = None,
     plan_version_id: UUID | None = None,
+    reliability_operation_id: UUID | None = None,
     failure_code: str | None = None,
     prior_plan_exists: bool | None = None,
     new_plan_saved: bool | None = None,
@@ -1447,6 +1479,7 @@ def emit_progress_event(
             plan_origin=plan_origin,
             plan_version=plan_version,
             plan_version_id=plan_version_id,
+            reliability_operation_id=reliability_operation_id,
             failure_code=failure_code,
             prior_plan_exists=prior_plan_exists,
             new_plan_saved=new_plan_saved,

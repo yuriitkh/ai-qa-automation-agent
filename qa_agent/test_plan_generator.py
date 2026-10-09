@@ -3,7 +3,6 @@ import re
 from dataclasses import dataclass
 
 from qa_agent.llm.router import LLMRouter
-from qa_agent.execution_progress import ExecutionEventType, emit_progress_event
 from qa_agent.models import (
     AssertionGroundingEntry,
     DiscoveryResult,
@@ -25,6 +24,7 @@ from qa_agent.llm_usage import (
 )
 from qa_agent.assertion_grounding import validate_assertion_grounding
 from qa_agent.expected_result_coverage import validate_expected_result_coverage
+from qa_agent.reliability import AutomationReliabilitySupervisor, current_reliability_operation
 
 
 @dataclass(frozen=True)
@@ -79,8 +79,9 @@ class TestPlanGenerator:
 class LLMTestPlanGenerator(TestPlanGenerator):
     """Generate an executable plan version through the configured LLM Router."""
 
-    def __init__(self, router: LLMRouter) -> None:
+    def __init__(self, router: LLMRouter, supervisor: AutomationReliabilitySupervisor | None = None) -> None:
         self._router = router
+        self.supervisor = supervisor or AutomationReliabilitySupervisor()
 
     def generate_with_plan(
         self,
@@ -95,60 +96,37 @@ class LLMTestPlanGenerator(TestPlanGenerator):
             test_step, discovery_result, requirement_context=requirement_context
         )
         page_snapshot = self._build_discovery_context(discovery_result)
-        with llm_usage_scope(operation_type=OP_GENERATE_AUTOMATION_PLAN):
-            router_result = self._router.create_test_plan(
-                task=task,
-                target_url=discovery_result.url,
-                page_snapshot=page_snapshot,
+        previous_candidate = None
+        repairing = False
+        def request(action, error):
+            nonlocal previous_candidate, repairing
+            repairing = error is not None
+            request_task = self._build_repair_task(task, error.issues) if isinstance(error, PlanValidationError) else (
+                task + "\nReturn a complete valid JSON plan matching the supplied schema. Preserve all original actions, requirements, assertions and locator identities. Do not invent values or selectors."
+                if error is not None else task
             )
+            with llm_usage_scope(operation_type=OP_REPAIR_AUTOMATION_PLAN if error else OP_GENERATE_AUTOMATION_PLAN):
+                call = lambda: self._router.create_test_plan(task=request_task, target_url=discovery_result.url, page_snapshot=page_snapshot)
+                if isinstance(self._router, LLMRouter) and type(self._router).create_test_plan is LLMRouter.create_test_plan:
+                    candidate = call()
+                else:
+                    operation = current_reliability_operation()
+                    candidate = operation.invoke(None, call, action=operation.request_action, reason=operation.request_reason)
+                return candidate
 
-        # Validate at this boundary as well, so a nonconforming Router
-        # implementation cannot create a version from invalid plan data.
-        repaired = False
-        try:
-            executable_plan, grounding = self._validate_generated_plan(
-                router_result, discovery_result, test_step,
-                requirement_context=requirement_context,
-            )
-        except PlanValidationError as initial_error:
-            repaired = True
-            emit_progress_event(
-                ExecutionEventType.PLAN_REPAIR_STARTED,
-                step=test_step,
-                message="Generated automation requires correction. Repairing once.",
-            )
-            repair_task = self._build_repair_task(task, initial_error.issues)
-            try:
-                with llm_usage_scope(operation_type=OP_REPAIR_AUTOMATION_PLAN):
-                    repaired_result = self._router.create_test_plan(
-                        task=repair_task,
-                        target_url=discovery_result.url,
-                        page_snapshot=page_snapshot,
-                    )
-            except Exception:
-                emit_progress_event(
-                    ExecutionEventType.PLAN_REPAIR_FAILED,
-                    step=test_step,
-                    message="Automation repair did not produce a validated plan.",
-                )
-                raise
-            try:
-                executable_plan, grounding = self._validate_generated_plan(
-                    repaired_result, discovery_result, test_step,
-                    requirement_context=requirement_context,
-                )
-            except PlanValidationError:
-                emit_progress_event(
-                    ExecutionEventType.PLAN_REPAIR_FAILED,
-                    step=test_step,
-                    message="Generated automation still failed validation.",
-                )
-                raise
-            emit_progress_event(
-                ExecutionEventType.PLAN_REPAIR_SUCCEEDED,
-                step=test_step,
-                message="Automation validated after repair.",
-            )
+        def validate(value):
+            nonlocal previous_candidate
+            original = previous_candidate
+            previous_candidate = value
+            validated = self._validate_generated_plan(value, discovery_result, test_step, requirement_context=requirement_context)
+            if repairing and original is not None:
+                self._validate_repair_preserves_actions(original, value)
+            return validated
+
+        (executable_plan, grounding), operation_id, repaired = self.supervisor.generate(
+            test_step, request,
+            validate,
+        )
         if existing_test_plan is not None:
             if existing_test_plan.test_step_id != test_step.id:
                 raise ValueError("Existing TestPlan belongs to a different TestStep.")
@@ -169,7 +147,27 @@ class LLMTestPlanGenerator(TestPlanGenerator):
             qa_test_plan=executable_plan,
             assertion_grounding=grounding,
         )
+        self.supervisor.attach_candidate(operation_id, version.id)
         return GeneratedTestPlan(test_plan=test_plan, test_plan_version=version)
+
+    @staticmethod
+    def _validate_repair_preserves_actions(previous, candidate):
+        """A structural repair may add missing coverage, but cannot remove valid actions."""
+        original = previous.model_dump() if isinstance(previous, QATestPlan) else previous
+        if not isinstance(original, dict) or not isinstance(original.get("steps"), list):
+            return
+        repaired = validate_executable_plan(candidate)
+        remaining = iter(repaired.steps)
+        for action in original["steps"]:
+            try:
+                valid = validate_executable_plan({"url": repaired.url, "steps": [action]}).steps[0]
+            except PlanValidationError:
+                continue
+            if not any(item == valid for item in remaining):
+                raise PlanValidationError([PlanValidationIssue(
+                    code="REPAIR_CHANGED_SEMANTICS", path="steps",
+                    message="A structural repair must preserve existing valid actions, values, assertions and their order.",
+                )])
 
     @staticmethod
     def _validate_generated_plan(
@@ -183,6 +181,7 @@ class LLMTestPlanGenerator(TestPlanGenerator):
         LLMTestPlanGenerator._validate_discovery_capabilities(
             executable_plan, discovery_result, test_step
         )
+        LLMTestPlanGenerator._validate_locator_identity(executable_plan, discovery_result)
         grounding = validate_assertion_grounding(
             executable_plan,
             test_step,
@@ -191,6 +190,32 @@ class LLMTestPlanGenerator(TestPlanGenerator):
         )
         validate_expected_result_coverage(test_step, executable_plan)
         return executable_plan, grounding
+
+    @staticmethod
+    def _validate_locator_identity(plan: QATestPlan, discovery: DiscoveryResult) -> None:
+        selectors = {element.selector for element in discovery.interactive_elements}
+
+        def collect(value):
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if isinstance(child, str) and (key == "selector" or key.endswith("_selector")):
+                        selectors.add(child)
+                    else:
+                        collect(child)
+            elif isinstance(value, list):
+                for child in value:
+                    collect(child)
+
+        collect(discovery.snapshot)
+        for field in (discovery.navigation_paths, discovery.direct_navigation_paths, discovery.navigation):
+            collect([item.model_dump(mode="python") for item in field])
+        for index, action in enumerate(plan.steps):
+            selector = action.parameters.get("selector")
+            if selector is not None and selector not in selectors:
+                raise PlanValidationError([PlanValidationIssue(
+                    code="DISCOVERY_SELECTOR_MISMATCH", path=f"steps[{index}].parameters.selector",
+                    message="The control selector is not established by deterministic Discovery. Review its identity before generation continues.",
+                )])
 
     @staticmethod
     def _build_repair_task(

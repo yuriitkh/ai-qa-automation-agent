@@ -23,6 +23,7 @@ from qa_agent.presentation import (
     result_badge,
 )
 from qa_agent.result_semantics import history_outcome, result_label, result_outcome, terminal_phase
+from qa_agent.reliability import AutomationReliabilitySupervisor, ReliabilitySettings
 from qa_agent.cookie_consent import (
     DEFAULT_COOKIE_CONSENT_POLICY,
     CookieConsentPolicy,
@@ -195,6 +196,7 @@ class LocalWebApplication:
         test_case_review: TestCaseReviewService | None = None,
         database_path: str | Path | None = None,
         readiness_service: SystemReadinessService | None = None,
+        reliability: AutomationReliabilitySupervisor | None = None,
     ) -> None:
         self._run_history = run_history
         self._reports = reports or RunReportGenerator()
@@ -213,6 +215,7 @@ class LocalWebApplication:
         self._provider_settings = provider_settings
         self._provider_router = provider_router
         self._llm_usage = llm_usage
+        self._reliability = reliability
         self._test_suites = test_suites or TestSuiteService(
             InMemoryTestSuiteRepository(), test_cases
         )
@@ -263,6 +266,8 @@ class LocalWebApplication:
         return self._progress_store
 
     def close(self) -> None:
+        if self._reliability is not None:
+            self._reliability.cancel_all()
         if self._background_runs is not None:
             self._background_runs.close()
         if self._suite_run_service is not None:
@@ -351,6 +356,11 @@ class LocalWebApplication:
             return WebResponse.html(200, self._provider_settings_page(query))
         if path == "/settings/usage" and self._llm_usage is not None:
             return WebResponse.html(200, self._usage_analytics_page(query))
+        if path == "/settings/reliability" and self._reliability is not None:
+            return WebResponse.html(200, self._reliability_page(query))
+        if len(parts) == 3 and parts[:2] == ["settings", "reliability"] and self._reliability is not None:
+            operation_id = _parse_uuid(parts[2])
+            return self._reliability_operation_page(operation_id) if operation_id else self._not_found("Generation operation not found")
         if path == "/demo-target/registration":
             return WebResponse.html(200, _local_demo_page())
         if path == "/demo-target/registration/help":
@@ -473,6 +483,13 @@ class LocalWebApplication:
         return self._not_found("Page not found")
 
     def _handle_post(self, parts: list[str], body: bytes | str | None) -> WebResponse:
+        if parts == ["settings", "reliability"] and self._reliability is not None:
+            return self._handle_reliability_settings(body)
+        if len(parts) == 4 and parts[:2] == ["settings", "reliability"] and parts[3] == "cancel" and self._reliability is not None:
+            operation_id = _parse_uuid(parts[2])
+            if operation_id is None or not self._reliability.cancel(operation_id):
+                return WebResponse.html(409, self._page("Automation Reliability", '<p>No active generation operation can be cancelled.</p>'))
+            return WebResponse.redirect(f"/settings/reliability/{operation_id}")
         if parts == ["system", "health", "refresh"]:
             return self._handle_system_health_refresh()
         if len(parts) == 3 and parts[0] == "test-cases" and parts[2] == "readiness":
@@ -798,6 +815,10 @@ class LocalWebApplication:
             else:
                 step["plan_url"] = None
         payload["actions"] = [{"label": "Open TestCase", "url": f"/test-cases/{snapshot.test_case_id}"}]
+        if self._reliability is not None:
+            operation_ids = dict.fromkeys(event.reliability_operation_id for event in snapshot.events if event.reliability_operation_id)
+            for operation_id in operation_ids:
+                payload["actions"].append({"label": "Generation decisions", "url": f"/settings/reliability/{operation_id}"})
         if persisted:
             payload["actions"].insert(0, {"label": "View Run Details", "url": f"/runs/{persisted.run_id}"})
         if payload["summary"]["outcome"] == "INFRASTRUCTURE_ERROR":
@@ -4399,15 +4420,116 @@ class LocalWebApplication:
         )
         return self._page("AI Providers", content, current="Settings", breadcrumbs=[("Dashboard", "/")])
 
-    @staticmethod
-    def _settings_tabs(active: str) -> str:
+    def _settings_tabs(self, active: str) -> str:
         providers_current = ' aria-current="page"' if active == "providers" else ""
         usage_current = ' aria-current="page"' if active == "usage" else ""
+        reliability_current = ' aria-current="page"' if active == "reliability" else ""
         return (
             '<nav class="settings-tabs" aria-label="Settings sections">'
             f'<a href="/settings/providers"{providers_current}>AI Providers</a>'
-            f'<a href="/settings/usage"{usage_current}>AI Usage</a></nav>'
+            f'<a href="/settings/usage"{usage_current}>AI Usage</a>'
+            + (f'<a href="/settings/reliability"{reliability_current}>Automation Reliability</a>' if self._reliability is not None else '')
+            + '</nav>'
         )
+
+    def _handle_reliability_settings(self, body) -> WebResponse:
+        form, error = _parse_form_body(body, max_bytes=8192)
+        fields = {"additional_retries", "provider_fallback", "automatic_plan_repair", "max_total_attempts"}
+        if error or set(form) != fields or any(len(values) != 1 for values in form.values()):
+            return WebResponse.html(400, self._reliability_page({}, error="Submit one allowed value for each reliability setting."))
+        values = {key: items[0] for key, items in form.items()}
+        if any(values[key] not in {"on", "off"} for key in fields - {"max_total_attempts"}) or values["max_total_attempts"] not in {"1", "2", "3"}:
+            return WebResponse.html(400, self._reliability_page({}, error="Toggles must be ON or OFF; maximum total attempts must be 1, 2 or 3."))
+        settings = ReliabilitySettings(
+            **{key: values[key] == "on" for key in fields - {"max_total_attempts"}},
+            max_total_attempts=int(values["max_total_attempts"]),
+        )
+        try:
+            self._reliability.repository.save_settings(settings)
+        except Exception:
+            return WebResponse.html(503, self._page("Automation Reliability", '<p>Reliability settings could not be saved. Review local storage in System Health.</p>'))
+        return WebResponse.redirect("/settings/reliability?saved=1")
+
+    def _reliability_page(self, query: dict, *, error: str | None = None) -> str:
+        settings = self._reliability.repository.settings()
+        stats = self._reliability.statistics()
+        esc = escape_html
+        controls = []
+        for key, title, description in (
+            ("additional_retries", "Additional retries", "Retry transient provider timeouts, rate limits and temporary connection failures within the shared budget."),
+            ("provider_fallback", "Provider fallback", "Use the next eligible configured provider in your saved order. Each fallback consumes an attempt."),
+            ("automatic_plan_repair", "Automatic plan repair", "Allow one targeted correction of a structurally invalid unapproved candidate or explicit missing verification coverage. Uncertain assertions and locators require human review."),
+        ):
+            enabled = getattr(settings, key)
+            controls.append(f'<label>{title}<select name="{key}"><option value="off"' + ('' if enabled else ' selected') + '>OFF</option><option value="on"' + (' selected' if enabled else '') + f'>ON</option></select><span class="muted">{description}</span></label>')
+        controls.append('<label>Maximum total attempts<select name="max_total_attempts">' + ''.join(f'<option value="{number}"' + (' selected' if settings.max_total_attempts == number else '') + f'>{number}</option>' for number in (1, 2, 3)) + '</select><span class="muted">Per atomic TestStep generation, including the initial request, retries, fallback and repair together.</span></label>')
+        rate = lambda value: f'{value * 100:.1f}%' if value is not None else 'Unknown'
+        cards = ''.join(_summary_card(label, value) for label, value in (
+            ("Generation operations", str(stats["generation_operations"])),
+            ("First-attempt success", rate(stats["first_attempt_success_rate"])),
+            ("Recovery success", rate(stats["recovery_success_rate"])),
+            ("Recovery attempts", str(stats["recovery_attempts"])),
+            ("Provider fallback events", str(stats["fallback_count"])),
+            ("Average attempts", f'{stats["average_attempts"]:.2f}' if stats["average_attempts"] is not None else 'Unknown'),
+            ("Average generation duration", format_duration(stats["average_generation_duration_ms"]) if stats["average_generation_duration_ms"] is not None else 'Unknown'),
+        ))
+        provider_rows = ''.join(f'<tr><td>{esc(row["provider"] or "Unknown")}</td><td>{esc(row["model"] or "Unknown")}</td><td>{row["count"]}</td></tr>' for row in stats["provider_model_attempts"])
+        gate_rows = ''.join(f'<li>{esc(category)}: {count}</li>' for category, count in sorted(stats["quality_gate_rejections"].items()))
+        operations = self._reliability.repository.list_records()
+        rows = ''.join(
+            f'<tr><td><a href="/settings/reliability/{record.id}">{esc(str(record.id))}</a></td>'
+            + f'<td>{esc(format_timestamp(record.started_at))}</td><td>{esc(record.outcome.replace("_", " ").title())}</td><td>{len(record.attempts)}</td></tr>'
+            for record in operations[:100]
+        )
+        usage = f'<p>Input tokens: {stats["input_tokens"] if stats["input_tokens"] is not None else "Unknown"} · Output tokens: {stats["output_tokens"] if stats["output_tokens"] is not None else "Unknown"}. Complete token metadata: {stats["usage_known_attempts"]} of {stats["total_attempts"]} attempts.</p>'
+        usage += f'<p>Estimated cost: {"$" + format(stats["estimated_cost_usd"], ".6f") if stats["estimated_cost_usd"] is not None else "Unknown"}. Verified pricing coverage: {stats["cost_known_attempts"]} of {stats["total_attempts"]} attempts. Partial sums cover recorded values only and are not provider billing.</p>'
+        content = (
+            '<header class="page-heading"><h1>Automation Reliability</h1><p class="lead">Safe recovery for automation generation.</p></header>'
+            + self._settings_tabs("reliability")
+            + (f'<p class="notice danger">{esc(error)}</p>' if error else '<p class="notice">Settings saved. New operations use these values.</p>' if query.get("saved") == ["1"] else '')
+            + '<section class="panel"><h2>Current effective settings</h2><form method="post" action="/settings/reliability">' + ''.join(controls) + '<button class="button primary" type="submit">Save reliability settings</button></form>'
+            + '<p class="muted">Quality gates always run. Recovery never changes expected results, repairs confirmed product failures, or approves automation. Repaired candidates require human review and Approve for Validation before execution. Each generation has a 60-second overall limit.</p></section>'
+            + '<section class="panel"><h2>Generation statistics</h2><div class="summary-grid">' + cards + '</div>'
+            + '<p>Success here means a candidate passed quality gates. It does not mean human approval, Browser Validation PASS, or product correctness. Rates use completed recorded operations; recovery success uses completed operations with more than one attempt.</p>'
+            + usage + '<h3>Quality Gate rejections</h3><ul>' + (gate_rows or '<li>No recorded Quality Gate rejections.</li>') + '</ul>'
+            + '<h3>Provider and model attempts</h3><div class="table-wrap"><table><thead><tr><th>Provider</th><th>Model</th><th>Attempts</th></tr></thead><tbody>' + provider_rows + '</tbody></table></div></section>'
+            + '<section class="panel"><h2>Generation operations</h2><p class="muted">Showing up to 100 most recent operations. Aggregate statistics cover all recorded operations.</p><div class="table-wrap"><table><thead><tr><th>Operation</th><th>Started</th><th>Quality result</th><th>Attempts</th></tr></thead><tbody>' + rows + '</tbody></table></div></section>'
+        )
+        return self._page("Automation Reliability", content, current="Settings", breadcrumbs=[("Dashboard", "/")])
+
+    def _reliability_operation_page(self, operation_id) -> WebResponse:
+        record = self._reliability.repository.get(operation_id)
+        if record is None:
+            return self._not_found("Generation operation not found")
+        esc = escape_html
+        rows = []
+        for attempt in record.attempts:
+            rows.append(
+                f'<li><h3>Attempt {attempt.index} — {esc(attempt.action.replace("_", " ").title())}</h3>'
+                + f'<p>{esc(attempt.status.replace("_", " ").title())} · {esc(attempt.reason)}</p>'
+                + (f'<p>Provider: {esc(attempt.provider)}</p>' if attempt.provider else '')
+                + (f'<p>Model: {esc(attempt.model)}</p>' if attempt.model else '')
+                + (f'<p>Provider request duration: {esc(format_duration(attempt.duration_ms))}</p>' if attempt.duration_ms is not None else '')
+                + '<details class="technical-details"><summary>Developer details</summary><pre>' + esc(attempt.model_dump_json(indent=2)) + '</pre></details></li>'
+            )
+        decisions = ''.join(f'<li>{esc(format_timestamp(item.timestamp))} · {esc(item.action)} · {esc(item.reason)}</li>' for item in record.decisions)
+        actions = '<a class="button" href="/settings/reliability">Back to Automation Reliability</a>'
+        case = self._test_cases.get(record.test_case_id) if self._test_cases is not None and record.test_case_id else None
+        if case is not None and any(step.id == record.test_step_id for step in case.steps):
+            actions += f'<a class="button" href="/test-cases/{record.test_case_id}">Review TestCase and automation</a>'
+            version = self._saved_version(record.test_step_id, record.candidate_version_id)
+            if version:
+                actions += f'<a class="button" href="/test-cases/{record.test_case_id}/automation/steps/{record.test_step_id}/versions/{version.id}">View saved candidate v{version.version}</a>'
+        if record.outcome == "RUNNING":
+            actions += f'<form method="post" action="/settings/reliability/{record.id}/cancel"><button class="button" type="submit">Cancel generation</button></form>'
+        content = (
+            '<header class="page-heading"><h1>Automation generation operation</h1>' + f'<p>{esc(record.id)}</p><p>{esc(record.outcome.replace("_", " ").title())}</p></header>'
+            + '<p>Generation quality is separate from human approval and Browser Validation. No product PASS is inferred.</p>'
+            + '<div class="actions">' + actions + '</div><section class="panel"><h2>Effective settings for this operation</h2><pre>' + esc(record.settings.model_dump_json(indent=2)) + '</pre></section>'
+            + '<section class="panel"><h2>Attempts</h2><ol>' + ''.join(rows) + '</ol></section>'
+            + '<section class="panel"><h2>Recovery decisions</h2><ol>' + decisions + '</ol></section>'
+        )
+        return WebResponse.html(200, self._page("Automation generation operation", content, current="Settings"))
 
     def _page(
         self,
@@ -4511,13 +4633,16 @@ def create_application(
         usage_recorder=llm_usage,
     )
     automation_router = provider_settings.create_router(usage_recorder=llm_usage)
+    reliability = AutomationReliabilitySupervisor(storage.reliability_repository)
+    reliability.reconcile_interrupted()
     automation_workflow = AutomationWorkflow(QATestPipeline(
         decomposer=TestCaseDecomposer(),
-        plan_generator=LLMTestPlanGenerator(automation_router),
+        plan_generator=LLMTestPlanGenerator(automation_router, reliability),
         runner=BrowserRunner(evidence_root, headless=True),
         plan_store=storage.plan_store,
         execution_repository=storage.execution_repository,
         run_history=storage.run_history,
+        candidate_review_approved=lambda case: test_case_review.record(case.id) is not None and test_case_review.validation_approved_for(case),
     ))
     run_service = TestCaseExecutionService(
         storage.test_case_repository,
@@ -4528,6 +4653,7 @@ def create_application(
         automation_workflow=automation_workflow,
         automation_lifecycle=automation_lifecycle,
         test_case_review=test_case_review,
+        candidate_review_required=lambda version_id: reliability.requires_review(version_id) is not None,
     )
     test_suites = TestSuiteService(
         SQLiteTestSuiteRepository(storage.database_path),
@@ -4557,6 +4683,7 @@ def create_application(
         test_suites=test_suites,
         suite_run_service=suite_run_service,
         test_case_review=test_case_review,
+        reliability=reliability,
     )
 
 

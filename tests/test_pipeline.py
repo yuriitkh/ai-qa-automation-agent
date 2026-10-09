@@ -1335,7 +1335,7 @@ class QATestPipelineTests(unittest.TestCase):
         self.assertIsNotNone(trace)
         self.assertEqual(trace.status, TraceStatus.ERROR)
         self.assertIn("plan generation", trace.error_stage or "")
-        self.assertIn("All LLM providers failed", trace.error or "")
+        self.assertIn("total generation attempt limit", trace.error or "")
 
         # Exactly two retryable attempts; neither provider was selected.
         step_trace = trace.steps[0]
@@ -1487,7 +1487,7 @@ class QATestPipelineTests(unittest.TestCase):
         self.assertEqual(repository.list_for_test_step(step.id), [])
         self.assertEqual(len(step_trace.execution_attempts), 0)
 
-    def test_incompatible_generated_plan_fails_after_one_repair_without_version(
+    def test_incompatible_generated_plan_stops_without_unsafe_identity_repair(
         self,
     ) -> None:
         # P2-4 characterization: an LLM plan that is schema-valid but
@@ -1573,12 +1573,10 @@ class QATestPipelineTests(unittest.TestCase):
         self.assertEqual(trace.status, TraceStatus.ERROR)
         self.assertIn("plan generation", trace.error_stage or "")
 
-        # Both generation and the single bounded repair went through the
-        # configured router and recorded the provider response before the
-        # capability validator rejected it.
+        # The provider response is recorded before identity validation rejects it.
         step_trace = trace.steps[0]
         attempts = step_trace.provider_attempts
-        self.assertEqual(len(attempts), 2)
+        self.assertEqual(len(attempts), 1)
         self.assertTrue(all(attempt.outcome == ProviderAttemptOutcome.SUCCESS for attempt in attempts))
         self.assertTrue(all(attempt.is_selected for attempt in attempts))
 
@@ -1589,9 +1587,9 @@ class QATestPipelineTests(unittest.TestCase):
         self.assertEqual(runner_calls, [])
         self.assertEqual(len(step_trace.execution_attempts), 0)
 
-        # Discovery ran once; semantic repair is bounded to one extra router call.
+        # Uncertain control identity cannot trigger generation repair.
         self.assertEqual(len(discovery_calls), 1)
-        self.assertEqual(provider.calls, 2)
+        self.assertEqual(provider.calls, 1)
 
     def test_runner_error_is_propagated_with_execution_stage_context(self) -> None:
         runner_error = RuntimeError("browser launch failed")

@@ -30,6 +30,7 @@ class PlanValidationIssue(BaseModel):
         "ACTION_TARGET_MISMATCH",
         "UNGROUNDED_ASSERTION",
         "EXPECTED_RESULT_NOT_COVERED",
+        "REPAIR_CHANGED_SEMANTICS",
     ]
     path: str
     message: str

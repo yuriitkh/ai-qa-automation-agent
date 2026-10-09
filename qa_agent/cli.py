@@ -23,6 +23,7 @@ from qa_agent.storage import create_sqlite_storage
 from qa_agent.llm_usage import LLMUsageService
 from qa_agent.test_case_decomposer import TestCaseDecomposer
 from qa_agent.test_plan_generator import LLMTestPlanGenerator
+from qa_agent.reliability import AutomationReliabilitySupervisor
 
 EXIT_PASSED = 0
 EXIT_FAILED = 1
@@ -45,7 +46,7 @@ def build_pipeline(
     router = create_router(usage_recorder=usage_service)
     return QATestPipeline(
         decomposer=TestCaseDecomposer(),
-        plan_generator=LLMTestPlanGenerator(router),
+        plan_generator=LLMTestPlanGenerator(router, AutomationReliabilitySupervisor(storage.reliability_repository)),
         evidence_directory=evidence_directory,
         plan_store=storage.plan_store,
         execution_repository=storage.execution_repository,

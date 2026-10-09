@@ -14,6 +14,7 @@ from .errors import (
 )
 from .json_schema import normalize_strict_json_schema, qa_test_plan_schema
 from .usage_metadata import capture_openai_usage
+from ..reliability import current_reliability_operation, provider_timeout
 
 
 class OpenAICompatibleProvider(LLMProvider):
@@ -75,7 +76,8 @@ class OpenAICompatibleProvider(LLMProvider):
             else:
                 raise NonRetryableLLMError(f"{self.name}: {self.api_key_env} is not configured.")
         try:
-            client = OpenAI(api_key=api_key, base_url=self.base_url, timeout=self.timeout_seconds)
+            limits = {"max_retries": 0} if current_reliability_operation() is not None else {}
+            client = OpenAI(api_key=api_key, base_url=self.base_url, timeout=provider_timeout(self.timeout_seconds), **limits)
             response = client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
@@ -183,7 +185,10 @@ class OpenAICompatibleProvider(LLMProvider):
         except (RetryableLLMError, NonRetryableLLMError):
             raise
         except Exception as error:
-            raise RetryableLLMError(f"{self.name}: returned an invalid QA test plan.") from error
+            raise RetryableLLMError(
+                f"{self.name}: returned an invalid QA test plan.",
+                category="INVALID_RESPONSE", safe_detail="Invalid structured response",
+            ) from error
 
     def create_discovery(self, task: str, target_url: str, page_snapshot: str) -> AIDiscoveryResult:
         prompt = (
