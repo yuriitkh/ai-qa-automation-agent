@@ -4,6 +4,7 @@ from contextvars import copy_context
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
@@ -223,8 +224,16 @@ class QATestPipeline:
             if token is not None and token.requested and not result.cancelled:
                 result = replace(result, cancelled=True)
             if result.cancelled:
-                from datetime import datetime, timezone
-                object.__setattr__(result, "test_run", result.test_run.model_copy(update={"finished_at": datetime.now(timezone.utc)}))
+                finished_at = datetime.now(timezone.utc)
+                # The step snapshot precedes owner-thread cleanup. Cancellation
+                # can still win here; retain its identity and original findings.
+                if result.trace is not None:
+                    object.__setattr__(result, "trace", result.trace.model_copy(update={
+                        "status": TraceStatus.ERROR,
+                        "finished_at": finished_at,
+                        "duration_ms": max(0, int((finished_at - result.trace.started_at).total_seconds() * 1000)),
+                    }))
+                object.__setattr__(result, "test_run", result.test_run.model_copy(update={"finished_at": finished_at}))
             if self._run_history is not None:
                 self._run_history.record_completed_run(
                     result.test_case,

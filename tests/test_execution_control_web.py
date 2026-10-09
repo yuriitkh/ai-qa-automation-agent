@@ -2,6 +2,8 @@
 from contextlib import contextmanager
 from threading import Event, Thread
 
+import pytest
+
 from playwright.sync_api import expect, sync_playwright, Page
 from unittest.mock import patch
 
@@ -110,6 +112,64 @@ def test_browser_preferences_save_queue_retry_refresh_restart_and_mobile(tmp_pat
                 expect(page.locator('select[name="screenshot_mode"]')).to_have_value('ELEMENT_AND_PAGE')
         finally:
             release.set(); browser.close()
+
+
+@pytest.mark.parametrize("conflict", [False, True])
+def test_browser_preferences_reconcile_responses_without_losing_pending_edits(tmp_path, conflict):
+    preferences = SQLiteExecutionPreferences(tmp_path / "preferences.sqlite3")
+    app, case = case_application(preferences)
+    with local_server(app) as origin, sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page, other_tab = browser.new_page(), browser.new_page()
+        try:
+            # Hold the first actual HTTP response after the server has handled
+            # it, so edits made while it is in flight have a fixed ordering.
+            page.add_init_script("""
+                const originalFetch = window.fetch.bind(window);
+                window.fetch = async (...args) => {
+                    const response = await originalFetch(...args);
+                    if (String(args[0]).endsWith('/preferences') && !window.preferenceResponseHeld) {
+                        window.preferenceResponseHeld = true;
+                        await new Promise(resolve => { window.releasePreferenceResponse = resolve; });
+                    }
+                    return response;
+                };
+            """)
+            url = f"{origin}/test-cases/{case.id}"
+            page.goto(url)
+            other_tab.goto(url)
+            page.get_by_text("Evidence settings", exact=True).click()
+            page.get_by_text("Cookie consent", exact=True).click()
+            if conflict:
+                other_tab.get_by_text("Cookie consent", exact=True).click()
+                other_tab.locator('select[name="cookie_policy"]').select_option("LEAVE_UNCHANGED")
+                expect(other_tab.locator('[data-preferences-status]')).to_have_text("Saved")
+            page.locator('select[name="evidence_mode"]').select_option("EVERY_STEP")
+            page.wait_for_function("typeof window.releasePreferenceResponse === 'function'")
+            expect(page.locator('[data-preferences-status]')).to_have_text("Saving…")
+            page.locator('select[name="evidence_mode"]').select_option("EVERY_VERIFICATION")
+            page.locator('select[name="screenshot_mode"]').select_option("ELEMENT_AND_PAGE")
+            page.evaluate("window.releasePreferenceResponse()")
+            if conflict:
+                expect(page.locator('[data-preferences-status]')).to_have_text("Save failed — Retry")
+                expect(page.locator('select[name="cookie_policy"]')).to_have_value("LEAVE_UNCHANGED")
+                expect(page.locator('select[name="evidence_mode"]')).to_have_value("EVERY_VERIFICATION")
+                expect(page.locator('select[name="screenshot_mode"]')).to_have_value("ELEMENT_AND_PAGE")
+                assert page.locator('[data-execution-preferences]').get_attribute("data-revision") == "1"
+                expect(page.get_by_role("button", name="Run Regression", exact=True)).to_be_disabled()
+                page.get_by_role("button", name="Retry", exact=True).click()
+            expect(page.locator('[data-preferences-status]')).to_have_text("Saved")
+            saved = preferences.get(case.id).model_dump(mode="json")
+            assert saved["evidence_mode"] == "EVERY_VERIFICATION"
+            assert saved["screenshot_mode"] == "ELEMENT_AND_PAGE"
+            assert saved["cookie_policy"] == ("LEAVE_UNCHANGED" if conflict else "AUTO_HANDLE")
+            for field in ("cookie_policy", "evidence_mode", "screenshot_mode"):
+                expect(page.locator(f'select[name="{field}"]')).to_have_value(saved[field])
+            assert page.locator('[data-execution-preferences]').get_attribute("data-revision") == str(saved["revision"])
+            expect(page.get_by_role("button", name="Run Regression", exact=True)).to_be_enabled()
+            assert app._run_history.list_recent() == []
+        finally:
+            browser.close()
 
 
 def test_browser_authoring_stop_reopen_and_late_response(tmp_path):

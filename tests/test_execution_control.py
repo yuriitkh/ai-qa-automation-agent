@@ -2,7 +2,9 @@
 import json
 import time
 import unittest
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 from threading import Barrier, Event, Thread
 from urllib.parse import urlencode
 from uuid import uuid4
@@ -17,6 +19,7 @@ from qa_agent.execution_control import CancellationToken, OperationCancelled, ca
 from qa_agent.execution_preferences import SQLiteExecutionPreferences, PreferencesConflict
 from qa_agent.execution_progress import ExecutionProgressStore
 from qa_agent.execution_repository import InMemoryExecutionRepository
+from qa_agent.execution_trace import ExecutionTraceRecorder, TraceStatus
 from qa_agent.models import ExecutionStatus, TestCase as Case, QATestPlan, RunContext
 from qa_agent.pipeline import QATestPipeline
 from qa_agent.pinned_execution import PinnedExecutionService, PlanVersionSet
@@ -269,6 +272,102 @@ def test_stop_between_steps_preserves_product_failure_evidence_pins_and_reports(
     assert 'Stopped by user' in RunReportGenerator().to_html(report)
     assert json.loads(report.to_json())["outcome"] == "CANCELLED"
     assert DomainReportGenerator().generate(result.test_run).display_outcome == "CANCELLED"
+
+
+@pytest.mark.parametrize("runner_status", ["passed", "failed"])
+@pytest.mark.parametrize("cancel_during_cleanup", [False, True])
+def test_cleanup_completion_keeps_trace_identity_timestamp_and_product_findings(
+    tmp_path, runner_status, cancel_during_cleanup,
+):
+    case = _case()
+    plans, executions = InMemoryPlanStore(), InMemoryExecutionRepository()
+    plan, version = _plan(case)
+    plans.save(case.steps[0].id, version, test_plan=plan)
+    original_plan = version.model_dump_json()
+    history = RunHistoryService(InMemoryRunHistoryRepository(), executions, plan_store=plans)
+    token, cleanup_entered, release_cleanup = CancellationToken(), Event(), Event()
+    snapshots = []
+    evidence = tmp_path / "completed-assertion.png"
+    evidence.write_bytes(b"original evidence")
+
+    class Recorder(ExecutionTraceRecorder):
+        def finalize(self, *args, **kwargs):
+            snapshot = super().finalize(*args, **kwargs)
+            snapshots.append(snapshot)
+            return snapshot
+
+    class Pipeline(QATestPipeline):
+        def _create_trace_recorder(self, task):
+            return Recorder(task)
+
+    class Runner:
+        @contextmanager
+        def open_test_case_session(self, _):
+            try:
+                yield self
+            finally:
+                cleanup_entered.set()
+                assert release_cleanup.wait(5)
+
+        def run_plan(self, *_):
+            return {
+                "status": runner_status,
+                "steps": [{"action": "assert_title", "status": runner_status,
+                           "error": "Unexpected title" if runner_status == "failed" else ""}],
+                "evidence": [{"type": "SCREENSHOT", "path": str(evidence)}],
+            }
+
+        def __call__(self, _):
+            pytest.fail("The bound session must execute the plan")
+
+    pipeline = Pipeline(object(), object(), plan_store=plans,
+                        execution_repository=executions, run_history=history, runner=Runner())
+
+    def execute():
+        with cancellation_scope(token):
+            return pipeline.run_test_case(case)
+
+    with ThreadPoolExecutor(max_workers=1) as workers:
+        future = workers.submit(execute)
+        try:
+            assert cleanup_entered.wait(3)
+            assert len(snapshots) == 1
+            original_trace = snapshots[0]
+            assert original_trace.status == (TraceStatus.PASSED if runner_status == "passed" else TraceStatus.FAILED)
+            assert history.list_recent() == []
+            final_timestamp = original_trace.finished_at + timedelta(seconds=2)
+            with patch("qa_agent.pipeline.datetime") as clock:
+                clock.now.return_value = final_timestamp
+                if cancel_during_cleanup:
+                    assert token.request()
+                assert not future.done()
+                release_cleanup.set()
+                result = future.result(timeout=3)
+        finally:
+            release_cleanup.set()
+
+    record = history.get(result.test_run.id)
+    assert record.trace_id == result.trace.trace_id == original_trace.trace_id
+    assert result.trace.started_at == original_trace.started_at
+    assert result.trace.steps == original_trace.steps
+    assert result.trace.totals == original_trace.totals
+    assert result.trace.error == original_trace.error
+    if cancel_during_cleanup:
+        assert result.test_run.status == ExecutionStatus.CANCELLED
+        assert record.outcome == "CANCELLED" and result.trace.status == TraceStatus.ERROR
+        assert result.trace.finished_at == result.test_run.finished_at == record.finished_at == final_timestamp
+        assert result.trace.duration_ms == int((final_timestamp - original_trace.started_at).total_seconds() * 1000)
+    else:
+        assert result.trace == original_trace
+        assert record.outcome == ("PASSED" if runner_status == "passed" else "PRODUCT_FAILURE")
+    finding = result.test_run.executions[0]
+    assert finding.status.value.lower() == runner_status
+    assert finding.id == original_trace.steps[0].execution_attempts[0].execution_id
+    assert record.executions[0].classification == ("PASSED" if runner_status == "passed" else "PRODUCT_FAILURE")
+    assert list(finding.evidence) == original_trace.steps[0].execution_attempts[0].evidence
+    assert evidence.read_bytes() == b"original evidence"
+    assert plans.find(case.steps[0].id).model_dump_json() == original_plan
+    assert not token.request()
 
 
 @pytest.mark.parametrize('automation', [True, False])

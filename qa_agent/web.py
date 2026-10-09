@@ -5575,6 +5575,13 @@ _UI_JAVASCRIPT = r"""
   const retry = panel.querySelector('[data-preferences-retry]');
   const pending = new Map();
   let saving = false, failed = false, revision = Number(panel.dataset.revision);
+  const preferenceSelects = panel.querySelectorAll('select[name="cookie_policy"], select[name="evidence_mode"], select[name="screenshot_mode"]');
+  const reconcile = (preferences) => {
+    revision = preferences.revision; panel.dataset.revision = String(revision);
+    preferenceSelects.forEach((select) => {
+      if (!pending.has(select.name)) select.value = preferences[select.name];
+    });
+  };
   const dirty = () => saving || failed || pending.size > 0;
   const setRunButtons = () => {
     document.querySelectorAll('[data-run-form] button[type="submit"]').forEach((button) => { button.disabled = dirty(); });
@@ -5596,17 +5603,17 @@ _UI_JAVASCRIPT = r"""
           body: new URLSearchParams({field, value, revision: String(revision)})
         });
         const result = await response.json();
-        if (response.status === 409 && result.preferences) revision = result.preferences.revision;
+        if (response.status === 409 && result.preferences) reconcile(result.preferences);
         if (!response.ok) throw new Error('Save failed');
-        revision = result.revision; panel.dataset.revision = String(revision);
         if (pending.get(field) === value) pending.delete(field);
+        reconcile(result);
       }
       status.textContent = 'Saved';
     } catch (_error) {
       failed = true; status.textContent = 'Save failed — Retry'; retry.hidden = false;
     } finally { saving = false; setRunButtons(); }
   };
-  panel.querySelectorAll('select[name="cookie_policy"], select[name="evidence_mode"], select[name="screenshot_mode"]').forEach((select) => {
+  preferenceSelects.forEach((select) => {
     select.addEventListener('change', () => { pending.set(select.name, select.value); setRunButtons(); save(); });
   });
   retry.addEventListener('click', () => { failed = false; save(); });
