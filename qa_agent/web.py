@@ -473,6 +473,8 @@ class LocalWebApplication:
             return self._reliability_operation_page(operation_id) if operation_id else self._not_found("Generation operation not found")
         if path == "/demo-target/registration":
             return WebResponse.html(200, _local_demo_page())
+        if path == "/assets/demo-registration.js":
+            return WebResponse(200, "application/javascript; charset=utf-8", _local_demo_javascript().encode("utf-8"))
         if path == "/demo-target/registration/help":
             return WebResponse.html(200, _local_demo_help_page())
         if path == "/test-cases":
@@ -900,6 +902,7 @@ class LocalWebApplication:
             saved_step = report_steps.get(UUID(step["id"]))
             step["evidence_links"] = []
             step["observation"] = None
+            step.setdefault("action_failure", None)
             if saved_step:
                 step["display_status"] = saved_step.display_status
                 if saved_step.attempts:
@@ -908,6 +911,7 @@ class LocalWebApplication:
                     step["plan_version"] = last.plan_version_number
                     step["plan_origin"] = last.plan_version_origin.value if last.plan_version_origin else None
                     step["observation"] = last.observation
+                    step["action_failure"] = last.action_failure.model_dump(mode="json") if last.action_failure else None
                 for attempt_number, attempt in enumerate(saved_step.attempts, start=1):
                     for index, evidence in enumerate(attempt.evidence):
                         url = self._evidence_url_if_available(detail, persisted.run_id, saved_step, attempt, evidence, index)
@@ -1089,6 +1093,7 @@ class LocalWebApplication:
                 + (f'<span class="muted">Automation {esc(step["automation_state"].lower())}</span>' if step["automation_state"] and step["automation_state"] != 'Failed' else '')
                 + f'<span class="muted">{plan}</span>'
                 + (f'<span>Observed: {esc(step["observation"])}</span>' if step["observation"] else '')
+                + (f'<details><summary>Action failure details</summary><pre>{esc(json.dumps(step["action_failure"], indent=2))}</pre></details>' if step.get("action_failure") else '')
                 + (f'<span class="progress-evidence">Screenshot evidence captured ({step["evidence_count"]})</span>' if step["evidence_count"] else '')
                 + evidence + '</span></li>'
             )
@@ -4889,8 +4894,12 @@ def _local_demo_page() -> str:
   <button id="accept-cookies" type="button">Accept all cookies</button>
 </section>
 </main>
-<script>
-const form = document.querySelector('#registration-form');
+<script src="/assets/demo-registration.js" defer></script></body></html>"""
+
+
+def _local_demo_javascript() -> str:
+    """Same-origin script served under the application's unchanged CSP."""
+    return """const form = document.querySelector('#registration-form');
 const error = document.querySelector('#form-error');
 const success = document.querySelector('#registration-success');
 form.addEventListener('submit', event => {
@@ -4923,7 +4932,7 @@ document.querySelector('#close-details').addEventListener('click', () => {
 document.querySelector('#accept-cookies').addEventListener('click', () => {
   document.querySelector('#cookie-consent').hidden = true;
 });
-</script></body></html>"""
+"""
 
 
 def _local_demo_help_page() -> str:
@@ -6292,6 +6301,11 @@ _UI_JAVASCRIPT = r"""
         const line = document.createElement('span'); line.className = 'muted'; line.append(plan); content.append(line);
       } else content.append(textNode('span', 'No saved TestPlan available.', 'muted'));
       if (step.observation) content.append(textNode('p', `Observed: ${step.observation}`));
+      if (step.action_failure) {
+        const details = document.createElement('details');
+        details.append(textNode('summary', 'Action failure details'), textNode('pre', JSON.stringify(step.action_failure, null, 2)));
+        content.append(details);
+      }
       if (step.evidence_count) content.append(textNode('span', `Screenshot evidence captured (${step.evidence_count})`, 'progress-evidence'));
       (step.evidence_links || []).forEach((evidence) => {
         const link = localLink(evidence.url, `Open full-size evidence \u00b7 ${evidence.label}`);

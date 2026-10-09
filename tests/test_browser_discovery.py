@@ -520,6 +520,7 @@ class BrowserDiscoveryTests(unittest.TestCase):
                 "test_id": "registration-email",
                 "text": "",
                 "value": "private input",
+                "has_value": True,
                 "visible": True,
                 "enabled": True,
             }],
@@ -533,7 +534,9 @@ class BrowserDiscoveryTests(unittest.TestCase):
         self.assertEqual(control["test_id"], "registration-email")
         self.assertNotIn("value", control)
         self.assertNotIn("private input", serialized)
-        self.assertNotIn("element.value", _SNAPSHOT_SCRIPT)
+        self.assertIs(control["has_value"], True)
+        self.assertIn("item.has_value = element.value.length > 0", _SNAPSHOT_SCRIPT)
+        self.assertNotIn("item.value", _SNAPSHOT_SCRIPT)
         self.assertNotIn("|| item.placeholder", _SNAPSHOT_SCRIPT)
 
     def test_modal_control_snapshot_records_its_dialog_identity(self) -> None:

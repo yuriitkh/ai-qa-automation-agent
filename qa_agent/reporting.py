@@ -1,5 +1,6 @@
 """Deterministic JSON reports derived from domain TestRun data."""
 
+import json
 from pathlib import Path
 from datetime import datetime
 from typing import Any
@@ -50,6 +51,7 @@ from qa_agent.run_history import (
     RunHistoryRecord,
     WorkflowType,
 )
+from qa_agent.execution_diagnostics import ActionFailureDiagnostic, action_failure_diagnostic, redact_action_failure
 from qa_agent.setup_orchestration import CleanupOutcome, SetupRunOutcome
 
 
@@ -87,6 +89,7 @@ class TestAttemptReport(BaseModel):
     finished_at: datetime | None
     actual_result: Any
     error: str | None
+    action_failure: ActionFailureDiagnostic | None = None
     evidence: list[EvidenceReport] = Field(default_factory=list)
 
     @classmethod
@@ -101,6 +104,7 @@ class TestAttemptReport(BaseModel):
             finished_at=execution.finished_at,
             actual_result=execution.actual_result,
             error=execution.error,
+            action_failure=action_failure_diagnostic(execution.runner_result),
             evidence=[EvidenceReport.from_evidence(item) for item in execution.evidence],
         )
 
@@ -193,6 +197,7 @@ class TestReportGenerator:
         return attempt.model_copy(update={
             "actual_result": _safe_report_value(attempt.actual_result, test_run),
             "error": _redact_report_value(_safe_report_value(attempt.error, test_run)),
+            "action_failure": redact_action_failure(attempt.action_failure, lambda value: _safe_report_value(value, test_run)),
             "evidence": [
                 item.model_copy(update={
                     "path": _safe_report_value(item.path, test_run),
@@ -232,6 +237,7 @@ class RunAttemptReport(BaseModel):
     actual_result: Any = None
     error: str | None = None
     diagnostics: str | None = None
+    action_failure: ActionFailureDiagnostic | None = None
     evidence: list[RunEvidenceReport] = Field(default_factory=list)
 
 
@@ -439,6 +445,7 @@ class RunReportGenerator:
             actual_result=_redact_report_value(reference.safe_actual_result),
             error=redact_diagnostic(reference.safe_error) if reference.safe_error else None,
             diagnostics=redact_diagnostic(reference.safe_diagnostics or reference.safe_error) if reference.safe_diagnostics or reference.safe_error else None,
+            action_failure=reference.action_failure,
             evidence=evidence,
         )
 
@@ -494,6 +501,8 @@ class RunReportGenerator:
                     '<div class="status-line">' + result_badge(attempt.classification)
                     + f'<strong>Attempt {attempt_number}</strong></div>'
                     + f'<p><strong>Actual observation:</strong> {esc(observed)}</p>'
+                    + (f'<p class="action-diagnostic">{esc(attempt.action_failure.summary())}</p>' if attempt.action_failure else '')
+                    + (f'<pre>{esc(json.dumps(attempt.action_failure.model_dump(mode="json", exclude_none=True), indent=2))}</pre>' if attempt.action_failure else '')
                     + f'<p>{version_html}</p>'
                     + (f'<p class="muted">Attempt duration: {esc(format_duration(attempt.duration_ms))}</p>' if attempt.duration_ms is not None else '')
                     + '<div class="attempt-evidence"><h4>Evidence</h4>'

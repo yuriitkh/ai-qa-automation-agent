@@ -20,6 +20,7 @@ from qa_agent.models import (
 from qa_agent.plan_store import PlanStore
 from qa_agent.public_ids import format_run_public_id, parse_run_public_id
 from qa_agent.redaction import redact_secrets, redact_diagnostic
+from qa_agent.execution_diagnostics import ActionFailureDiagnostic, action_failure_diagnostic, redact_action_failure
 from qa_agent.result_semantics import execution_classification, execution_observation
 from qa_agent.run_context import RunContext
 from qa_agent.setup_orchestration import CleanupOutcome, SetupRunOutcome
@@ -89,6 +90,7 @@ class HistoryExecutionReference(BaseModel):
     finished_at: datetime | None = None
     safe_error: str | None = None
     safe_diagnostics: str | None = None
+    action_failure: ActionFailureDiagnostic | None = None
     safe_actual_result: Any = None
     evidence: list[HistoryEvidenceReference] = Field(default_factory=list)
 
@@ -269,6 +271,8 @@ class RunHistoryRecord(BaseModel):
                     started_at=execution.started_at,
                     finished_at=execution.finished_at,
                     safe_error=_safe_text(execution.error, run_context),
+                    action_failure=redact_action_failure(action_failure_diagnostic(execution.runner_result),
+                        lambda value: _safe_text(value, run_context)),
                     safe_diagnostics=redact_diagnostic(
                         _safe_text(_runner_diagnostic(execution), run_context) or ""
                     ) or None,
@@ -468,6 +472,9 @@ def _safe_context(run_context: RunContext) -> dict[str, dict[str, Any]]:
 
 
 def _runner_diagnostic(execution: Execution) -> str | None:
+    diagnostic = action_failure_diagnostic(execution.runner_result)
+    if diagnostic is not None:
+        return diagnostic.summary()
     for step in (execution.runner_result or {}).get("steps", []):
         if isinstance(step, dict) and step.get("status") == "failed" and isinstance(step.get("error"), str):
             return step["error"]

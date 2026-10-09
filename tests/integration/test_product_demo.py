@@ -544,12 +544,15 @@ class ProductDemoSliceTests(unittest.TestCase):
                     test_step_id=test_step.id,
                     name=test_step.name,
                 )
-                plan = QATestPlan(url=self.target_url, steps=[
+                setup = [
                     QATestStep(action="navigate", parameters={"url": self.target_url}),
                     QATestStep(action="fill", parameters={
                         "selector": "#delayed-email",
                         "value": "local-test@example.test",
                     }),
+                ] if test_step.order == 0 else []
+                plan = QATestPlan(url=self.target_url, steps=[
+                    *setup,
                     QATestStep(action="assert_visible", parameters={
                         "selector": "main p#registration-page",
                     }),
@@ -978,18 +981,15 @@ class ProductDemoSliceTests(unittest.TestCase):
                         }},
                     ],
                     2: [
-                        {"action": "navigate", "parameters": {"url": target_url}},
                         {"action": "fill", "parameters": {
                             "selector": email_selector,
                             "value": "qa.demo@example.test",
                         }},
                     ],
                     3: [
-                        {"action": "navigate", "parameters": {"url": target_url}},
                         {"action": "click", "parameters": {"selector": submit_selector}},
                     ],
                     4: [
-                        {"action": "navigate", "parameters": {"url": target_url}},
                         {"action": "assert_text_contains", "parameters": {
                             "expected_text": "Account created successfully",
                         }},
@@ -1122,7 +1122,7 @@ class ProductDemoSliceTests(unittest.TestCase):
                     PlanExecutionClassification.PRODUCT_FAILURE,
                 )
                 self.assertIn(
-                    "Account created successfully",
+                    "ASSERTION_FAILURE",
                     failed_execution.error,
                 )
                 self.assertNotIn("NoneType", failed_execution.error)

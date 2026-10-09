@@ -19,6 +19,7 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from qa_agent.execution_control import completion_boundary
+from qa_agent.execution_diagnostics import ActionFailureDiagnostic, redact_action_failure
 from qa_agent.models import TestCase, TestStep
 from qa_agent.presentation import failure_message
 from qa_agent.result_semantics import result_outcome, result_label, terminal_phase, result_summary
@@ -118,6 +119,7 @@ class ProgressStep(BaseModel):
     failure_classification: str | None = None
     message: str | None = None
     evidence_count: int = 0
+    action_failure: ActionFailureDiagnostic | None = None
 
 
 class AutomationGenerationFailure(BaseModel):
@@ -168,6 +170,7 @@ class ExecutionProgressEvent(BaseModel):
     evidence_execution_id: UUID | None = None
     evidence_index: int | None = None
     evidence_name: str | None = None
+    action_failure: ActionFailureDiagnostic | None = None
 
     def to_public_dict(self) -> dict[str, Any]:
         """Serialize only presentation-safe event fields."""
@@ -196,6 +199,7 @@ class ExecutionProgressEvent(BaseModel):
             "outcome": self.outcome,
             "error_category": self.error_category,
             "duration_ms": self.duration_ms,
+            "action_failure": self.action_failure.model_dump(mode="json") if self.action_failure else None,
             "evidence": ({
                 "execution_id": str(self.evidence_execution_id),
                 "index": self.evidence_index,
@@ -307,6 +311,7 @@ class ExecutionProgressSnapshot(BaseModel):
                 "failure_classification": step.failure_classification,
                 "message": step.message,
                 "evidence_count": step.evidence_count,
+                "action_failure": step.action_failure.model_dump(mode="json") if step.action_failure else None,
             } for step in self.steps],
             "events": [event.to_public_dict() for event in self.events],
             "final_run_id": str(self.final_run_id) if self.final_run_id else None,
@@ -745,6 +750,7 @@ class ExecutionProgressStore:
         duration_ms: int | None = None,
         evidence_execution_id: UUID | None = None,
         evidence_index: int | None = None,
+        action_failure: ActionFailureDiagnostic | None = None,
     ) -> ExecutionProgressEvent:
         now = self._now()
         with self._lock:
@@ -777,6 +783,7 @@ class ExecutionProgressStore:
                 evidence_execution_id=evidence_execution_id,
                 evidence_index=evidence_index,
                 evidence_name="Screenshot" if evidence_execution_id is not None else None,
+                action_failure=action_failure,
             )
             self._append_to_record(record, event)
             return event
@@ -986,6 +993,7 @@ class ExecutionProgressStore:
                 execution_state=ProgressStepState.FAILED,
                 failure_classification=event.classification,
                 message=event.message,
+                action_failure=event.action_failure,
             )
         elif event.event_type == ExecutionEventType.STEP_BLOCKED:
             self._update_step(
@@ -1074,6 +1082,7 @@ class ExecutionProgressStore:
         clear_failure: bool = False,
         message: str | None = None,
         evidence_increment: int = 0,
+        action_failure: ActionFailureDiagnostic | None = None,
     ) -> None:
         if step_id is None or step_id not in record.steps:
             return
@@ -1096,6 +1105,7 @@ class ExecutionProgressStore:
             ),
             "message": message if message is not None else current.message,
             "evidence_count": current.evidence_count + evidence_increment,
+            "action_failure": None if clear_failure else (action_failure or current.action_failure),
         })
 
     def _require_record(self, progress_id: str) -> _ProgressRecord:
@@ -1364,6 +1374,7 @@ class ExecutionProgressReporter:
         duration_ms: int | None = None,
         evidence_execution_id: UUID | None = None,
         evidence_index: int | None = None,
+        action_failure: ActionFailureDiagnostic | None = None,
     ) -> None:
         self._store.append_for(
             self.progress_id,
@@ -1396,6 +1407,7 @@ class ExecutionProgressReporter:
             duration_ms=duration_ms,
             evidence_execution_id=evidence_execution_id,
             evidence_index=evidence_index,
+            action_failure=redact_action_failure(action_failure, self.safe_text),
         )
 
     def capture_provider_diagnostics(self, trace) -> None:
@@ -1508,6 +1520,7 @@ def emit_progress_event(
     validation_issues: tuple[PlanValidationIssue, ...] = (),
     evidence_execution_id: UUID | None = None,
     evidence_index: int | None = None,
+    action_failure: ActionFailureDiagnostic | None = None,
 ) -> None:
     reporter = get_active_execution_progress()
     if reporter is not None:
@@ -1527,6 +1540,7 @@ def emit_progress_event(
             validation_issues=validation_issues,
             evidence_execution_id=evidence_execution_id,
             evidence_index=evidence_index,
+            action_failure=action_failure,
         )
 
 

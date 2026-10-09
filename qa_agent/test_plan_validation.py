@@ -31,6 +31,7 @@ class PlanValidationIssue(BaseModel):
         "UNGROUNDED_ASSERTION",
         "EXPECTED_RESULT_NOT_COVERED",
         "REPAIR_CHANGED_SEMANTICS",
+        "TESTSTEP_BOUNDARY_VIOLATION",
     ]
     path: str
     message: str

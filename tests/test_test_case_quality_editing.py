@@ -303,6 +303,7 @@ def test_navigation_has_no_locator_requirement_dom_assertions_do(selector, obser
                 expected="Cookie banner is visible on the page." if selector else "The page is loaded.", order=0)
     discovery = DiscoveryResult(status=DiscoveryStatus.PARTIAL, url="http://127.0.0.1/",
         interactive_elements=[InteractiveElement(tag="div", role="dialog", kind="dialog", selector="#cookie-banner", text="Cookie banner")] if observed else [])
+    discovery.snapshot = {"interactive_elements": [item.model_dump(mode="json") for item in discovery.interactive_elements]}
     actions = [{"action": "navigate", "parameters": {"url": discovery.url}}]
     actions += [{"action": "assert_visible", "parameters": {"selector": selector}}] if selector else [{"action": "assert_page_loaded"}]
     provider = LocalPlanProvider(actions)

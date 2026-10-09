@@ -111,7 +111,8 @@ class _Page:
     def wait_for_load_state(self, *_args, **_kwargs):
         return None
 
-    def screenshot(self, *, path):
+    def screenshot(self, *, path, mask):
+        assert len(mask) == 1 and isinstance(mask[0], _Action)
         self.screenshot_paths.append(path)
 
 

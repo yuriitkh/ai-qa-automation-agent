@@ -135,6 +135,10 @@ class InteractiveElement(BaseModel):
     dialog_identity: str = ""
     visible: bool = True
     enabled: bool = True
+    input_type: str = ""
+    button_type: str = ""
+    option_labels: tuple[str, ...] = ()
+    has_value: bool | None = None
 
 
 class LocatorIdentityEntry(BaseModel):

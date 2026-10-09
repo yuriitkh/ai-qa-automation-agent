@@ -16,7 +16,7 @@ from qa_agent.plan_execution import PlanExecutionService
 from qa_agent.pipeline import QATestPipeline
 from qa_agent.storage import create_sqlite_storage
 from qa_agent.test_plan_generator import LLMTestPlanGenerator
-from qa_agent.web import WebResponse, _local_demo_page
+from qa_agent.web import WebResponse, _local_demo_page, _local_demo_javascript
 from qa_agent.workflows import RegressionWorkflow, ValidationWorkflow, WorkflowOutcome
 from tests.integration.test_test_case_quality_integration import local_server
 from tests.test_registration_coverage import RegistrationProvider, assertion, registration_plan, registration_step
@@ -24,12 +24,8 @@ from tests.test_registration_coverage import RegistrationProvider, assertion, re
 
 class RegistrationTarget:
     def __init__(self, *, reject_input=False):
-        markup, _, script = _local_demo_page().partition('<script>')
-        javascript, _, tail = script.partition('</script>')
-        # Serve the existing fixture's script from the same origin under the
-        # local server's CSP, retaining its DOM rather than inventing selectors.
-        self.markup = markup + '<script src="/registration.js"></script>' + tail
-        self.javascript = javascript + "\nerror.textContent = 'hidden-fixture-private-content';"
+        self.markup = _local_demo_page()
+        self.javascript = _local_demo_javascript() + "\nerror.textContent = 'hidden-fixture-private-content';"
         if reject_input:
             self.javascript += "\nform.addEventListener('input', () => { error.hidden = false; });"
 
@@ -37,7 +33,7 @@ class RegistrationTarget:
         pass
 
     def handle(self, method, target, body=None, headers=None):
-        if target == '/registration.js':
+        if target == '/assets/demo-registration.js':
             return WebResponse(200, 'application/javascript', self.javascript.encode())
         return WebResponse.html(200, self.markup)
 

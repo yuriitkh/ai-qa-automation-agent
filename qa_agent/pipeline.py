@@ -19,6 +19,7 @@ from qa_agent.execution_control import (
 from qa_agent.browser_discovery import capture_discovery_result, extract_target_url
 from qa_agent.assertion_grounding import validate_assertion_grounding
 from qa_agent.expected_result_coverage import validate_expected_result_coverage
+from qa_agent.generation_context import StepGenerationContext, validate_step_boundaries
 from qa_agent.browser_runner import BrowserRunner
 from qa_agent.execution_repository import ExecutionRepository, InMemoryExecutionRepository
 from qa_agent.execution_trace import (
@@ -485,6 +486,18 @@ class QATestPipeline:
                         ) from error
 
                     generation_started = time.perf_counter()
+                    segment = segment_by_step[test_step.id]
+                    completed_ids = {item.test_step_id for item in executions if item.status == ExecutionStatus.PASSED}
+                    segment_ids = {item.id for item in segment.steps}
+                    step_context = StepGenerationContext(
+                        segment_order=segment.order,
+                        previous_steps=tuple(item for item in ordered_steps if item.id in segment_ids and item.order < test_step.order),
+                        remaining_steps=tuple(item for item in ordered_steps if item.id in segment_ids and item.order > test_step.order),
+                        completed_actions=tuple((action.action, action.parameters.get("selector"))
+                            for prior in generated_plans if prior.test_plan.test_step_id in completed_ids & segment_ids
+                            for action in prior.test_plan_version.qa_test_plan.steps),
+                        state_preserved=case_runner is not None and case_runner.browser_session_started,
+                    )
                     try:
                         with llm_usage_scope(
                             related_test_case_id=test_case.id,
@@ -498,12 +511,14 @@ class QATestPipeline:
                                 **_requirement_context_kwargs(
                                     self._plan_generator, test_case.description
                                 ),
+                                **_optional_generation_kwargs(self._plan_generator, step_context=step_context),
                             )
                         generated_plan = _validate_generated_plan(
                             generated_plan,
                             test_step,
                             discovery_result=discovery_result,
                             requirement_context=test_case.description,
+                            step_context=step_context,
                             expected_version=cached_version.version + 1 if cached_version is not None else 1,
                         )
                         generated_plan = _with_discovered_locator_identity(
@@ -916,6 +931,7 @@ def _validate_generated_plan(
     *,
     discovery_result: DiscoveryResult,
     requirement_context: str | None = None,
+    step_context: StepGenerationContext | None = None,
     expected_version: int,
 ) -> GeneratedTestPlan:
     """Revalidate plan structure and ownership before any version is saved."""
@@ -936,6 +952,7 @@ def _validate_generated_plan(
         requirement_context=requirement_context,
     )
     validate_expected_result_coverage(test_step, executable_plan, discovery=discovery_result)
+    validate_step_boundaries(executable_plan, test_step, discovery_result, step_context)
     return GeneratedTestPlan(
         test_plan=generated_plan.test_plan,
         test_plan_version=version.model_copy(update={
@@ -947,17 +964,17 @@ def _validate_generated_plan(
 
 def _requirement_context_kwargs(generator: TestPlanGenerator, context: str) -> dict[str, str]:
     """Pass the original requirement to capable generators without breaking older extensions."""
+    return _optional_generation_kwargs(generator, requirement_context=context)
+
+
+def _optional_generation_kwargs(generator, **context):
     try:
         parameters = inspect.signature(generator.generate_with_plan).parameters.values()
     except (TypeError, ValueError):
         return {}
-    if any(
-        parameter.name == "requirement_context"
-        or parameter.kind == inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters
-    ):
-        return {"requirement_context": context}
-    return {}
+    names = {parameter.name for parameter in parameters}
+    accepts_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters)
+    return {name: value for name, value in context.items() if accepts_kwargs or name in names}
 
 
 def _generation_failure_details(error: Exception) -> tuple[str, str]:

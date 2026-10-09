@@ -7,8 +7,10 @@ from qa_agent.llm.router import LLMRouter
 from qa_agent.models import (
     AssertionGroundingEntry,
     DiscoveryResult,
+    DiscoveryStatus,
     PlanVersionOrigin,
     QATestPlan,
+    QATestStep,
     TestPlan,
     TestPlanVersion,
     TestStep,
@@ -25,6 +27,7 @@ from qa_agent.llm_usage import (
 )
 from qa_agent.assertion_grounding import validate_assertion_grounding
 from qa_agent.expected_result_coverage import validate_expected_result_coverage
+from qa_agent.generation_context import StepGenerationContext, observed_controls, validate_step_boundaries
 from qa_agent.reliability import AutomationReliabilitySupervisor, current_reliability_operation
 
 
@@ -70,6 +73,7 @@ class TestPlanGenerator:
         existing_test_plan: TestPlan | None = None,
         version_number: int = 1,
         requirement_context: str | None = None,
+        step_context: StepGenerationContext | None = None,
     ) -> GeneratedTestPlan:
         """Generate a version while retaining its owning TestPlan object."""
         raise NotImplementedError(
@@ -92,9 +96,10 @@ class LLMTestPlanGenerator(TestPlanGenerator):
         existing_test_plan: TestPlan | None = None,
         version_number: int = 1,
         requirement_context: str | None = None,
+        step_context: StepGenerationContext | None = None,
     ) -> GeneratedTestPlan:
         task = self._build_task_context(
-            test_step, discovery_result, requirement_context=requirement_context
+            test_step, discovery_result, requirement_context=requirement_context, step_context=step_context
         )
         page_snapshot = self._build_discovery_context(discovery_result)
         previous_candidate = None
@@ -119,7 +124,7 @@ class LLMTestPlanGenerator(TestPlanGenerator):
             nonlocal previous_candidate
             original = previous_candidate
             previous_candidate = value
-            validated = self._validate_generated_plan(value, discovery_result, test_step, requirement_context=requirement_context)
+            validated = self._validate_generated_plan(value, discovery_result, test_step, requirement_context=requirement_context, step_context=step_context)
             if repairing and original is not None:
                 self._validate_repair_preserves_actions(original, value)
             return validated
@@ -177,6 +182,7 @@ class LLMTestPlanGenerator(TestPlanGenerator):
         test_step: TestStep,
         *,
         requirement_context: str | None = None,
+        step_context: StepGenerationContext | None = None,
     ) -> tuple[QATestPlan, tuple[AssertionGroundingEntry, ...]]:
         check_cancelled()
         executable_plan = validate_executable_plan(value)
@@ -195,11 +201,13 @@ class LLMTestPlanGenerator(TestPlanGenerator):
         )
         check_cancelled()
         validate_expected_result_coverage(test_step, executable_plan, discovery=discovery_result)
+        check_cancelled()
+        validate_step_boundaries(executable_plan, test_step, discovery_result, step_context)
         return executable_plan, grounding
 
     @staticmethod
     def _validate_locator_identity(plan: QATestPlan, discovery: DiscoveryResult) -> None:
-        selectors = {element.selector for element in discovery.interactive_elements}
+        selectors = set(observed_controls(discovery))
 
         def collect(value):
             if isinstance(value, dict):
@@ -213,8 +221,9 @@ class LLMTestPlanGenerator(TestPlanGenerator):
                     collect(child)
 
         collect(discovery.snapshot)
-        for field in (discovery.navigation_paths, discovery.direct_navigation_paths, discovery.navigation):
-            collect([item.model_dump(mode="python") for item in field])
+        if discovery.status == DiscoveryStatus.SUCCESS:
+            for field in (discovery.navigation_paths, discovery.direct_navigation_paths, discovery.navigation):
+                collect([item.model_dump(mode="python") for item in field])
         for index, action in enumerate(plan.steps):
             selector = action.parameters.get("selector")
             if selector is not None and selector not in selectors:
@@ -255,12 +264,27 @@ class LLMTestPlanGenerator(TestPlanGenerator):
         discovery_result: DiscoveryResult,
         *,
         requirement_context: str | None = None,
+        step_context: StepGenerationContext | None = None,
     ) -> str:
+        context = {}
+        if step_context is not None:
+            describe = lambda item: {"order": item.order, "name": item.name, "description": item.description, "expected": item.expected}
+            context = {
+                "segment_order": step_context.segment_order,
+                "previous_steps": [describe(item) for item in step_context.previous_steps[-12:]],
+                "remaining_steps": [describe(item) for item in step_context.remaining_steps[:12]],
+                "completed_action_targets": list(step_context.completed_actions[-64:]),
+                "browser_state_preserved": step_context.state_preserved,
+            }
         return (
             "Generate an executable Playwright-oriented QATestPlan for this "
             "one human TestStep. Do not generate a TestCase or add unrelated "
             "checks. A human TestStep may require multiple ordered executable "
-            "actions, such as filling several fields before submitting a form. "
+            "actions, such as filling several fields. Submit only when this TestStep requests submission. "
+            "The original TestCase is background context, never permission to implement future steps. "
+            "Preserve the active segment's browser state. Do not repeat navigation or completed form filling "
+            "unless the current step requests it or observed state establishes that setup is necessary. "
+            "Navigation/setup is allowed when needed and not already satisfied. "
             "Preserve every requested action and verification from the TestStep. "
             "Every verification-oriented TestStep must include at least one "
             "assertion that checks the expected result itself; an unrelated page "
@@ -288,6 +312,18 @@ class LLMTestPlanGenerator(TestPlanGenerator):
             "'such as' are illustrative, never mandatory unless separately required. "
             "Exact-value assertions require explicit requirement or observation "
             "grounding; when uncertain, do not assert the value.\n"
+            "Canonical actions and required parameters (case-sensitive): "
+            f"{json.dumps(QATestStep.ACTION_PARAMETER_FIELDS)}\n"
+            "assert_selected additionally requires expected for a discovered select, but not for a radio. "
+            "For a select, use an observed option_label to select and a requirement-stated expected label to verify. "
+            "An available option alone does not establish that it should be selected. "
+            "Checkbox assertions require a discovered checkbox; never infer one from appearance. "
+            "Use interactive_elements input_type/button_type and option_labels to distinguish controls. "
+            "For compound expected results, cover every clause with its relevant assertion. "
+            "For unsupported meaningful outcomes, stop for Needs Attention; action completion cannot prove persistence. "
+            "Assertion subjects must match the expected state using the asserted value or that exact Discovery identity, "
+            "never action-context overlap or unrelated parent/form text.\n"
+            f"ExecutionSegment context (only current TestStep is in scope): {json.dumps(context, ensure_ascii=False)}\n"
             f"Original TestCase requirement: {requirement_context or '(not supplied)'}\n"
             f"TestStep order: {test_step.order}\n"
             f"TestStep name: {test_step.name}\n"
@@ -300,8 +336,9 @@ class LLMTestPlanGenerator(TestPlanGenerator):
     @staticmethod
     def _build_discovery_context(discovery_result: DiscoveryResult) -> str:
         snapshot = dict(discovery_result.snapshot)
-        # The typed fields are authoritative, while retaining all other data
-        # from the existing structured snapshot unchanged.
+        # SUCCESS typed fields are deterministic. Fallback results may merge
+        # AI suggestions into these fields; retain snapshot evidence instead.
+        successful = discovery_result.status == DiscoveryStatus.SUCCESS
         snapshot.update(
             {
                 "url": discovery_result.url,
@@ -309,13 +346,15 @@ class LLMTestPlanGenerator(TestPlanGenerator):
                 "navigation_paths": [
                     path.model_dump(mode="json")
                     for path in discovery_result.navigation_paths
-                ],
+                ] if successful else snapshot.get("navigation_paths", []),
                 "direct_navigation_paths": [
                     path.model_dump(mode="json")
                     for path in discovery_result.direct_navigation_paths
-                ],
-                "interactive_elements": [element.model_dump(mode="json") for element in discovery_result.interactive_elements],
-                "navigation": [sequence.model_dump(mode="json") for sequence in discovery_result.navigation],
+                ] if successful else snapshot.get("direct_navigation_paths", []),
+                "interactive_elements": [element.model_dump(mode="json", exclude_defaults=True)
+                    for element in list(observed_controls(discovery_result).values())[:32]],
+                "navigation": [sequence.model_dump(mode="json") for sequence in discovery_result.navigation]
+                    if successful else snapshot.get("navigation", []),
                 "warnings": discovery_result.warnings,
                 "strategies_used": discovery_result.strategies_used,
             }
@@ -326,7 +365,7 @@ class LLMTestPlanGenerator(TestPlanGenerator):
     def _validate_discovery_capabilities(
         plan: QATestPlan, discovery: DiscoveryResult, test_step: TestStep | str
     ) -> None:
-        elements = {element.selector: element for element in discovery.interactive_elements}
+        elements = observed_controls(discovery)
         intent = (
             test_step.casefold()
             if isinstance(test_step, str)
@@ -342,7 +381,7 @@ class LLMTestPlanGenerator(TestPlanGenerator):
                 "select": {"select_option", "assert_selected"},
                 "input": {"assert_enabled", "assert_disabled"},
             }
-            for discovered in discovery.interactive_elements:
+            for discovered in elements.values():
                 label = discovered.accessible_name.casefold()
                 actions = next((allowed for kind, allowed in relevant_actions.items()
                                 if kind in (discovered.kind + " " + discovered.tag + " " + discovered.role).casefold()), set())
@@ -357,24 +396,27 @@ class LLMTestPlanGenerator(TestPlanGenerator):
                         path=path,
                         message="The action must use the deterministic Discovery selector for the requested control.",
                     )])
+            if element is None and step.action in {"select_option", "assert_selected", "check", "uncheck", "assert_checked", "assert_unchecked"}:
+                raise PlanValidationError([PlanValidationIssue(code="ACTION_TARGET_MISMATCH", path=path,
+                    message="This action requires a control type established by deterministic Discovery.")])
             if element is None:
                 continue
-            kind = (element.kind + " " + element.tag + " " + element.role).casefold()
-            if step.action == "select_option" and "select" not in kind:
+            kinds = {element.kind.casefold(), element.tag.casefold(), element.role.casefold(), element.input_type.casefold()}
+            if step.action == "select_option" and "select" not in kinds:
                 raise PlanValidationError([PlanValidationIssue(
                     code="ACTION_TARGET_MISMATCH",
                     path=path,
                     message="SELECT_OPTION must target a discovered select control.",
                 )])
             if step.action == "assert_selected":
-                if "radio" in kind:
+                if "radio" in kinds:
                     if step.parameters.get("expected") is not None:
                         raise PlanValidationError([PlanValidationIssue(
                             code="INVALID_PARAMETER",
                             path=f"steps[{index}].parameters.expected",
                             message="A radio selection assertion does not take an expected option value.",
                         )])
-                elif "select" in kind:
+                elif "select" in kinds:
                     if not isinstance(step.parameters.get("expected"), str):
                         raise PlanValidationError([PlanValidationIssue(
                             code="MISSING_EXPECTED_VALUE",
@@ -387,7 +429,7 @@ class LLMTestPlanGenerator(TestPlanGenerator):
                         path=path,
                         message="ASSERT_SELECTED does not target a radio or select control supported by Discovery.",
                     )])
-            if step.action in {"check", "uncheck", "assert_checked", "assert_unchecked"} and "checkbox" not in kind:
+            if step.action in {"check", "uncheck", "assert_checked", "assert_unchecked"} and "checkbox" not in kinds:
                 raise PlanValidationError([PlanValidationIssue(
                     code="ACTION_TARGET_MISMATCH",
                     path=path,

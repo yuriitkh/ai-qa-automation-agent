@@ -140,7 +140,8 @@ class GeminiProvider(LLMProvider):
                     "assert_enabled and assert_disabled verify actual enabled state. "
                     "One human TestStep may require multiple ordered executable actions, "
                     "including filling several fields and then submitting. Preserve all "
-                    "requested actions and verifications. "
+                    "requested actions and verifications only when the current TestStep requests them. "
+                    "Do not submit during preparation or repeat completed setup; respect previous and remaining segment steps. "
                     "assert_hidden uses parameters {selector: CSS selector}. "
                     "assert_url uses parameters {expected: expected current URL}. "
                     'The assert_url parameter name MUST be exactly "expected". '
@@ -154,7 +155,7 @@ class GeminiProvider(LLMProvider):
                     "in the supplied page snapshot. For every selector parameter "
                     "in click, check, uncheck, fill, assert_hidden, or assert_visible, use an exact "
                     "selector listed in visible_text_elements, headings, links, or "
-                    "buttons. "
+                    "buttons, interactive_elements or state_elements. "
                     "Use visible_text_elements to ground ordinary visible-text "
                     "assertions. Use each selector exactly as provided in the "
                     "PAGE SNAPSHOT. Do not modify selectors. Preserve Unicode "

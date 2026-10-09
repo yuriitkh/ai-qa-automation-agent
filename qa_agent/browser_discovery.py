@@ -72,13 +72,27 @@ _SNAPSHOT_SCRIPT = r"""() => {
         const selector = `body > ${path.join(" > ")}`;
         return isExactMatch(selector) ? selector : null;
     };
+    const safeText = (element) => {
+        // A wrapping label/container can include textarea default contents.
+        // Preserve visible labels while excluding all descendant control text.
+        if (!element.querySelector('input, textarea, select')) return element.innerText || '';
+        const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+        const parts = [];
+        while (walker.nextNode()) {
+            const parent = walker.currentNode.parentElement;
+            if (parent && !parent.closest('input, textarea, select, script, style') && isVisible(parent)) {
+                parts.push(walker.currentNode.textContent);
+            }
+        }
+        return parts.join(' ').replace(/\s+/g, ' ').trim();
+    };
   const describe = (element) => {
     const tag = element.tagName.toLowerCase();
     const id = element.id || "";
     const name = element.getAttribute("name") || "";
     const role = element.getAttribute("role") || "";
     const ariaLabel = element.getAttribute("aria-label") || "";
-    const labelText = element.labels?.[0]?.innerText || "";
+    const labelText = element.labels?.[0] ? safeText(element.labels[0]) : "";
     const placeholder = element.getAttribute("placeholder") || "";
     const testId = element.getAttribute("data-testid") ||
         element.getAttribute("data-test") || element.getAttribute("data-qa") || "";
@@ -103,7 +117,7 @@ _SNAPSHOT_SCRIPT = r"""() => {
       tag,
       selector,
       // Never include a control's current value in discovery or recovery data.
-      text: (element.innerText || "").trim().slice(0, 120),
+      text: (['input', 'textarea', 'select'].includes(tag) ? '' : safeText(element)).trim().slice(0, 120),
     };
     if (id) item.id = id;
     if (name) item.name = name;
@@ -153,7 +167,7 @@ _SNAPSHOT_SCRIPT = r"""() => {
         const selector = "h1, h2, h3, h4, h5, h6, p, li, td, th, blockquote, pre, figcaption, label, summary, dt, dd, div, span";
         const candidates = Array.from(document.querySelectorAll(selector));
         const hasUsefulText = (element) =>
-            isVisible(element) && (element.innerText || "").trim().length > 0;
+            isVisible(element) && safeText(element).trim().length > 0;
         const visibleHeadings = Array.from(
             document.querySelectorAll("h1, h2, h3, h4, h5, h6")
         ).filter(isVisible).slice(0, 8);
@@ -184,7 +198,7 @@ _SNAPSHOT_SCRIPT = r"""() => {
             elements.push({
                 tag,
                 selector,
-                text: element.innerText.trim().slice(0, 120),
+                text: safeText(element).trim().slice(0, 120),
                 visible: true,
             });
             if (elements.length >= 16) break;
@@ -211,6 +225,10 @@ _SNAPSHOT_SCRIPT = r"""() => {
             const type = (element.getAttribute('type') || '').toLowerCase();
             const kind = role || (tag === 'input' && ['checkbox', 'radio'].includes(type) ? type : tag);
             item.kind = kind;
+            if (tag === 'input') item.input_type = element.type;
+            if (tag === 'input' || tag === 'textarea') item.has_value = element.value.length > 0;
+            if (tag === 'button' || (tag === 'input' && ['submit', 'reset', 'button'].includes(type))) item.button_type = element.type;
+            if (tag === 'select') item.option_labels = Array.from(element.options).slice(0, 16).map(option => option.label.trim().slice(0, 120));
             // Keep placeholder separate so recovery can treat it as weaker
             // evidence than an accessible name or an explicit label.
             item.accessible_name = (element.getAttribute('aria-label') || item.label || item.text || '').trim().slice(0, 120);
@@ -1059,12 +1077,16 @@ def _normalize_interactive_elements(value: Any) -> list[dict[str, Any]]:
         return []
     fields = (
         "kind", "selector", "text", "accessible_name", "label", "placeholder",
-        "test_id", "tag", "role", "id", "name", "href", "dialog_identity",
+        "test_id", "tag", "role", "id", "name", "href", "dialog_identity", "input_type", "button_type",
     )
     result: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for entry in value[:32]:
-        if not isinstance(entry, dict) or not entry.get("selector"):
+        if not isinstance(entry, dict) or not isinstance(entry.get("selector"), str) or not entry["selector"]:
             continue
+        if entry["selector"] in seen:
+            continue
+        seen.add(entry["selector"])
         item = {
             key: _bounded_text(
                 entry.get(key),
@@ -1077,6 +1099,11 @@ def _normalize_interactive_elements(value: Any) -> list[dict[str, Any]]:
         }
         item["visible"] = entry.get("visible") is True
         item["enabled"] = entry.get("enabled") is not False
+        if isinstance(entry.get("has_value"), bool):
+            item["has_value"] = entry["has_value"]
+        labels = entry.get("option_labels")
+        if isinstance(labels, (list, tuple)):
+            item["option_labels"] = [_bounded_text(label, MAX_TEXT_CHARS) for label in labels[:16] if isinstance(label, str)]
         if item.get("kind"):
             result.append(item)
     return result

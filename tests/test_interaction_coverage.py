@@ -13,7 +13,7 @@ from qa_agent.browser_runner import BrowserRunner
 from qa_agent.cookie_consent import CookieConsentPolicy, CookieConsentStatus, cookie_consent_scope
 from qa_agent.evidence_policy import EvidenceMode, EvidencePolicy, ScreenshotMode, evidence_policy_scope
 from qa_agent.models import QATestPlan
-from qa_agent.web import _local_demo_help_page, _local_demo_page
+from qa_agent.web import _local_demo_help_page, _local_demo_page, _local_demo_javascript
 
 
 class _InteractionDemoHandler(BaseHTTPRequestHandler):
@@ -23,11 +23,13 @@ class _InteractionDemoHandler(BaseHTTPRequestHandler):
             body = _local_demo_page().encode("utf-8")
         elif path == "/demo-target/registration/help":
             body = _local_demo_help_page().encode("utf-8")
+        elif path == "/assets/demo-registration.js":
+            body = _local_demo_javascript().encode("utf-8")
         else:
             self.send_error(404)
             return
         self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", "application/javascript; charset=utf-8" if path.endswith(".js") else "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

@@ -29,6 +29,10 @@ from .evidence_policy import (
     current_evidence_policy,
 )
 from .models import QATestPlan, QATestStep, TestCase
+from .execution_diagnostics import capture_action_failure
+from .redaction import redact_secrets
+
+_PRIVATE_INPUTS = 'input:not([type=checkbox]):not([type=radio]):not([type=button]):not([type=submit]):not([type=reset]):not([type=hidden]), textarea'
 
 
 class BrowserSession:
@@ -359,7 +363,7 @@ def _run_plan_on_page(
                 expected_text = step.parameters["expected_text"].replace("\\n", "\n")
                 selector = step.parameters.get("selector")
                 target = page.locator(selector) if selector else page.locator("body")
-                expect(target.get_by_text(expected_text, exact=False)).to_be_visible(
+                expect(target).to_be_visible(
                     timeout=ASSERTION_TIMEOUT_MS,
                 )
                 expected_pattern = re.compile(
@@ -451,8 +455,15 @@ def _run_plan_on_page(
                 result["steps"].append(step_result)
                 break
             step_result["status"] = "failed"
-            step_result["error"] = str(error)
+            safe_error = redact_secrets(str(error))
+            for item in plan.steps:
+                value = item.parameters.get("value") if item.action == "fill" else None
+                if isinstance(value, str) and value:
+                    safe_error = safe_error.replace(value, "[REDACTED]")
+            step_result["error"] = safe_error
+            diagnostic = capture_action_failure(page, step, step_index, plan, error)
             result["status"] = "failed"
+            first_evidence = len(result["evidence"])
             _capture_screenshots(
                 page,
                 evidence_directory,
@@ -461,6 +472,9 @@ def _run_plan_on_page(
                 action_index=step_index,
                 event_kind="FAILURE",
             )
+            step_result["diagnostic"] = diagnostic.model_copy(update={
+                "evidence_indexes": tuple(range(first_evidence, len(result["evidence"])))
+            }).model_dump(mode="json")
             result["steps"].append(step_result)
             break
 
@@ -529,7 +543,7 @@ def _record_cookie_consent_attention(
     )
     try:
         directory.mkdir(parents=True, exist_ok=True)
-        page.screenshot(path=str(screenshot_path))
+        page.screenshot(path=str(screenshot_path), mask=[page.locator(_PRIVATE_INPUTS)])
     except Exception:
         return
     result.setdefault("evidence", []).append({
@@ -594,9 +608,10 @@ def _capture_screenshots(
                 page.locator(selector).screenshot(
                     path=str(screenshot_path),
                     timeout=ACTION_TIMEOUT_MS,
+                    mask=[page.locator(_PRIVATE_INPUTS)],
                 )
             else:
-                page.screenshot(path=str(screenshot_path))
+                page.screenshot(path=str(screenshot_path), mask=[page.locator(_PRIVATE_INPUTS)])
             if event_kind == "FAILURE":
                 description = f"Failure screenshot after {action.action} action."
             elif event_kind == "VERIFICATION":

@@ -245,7 +245,9 @@ def test_ai_suggestion_and_generic_status_role_cannot_establish_confirmation_sub
     ):
         with pytest.raises(PlanValidationError) as caught:
             LLMTestPlanGenerator._validate_generated_plan(plan, discovery, confirmation_step())
-        assert caught.value.issues[0].code == "EXPECTED_RESULT_NOT_COVERED"
+        assert caught.value.issues[0].code == (
+            "DISCOVERY_SELECTOR_MISMATCH" if discovery.status == DiscoveryStatus.PARTIAL else "EXPECTED_RESULT_NOT_COVERED")
+        assert expected_result_coverage(confirmation_step(), plan, discovery=discovery).status == ExpectedResultCoverageStatus.NOT_COVERED
 
 
 def test_expected_outcome_subject_cannot_be_replaced_by_its_account_modifier():
@@ -437,7 +439,7 @@ def test_coverage_rejection_is_generation_error_without_plan_run_or_product_fail
     assert record.attempts[0].error_category == "PROVIDER_UNAVAILABLE"
     assert record.attempts[-1].quality_gates == {
         "schema_and_actions": "PASSED", "locator_identity": "PASSED",
-        "assertion_grounding": "PASSED", "expected_result_coverage": "FAILED"}
+        "assertion_grounding": "PASSED", "expected_result_coverage": "FAILED", "step_boundaries": "NOT_RUN"}
     usage = usage_repo.list_records()
     assert [r.request_status for r in usage] == ["FAILED", "SUCCESS"]
     assert usage[-1].fallback_used and usage[-1].input_tokens == 11 and usage[-1].output_tokens == 7

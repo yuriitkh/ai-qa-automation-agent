@@ -23,7 +23,7 @@ from qa_agent.test_plan_validation import PlanValidationError
 OVERALL_TIMEOUT_SECONDS = 60.0
 PROVIDER_TIMEOUT_SECONDS = 30.0
 MAX_BACKOFF_SECONDS = 5.0
-QUALITY_GATES = ("schema_and_actions", "locator_identity", "assertion_grounding", "expected_result_coverage")
+QUALITY_GATES = ("schema_and_actions", "locator_identity", "assertion_grounding", "expected_result_coverage", "step_boundaries")
 
 
 class ReliabilitySettings(BaseModel):
@@ -181,6 +181,8 @@ def classify_failure(error: BaseException) -> str:
         return error.category
     if isinstance(error, PlanValidationError):
         codes = {issue.code for issue in error.issues}
+        if "TESTSTEP_BOUNDARY_VIOLATION" in codes:
+            return "STEP_BOUNDARY_VIOLATION"
         if "UNGROUNDED_ASSERTION" in codes:
             return "ASSERTION_NOT_GROUNDED"
         if "REPAIR_CHANGED_SEMANTICS" in codes:
@@ -203,6 +205,7 @@ def classify_failure(error: BaseException) -> str:
 
 def safe_reason(category: str) -> str:
     return {
+        "STEP_BOUNDARY_VIOLATION": "The candidate crosses TestStep boundaries. Review the current step and regenerate without premature or repeated actions.",
         "TIMEOUT": "The provider request timed out.",
         "RATE_LIMIT": "The provider rate limit prevented this request.",
         "PROVIDER_UNAVAILABLE": "The configured provider is temporarily unavailable.",
@@ -577,4 +580,5 @@ def gate_for_category(category):
         "PLAN_SCHEMA_INVALID": "schema_and_actions", "UNSUPPORTED_ACTION": "schema_and_actions",
         "LOCATOR_IDENTITY_UNCERTAIN": "locator_identity", "ASSERTION_NOT_GROUNDED": "assertion_grounding",
         "EXPECTED_RESULT_NOT_COVERED": "expected_result_coverage",
+        "STEP_BOUNDARY_VIOLATION": "step_boundaries",
     }.get(category)

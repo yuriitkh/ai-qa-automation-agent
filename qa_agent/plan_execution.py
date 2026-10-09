@@ -26,6 +26,7 @@ from qa_agent.models import (
     TestCase,
 )
 from qa_agent.presentation import failure_message
+from qa_agent.execution_diagnostics import action_failure_diagnostic
 
 
 class PlanExecutionClassification(str, Enum):
@@ -212,6 +213,20 @@ class PlanExecutionService:
             # This static explanation intentionally replaces runner text that
             # can contain sensitive expected/actual page values.
             execution = execution.model_copy(update={"error": grounding_reason})
+        diagnostic = action_failure_diagnostic(execution.runner_result)
+        if diagnostic is not None and status == ExecutionStatus.FAILED:
+            diagnostic = diagnostic.model_copy(update={"classification": classification.value})
+            # Classification has used the original error. Persist only the safe
+            # diagnostic; raw Playwright errors may include arbitrary page text.
+            execution.error = grounding_reason or diagnostic.summary()
+            execution.runner_result = {
+                **execution.runner_result,
+                "steps": [
+                    {**item, "error": diagnostic.summary(), "diagnostic": diagnostic.model_dump(mode="json")}
+                    if isinstance(item, dict) and item.get("status") == "failed" else item
+                    for item in execution.runner_result.get("steps", [])
+                ],
+            }
         # Keep the exact attempt's grounded classification in the existing JSON
         # storage payload. Report generation must not reclassify without its plan.
         execution.runner_result = {
@@ -253,7 +268,8 @@ class PlanExecutionService:
                 step=test_step,
                 status=status.value,
                 classification=classification.value,
-                message=failure_message(classification.value),
+                message=failure_message(classification.value) + (" " + diagnostic.summary() if diagnostic is not None else ""),
+                action_failure=diagnostic,
             )
         return PlanExecutionOutcome(
             execution=execution,
@@ -491,6 +507,11 @@ def _is_stale_ui_failure(runner_result: dict[str, Any] | None) -> bool:
 def _is_assertion_target_unavailable(runner_result: dict[str, Any] | None) -> bool:
     """Separate a missing generated assertion target from product mismatches."""
     if not isinstance(runner_result, dict):
+        return False
+    diagnostic = action_failure_diagnostic(runner_result)
+    if diagnostic is not None and diagnostic.exception_category == "ASSERTION_FAILURE" and diagnostic.target_count == 1:
+        # An established, present target with a wrong state is an assertion
+        # mismatch, not a missing generated locator. Provenance decides below.
         return False
     unavailable_markers = (
         "not found",

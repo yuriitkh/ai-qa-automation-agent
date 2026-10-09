@@ -655,7 +655,8 @@ class BrowserRunnerActionTests(unittest.TestCase):
     def test_failure_captures_screenshot_in_configured_directory(self) -> None:
         self.page.title.return_value = "Wrong title"
         with tempfile.TemporaryDirectory() as directory:
-            def save_screenshot(*, path: str) -> None:
+            def save_screenshot(*, path: str, mask) -> None:
+                self.assertEqual(mask, [self.locator])
                 Path(path).write_bytes(b"png")
 
             self.page.screenshot.side_effect = save_screenshot
@@ -675,7 +676,7 @@ class BrowserRunnerActionTests(unittest.TestCase):
     def test_assert_visible_failure_captures_screenshot(self) -> None:
         self.locator.first.inner_text.return_value = "Actual"
         with tempfile.TemporaryDirectory() as directory:
-            self.page.screenshot.side_effect = lambda *, path: Path(path).write_bytes(b"png")
+            self.page.screenshot.side_effect = lambda *, path, mask: Path(path).write_bytes(b"png")
             plan = QATestPlan(url="https://example.com", steps=[{
                 "action": "assert_visible",
                 "parameters": {"selector": "h1", "expected_text": "Expected"},
@@ -688,7 +689,7 @@ class BrowserRunnerActionTests(unittest.TestCase):
     def test_locator_failure_captures_screenshot_when_page_is_available(self) -> None:
         self.locator.click.side_effect = RuntimeError("selector timeout")
         with tempfile.TemporaryDirectory() as directory:
-            self.page.screenshot.side_effect = lambda *, path: Path(path).write_bytes(b"png")
+            self.page.screenshot.side_effect = lambda *, path, mask: Path(path).write_bytes(b"png")
             plan = QATestPlan(url="https://example.com", steps=[{
                 "action": "click", "parameters": {"selector": "#missing"}
             }])
@@ -734,7 +735,7 @@ class BrowserRunnerActionTests(unittest.TestCase):
     def test_every_verification_captures_only_successful_assertions(self) -> None:
         self.page.title.return_value = "Expected"
         with tempfile.TemporaryDirectory() as directory:
-            self.page.screenshot.side_effect = lambda *, path: Path(path).write_bytes(b"png")
+            self.page.screenshot.side_effect = lambda *, path, mask: Path(path).write_bytes(b"png")
             result = self.run_with_evidence_policy(
                 EvidencePolicy(mode=EvidenceMode.EVERY_VERIFICATION),
                 [
@@ -836,7 +837,7 @@ class BrowserRunnerActionTests(unittest.TestCase):
     def test_every_step_failure_is_captured_once_as_failure_evidence(self) -> None:
         self.page.title.return_value = "Wrong"
         with tempfile.TemporaryDirectory() as directory:
-            self.page.screenshot.side_effect = lambda *, path: Path(path).write_bytes(b"png")
+            self.page.screenshot.side_effect = lambda *, path, mask: Path(path).write_bytes(b"png")
             result = self.run_with_evidence_policy(
                 EvidencePolicy(mode=EvidenceMode.EVERY_STEP),
                 [{"action": "assert_title", "parameters": {"expected": "Expected"}}],
@@ -867,7 +868,7 @@ class BrowserRunnerActionTests(unittest.TestCase):
     def test_failures_only_is_default_and_keeps_page_scope(self) -> None:
         self.page.title.return_value = "Wrong"
         with tempfile.TemporaryDirectory() as directory:
-            self.page.screenshot.side_effect = lambda *, path: Path(path).write_bytes(b"png")
+            self.page.screenshot.side_effect = lambda *, path, mask: Path(path).write_bytes(b"png")
             plan = QATestPlan(url="https://example.com", steps=[{
                 "action": "assert_title", "parameters": {"expected": "Expected"}
             }])
