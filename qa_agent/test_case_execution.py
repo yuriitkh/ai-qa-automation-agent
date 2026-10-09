@@ -140,6 +140,11 @@ class TestCaseExecutionService:
         coverage_sufficient = (
             complete and has_sufficient_test_case_coverage(test_case, self._plan_store)
         )
+        if self._automation_lifecycle is not None and self._automation_lifecycle.status(test_case) in {AutomationStatus.NEEDS_UPDATE, AutomationStatus.AUTOMATION_FAILED}:
+            return WorkflowAvailability(automation_available=self._automation_workflow is not None,
+                validation_available=False, regression_available=False,
+                usable_plan_count=0, total_step_count=len(steps), plan_versions=tuple(versions),
+                reason="The TestCase changed or generation needs attention. Generate updated automation before approving Validation.")
         has_saved_plan = any(
             self._plan_store.find(step.id) is not None for step in steps
         )
@@ -272,7 +277,8 @@ class TestCaseExecutionService:
                 progress.bind_run_context(run_context)
                 progress.test_case_loaded(test_case)
             try:
-                result = self._automation_workflow.run_test_case(test_case, run_context)
+                regenerate = self._automation_lifecycle is not None and self._automation_lifecycle.status(test_case) in {AutomationStatus.NEEDS_UPDATE, AutomationStatus.AUTOMATION_FAILED}
+                result = self._automation_workflow.run_test_case(test_case, run_context, **({"regenerate": True} if regenerate else {}))
             except Exception as error:
                 if self._automation_lifecycle is not None and not is_cancelled(error):
                     self._lifecycle_update(
@@ -293,6 +299,8 @@ class TestCaseExecutionService:
         test_case = self._test_cases.get(test_case_id)
         if test_case is None:
             raise RunUnavailableError("TestCase not found.", category="INVALID_TESTCASE")
+        if self._automation_lifecycle is not None and self._automation_lifecycle.status(test_case) in {AutomationStatus.NEEDS_UPDATE, AutomationStatus.AUTOMATION_FAILED}:
+            raise RunUnavailableError("Generate updated automation before running the current TestCase.")
         review_record = (
             self._test_case_review.record(test_case.id)
             if self._test_case_review is not None else None

@@ -226,7 +226,7 @@ def test_reviewed_draft_save_associates_usage_and_renders_testcase_details(tmp_p
         llm_usage=service,
     )
     try:
-        response = app.handle("POST", f"/test-cases/review/{token}/save", b"")
+        response = app.handle("POST", f"/test-cases/review/{token}/save", b"", headers={"X-QA-CSRF": app._csrf_token})
         assert response.status == 303
         saved = cases.list()[0]
         summary = service.test_case_summary(saved.id)

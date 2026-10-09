@@ -11,6 +11,7 @@ from qa_agent.automation_lifecycle import (
     AutomationLifecycleService,
     AutomationStatus,
     SQLiteAutomationLifecycleRepository,
+    definition_fingerprint,
 )
 from qa_agent.drafts import Draft, DraftStatus, SQLiteDraftRepository
 from qa_agent.execution_progress import (
@@ -64,7 +65,7 @@ class ProductAuthoringControlsTests(unittest.TestCase):
         )
 
     def post(self, path, fields=None):
-        return self.app.handle("POST", path, urlencode(fields or {}))
+        return self.app.handle("POST", path, urlencode(fields or {}), headers={"X-QA-CSRF": self.app._csrf_token})
 
     def test_draft_create_edit_delete_persists_and_stays_out_of_testcases(self):
         response = self.post("/drafts", {
@@ -330,10 +331,10 @@ class ProductAuthoringControlsTests(unittest.TestCase):
         case = self.case_with_steps(["Alpha", "Beta", "Gamma"])
         self.storage.test_case_repository.save(case)
         editor = self.app.handle("GET", f"/test-cases/{case.id}/edit").body.decode()
-        self.assertIn("Move up", editor)
-        self.assertIn("Move down", editor)
-        self.assertIn("Duplicate", editor)
-        self.assertIn("Delete", editor)
+        self.assertIn("data-structured-editor", editor)
+        script = self.app.handle("GET", "/assets/ui.js").body.decode()
+        for label in ("Move up", "Move down", "Insert before", "Insert after", "Delete"):
+            self.assertIn(label, script)
 
         moved_down = self.post(f"/test-cases/{case.id}/edit", self.edit_values(case, "down:0:0"))
         self.assertEqual(moved_down.status, 303)
@@ -545,9 +546,9 @@ class ProductAuthoringControlsTests(unittest.TestCase):
         edited = edit_test_case(case, {"description": "The local page remains correct after its scenario changes."})
         self.storage.test_case_repository.save(edited)
         self.assertEqual(self.lifecycle.status(edited), AutomationStatus.NEEDS_UPDATE)
-        result = service.run(edited.id, WorkflowType.VALIDATION)
-        self.assertEqual(result.outcome.value, "PASSED")
-        self.assertEqual(self.lifecycle.status(edited), AutomationStatus.AUTOMATION_READY)
+        with self.assertRaises(RunUnavailableError):
+            service.run(edited.id, WorkflowType.VALIDATION)
+        self.assertEqual(self.lifecycle.status(edited), AutomationStatus.NEEDS_UPDATE)
 
     def test_validation_does_not_mark_a_concurrently_changed_plan_ready(self):
         case = self.case_with_steps(["Assert local page"])
@@ -646,6 +647,7 @@ class ProductAuthoringControlsTests(unittest.TestCase):
     @staticmethod
     def edit_values(case, operation):
         fields = {
+            "definition_fingerprint": definition_fingerprint(case),
             "name": case.name,
             "description": case.description,
             "base_url": case.base_url or "",

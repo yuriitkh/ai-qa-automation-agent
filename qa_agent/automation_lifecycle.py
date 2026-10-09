@@ -166,6 +166,10 @@ class AutomationLifecycleService:
         # A failed attempt does not invalidate an already validated plan set.
         if current == AutomationStatus.AUTOMATION_READY:
             return current
+        # A partial regeneration must retain the definition invalidation. Old
+        # versions remain historical until the entire new definition is prepared.
+        if current == AutomationStatus.NEEDS_UPDATE:
+            return current
         self._save(test_case, AutomationStatus.AUTOMATION_FAILED)
         return AutomationStatus.AUTOMATION_FAILED
 
@@ -199,6 +203,8 @@ class AutomationLifecycleService:
     def mark_test_case_changed(self, test_case: TestCase) -> None:
         record = self._repository.get(test_case.id)
         if record is None:
+            if any(self._plan_store.find(step.id) is not None for step in test_case.steps):
+                self._save(test_case, AutomationStatus.NEEDS_UPDATE)
             return
         if record.state != AutomationStatus.NOT_AUTOMATED:
             self._repository.save(AutomationLifecycleRecord(

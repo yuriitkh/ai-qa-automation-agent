@@ -202,7 +202,7 @@ class BackgroundAuthoringService:
                             return callback(*args, **kwargs)
                 return emit
             draft = cancellable_call(lambda: self._authoring_service.generate(
-                validated.name,
+                name,
                 validated.scenario,
                 validated.base_url,
                 progress_callback=guarded(reporter.emit),

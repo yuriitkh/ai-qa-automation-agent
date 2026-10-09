@@ -108,6 +108,15 @@ class TestCasePlanRunner:
                     primary_error.__traceback__,
                 )
 
+    def capture_discovery(self, test_step: TestStep):
+        if self._session is None:
+            return None
+        try:
+            getattr_static(self._session, "capture_discovery")
+        except AttributeError:
+            return None
+        return self._session.capture_discovery(self._segment_by_step[test_step.id])
+
 
 class PlanExecutionService:
     """Run and persist one TestStep against the exact supplied plan version.

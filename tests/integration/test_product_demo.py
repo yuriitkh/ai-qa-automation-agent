@@ -822,11 +822,11 @@ class ProductDemoSliceTests(unittest.TestCase):
                 self.assertEqual(authoring["error_category"], None)
                 token = authoring["review_url"].rsplit("/", 1)[1]
                 review = application.handle("GET", authoring["review_url"])
-                self.assertIn(b"Verify registration confirmation", review.body)
+                self.assertIn(b"Account confirmation displayed", review.body)
                 self.assertEqual(storage.test_case_repository.list(), [])
 
                 saved = application.handle(
-                    "POST", f"/test-cases/review/{token}/save", b""
+                    "POST", f"/test-cases/review/{token}/save", b"", headers={"X-QA-CSRF": application._csrf_token}
                 )
                 self.assertEqual(saved.status, 303)
                 case_id = UUID(saved.headers["Location"].rsplit("/", 1)[1])
@@ -841,7 +841,8 @@ class ProductDemoSliceTests(unittest.TestCase):
                 self.assertIn(b"NOT RUN", before_run.body)
                 self.assertIn(b"Never", before_run.body)
                 self.assertIn(b"Generate Automation", before_run.body)
-                self.assertIn(b"TestCase approved", before_run.body)
+                self.assertEqual(application._test_case_review.status(case_id).value, "APPROVED")
+                self.assertIn(b"TestCase content is approved.", before_run.body)
 
                 unavailable = application.handle(
                     "POST", f"/test-cases/{case_id}/run", b"workflow=VALIDATION"
@@ -1046,7 +1047,7 @@ class ProductDemoSliceTests(unittest.TestCase):
                 self.assertTrue(authoring["success"])
                 token = authoring["review_url"].rsplit("/", 1)[1]
                 saved = application.handle(
-                    "POST", f"/test-cases/review/{token}/save", b""
+                    "POST", f"/test-cases/review/{token}/save", b"", headers={"X-QA-CSRF": application._csrf_token}
                 )
                 self.assertEqual(saved.status, 303)
                 case_id = UUID(saved.headers["Location"].rsplit("/", 1)[1])

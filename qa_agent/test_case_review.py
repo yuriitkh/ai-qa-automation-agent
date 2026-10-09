@@ -132,6 +132,8 @@ class TestCaseReviewService:
         self._save(test_case.id, TestCaseReviewStatus.READY_FOR_REVIEW, None)
 
     def approve_test_case(self, test_case: TestCase) -> None:
+        from qa_agent.test_case_quality import validate_test_case_quality
+        validate_test_case_quality(test_case)
         self._save(test_case.id, TestCaseReviewStatus.APPROVED, None)
 
     def approve_for_validation(self, test_case: TestCase) -> str:

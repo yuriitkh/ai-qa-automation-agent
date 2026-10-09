@@ -158,6 +158,7 @@ class TestCaseBrowserSession:
     def __init__(self, runner: BrowserRunner, test_case: TestCase) -> None:
         self._runner = runner
         self._segment_orders = {segment.order for segment in test_case.segments}
+        self._segment_urls = {segment.order: segment.base_url or test_case.base_url or "about:blank" for segment in test_case.segments}
         self._session: BrowserSession | None = None
         self._pages: dict[int, Any] = {}
         self._closed = False
@@ -183,6 +184,14 @@ class TestCaseBrowserSession:
             page = self._session.new_page()
             self._pages[segment_order] = page
         return self._session.run_plan(page, plan)
+
+    def capture_discovery(self, segment_order: int):
+        from qa_agent.browser_discovery import capture_current_page_discovery
+        page = self._pages.get(segment_order)
+        if page is None:
+            from qa_agent.models import DiscoveryResult, DiscoveryStatus
+            return DiscoveryResult(status=DiscoveryStatus.PARTIAL, url=self._segment_urls[segment_order], warnings=["This segment has no observed page. Its configured URL is a navigation target only; an explicit navigation step is required before state-dependent assertions."], strategies_used=["current_page"])
+        return capture_current_page_discovery(page)
 
     def close(self, primary_error: BaseException | None = None) -> None:
         if self._closed:

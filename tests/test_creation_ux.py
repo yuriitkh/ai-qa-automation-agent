@@ -61,7 +61,7 @@ class CreationUXTests(unittest.TestCase):
         self.temp.cleanup()
 
     def post(self, path, **fields):
-        return self.app.handle("POST", path, urlencode(fields))
+        return self.app.handle("POST", path, urlencode(fields), headers={"X-QA-CSRF": self.app._csrf_token})
 
     def generated(self, **fields):
         values = {"name": "", "base_url": "http://127.0.0.1/sign-in", "scenario": "Check login"}
@@ -141,7 +141,7 @@ class CreationUXTests(unittest.TestCase):
         source = Draft(title="Draft title to clear", body="Check login", base_url="http://127.0.0.1/sign-in")
         self.drafts.save(source)
         _token, draft = self.generated(name="  ", source_draft_id=str(source.id))
-        self.assertIn("Sign In", draft.test_case.name)
+        self.assertEqual(draft.test_case.name, "Check login")
         self.assertNotEqual(draft.test_case.name, source.title)
         self.assertNotEqual(draft.test_case.name, "Generated Account Summary")
         self.assertEqual(len(self.provider.calls), 1)
@@ -224,7 +224,7 @@ class CreationUXTests(unittest.TestCase):
         self.assertEqual(self.drafts.get(source.id).status, DraftStatus.ACTIVE)
         fields = dict(name="Edited Summary", description="Edited scenario", base_url="http://127.0.0.1/edited",
                       source_draft_id=str(source.id), step_name_0="Sign in", step_action_0="Open sign-in page")
-        self.assertEqual(self.post("/test-cases/manual", **fields).status, 400)
+        self.assertEqual(self.post("/test-cases/manual", **{**fields, "description": ""}).status, 400)
         self.assertEqual(self.drafts.get(source.id).status, DraftStatus.ACTIVE)
         fields["step_expected_0"] = "The account page is displayed."
         self.assertEqual(self.post("/test-cases/manual", **fields).status, 303)

@@ -20,7 +20,7 @@ class TestCaseCatalogEntry:
 
 
 class TestCaseRepository(Protocol):
-    def save(self, test_case: TestCase) -> None: ...
+    def save(self, test_case: TestCase, *, expected_fingerprint: str | None = None) -> None: ...
 
     def get(self, test_case_id: UUID) -> TestCase | None: ...
 
@@ -42,15 +42,29 @@ class TestCaseRepository(Protocol):
     ) -> tuple[list[TestCaseCatalogEntry], int]: ...
 
 
+class TestCaseConflict(ValueError):
+    """An optimistic definition update lost to a newer saved definition."""
+
+
 class InMemoryTestCaseRepository:
     """Process-local TestCase storage with copy-on-read/write semantics."""
 
     def __init__(self) -> None:
+        from threading import RLock
+        self._lock = RLock()
         self._test_cases: dict[UUID, TestCase] = {}
         self._timestamps: dict[UUID, tuple[datetime, datetime]] = {}
         self._next_public_id = 1
 
-    def save(self, test_case: TestCase) -> None:
+    def save(self, test_case: TestCase, *, expected_fingerprint: str | None = None) -> None:
+        from qa_agent.automation_lifecycle import definition_fingerprint
+        with self._lock:
+            current = self._test_cases.get(test_case.id)
+            if expected_fingerprint is not None and (current is None or definition_fingerprint(current) != expected_fingerprint):
+                raise TestCaseConflict("This TestCase changed elsewhere. Reload it before saving; your submitted changes are shown below.")
+            self._save(test_case)
+
+    def _save(self, test_case: TestCase) -> None:
         existing = self._test_cases.get(test_case.id)
         public_id = existing.public_id if existing is not None else test_case.public_id
         sequence = parse_test_case_public_id(public_id)
@@ -70,8 +84,9 @@ class InMemoryTestCaseRepository:
         self._timestamps[test_case.id] = (created_at, now)
 
     def get(self, test_case_id: UUID) -> TestCase | None:
-        test_case = self._test_cases.get(test_case_id)
-        return deepcopy(test_case) if test_case is not None else None
+        with self._lock:
+            test_case = self._test_cases.get(test_case_id)
+            return deepcopy(test_case) if test_case is not None else None
 
     def get_by_public_id(self, public_id: str) -> TestCase | None:
         test_case = next(

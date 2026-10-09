@@ -146,6 +146,21 @@ def merge_test_case_edits(
     Indices in field names address the original draft structure; submitted IDs,
     ordering, segment membership, and unsupported fields are never consulted.
     """
+    if "steps_json" in submitted_fields:
+        from qa_agent.automation_lifecycle import definition_fingerprint
+        from qa_agent.test_case_editing import edit_test_case, TestCaseEditError
+        allowed = {"name", "description", "base_url", "preconditions", "steps_json", "definition_fingerprint", "_csrf"}
+        try:
+            if set(submitted_fields) - allowed:
+                raise TestCaseEditError("Unexpected TestCase edit fields.")
+            if submitted_fields.get("definition_fingerprint") != definition_fingerprint(test_case):
+                raise TestCaseEditError("The reviewed Draft changed. Reload it before saving.")
+            if submitted_fields.get("base_url", test_case.base_url or "") != (test_case.base_url or ""):
+                raise TestCaseEditError("The reviewed Draft Website cannot change in this form.")
+            edited = edit_test_case(test_case, submitted_fields)
+            return TestCaseEditResult(edited, dict(submitted_fields), {})
+        except (ValueError, TypeError) as error:
+            return TestCaseEditResult(None, dict(submitted_fields), {"form": str(error) if isinstance(error, TestCaseEditError) else "The edited TestCase could not be validated."})
     original_values = editable_test_case_values(test_case)
     values = dict(original_values)
     values.update({
@@ -454,88 +469,23 @@ def _is_timeout_error(error: Exception) -> bool:
 
 
 def _valid_generated_name(value: str | None, scenario: str = "") -> str | None:
-    """Accept only short, title-like names from the authoring response."""
+    from qa_agent.test_case_naming import content_title
     if not isinstance(value, str):
         return None
     name = re.sub(r"\s+", " ", value).strip(" \t\r\n\"'“”‘’.,;:")
-    words = re.findall(r"[A-Za-zÀ-ÿ0-9]+(?:['’-][A-Za-zÀ-ÿ0-9]+)*", name)
-    if not 3 <= len(words) <= 10 or len(name) > 80:
+    words = re.findall(r"[^\W_]+", name, re.UNICODE)
+    if not 3 <= len(words) <= 10 or len(name) > 80 or name[0].isdigit():
         return None
-    if name.casefold().startswith("verify that"):
+    if any(a.casefold() == b.casefold() for a, b in zip(words, words[1:])):
         return None
-    if re.match(r"^(?:step\s*)?\d+[.)\-:]?\s*", name, re.IGNORECASE):
+    if re.match(r"^(?:step|крок)\s*\d+", name, re.I) or name.casefold().startswith(("verify that", "generated ", "new draft")) or "..." in name or "…" in name or "?" in name:
         return None
-    if "…" in name or "..." in name:
-        return None
-    normalized_name = " ".join(re.findall(r"[a-z0-9]+", name.casefold()))
-    normalized_scenario = " ".join(re.findall(r"[a-z0-9]+", scenario.casefold()))
-    if normalized_name and normalized_name == normalized_scenario:
-        return None
-    return name
+    return name if content_title(name) else None
 
 
-def _derive_test_case_name(
-    scenario: str, step_names: list[str] | None = None
-) -> str:
-    """Derive a concise deterministic title without copying the scenario."""
-    stop_words = {
-        "a", "an", "and", "are", "as", "at", "be", "by", "can", "could",
-        "do", "does", "for", "from", "get", "i", "in", "into", "is", "it",
-        "of", "on", "or", "please", "should", "that", "the", "then", "to",
-        "using", "when", "with", "would", "you", "your",
-        "verify", "check", "confirm", "ensure", "test", "make", "sure", "want",
-        "need", "like", "new", "was", "were", "successfully", "appears", "appear", "displayed", "display",
-        "shows", "show", "works", "work", "created", "create", "open", "visit",
-        "visits", "navigate", "click", "fill", "submit", "register", "registration",
-        "search", "find", "login", "signin", "sign", "purchase", "pay", "checkout",
-        "book", "upload", "download", "delete", "update", "edit", "create", "appears",
-    }
-    action_titles = {
-        "register": "Registration", "registration": "Registration",
-        "search": "Search", "find": "Search", "login": "Sign In",
-        "signin": "Sign In", "sign": "Sign In", "purchase": "Purchase", "pay": "Payment",
-        "checkout": "Checkout", "book": "Booking", "upload": "Upload",
-        "download": "Download", "delete": "Deletion", "update": "Update",
-        "edit": "Editing", "create": "Creation",
-    }
-    source = next((text for text in [scenario, *(step_names or [])] if text.strip()), "")
-    first_line = next((line.strip() for line in source.splitlines() if line.strip()), "")
-    phrase = re.split(r"(?<=[.!?])\s+", first_line, maxsplit=1)[0]
-    phrase = re.sub(r"^\s*(?:step\s*)?\d+[.)\-:]\s*", "", phrase, flags=re.IGNORECASE)
-    phrase = re.sub(
-        r"^\s*(?:verify\s+that|please|i would like to|i want to|i need to|can you|could you)\s*:?[\s]*",
-        "", phrase, flags=re.IGNORECASE,
-    )
-    tokens = re.findall(r"[A-Za-zÀ-ÿ0-9]+", phrase)
-    if not tokens:
-        return "Web Scenario Overview"
-    action_token = next((
-        token.casefold() for token in tokens
-        if token.casefold() in action_titles
-    ), None)
-    action = action_titles.get(action_token) if action_token else None
-    if action_token not in {"register", "registration"}:
-        stop_words.update({"user", "users"})
-    keywords = [
-        word for word in tokens
-        if word.casefold() not in stop_words
-        and word.casefold() != action_token
-    ]
-    if not keywords:
-        keywords = tokens[:3]
-    action_words = action.split() if action else []
-    suffix_actions = {"Registration", "Sign In", "Confirmation", "Creation", "Display"}
-    if action in suffix_actions:
-        title_words = keywords[:6] + action_words
-    else:
-        title_words = action_words + keywords[:6]
-    if len(title_words) < 3:
-        title_words.extend(["Behavior"] * (3 - len(title_words)))
-    title_words = title_words[:10]
-    return " ".join(
-        word if word.istitle() else word.capitalize()
-        for word in title_words
-    ) or "Web Scenario Overview"
+def _derive_test_case_name(scenario: str, step_names: list[str] | None = None) -> str:
+    from qa_agent.test_case_naming import fallback_summary
+    return fallback_summary(scenario, step_names or ())
 
 
 @dataclass(frozen=True)

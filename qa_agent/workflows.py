@@ -240,5 +240,6 @@ class AutomationWorkflow:
         self,
         test_case: TestCase,
         run_context: RunContext | None = None,
+        *, regenerate: bool = False,
     ) -> PipelineResult:
-        return self._pipeline.run_test_case(test_case, run_context)
+        return self._pipeline.run_test_case(test_case, run_context, **({"regenerate": True} if regenerate else {}))

@@ -1172,6 +1172,17 @@ def capture_page_snapshot(url: str) -> str:
             browser.close()
 
 
+def capture_current_page_discovery(page: Any) -> DiscoveryResult:
+    """Observe the owner's current DOM without navigation or cookie mutations."""
+    from qa_agent.execution_control import check_cancelled
+    check_cancelled()
+    snapshot = json.loads(_build_snapshot(page.evaluate(_SNAPSHOT_SCRIPT)))
+    return DiscoveryResult(status=DiscoveryStatus.PARTIAL, url=snapshot.get("url") or page.url,
+        title=snapshot.get("title", ""), snapshot=snapshot,
+        interactive_elements=[InteractiveElement.model_validate(item) for item in snapshot.get("interactive_elements", [])],
+        strategies_used=["current_page"], warnings=["Only the current page was observed; no navigation or cookie state was changed."])
+
+
 def capture_discovery_result(url: str) -> DiscoveryResult:
     """Return typed discovery data while retaining the legacy snapshot API."""
     try:

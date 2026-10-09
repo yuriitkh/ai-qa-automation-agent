@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import re
 import logging
 from secrets import token_urlsafe, compare_digest
 import mimetypes
@@ -131,6 +132,7 @@ from qa_agent.readiness import (
 from qa_agent.test_case_decomposer import TestCaseDecomposer
 from qa_agent.test_plan_generator import LLMTestPlanGenerator
 from qa_agent.test_case_editing import TestCaseEditError, create_manual_test_case, edit_test_case
+from qa_agent.test_case_naming import step_display_name
 from qa_agent.workflows import AutomationWorkflow
 
 
@@ -280,9 +282,9 @@ class LocalWebApplication:
         if self._background_authoring is not None:
             self._background_authoring.close()
 
-    def _valid_control_request(self, body, headers) -> bool:
+    def _valid_control_request(self, body, headers, *, max_bytes=_MAX_FORM_BODY_BYTES) -> bool:
         request_headers = {key.lower(): value for key, value in (headers or {}).items()}
-        form, error = _parse_form_body(body)
+        form, error = _parse_form_body(body, max_bytes=max_bytes)
         if error:
             return False
         token = request_headers.get("x-qa-csrf", form.get("_csrf", [""])[0])
@@ -382,7 +384,8 @@ class LocalWebApplication:
         parts = path.strip("/").split("/")
         if method.upper() == "POST":
             protected = parts[-1:] in (["stop"], ["preferences"]) or (parts[:2] == ["settings", "reliability"] and parts[-1:] == ["cancel"])
-            if protected and not self._valid_control_request(body, headers):
+            definition_edit = (len(parts) == 3 and parts[0] == "test-cases" and parts[2] == "edit") or (len(parts) == 4 and parts[:2] == ["test-cases", "review"] and parts[3] in {"save", "cancel", "regenerate"})
+            if (protected or definition_edit) and not self._valid_control_request(body, headers, max_bytes=_MAX_MANUAL_FORM_BODY_BYTES if definition_edit else _MAX_FORM_BODY_BYTES):
                 return WebResponse.json(403, json.dumps({"error": "Request validation failed. Refresh this page and retry."}))
             if parts[-1:] == ["stop"]:
                 return self._handle_stop(parts)
@@ -768,9 +771,14 @@ class LocalWebApplication:
         if action == "approve":
             record = self._test_case_review.record(test_case.id)
             if record is not None and record.status == TestCaseReviewStatus.READY_FOR_REVIEW:
-                self._test_case_review.approve_test_case(test_case)
+                try:
+                    self._test_case_review.approve_test_case(test_case)
+                except ValueError as quality_error:
+                    return WebResponse.html(409, self._page("TestCase needs review", '<div class="error-state"><h1>TestCase needs review</h1>' + self._quality_feedback(test_case) + '</div>' + f'<a class="button" href="/test-cases/{test_case.id}/edit">Edit TestCase</a>'))
             return WebResponse.redirect(f"/test-cases/{test_case.id}")
         try:
+            if self._automation_lifecycle.status(test_case) in {AutomationStatus.NEEDS_UPDATE, AutomationStatus.AUTOMATION_FAILED}:
+                raise ValueError("Generate updated automation for this definition before approving it for Validation.")
             self._test_case_review.approve_for_validation(test_case)
         except ValueError as approval_error:
             return WebResponse.html(409, self._page(
@@ -1355,22 +1363,23 @@ class LocalWebApplication:
         scenario: str = "",
         source_draft_id: str = "",
         error: str | None = None,
+        submitted: dict[str, str] | None = None,
     ) -> str:
+        submitted = submitted or {}
         error_html = f'<p class="authoring-error" role="alert">{escape_html(error)}</p>' if error else ""
         rows = []
         for index in range(8):
-            required = " required" if index == 0 else ""
             rows.append(
                 f'<fieldset class="subpanel"><legend>Step {index + 1}</legend>'
-                f'<div class="field"><label for="step-name-{index}">Title</label>'
-                f'<input id="step-name-{index}" name="step_name_{index}" maxlength="200"{required}'
-                f' value="{escape_html(name if index == 0 else "")}"></div>'
+                '<div class="field">'
+                f'<input type="hidden" id="step-name-{index}" name="step_name_{index}" maxlength="200"'
+                f' value="{escape_html(submitted.get(f"step_name_{index}", ""))}"></div>'
                 f'<div class="field"><label for="step-action-{index}">Action / instruction</label>'
-                f'<textarea id="step-action-{index}" name="step_action_{index}" maxlength="6000" rows="3"{required}>'
-                f'{escape_html(scenario if index == 0 else "")}</textarea></div>'
+                f'<textarea id="step-action-{index}" name="step_action_{index}" maxlength="6000" rows="3">'
+                f'{escape_html(submitted.get(f"step_action_{index}", scenario if index == 0 else ""))}</textarea></div>'
                 f'<div class="field"><label for="step-expected-{index}">Expected result</label>'
-                f'<textarea id="step-expected-{index}" name="step_expected_{index}" maxlength="6000" rows="2"{required}'
-                f'>{escape_html("The described behavior works as expected." if index == 0 else "")}</textarea></div>'
+                f'<textarea id="step-expected-{index}" name="step_expected_{index}" maxlength="6000" rows="2"'
+                f'>{escape_html(submitted.get(f"step_expected_{index}", ""))}</textarea></div>'
                 '</fieldset>'
             )
         content = (
@@ -1378,14 +1387,14 @@ class LocalWebApplication:
             '<p class="lead">This path does not call an AI provider. You can add more steps after saving.</p></header>'
             + error_html + '<form method="post" action="/test-cases/manual" class="panel" data-inline-validation novalidate>'
             + (f'<input type="hidden" name="source_draft_id" value="{escape_html(source_draft_id)}">' if source_draft_id else "")
-            + '<div class="field"><label for="manual-name">TestCase name</label>'
-            + f'<input id="manual-name" name="name" maxlength="200" required value="{escape_html(name)}"></div>'
+            + '<div class="field"><label for="manual-name">Summary (optional)</label>'
+            + f'<input id="manual-name" name="name" maxlength="200" value="{escape_html(name)}"></div>'
             + '<div class="field"><label for="manual-description">Scenario / description</label>'
             + f'<textarea id="manual-description" name="description" maxlength="6000" rows="4" required>{escape_html(scenario)}</textarea></div>'
             + '<div class="field"><label for="manual-base-url">Base URL (optional)</label>'
             + f'<input id="manual-base-url" name="base_url" maxlength="2048" value="{escape_html(base_url)}"></div>'
             + '<div class="field"><label for="manual-preconditions">Preconditions (one per line)</label>'
-            + '<textarea id="manual-preconditions" name="preconditions" maxlength="180000" rows="3"></textarea></div>'
+            + f'<textarea id="manual-preconditions" name="preconditions" maxlength="180000" rows="3">{escape_html(submitted.get("preconditions", ""))}</textarea></div>'
             + '<h2>Steps</h2>' + "".join(rows)
             + '<div class="actions"><button class="button primary" type="submit">Create TestCase</button>'
             + '<a class="button" href="/test-cases/new">Back to AI authoring</a></div></form>'
@@ -1415,7 +1424,7 @@ class LocalWebApplication:
             return WebResponse.html(400, self._manual_test_case_page(
                 name=values.get("name", ""), base_url=values.get("base_url", ""),
                 scenario=values.get("description", ""),
-                source_draft_id=values.get("source_draft_id", ""), error=str(create_error),
+                source_draft_id=values.get("source_draft_id", ""), error=str(create_error), submitted=values,
             ))
         self._test_case_review.mark_ready_for_review(test_case)
         if source_draft is not None:
@@ -1428,67 +1437,74 @@ class LocalWebApplication:
             return self._not_found("TestCase not found")
         return WebResponse.html(200, self._test_case_edit_page(test_case))
 
-    def _test_case_edit_page(self, test_case: TestCase, error: str | None = None, submitted: dict[str, str] | None = None) -> str:
+    def _definition_editor(self, test_case: TestCase, action: str, cancel_url: str, error: str | None = None, submitted: dict[str, str] | None = None, *, review: bool = False) -> str:
+        from qa_agent.automation_lifecycle import definition_fingerprint
         submitted = submitted or {}
-        def value(key: str, default: str) -> str:
+        payload = submitted.get("steps_json", json.dumps([
+            {"id": str(segment.id), "steps": [
+                {"id": str(step.id), "description": step.description.strip(), "expected": step.expected.strip()}
+                for step in segment.steps]}
+            for segment in test_case.segments], ensure_ascii=False))
+        def value(key, default):
             return escape_html(submitted.get(key, default))
-        preconditions = "\n".join(item.description for item in test_case.preconditions)
-        content = (
-            f'<header class="page-heading"><h1>Edit {escape_html(test_case.name)}</h1>'
-            '<p class="lead">Step actions stay inside their existing execution segment.</p></header>'
-            + (f'<p class="authoring-error" role="alert">{escape_html(error)}</p>' if error else "")
-            + f'<form method="post" action="/test-cases/{test_case.id}/edit" class="testcase-editor" data-inline-validation novalidate>'
+        fingerprint = submitted.get("definition_fingerprint", definition_fingerprint(test_case))
+        title = "Review TestCase" if review else "Edit TestCase"
+        conditions = "\n".join(item.description for item in test_case.preconditions)
+        segment_urls = json.dumps([segment.base_url or test_case.base_url or "No URL configured" for segment in test_case.segments])
+        return (
+            f'<header class="page-heading"><h1>{title}</h1><p class="lead">Edit Description and Expected Result. Step changes stay unsaved until Save TestCase.</p></header>'
+            + (f'<p class="authoring-error" role="alert">{escape_html(error)}</p><p><a href="{escape_html(cancel_url + ("/edit" if not review else ""))}">Reload the saved definition</a></p>' if error else '')
+            + f'<form method="post" action="{escape_html(action)}" class="testcase-editor" data-testcase-editor data-structured-editor data-max-body="{_MAX_DRAFT_SAVE_BODY_BYTES if review else _MAX_MANUAL_FORM_BODY_BYTES}">'
+            + f'<input type="hidden" name="_csrf" value="{self._csrf_token}">'
+            + f'<input type="hidden" name="definition_fingerprint" value="{escape_html(fingerprint)}">'
+            + f'<input type="hidden" name="steps_json" data-step-payload value="{escape_html(payload)}">'
             + '<section class="panel"><h2>Definition</h2>'
-            + f'<div class="field"><label for="edit-name">Name</label><input id="edit-name" name="name" maxlength="200" value="{value("name", test_case.name)}" required></div>'
-            + f'<div class="field"><label for="edit-description">Scenario / description</label><textarea id="edit-description" name="description" maxlength="6000" rows="5" required>{value("description", test_case.description)}</textarea></div>'
-            + f'<div class="field"><label for="edit-base-url">Base URL</label><input id="edit-base-url" name="base_url" maxlength="2048" value="{value("base_url", test_case.base_url or "")}"></div>'
-            + f'<div class="field"><label for="edit-preconditions">Preconditions (one per line)</label><textarea id="edit-preconditions" name="preconditions" maxlength="180000" rows="4">{value("preconditions", preconditions)}</textarea></div>'
-            + '</section>'
+            + f'<div class="field"><label for="edit-name">Summary</label><input id="edit-name" name="name" maxlength="200" value="{value("name", test_case.name)}"></div>'
+            + f'<div class="field"><label for="edit-description">Scenario</label><textarea id="edit-description" name="description" maxlength="6000" required>{value("description", test_case.description)}</textarea></div>'
+            + (f'<input type="hidden" name="base_url" value="{escape_html(test_case.base_url or "")}"><p>Website: {escape_html(test_case.base_url or "No URL configured")}</p>' if review else
+               f'<div class="field"><label for="edit-url">Website</label><input id="edit-url" name="base_url" maxlength="2048" value="{value("base_url", test_case.base_url or "")}"></div>')
+            + f'<div class="field"><label for="edit-preconditions">Preconditions (one per line)</label><textarea id="edit-preconditions" name="preconditions" maxlength="180000" rows="3">{value("preconditions", conditions)}</textarea></div></section>'
+            + '<section class="panel"><h2>Steps</h2><p class="muted">Empty fields can be saved as unfinished work. Approval requires meaningful content. Moves stay within their segment.</p>'
+            + f'<div data-structured-steps data-segment-urls="{escape_html(segment_urls)}"></div><noscript>Enable JavaScript to insert or reorder steps.</noscript></section>'
+            + '<div class="actions"><button class="button primary" type="submit">Save TestCase</button>'
+            + (f'<button class="button" type="submit" data-regenerate-testcase formnovalidate formaction="{escape_html(action.rsplit("/", 1)[0] + "/regenerate")}">Generate Again</button>' if review else '')
+            + f'<a class="button" data-cancel-testcase href="{escape_html(cancel_url)}">Cancel unsaved changes</a></div></form>'
+            + ('<p class="muted">Generate Again keeps your current Summary and uses the original Scenario.</p>' if review else '')
         )
-        for segment_index, segment in enumerate(test_case.segments):
-            rows = []
-            for step_index, step in enumerate(segment.steps):
-                prefix = f"step_{segment_index}_{step_index}_"
-                rows.append(
-                    f'<li class="subpanel"><h3>Step {step.order + 1}</h3>'
-                    + f'<div class="field"><label>Title</label><input name="{prefix}name" maxlength="200" value="{value(prefix + "name", step.name)}" required></div>'
-                    + f'<div class="field"><label>Action / instruction</label><textarea name="{prefix}action" maxlength="6000" rows="3" required>{value(prefix + "action", step.description)}</textarea></div>'
-                    + f'<div class="field"><label>Expected result</label><textarea name="{prefix}expected" maxlength="6000" rows="2" required>{value(prefix + "expected", step.expected)}</textarea></div>'
-                    + '<div class="button-row">'
-                    + f'<button class="button" name="operation" value="up:{segment_index}:{step_index}" type="submit">Move up</button>'
-                    + f'<button class="button" name="operation" value="down:{segment_index}:{step_index}" type="submit">Move down</button>'
-                    + f'<button class="button" name="operation" value="duplicate:{segment_index}:{step_index}" type="submit">Duplicate</button>'
-                    + f'<button class="button" name="operation" value="delete:{segment_index}:{step_index}" type="submit"'
-                    + (' disabled' if len(segment.steps) == 1 else '') + '>Delete</button></div></li>'
-                )
-            url_label = segment.base_url or test_case.base_url or "No URL configured"
-            content += (
-                f'<section class="panel"><h2>Segment {segment_index + 1}</h2>'
-                f'<p class="muted">Base URL: {escape_html(url_label)}</p><ol>{"".join(rows)}</ol>'
-                f'<button class="button" name="operation" value="add:{segment_index}" type="submit">Add step to this segment</button></section>'
-            )
-        content += (
-            '<section class="panel"><div class="actions"><button class="button primary" name="operation" value="save" type="submit">Save TestCase</button>'
-            f'<a class="button" href="/test-cases/{test_case.id}">Cancel</a></div></section></form>'
-        )
-        return self._page("Edit TestCase", content, current="Test Cases", breadcrumbs=[("Dashboard", "/"), ("Test Cases", "/test-cases"), (test_case.name, f"/test-cases/{test_case.id}")])
+
+    def _test_case_edit_page(self, test_case: TestCase, error: str | None = None, submitted: dict[str, str] | None = None) -> str:
+        content = self._definition_editor(test_case, f"/test-cases/{test_case.id}/edit", f"/test-cases/{test_case.id}", error, submitted)
+        return self._page("Edit TestCase", content, current="Test Cases", breadcrumbs=[("Test Cases", "/test-cases"), (test_case.name, f"/test-cases/{test_case.id}")])
 
     def _handle_test_case_edit(self, test_case_id_text: str, body: bytes | str | None) -> WebResponse:
+        from qa_agent.automation_lifecycle import definition_fingerprint
+        from qa_agent.test_case_repository import TestCaseConflict
         test_case_id = _parse_uuid(test_case_id_text)
         test_case = self._test_cases.get(test_case_id) if test_case_id and self._test_cases is not None else None
         if test_case is None:
             return self._not_found("TestCase not found")
         form, error = _parse_form_body(body, max_bytes=_MAX_MANUAL_FORM_BODY_BYTES)
         submitted = {key: items[0] for key, items in form.items()}
-        if error:
-            return WebResponse.html(400, self._test_case_edit_page(test_case, error))
         try:
+            if error or any(len(items) != 1 for items in form.values()):
+                raise TestCaseEditError(error or "Submit each field once.")
+            if submitted.get("definition_fingerprint") != definition_fingerprint(test_case):
+                raise TestCaseConflict("This TestCase changed elsewhere. Reload it before saving; your submitted changes are shown below.")
+            known = {"name", "description", "base_url", "preconditions", "steps_json", "definition_fingerprint", "_csrf"}
+            if "steps_json" not in submitted:
+                known.add("operation")
+                for segment_index, segment in enumerate(test_case.segments):
+                    for index, _ in enumerate(segment.steps):
+                        known.update(f"step_{segment_index}_{index}_{suffix}" for suffix in ("name", "action", "expected"))
+            if set(submitted) - known:
+                raise TestCaseEditError("Unexpected TestCase edit fields.")
             edited = edit_test_case(test_case, submitted, submitted.get("operation", "save"))
-            self._test_cases.save(edited)
-            self._automation_lifecycle.mark_test_case_changed(edited)
-            self._test_case_review.mark_ready_for_review(edited)
+            self._test_cases.save(edited, expected_fingerprint=submitted["definition_fingerprint"])
+            if definition_fingerprint(edited) != definition_fingerprint(test_case):
+                self._automation_lifecycle.mark_test_case_changed(edited)
+                self._test_case_review.mark_ready_for_review(edited)
         except (TestCaseEditError, ValueError) as edit_error:
-            return WebResponse.html(400, self._test_case_edit_page(test_case, str(edit_error), submitted))
+            return WebResponse.html(409 if isinstance(edit_error, TestCaseConflict) else 400, self._test_case_edit_page(test_case, str(edit_error), submitted))
         return WebResponse.redirect(f"/test-cases/{edited.id}")
 
     def _test_plan_view(self, test_case_id: UUID) -> WebResponse:
@@ -1552,6 +1568,8 @@ class LocalWebApplication:
                 "Automation editor unavailable",
                 self._empty_state("Automation editor unavailable", "No saved plan store is configured."),
             ))
+        if self._automation_lifecycle.status(test_case) == AutomationStatus.NEEDS_UPDATE:
+            return WebResponse.html(409, self._page("Automation needs update", '<p>Generate updated automation before editing plans for this definition.</p>' + f'<a href="/test-cases/{test_case.id}/plans">View saved plans</a>'))
 
         query = query or {}
         submitted_values = submitted_values or {}
@@ -1717,6 +1735,8 @@ class LocalWebApplication:
                 f'<a class="button" href="/test-cases/{test_case.id}">Review TestCase</a></div>',
             ))
         step = next((item for item in test_case.steps if item.id == step_id), None)
+        if self._automation_lifecycle.status(test_case) == AutomationStatus.NEEDS_UPDATE:
+            return WebResponse.html(409, self._page("Automation needs update", '<p>Generate updated automation before editing plans for this definition.</p>'))
         if step is None:
             return self._not_found("TestStep not found")
         if self._plan_store is None:
@@ -1855,7 +1875,7 @@ class LocalWebApplication:
             )
         try:
             progress_id = self._background_authoring.start(
-                name=validated.name,
+                name=values["name"].strip(),
                 base_url=validated.base_url,
                 scenario=validated.scenario,
                 source_draft_id=source_draft.id if source_draft is not None else None,
@@ -1891,7 +1911,7 @@ class LocalWebApplication:
                 source_draft_id=str(source_draft_id or ""),
             ))
         new_progress_id = self._background_authoring.start(
-            name=validated.name,
+            name=name.strip(),
             base_url=validated.base_url,
             scenario=validated.scenario,
             source_draft_token=source_draft_token,
@@ -1921,9 +1941,9 @@ class LocalWebApplication:
                 "name": name,
                 "description": scenario,
                 "base_url": base_url,
-                "step_name_0": "Review scenario",
+                "step_name_0": "",
                 "step_action_0": scenario,
-                "step_expected_0": "The described behavior works as expected.",
+                "step_expected_0": "",
             })
             if self._test_cases is None:
                 return WebResponse.html(503, self._manual_test_case_page(
@@ -1951,6 +1971,8 @@ class LocalWebApplication:
         )
         if form_error is not None:
             return self._not_found("Draft not found or expired")
+        if any(len(items) != 1 for items in form.values()):
+            return WebResponse.html(400, self._page("Invalid review", '<p>Submit each field once.</p>'))
         if action == "cancel":
             self._draft_store.take(token)
             return WebResponse.redirect("/test-cases")
@@ -1986,7 +2008,7 @@ class LocalWebApplication:
                     values=submitted_values,
                 ))
             progress_id = self._background_authoring.start(
-                name=validated.name,
+                name=summary.strip(),
                 base_url=validated.base_url,
                 scenario=validated.scenario,
                 source_draft_token=token,
@@ -2019,11 +2041,10 @@ class LocalWebApplication:
         try:
             self._test_cases.save(edits.test_case)
         except Exception:
-            return WebResponse.html(500, self._page(
-                "TestCase not saved",
-                '<div class="error-state"><h1>TestCase not saved</h1>'
-                '<p>The reviewed TestCase could not be saved. Generate a new draft and try again.</p>'
-                '<a class="button" href="/test-cases">Return to TestCases</a></div>',
+            retry_token = self._draft_store.put(consumed)
+            return WebResponse.html(500, self._draft_review_html(
+                consumed, retry_token, "The TestCase could not be saved. Your changes are retained; retry Save TestCase.",
+                values={key: items[0] for key, items in form.items()},
             ))
         self._test_case_review.mark_ready_for_review(edits.test_case)
         if consumed.source_draft_id is not None:
@@ -2043,113 +2064,22 @@ class LocalWebApplication:
             return self._not_found("Draft not found or expired")
         return WebResponse.html(200, self._draft_review_html(draft, token, error))
 
-    def _draft_review_html(
-        self,
-        draft: TestCaseDraft,
-        token: str,
-        error: str | None = None,
-        *,
-        values: dict[str, str] | None = None,
-        field_errors: dict[str, str] | None = None,
-    ) -> str:
-        test_case = draft.test_case
-        original_values = editable_test_case_values(test_case)
-        values = values or original_values
-        field_errors = field_errors or {}
-        user_modified = any(
-            values.get(key, value) != value for key, value in original_values.items()
-        )
-
-        def editable_field(key: str, label: str, *, textarea: bool, maximum: int) -> str:
-            field_id = "edit-" + key.replace(".", "-")
-            current_value = values.get(key, original_values[key])
-            original_value = original_values[key]
-            error_message = field_errors.get(key)
-            error_html = (
-                f'<span class="field-error" role="alert">{escape_html(error_message)}</span>'
-                if error_message else ""
-            )
-            attributes = (
-                f'id="{field_id}" name="{escape_html(key)}" '
-                f'data-editable-field data-original-value="{escape_html(original_value)}" '
-                f'maxlength="{maximum}"'
-            )
-            if textarea:
-                control = f'<textarea {attributes}>{escape_html(current_value)}</textarea>'
-            else:
-                control = f'<input type="text" {attributes} value="{escape_html(current_value)}">'
-            return (
-                f'<div class="field"><label for="{field_id}">{escape_html(label)}</label>'
-                f'{control}{error_html}</div>'
-            )
-
-        preconditions = "".join(
-            '<li>' + editable_field(
-                f"precondition.{index}.description",
-                f"Precondition {index + 1}",
-                textarea=True,
-                maximum=6000,
-            ) + "</li>"
-            for index, _item in enumerate(test_case.preconditions)
-        )
-        segments = []
-        step_number = 0
-        for segment_index, segment in enumerate(test_case.segments):
-            step_rows = []
-            for step_index, _step in enumerate(segment.steps):
-                step_number += 1
-                prefix = f"segment.{segment_index}.step.{step_index}"
-                fields = (
-                    editable_field(f"{prefix}.name", "Title", textarea=False, maximum=200)
-                    + editable_field(f"{prefix}.description", "Action / Description", textarea=True, maximum=6000)
-                    + editable_field(f"{prefix}.expected", "Expected Result", textarea=True, maximum=6000)
-                )
-                step_rows.append(f'<li><h4>Step {step_number}</h4>{fields}</li>')
-            steps = "".join(step_rows)
-            segments.append(
-                f'<section class="subpanel"><h3>Segment {segment_index + 1}</h3><ol>{steps}</ol></section>'
-            )
-        error_html = (
-            f'<div class="error-state"><p>{escape_html(error)}</p></div>' if error else ""
-        )
-        form_error_html = (
-            f'<div class="error-state"><p>{escape_html(field_errors["form"])}</p></div>'
-            if "form" in field_errors else ""
-        )
-        edited_badge = (
-            '<span class="badge neutral edited-indicator" data-edited-indicator>Edited</span>'
-            if user_modified else
-            '<span class="badge neutral edited-indicator" data-edited-indicator hidden>Edited</span>'
-        )
-        content = (
-            '<header class="page-heading"><h1>Review TestCase</h1>'
-            '<p class="lead">Review and edit the generated definition before saving it as Ready for review. Saving does not approve it. '
-            + edited_badge + '</p></header>'
-            + error_html
-            + form_error_html
-            + f'<form id="testcase-review-form" method="post" class="testcase-editor" action="/test-cases/review/{escape_html(token)}/save" data-testcase-editor>'
-            + '<section class="panel"><h2>Definition</h2>'
-            + editable_field("name", "TestCase name", textarea=False, maximum=200)
-            + f'<p><strong>Base URL:</strong> {escape_html(test_case.base_url or "")}</p>'
-            + editable_field("description", "Description / scenario", textarea=True, maximum=6000)
-            + '</section>'
-            + '<section class="panel"><h2>Preconditions</h2>'
-            + (f'<ul>{preconditions}</ul>' if preconditions else '<p class="muted">No preconditions proposed.</p>')
-            + '</section><section class="panel"><h2>Steps</h2>'
-            + "".join(segments)
-            + '</section><div class="actions">'
-            + '<button class="button primary" type="submit">Save TestCase</button></div></form>'
-            + '<div class="actions">'
-            + f'<button class="button" type="submit" form="testcase-review-form" '
-            f'formaction="/test-cases/review/{escape_html(token)}/regenerate" formnovalidate data-regenerate-testcase>Generate Again</button>'
-            + '<span class="muted">Keeps your current Summary and uses the original Scenario.</span>'
-            + f'<form method="post" action="/test-cases/review/{escape_html(token)}/cancel">'
-            + '<button class="button" type="submit">Cancel</button></form></div>'
-        )
-        return self._page(
-            "Review TestCase", content, current="Test Cases",
-            breadcrumbs=[("Dashboard", "/"), ("Test Cases", "/test-cases")],
-        )
+    def _draft_review_html(self, draft: TestCaseDraft, token: str, error: str | None = None, *, values: dict[str, str] | None = None, field_errors: dict[str, str] | None = None) -> str:
+        if values and "steps_json" not in values:
+            values = dict(values)
+            values["steps_json"] = json.dumps([
+                {"id": str(segment.id), "steps": [
+                    {"id": str(step.id), "description": values.get(f"segment.{si}.step.{index}.description", step.description),
+                     "expected": values.get(f"segment.{si}.step.{index}.expected", step.expected)}
+                    for index, step in enumerate(segment.steps)]}
+                for si, segment in enumerate(draft.test_case.segments)], ensure_ascii=False)
+            values.setdefault("preconditions", "\n".join(values.get(f"precondition.{index}.description", item.description) for index, item in enumerate(draft.test_case.preconditions)))
+        message = error or " ".join((field_errors or {}).values()) or None
+        content = self._definition_editor(draft.test_case, f"/test-cases/review/{token}/save", f"/test-cases/review/{token}", message, values, review=True)
+        content += (f'<form method="post" action="/test-cases/review/{escape_html(token)}/cancel" class="actions" data-discard-draft>'
+                    f'<input type="hidden" name="_csrf" value="{self._csrf_token}">'
+                    '<button class="button" type="submit">Discard Draft</button></form>')
+        return self._page("Review TestCase", content, current="Test Cases")
 
     def _run_error(self, test_case_id: UUID, message: str, status: int) -> WebResponse:
         content = (
@@ -3572,6 +3502,17 @@ class LocalWebApplication:
             + "</tbody></table></div>"
         )
 
+    @staticmethod
+    def _quality_feedback(test_case: TestCase) -> str:
+        from qa_agent.test_case_quality import quality_issues
+        items = []
+        for issue in quality_issues(test_case):
+            match = re.match(r"Step (\d+):", issue)
+            step = next((step for step in test_case.steps if step.order + 1 == int(match[1])), None) if match else None
+            url = f'/test-cases/{test_case.id}/edit' + (f'#structured-{step.id}-description' if step else '')
+            items.append(f'<li><a href="{url}">{escape_html(issue)}</a></li>')
+        return '<ul class="quality-feedback">' + ''.join(items) + '</ul>' if items else ''
+
     def _test_case_page(self, test_case_id: UUID) -> WebResponse:
         records = self._run_history.list_for_test_case(test_case_id, _PAGE_LIMIT)
         test_case = self._test_cases.get(test_case_id) if self._test_cases is not None else None
@@ -3605,7 +3546,9 @@ class LocalWebApplication:
             case_description = test_case.description
             source_note = "Definition loaded from the saved TestCase."
             steps = "".join(
-                f'<li><strong>{escape_html(step.name)}</strong>'
+                f'<li id="test-step-{step.id}"><strong>Step {step.order + 1}'
+                + (f': {escape_html(step.name)}' if step.name.strip().rstrip('.').casefold() not in {step.description.strip().rstrip('.').casefold(), step_display_name(step.description).casefold()} else '') + '</strong>'
+                +
                 f'<div>{escape_html(step.description)}</div>'
                 f'<div class="muted">Expected: {escape_html(step.expected)}</div></li>'
                 for step in test_case.steps
@@ -3673,6 +3616,7 @@ class LocalWebApplication:
             )
         )
         run_form = ""
+        has_workflow_panel = False
         if (
             self._run_service is not None and test_case is not None
             and self._test_case_review.status(test_case.id) == TestCaseReviewStatus.APPROVED
@@ -3680,6 +3624,7 @@ class LocalWebApplication:
             availability = self._workflow_availability(test_case_id)
             if availability is not None:
                 run_form = self._workflow_panel(test_case_id, test_case, availability)
+                has_workflow_panel = True
             else:
                 # Compatibility for lightweight adapters that only implement run().
                 run_form = self._run_form(test_case_id)
@@ -3753,15 +3698,16 @@ class LocalWebApplication:
             if test_case is not None and review_status == TestCaseReviewStatus.READY_FOR_REVIEW else
             ('<section class="panel review-action-panel"><h2>Next step</h2>'
              '<p>TestCase approved. Generate automation when you are ready.</p></section>'
-             if test_case is not None else "")
+             if test_case is not None and not has_workflow_panel else "")
         )
         edit_links = (
             f'<div class="actions"><a class="button" href="/test-cases/{test_case_id}/edit">Edit TestCase</a>'
-            f'<a class="button" href="/test-cases/{test_case_id}/plans">View TestPlan</a></div>'
+            + (f'<a class="button" href="/test-cases/{test_case_id}/plans">View TestPlan</a>' if not has_workflow_panel else '') + '</div>'
             if test_case is not None else ""
         )
         if (
             test_case is not None
+            and not has_workflow_panel
             and review_status == TestCaseReviewStatus.APPROVED
             and self._plan_store is not None and any(
             self._plan_store.find(step.id) is not None for step in test_case.steps
@@ -3769,7 +3715,7 @@ class LocalWebApplication:
         ):
             edit_links = edit_links.replace(
                 '</div>',
-                f'<a class="button primary" href="/test-cases/{test_case_id}/automation/edit">Edit Automation</a></div>',
+                f'<a class="button" href="/test-cases/{test_case_id}/automation/edit">Edit Automation</a></div>',
             )
         export_panel = ""
         if test_case is not None and self._testplan_exports is not None:
@@ -3791,12 +3737,13 @@ class LocalWebApplication:
             + f'<p>TestCase UUID: <code>{escape_html(test_case_id)}</code></p></details>'
             + f'<div class="summary-grid">{cards}</div>'
             + review_panel
+            + (self._quality_feedback(test_case) if test_case is not None and review_status == TestCaseReviewStatus.READY_FOR_REVIEW else '')
             + lifecycle_panel
             + run_status_panel
             + '<section class="panel"><h2>Preconditions</h2>'
             + (f"<ul>{conditions}</ul>" if conditions else '<p class="muted">No preconditions recorded.</p>')
             + '</section><section class="panel"><h2>Steps</h2>'
-            + (f"<ol>{steps}</ol>" if steps else '<p class="muted">No steps recorded.</p>')
+            + (f'<ol class="testcase-steps">{steps}</ol>' if steps else '<p class="muted">No steps recorded.</p>')
             + '</section><section class="panel"><h2>Execution segments</h2>'
             + (f"<ul>{segments}</ul>" if segments else '<p class="muted">No segment data recorded.</p>')
             + '</section>'
@@ -4106,7 +4053,7 @@ class LocalWebApplication:
             lifecycle_status = self._automation_lifecycle.status(test_case)
             if current_plan_approval:
                 status_message = (
-                    "Automation Ready. The saved plans passed Validation."
+                    "The saved plans passed Validation."
                     if lifecycle_status == AutomationStatus.AUTOMATION_READY else
                     "Automation is approved for Validation. Run Validation to confirm it is ready."
                 )
@@ -4145,6 +4092,9 @@ class LocalWebApplication:
             )
         else:
             status_message = (
+                "Saved versions are from an earlier or incomplete generation. Generate updated automation."
+                if self._automation_lifecycle.status(test_case) in {AutomationStatus.NEEDS_UPDATE, AutomationStatus.AUTOMATION_FAILED}
+                else
                 "Automation is incomplete. Review saved versions and retry generation."
                 if availability.usable_plan_count > 0
                 else "Automation has not been generated yet."
@@ -4179,7 +4129,7 @@ class LocalWebApplication:
                 'Validation is still required before Automation Ready.</p>'
             )
             plan_review = (
-                f'<p>{escape_html(status_message)}</p><p>{escape_html(plan_status)}</p>'
+                f'<p>{escape_html(status_message)}</p>'
                 f'{versions}{links}{run_note}'
                 + ('<div class="actions">' + ''.join(forms) + '</div>' if forms else '')
             )
@@ -4828,7 +4778,7 @@ def create_http_server(
             elif (
                 len(request_path) == 4
                 and request_path[:2] == ["test-cases", "review"]
-                and request_path[3] == "save"
+                and request_path[3] in {"save", "regenerate"}
             ):
                 max_body_bytes = _MAX_DRAFT_SAVE_BODY_BYTES
             elif request_path == ["test-cases", "generate"]:
@@ -5534,6 +5484,108 @@ def _inline_invalid_attrs(error_id: str, error: str | None) -> str:
 
 _UI_JAVASCRIPT = r"""
 (() => {
+  document.querySelectorAll('[data-structured-editor]').forEach((form) => {
+    const payload = form.querySelector('[data-step-payload]');
+    const root = form.querySelector('[data-structured-steps]');
+    const segmentUrls = JSON.parse(root.dataset.segmentUrls || '[]');
+    let segments, changed = false, saving = false;
+    try {
+      segments = JSON.parse(payload.value);
+      if (!Array.isArray(segments) || !segments.every(segment => segment && typeof segment.id === 'string' && Array.isArray(segment.steps) && segment.steps.every(step => step && ['id', 'description', 'expected'].every(key => typeof step[key] === 'string')))) throw new Error('Invalid list');
+    } catch (_) {
+      root.textContent = 'The submitted step list cannot be displayed. Your submitted data is retained below. Reload the saved definition before editing.';
+      const raw = document.createElement('pre'); raw.textContent = payload.value; root.append(raw);
+      form.querySelector('button[type="submit"]').disabled = true;
+      return;
+    }
+    const sync = () => { payload.value = JSON.stringify(segments); changed = true; };
+    const node = (tag, text, className) => {
+      const element = document.createElement(tag);
+      if (text) element.textContent = text;
+      if (className) element.className = className;
+      return element;
+    };
+    const render = (focusId) => {
+      root.replaceChildren();
+      let number = 0;
+      segments.forEach((segment, segmentIndex) => {
+        const group = node('section', '', 'subpanel');
+        group.append(node('h3', `Segment ${segmentIndex + 1}`));
+        group.append(node('p', segmentUrls[segmentIndex] || 'No URL configured', 'muted'));
+        const list = node('div');
+        segment.steps.forEach((step, index) => {
+          number += 1;
+          const card = node('fieldset', '', 'structured-step');
+          card.dataset.stepId = step.id;
+          card.append(node('legend', `Step ${number}`));
+          ['description', 'expected'].forEach((key) => {
+            const field = node('div', '', 'field');
+            const id = `structured-${step.id}-${key}`;
+            const label = node('label', key === 'description' ? 'Description' : 'Expected Result');
+            label.htmlFor = id;
+            const input = node('textarea');
+            input.id = id; input.rows = key === 'description' ? 4 : 3;
+            input.maxLength = 6000; input.value = step[key];
+            input.addEventListener('input', () => { step[key] = input.value; sync(); });
+            field.append(label, input); card.append(field);
+          });
+          const actions = node('div', '', 'actions');
+          const button = (label, act, disabled = false) => {
+            const control = node('button', label, 'button');
+            control.type = 'button'; control.disabled = disabled;
+            control.setAttribute('aria-label', `${label} Step ${number}`);
+            control.addEventListener('click', () => { if (act() === false) return; sync(); render(step.id); });
+            actions.append(control);
+          };
+          const insert = (offset) => {
+            const added = {id: `new:${crypto.randomUUID()}`, description: '', expected: ''};
+            segment.steps.splice(index + offset, 0, added);
+            step = added;
+          };
+          button('Insert before', () => insert(0));
+          button('Insert after', () => insert(1));
+          button('Move up', () => { [segment.steps[index - 1], segment.steps[index]] = [step, segment.steps[index - 1]]; }, index === 0);
+          button('Move down', () => { [segment.steps[index + 1], segment.steps[index]] = [step, segment.steps[index + 1]]; }, index === segment.steps.length - 1);
+          button('Delete', () => {
+            if (!window.confirm('Delete this step? Changes are applied only when you save the TestCase.')) return false;
+            segment.steps.splice(index, 1);
+            step = segment.steps[Math.min(index, segment.steps.length - 1)];
+          }, segment.steps.length === 1);
+          card.append(actions); list.append(card);
+        });
+        group.append(list); root.append(group);
+      });
+      if (focusId) document.getElementById(`structured-${focusId}-description`)?.focus();
+    };
+    render();
+    if (location.hash) document.getElementById(location.hash.slice(1))?.focus();
+    form.addEventListener('input', () => { changed = true; });
+    form.addEventListener('submit', (event) => {
+      payload.value = JSON.stringify(segments);
+      const bytes = new TextEncoder().encode(new URLSearchParams(new FormData(form)).toString()).length;
+      if (bytes > Number(form.dataset.maxBody)) {
+        event.preventDefault();
+        let notice = form.querySelector('[data-editor-size-error]');
+        if (!notice) { notice = node('p', '', 'authoring-error'); notice.dataset.editorSizeError = ''; notice.setAttribute('role', 'alert'); form.append(notice); }
+        notice.textContent = 'This edit exceeds the request size limit. Your changes remain here; reduce the total text before saving.';
+        notice.scrollIntoView(); return;
+      }
+      saving = true;
+    });
+    form.querySelector('[data-cancel-testcase]')?.addEventListener('click', (event) => {
+      if (changed && !window.confirm('Discard your unsaved changes?')) event.preventDefault();
+      else saving = true;
+    });
+    document.querySelector('[data-discard-draft]')?.addEventListener('submit', (event) => {
+      if (!window.confirm('Discard this Draft and its unsaved changes?')) event.preventDefault();
+      else saving = true;
+    });
+    window.addEventListener('beforeunload', (event) => {
+      if (changed && !saving) { event.preventDefault(); event.returnValue = ''; }
+    });
+  });
+})();
+(() => {
   const csrf = document.querySelector('meta[name="qa-csrf-token"]')?.content || '';
   window.qaRenderStop = (snapshot) => {
     document.querySelectorAll('[data-stop-form]').forEach((form) => {
@@ -5664,19 +5716,25 @@ _UI_JAVASCRIPT = r"""
   };
   const draftSource = document.querySelector('[data-source-draft-id]');
   const draftStatus = document.querySelector('[data-draft-selection-status]');
+  const draftSummary = document.getElementById('case-name');
+  const selectedDraft = [...document.querySelectorAll('[data-draft-select]')].find(button => button.dataset.draftId === draftSource?.value);
+  let loadingDraft = false, summaryEdited = !!draftSummary?.value && draftSummary.value !== selectedDraft?.dataset.title;
+  draftSummary?.addEventListener('input', () => { if (!loadingDraft) summaryEdited = true; });
   document.querySelectorAll('[data-draft-select]').forEach((button) => {
     button.addEventListener('click', () => {
       const summary = document.getElementById('case-name');
       const website = document.getElementById('case-base-url');
       const scenario = document.getElementById('case-scenario');
       if (!summary || !website || !scenario || !draftSource || !draftStatus) return;
-      summary.value = button.dataset.title || '';
+      loadingDraft = true;
+      if (!summaryEdited || !summary.value.trim()) summary.value = button.dataset.title || '';
       website.value = button.dataset.website || '';
       scenario.value = button.dataset.scenario || '';
       draftSource.value = button.dataset.draftId || '';
       summary.dispatchEvent(new Event('input', { bubbles: true }));
       website.dispatchEvent(new Event('input', { bubbles: true }));
       scenario.dispatchEvent(new Event('input', { bubbles: true }));
+      loadingDraft = false;
       document.querySelectorAll('[data-draft-select]').forEach((item) => {
         item.setAttribute('aria-pressed', String(item === button));
       });

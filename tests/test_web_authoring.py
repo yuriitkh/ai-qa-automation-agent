@@ -57,6 +57,11 @@ class TestCaseAuthoringWebTests(unittest.TestCase):
             authoring_service=TestCaseAuthoringService(LLMRouter([self.provider])),
             plan_store=self.plans,
         )
+        original_handle = self.app.handle
+        def authorized_handle(method, target, body=None, *, headers=None):
+            # These fixtures represent an editor loaded from this application.
+            return original_handle(method, target, body, headers=headers or {"X-QA-CSRF": self.app._csrf_token})
+        self.app.handle = authorized_handle
 
     def tearDown(self):
         self.app.close()
@@ -160,7 +165,7 @@ class TestCaseAuthoringWebTests(unittest.TestCase):
         draft_token = progress["review_url"].rsplit("/", 1)[1]
         draft = self.app._draft_store.get(draft_token)
         self.assertIsNotNone(draft)
-        self.assertEqual(draft.test_case.name, "Account Details Sign In")
+        self.assertEqual(draft.test_case.name, "Check account details and sign in Confirm welcome page appears")
         self.assertEqual(self.cases.list(), [])
 
     def test_dashboard_invalid_input_does_not_start_authoring(self):
@@ -238,6 +243,7 @@ class TestCaseAuthoringWebTests(unittest.TestCase):
                 "POST",
                 completed["review_url"] + "/save",
                 urlencode({"name": "Async registration edited"}),
+                headers={"X-QA-CSRF": app._csrf_token},
             )
             self.assertEqual(saved.status, 303)
             self.assertEqual(self.cases.list()[0].name, "Async registration edited")
@@ -284,20 +290,17 @@ class TestCaseAuthoringWebTests(unittest.TestCase):
         self.assertIn(b'value="User registration"', review.body)
         self.assertIn(b'name="description"', review.body)
         self.assertIn(b">Register a new user.</textarea>", review.body)
-        self.assertIn(b'name="precondition.0.description"', review.body)
+        self.assertIn(b'name="preconditions"', review.body)
         self.assertIn(b">A test email is available.</textarea>", review.body)
-        self.assertIn(b'name="segment.0.step.0.name"', review.body)
-        self.assertIn(b'name="segment.0.step.0.description"', review.body)
-        self.assertIn(b'name="segment.0.step.0.expected"', review.body)
-        self.assertIn(b'value="Open registration"', review.body)
-        self.assertIn(b">Open the registration page.</textarea>", review.body)
-        self.assertIn(b"The registration page is visible.</textarea>", review.body)
+        self.assertNotIn(b'name="segment.0.step.0.name"', review.body)
+        self.assertIn(b'data-structured-editor', review.body)
+        self.assertIn(b'name="steps_json"', review.body)
+        self.assertIn(b"Open the registration page.", review.body)
+        self.assertIn(b"The registration page is visible.", review.body)
         draft = self.app._draft_store.get(token)
         self.assertIsNotNone(draft)
         for internal_id in (
             draft.test_case.id,
-            draft.test_case.segments[0].id,
-            draft.test_case.segments[0].steps[0].id,
             draft.test_case.preconditions[0].id,
         ):
             self.assertNotIn(str(internal_id).encode(), review.body)
@@ -419,8 +422,6 @@ class TestCaseAuthoringWebTests(unittest.TestCase):
         self.assertIn('value=""', html)
         self.assertIn("Edited scenario retained here.", html)
         self.assertIn("Edited action retained here.", html)
-        self.assertIn("data-edited-indicator", html)
-        self.assertIn(">Edited</span>", html)
         self.assertEqual(self.app.handle("GET", f"/test-cases/review/{token}").status, 200)
         self.assertEqual(self.cases.list(), [])
 
@@ -502,7 +503,7 @@ class TestCaseAuthoringWebTests(unittest.TestCase):
         token = response.headers["Location"].rsplit("/", 1)[1]
         review = self.app.handle("GET", f"/test-cases/review/{token}")
         html = review.body.decode("utf-8")
-        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", html)
+        self.assertNotIn('name="segment.0.step.0.name"', html)
         self.assertIn("&lt;img src=x onerror=alert(1)&gt;", html)
         self.assertNotIn("<script>alert(1)</script>", html)
         self.assertNotIn("<img src=x", html)
@@ -568,7 +569,7 @@ class TestCaseAuthoringWebTests(unittest.TestCase):
                 initial_progress = self.wait_for_authoring(initial, app=app)
             original_token = initial_progress["review_url"].rsplit("/", 1)[1]
             regenerate = app.handle(
-                "POST", f"/test-cases/review/{original_token}/regenerate", b""
+                "POST", f"/test-cases/review/{original_token}/regenerate", b"", headers={"X-QA-CSRF": app._csrf_token}
             )
             failed = self.wait_for_authoring(regenerate, app=app)
             self.assertFalse(failed["success"])

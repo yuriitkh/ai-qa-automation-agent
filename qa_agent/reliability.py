@@ -459,10 +459,12 @@ class AutomationReliabilitySupervisor:
                 raise ReliabilityStopped("INSUFFICIENT_TESTCASE_REQUIREMENTS")
             while True:
                 operation.check()
+                provider_responded = False
                 operation.emit("RELIABILITY_GENERATING" if repair_error is None else "RELIABILITY_REPAIR", "Generating automation." if repair_error is None else "Repairing an unapproved candidate while preserving the original requirement.")
                 try:
                     previous_count = len(record.attempts)
                     value = request("TARGETED_REPAIR" if repair_error else None, repair_error)
+                    provider_responded = len(record.attempts) > previous_count
                     if len(record.attempts) == previous_count:
                         raise ReliabilityStopped("UNKNOWN_ERROR")
                     operation.emit("RELIABILITY_CHECKING", "Checking automation quality using the mandatory gates.")
@@ -471,6 +473,9 @@ class AutomationReliabilitySupervisor:
                     operation.ensure_active()
                 except Exception as error:
                     category = classify_failure(error)
+                    error.reliability_operation_id = record.id
+                    error.provider_response_succeeded = provider_responded
+                    error.rejected_gate = gate_for_category(category)
                     if record.attempts and record.attempts[-1].status == "QUALITY_PENDING":
                         attempt = record.attempts[-1]
                         attempt.status, attempt.error_category = ("CANCELLED" if category == "CANCELLED" else "REJECTED"), category

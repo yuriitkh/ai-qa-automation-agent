@@ -478,7 +478,7 @@ class SQLiteTestCaseRepository(_SQLiteStorage):
                 prefix="TC-",
             )
 
-    def save(self, test_case: TestCase) -> None:
+    def save(self, test_case: TestCase, *, expected_fingerprint: str | None = None) -> None:
         now = datetime.now(timezone.utc).isoformat()
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -486,6 +486,10 @@ class SQLiteTestCaseRepository(_SQLiteStorage):
                 "SELECT public_id, definition_json FROM test_cases WHERE test_case_id = ?",
                 (str(test_case.id),),
             ).fetchone()
+            if expected_fingerprint is not None:
+                from qa_agent.test_case_repository import TestCaseConflict
+                if existing is None or definition_fingerprint(TestCase.model_validate_json(existing["definition_json"])) != expected_fingerprint:
+                    raise TestCaseConflict("This TestCase changed elsewhere. Reload it before saving; your submitted changes are shown below.")
             public_id = existing["public_id"] if existing is not None else test_case.public_id
             sequence = parse_test_case_public_id(public_id)
             if public_id is None:
@@ -511,8 +515,14 @@ class SQLiteTestCaseRepository(_SQLiteStorage):
             stored_json = stored_case.model_dump_json(exclude={"steps"})
             if existing is not None:
                 old_case = TestCase.model_validate_json(existing["definition_json"])
-                old_json = old_case.model_dump_json(exclude={"steps"})
-                if old_json != stored_json:
+                if definition_fingerprint(old_case) != definition_fingerprint(test_case):
+                    if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='test_case_review'").fetchone():
+                        connection.execute("""INSERT INTO test_case_review
+                            (test_case_id, status, approved_plan_fingerprint, updated_at)
+                            VALUES (?, 'READY_FOR_REVIEW', NULL, ?)
+                            ON CONFLICT(test_case_id) DO UPDATE SET
+                            status='READY_FOR_REVIEW', approved_plan_fingerprint=NULL, updated_at=excluded.updated_at""",
+                            (str(test_case.id), now))
                     lifecycle = connection.execute(
                         "SELECT state FROM test_case_automation_lifecycle WHERE test_case_id=?",
                         (str(test_case.id),),

@@ -110,7 +110,7 @@ class TestCaseAuthoringServiceTests(unittest.TestCase):
 
         with redirect_stdout(io.StringIO()):
             generated = service.generate(None, scenario, self.url)
-        self.assertEqual(generated.test_case.name, "Search Apartments Oslo Results")
+        self.assertEqual(generated.test_case.name, "Search for apartments in Oslo and check that results appear")
         self.assertLessEqual(len(generated.test_case.name.split()), 10)
         self.assertNotIn("...", generated.test_case.name)
         self.assertNotEqual(generated.test_case.name, scenario)
@@ -145,7 +145,7 @@ class TestCaseAuthoringServiceTests(unittest.TestCase):
                 "Register a new user and verify that the account was created successfully.",
                 self.url,
             )
-        self.assertEqual(fallback.test_case.name, "User Account Registration")
+        self.assertEqual(fallback.test_case.name, "Register new user and verify that account was created successfully")
         self.assertEqual(len(noisy.calls), 1)
 
     def test_preserves_segment_order_and_assigns_unique_application_owned_ids(self):

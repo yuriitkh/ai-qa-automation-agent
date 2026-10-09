@@ -159,6 +159,7 @@ class QATestPipeline:
         self,
         test_case: TestCase,
         run_context: RunContext | None = None,
+        *, regenerate: bool = False,
     ) -> PipelineResult:
         """Run a persisted canonical TestCase without decomposing its text again."""
         return self._run_entry(
@@ -166,6 +167,7 @@ class QATestPipeline:
             test_case.base_url,
             run_context,
             supplied_test_case=test_case,
+            regenerate=regenerate,
         )
 
     def _run_entry(
@@ -175,6 +177,7 @@ class QATestPipeline:
         run_context: RunContext | None,
         *,
         supplied_test_case: TestCase | None,
+        regenerate: bool = False,
     ) -> PipelineResult:
         """Run each decomposed step and return plans and executions together.
 
@@ -196,6 +199,7 @@ class QATestPipeline:
                         active_run_context,
                         supplied_test_case=supplied_test_case,
                         case_runner=case_runner,
+                        regenerate=regenerate,
                     )
                 except BaseException as error:
                     case_runner.close(primary_error=error)
@@ -252,9 +256,13 @@ class QATestPipeline:
     def _create_trace_recorder(self, task: str) -> ExecutionTraceRecorder:
         return ExecutionTraceRecorder(task=task)
 
-    def _discover(self, target_url: str, case_runner=None) -> DiscoveryResult:
-        """Keep discovery's Playwright runtime off the active browser thread."""
+    def _discover(self, target_url: str, case_runner=None, test_step=None) -> DiscoveryResult:
+        """Observe the active page; isolate fresh probes for non-session adapters."""
         check_cancelled()
+        if case_runner is not None and test_step is not None and case_runner.browser_session_started:
+            observed = case_runner.capture_discovery(test_step)
+            if observed is not None:
+                return observed
         if case_runner is not None and case_runner.browser_session_started:
             with ThreadPoolExecutor(
                 max_workers=1,
@@ -273,6 +281,7 @@ class QATestPipeline:
         *,
         supplied_test_case: TestCase | None = None,
         case_runner=None,
+        regenerate: bool = False,
     ) -> PipelineResult:
         decomposition_started = time.perf_counter()
         try:
@@ -338,7 +347,7 @@ class QATestPipeline:
                     cached_version,
                 )
 
-                if cached_version is not None:
+                if cached_version is not None and not regenerate:
                     try:
                         cached_plan = self._plan_store.find_test_plan(test_step.id)
                         if cached_plan is None:
@@ -399,7 +408,7 @@ class QATestPipeline:
                             related_test_case_id=test_case.id,
                             related_test_case_public_id=test_case.public_id,
                         ):
-                            discovery_result = self._discover(step_target_url, case_runner)
+                            discovery_result = self._discover(step_target_url, case_runner, test_step)
                         if (discovery_result.status != DiscoveryStatus.SUCCESS
                                 and self._discovery_fallback is not None):
                             fallback_started = time.perf_counter()
@@ -485,6 +494,7 @@ class QATestPipeline:
                             generated_plan = self._plan_generator.generate_with_plan(
                                 test_step,
                                 discovery_result,
+                                **({"existing_test_plan": self._plan_store.find_test_plan(test_step.id), "version_number": cached_version.version + 1} if cached_version is not None else {}),
                                 **_requirement_context_kwargs(
                                     self._plan_generator, test_case.description
                                 ),
@@ -494,18 +504,25 @@ class QATestPipeline:
                             test_step,
                             discovery_result=discovery_result,
                             requirement_context=test_case.description,
-                            expected_version=1,
+                            expected_version=cached_version.version + 1 if cached_version is not None else 1,
                         )
                         generated_plan = _with_discovered_locator_identity(
                             generated_plan, discovery_result
                         )
                         generated_plan = _with_plan_origin(
-                            generated_plan, PlanVersionOrigin.AI_GENERATED
+                            generated_plan, PlanVersionOrigin.REGENERATED if cached_version is not None else PlanVersionOrigin.AI_GENERATED
                         )
                     except Exception as error:
                         if is_cancelled(error):
                             raise
                         failure_code, safe_reason = _generation_failure_details(error)
+                        gate = getattr(error, "rejected_gate", None)
+                        if getattr(error, "provider_response_succeeded", False) and gate:
+                            safe_reason = (f"Provider responded successfully, but {gate.replace('_', ' ').title()} validation rejected the candidate. {safe_reason} "
+                                           "Review the requirement and observed target; never substitute an unobserved selector. ")
+                            if "cookie" in (test_step.description + test_step.expected).casefold():
+                                safe_reason += "Use Leave unchanged and explicit visitor setup for cookie checks. "
+                            safe_reason += f"Requirement: {test_step.description[:80]} Expected Result: {test_step.expected[:80]}"
                         emit_progress_event(
                             ExecutionEventType.PLAN_GENERATION_FAILED,
                             step=test_step,
@@ -515,6 +532,7 @@ class QATestPipeline:
                             new_plan_saved=False,
                             message=safe_reason,
                             validation_issues=(error.issues if isinstance(error, PlanValidationError) else ()),
+                            reliability_operation_id=getattr(error, "reliability_operation_id", None),
                         )
                         raise PipelineStageError(
                             f"plan generation (step {test_step.order}: {test_step.name})",
@@ -621,7 +639,7 @@ class QATestPipeline:
                         related_test_case_id=test_case.id,
                         related_test_case_public_id=test_case.public_id,
                     ):
-                        rediscovery_result = self._discover(step_target_url, case_runner)
+                        rediscovery_result = self._discover(step_target_url, case_runner, test_step)
                 except Exception as error:
                     if is_cancelled(error):
                         raise
