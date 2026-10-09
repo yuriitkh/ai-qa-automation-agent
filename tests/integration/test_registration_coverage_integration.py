@@ -56,7 +56,8 @@ def test_observed_hidden_error_coverage_preserves_requirement_and_runtime_classi
                 page.locator('#form-error').evaluate('(element) => { element.hidden = true; }')
                 discovery = capture_current_page_discovery(page)
                 state = next(item for item in discovery.snapshot['state_elements'] if item['selector'] == '#form-error')
-                assert state == {'tag': 'p', 'role': 'alert', 'selector': '#form-error', 'visible': False}
+                assert state == {'tag': 'p', 'role': 'alert', 'selector': '#form-error', 'visible': False,
+                                 'form_selector': '#registration-form'}
                 assert not any(item.selector == '#form-error' for item in discovery.interactive_elements)
                 assert not any(item['selector'] == '#form-error' for item in discovery.snapshot['visible_text_elements'])
                 snapshot = json.dumps(discovery.snapshot)

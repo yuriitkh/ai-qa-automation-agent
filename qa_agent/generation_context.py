@@ -20,6 +20,7 @@ class StepGenerationContext:
 _SUBMIT = re.compile(r"\b(?:submit|send|register|create\s+(?:an?\s+)?account|sign\s*up)\b", re.I)
 _FILL = re.compile(r"\b(?:fill|enter|type|replace|change|update|correct|edit)\b", re.I)
 _NAVIGATE = re.compile(r"\b(?:navigate|open|visit|go\s+to|reload|refresh|reset|return)\b", re.I)
+_EMPTY_FORM = re.compile(r"\b(?:empty\s+(?:\w+\s+){0,2}(?:form|fields)|(?:required\s+)?fields\s+empty)\b", re.I)
 
 
 def observed_controls(discovery: DiscoveryResult) -> dict[str, InteractiveElement]:
@@ -38,16 +39,24 @@ def observed_controls(discovery: DiscoveryResult) -> dict[str, InteractiveElemen
 
 def validate_step_boundaries(plan: QATestPlan, step: TestStep, discovery: DiscoveryResult,
                              context: StepGenerationContext | None) -> None:
+    intent = f"{step.name} {step.description}"
+    controls = observed_controls(discovery)
+    if _SUBMIT.search(intent) and _EMPTY_FORM.search(intent):
+        for index, action in enumerate(plan.steps):
+            control = controls.get(action.parameters.get("selector"))
+            if action.action == "fill" and control is not None and control.required is True and action.parameters.get("value") != "":
+                raise PlanValidationError([PlanValidationIssue(
+                    code="TESTSTEP_BOUNDARY_VIOLATION", path=f"steps[{index}]",
+                    message="This TestStep submits empty required fields; filling a required field with non-empty data changes the scenario.",
+                )])
     if context is None:
         return
-    intent = f"{step.name} {step.description}"
     future_submission = [item for item in context.remaining_steps if _SUBMIT.search(f"{item.name} {item.description}")]
     current_matches = assertion_subject_matches(step, plan, discovery=discovery)
     future_assertions = {
         index for item in context.remaining_steps
         for index, matches in assertion_subject_matches(item, plan, discovery=discovery).items() if matches
     }
-    controls = observed_controls(discovery)
     filled = {selector for action, selector in context.completed_actions if action == "fill"}
     for index, action in enumerate(plan.steps):
         selector = action.parameters.get("selector")

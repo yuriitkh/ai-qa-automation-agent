@@ -19,6 +19,7 @@ MAX_LINKS = 10
 MAX_BUTTONS = 8
 MAX_VISIBLE_TEXT_ELEMENTS = 16
 MAX_STATE_ELEMENTS = 16
+MAX_FORMS = 8
 MAX_NAVIGATION_PATHS = 3
 MAX_MENU_CANDIDATES = 12
 MAX_DIRECT_NAVIGATION_PATHS = 3
@@ -245,6 +246,14 @@ _SNAPSHOT_SCRIPT = r"""() => {
             }
             item.visible = true;
             item.enabled = !element.disabled && element.getAttribute('aria-disabled') !== 'true';
+            const form = element.form || element.closest('form, [role="form"]');
+            if (form) item.form_selector = verifiedSelector(form) || '';
+            if (['input', 'textarea', 'select'].includes(tag)) {
+                item.required = element.required === true || element.getAttribute('aria-required') === 'true';
+                item.error_selectors = (element.getAttribute('aria-errormessage') || '').split(/\s+/)
+                    .filter(Boolean).map(id => document.getElementById(id)).filter(Boolean)
+                    .map(verifiedSelector).filter(Boolean).slice(0, 8);
+            }
             return item;
         }).filter(Boolean);
     };
@@ -254,13 +263,44 @@ _SNAPSHOT_SCRIPT = r"""() => {
     // Hidden alert/status containers are real DOM identities needed for
     // absence assertions. Keep them separate from interactive controls and
     // visible text; never collect their hidden text or input values.
-    const stateElements = Array.from(document.querySelectorAll('[role="alert"], [role="status"]'))
+    const errorOwners = new Map();
+    for (const control of document.querySelectorAll('[aria-errormessage]')) {
+        const selector = verifiedSelector(control);
+        if (!selector) continue;
+        for (const id of (control.getAttribute('aria-errormessage') || '').split(/\s+/).filter(Boolean)) {
+            const error = document.getElementById(id);
+            if (error) errorOwners.set(error, [...(errorOwners.get(error) || []), selector].slice(0, 32));
+        }
+    }
+    const stateElements = Array.from(new Set([
+        ...document.querySelectorAll('[role="alert"], [role="status"]'), ...errorOwners.keys()
+    ]))
         .slice(0, 16).map((element) => {
             const selector = verifiedSelector(element);
             if (!selector || selector.length > 180) return null;
-            return {tag: element.tagName.toLowerCase(), role: element.getAttribute('role'),
+            const item = {tag: element.tagName.toLowerCase(), role: element.getAttribute('role') || '',
                 selector, visible: isVisible(element)};
+            const form = element.closest('form, [role="form"]');
+            if (form) item.form_selector = verifiedSelector(form) || '';
+            if (errorOwners.has(element)) item.error_for = errorOwners.get(element);
+            return item;
         }).filter(Boolean);
+    const forms = Array.from(document.querySelectorAll('form, [role="form"]')).slice(0, 8).map(element => {
+        const selector = verifiedSelector(element);
+        if (!selector) return null;
+        const labelledBy = (element.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
+            .map(id => document.getElementById(id)).filter(Boolean)
+            .filter(node => !node.querySelector('input, textarea, select'))
+            .map(safeText).join(' ');
+        const heading = Array.from(element.children).find(node => /^H[1-6]$/.test(node.tagName));
+        return {tag: element.tagName.toLowerCase(), role: element.getAttribute('role') || '', selector,
+            id: element.id || '', name: element.getAttribute('name') || '',
+            accessible_name: (element.getAttribute('aria-label') || labelledBy ||
+                (heading ? safeText(heading) : '')).trim().slice(0, 120),
+            visible: isVisible(element), no_validate: element.noValidate === true,
+            required_field_count: Array.from(element.elements || element.querySelectorAll('input, select, textarea'))
+                .filter(control => control.required === true || control.getAttribute('aria-required') === 'true').length};
+    }).filter(Boolean);
   return {
     url: window.location.href,
     title: document.title,
@@ -270,6 +310,7 @@ _SNAPSHOT_SCRIPT = r"""() => {
     interactive_elements: collectInteractive(),
     visible_text_elements: collectVisibleText(),
     state_elements: stateElements,
+    forms,
   };
 }"""
 
@@ -1101,6 +1142,14 @@ def _normalize_interactive_elements(value: Any) -> list[dict[str, Any]]:
         item["enabled"] = entry.get("enabled") is not False
         if isinstance(entry.get("has_value"), bool):
             item["has_value"] = entry["has_value"]
+        owner = entry.get("form_selector")
+        if isinstance(owner, str) and owner and len(owner) <= MAX_SELECTOR_CHARS:
+            item["form_selector"] = owner
+        if isinstance(entry.get("required"), bool):
+            item["required"] = entry["required"]
+        if isinstance(entry.get("error_selectors"), list):
+            item["error_selectors"] = [selector for selector in entry["error_selectors"][:8]
+                if isinstance(selector, str) and selector.strip() and len(selector) <= MAX_SELECTOR_CHARS]
         labels = entry.get("option_labels")
         if isinstance(labels, (list, tuple)):
             item["option_labels"] = [_bounded_text(label, MAX_TEXT_CHARS) for label in labels[:16] if isinstance(label, str)]
@@ -1115,7 +1164,12 @@ def _normalize_state_elements(value: Any) -> list[dict[str, Any]]:
         return []
     result = []
     for entry in value[:MAX_STATE_ELEMENTS]:
-        if not isinstance(entry, dict) or entry.get("role") not in ("alert", "status"):
+        if not isinstance(entry, dict):
+            continue
+        raw_owners = entry.get("error_for")
+        owners = [selector for selector in (raw_owners[:32] if isinstance(raw_owners, list) else [])
+                  if isinstance(selector, str) and selector.strip() and len(selector) <= MAX_SELECTOR_CHARS]
+        if entry.get("role") not in ("alert", "status") and not owners:
             continue
         selector = entry.get("selector")
         # Do not truncate a selector into a different DOM identity.
@@ -1123,9 +1177,36 @@ def _normalize_state_elements(value: Any) -> list[dict[str, Any]]:
             continue
         result.append({
             "tag": _bounded_text(entry.get("tag"), MAX_SELECTOR_CHARS),
-            "role": entry["role"], "selector": selector,
+            "role": entry.get("role") or "", "selector": selector,
             "visible": entry.get("visible") is True,
         })
+        owner = entry.get("form_selector")
+        if isinstance(owner, str) and owner and len(owner) <= MAX_SELECTOR_CHARS:
+            result[-1]["form_selector"] = owner
+        if owners:
+            result[-1]["error_for"] = owners
+    return result
+
+
+def _normalize_forms(value: Any) -> list[dict[str, Any]]:
+    """Form identity comes from the container, never aggregate descendant text."""
+    if not isinstance(value, list):
+        return []
+    result = []
+    for entry in value[:MAX_FORMS]:
+        if not isinstance(entry, dict) or not (entry.get("tag") == "form" or entry.get("role") == "form"):
+            continue
+        selector = entry.get("selector")
+        if not isinstance(selector, str) or not selector.strip() or len(selector) > MAX_SELECTOR_CHARS:
+            continue
+        item = {key: _bounded_text(entry.get(key), MAX_TEXT_CHARS)
+                for key in ("tag", "role", "id", "name", "accessible_name") if entry.get(key)}
+        item.update(selector=selector, visible=entry.get("visible") is True,
+                    no_validate=entry.get("no_validate") is True)
+        count = entry.get("required_field_count")
+        if type(count) is int and count >= 0:
+            item["required_field_count"] = count
+        result.append(item)
     return result
 
 
@@ -1155,6 +1236,7 @@ def _build_snapshot(page_data: Any) -> str:
             page_data.get("visible_text_elements")
         ),
         "state_elements": _normalize_state_elements(page_data.get("state_elements")),
+        "forms": _normalize_forms(page_data.get("forms")),
     }
 
     serialized = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
@@ -1165,6 +1247,7 @@ def _build_snapshot(page_data: Any) -> str:
         "links",
         "visible_text_elements",
         "state_elements",
+        "forms",
         "headings",
         "direct_navigation_paths",
         "navigation_paths",
@@ -1189,6 +1272,7 @@ def _build_snapshot(page_data: Any) -> str:
             "links",
             "visible_text_elements",
             "state_elements",
+            "forms",
             "headings",
             "direct_navigation_paths",
             "navigation_paths",

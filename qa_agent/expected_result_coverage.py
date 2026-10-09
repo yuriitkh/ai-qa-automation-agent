@@ -82,7 +82,7 @@ _ACTION_STEP = re.compile(
     re.IGNORECASE,
 )
 _OUTPUT_STATE = re.compile(
-    r"\b(?:displayed|visible|shown|appears?|present|hidden|disappears?|"
+    r"\b(?:display(?:ed|s)?|visible|shown|appears?|present|hidden|disappears?|"
     r"redirected|redirection|title|url|contains?|includes?|checked|selected|"
     r"unchecked|not\s+(?:be\s+)?(?:checked|ticked)|disabled|enabled|loaded|(?:page|site|homepage)\s+loads|exists?|created|saved|submitted|updated|deleted|"
     r"removed|added|accepted|rejected|authenticated|logged\s+in|signed\s+in|"
@@ -112,12 +112,24 @@ _ENABLED = re.compile(r"\benabled\b", re.I)
 _UNCHECKED = re.compile(r"\b(?:unchecked|not\s+(?:be\s+)?(?:checked|ticked))\b", re.I)
 _CHECKED = re.compile(r"\b(?:checked|ticked)\b", re.I)
 _SELECTED = re.compile(r"\b(?:selected|chosen)\b", re.I)
-_VISIBLE = re.compile(r"\b(?:displayed|visible|shown|appears?|present|exists?)\b", re.I)
+_VISIBLE = re.compile(r"\b(?:display(?:ed|s)?|visible|shown|appears?|present|exists?)\b", re.I)
 _LOADED = re.compile(r"\b(?:loaded|(?:page|site|homepage)\s+loads|open|opened|available)\b", re.I)
 _TEXT = re.compile(r"\b(?:text|message|error|success|confirmation|notification|alert|warning|notice|contains?|includes?|says?)\b", re.I)
 _NO_ERROR = re.compile(
     r"\b(?:without|no)\s+(?:(?:any|client-side|validation)\s+){0,2}errors?\b",
     re.I,
+)
+_INPUT_ACCEPTANCE = re.compile(
+    r"(?:all\s+)?(?:the\s+)?(?:(?:entered|provided|input)\s+)?"
+    r"(?:values|inputs?|(?:required\s+)?fields)\s+"
+    r"(?:(?:are|is)\s+accepted|accept\s+(?:the\s+)?(?:input|data|values))", re.I,
+)
+_SUBMISSION_BLOCKED = re.compile(
+    r"\b(?:form\s+)?submission\s+(?:is\s+)?(?:blocked|prevented)\b", re.I,
+)
+_REQUIRED_FIELD_ERRORS = re.compile(
+    r"\b(?:errors?|validation\s+messages?)\b.*\brequired\s+fields\b|"
+    r"\brequired\s+fields\b.*\b(?:errors?|validation\s+messages?)\b", re.I,
 )
 _RESULT = re.compile(
     r"\b(?:created|saved|submitted|updated|deleted|removed|added|accepted|rejected|"
@@ -217,6 +229,10 @@ def expected_result_coverage(
     covered_count = len({index for indexes in matches.values() for index in indexes})
     if covered_count == len(expectations):
         status = ExpectedResultCoverageStatus.COVERED
+    elif any(expectation.kind == "required_field_errors" for expectation in expectations) and _required_error_controls(plan, discovery) is None:
+        # A global error or a native validation bubble cannot establish errors
+        # for every required field. Never approve absent/incomplete capability.
+        status = ExpectedResultCoverageStatus.UNKNOWN
     elif covered_count:
         status = ExpectedResultCoverageStatus.PARTIALLY_COVERED
     else:
@@ -247,6 +263,17 @@ def validate_expected_result_coverage(
             guidance += (
                 " For 'without error', assert_hidden must check an error element established by Discovery"
                 " after the input actions. If none is observed, review Discovery or clarify the check; do not invent a selector."
+            )
+        if _REQUIRED_FIELD_ERRORS.search(test_step.expected):
+            guidance += (
+                " Required-field verification needs a complete observed form and a grounded error identity"
+                " for each required field. Browser-native validation bubbles are not DOM error elements;"
+                " do not invent their selectors or substitute a single global error."
+            )
+        if _SUBMISSION_BLOCKED.search(test_step.expected):
+            guidance += (
+                " Verify the attempted submission's observable rejection: an error is visible and"
+                " the same form's success confirmation is hidden after the submit action."
             )
         raise PlanValidationError([
             PlanValidationIssue(
@@ -284,6 +311,8 @@ def _verification_required(test_step: TestStep) -> bool | None:
     if _VERIFICATION_INTENT.search(combined):
         return True
     if has_error_absence_requirement(test_step.expected):
+        return True
+    if _SUBMISSION_BLOCKED.search(test_step.expected) or _REQUIRED_FIELD_ERRORS.search(test_step.expected):
         return True
     if _ACTION_COMPLETION.fullmatch(test_step.expected):
         return False
@@ -327,6 +356,10 @@ def _expectations(test_step: TestStep) -> tuple[_Expectation, ...] | None:
         # Actions can name a different element from the expected result.
         tokens = _subject_tokens(clause)
         expectations.append(_Expectation(kind, clause, frozenset(tokens), exact_values))
+        if kind == "required_field_errors" and _SUBMISSION_BLOCKED.search(clause):
+            # Two sentences (or a semicolon) can express both states without
+            # an 'and'. Per-field errors alone cannot erase the blocked result.
+            expectations.append(_Expectation("submission_blocked", clause, frozenset(), ()))
         if kind == "no_error":
             absence = _NO_ERROR.search(clause)
             # 'No errors are displayed' describes only absence. In contrast,
@@ -335,7 +368,7 @@ def _expectations(test_step: TestStep) -> tuple[_Expectation, ...] | None:
             if absence.start() or absence.group().casefold().startswith("without"):
                 remaining = (clause[:absence.start()] + clause[absence.end():]).strip(" ,.;")
                 other_kind = _expectation_kind(remaining)
-                if other_kind is not None:
+                if other_kind is not None and not _input_acceptance_without_error(clause):
                     expectations.append(_Expectation(
                         other_kind, remaining, frozenset(_subject_tokens(remaining)),
                         tuple(match.group(1).strip() for match in _QUOTED.finditer(remaining)),
@@ -385,7 +418,7 @@ def assertion_subject_matches(
             continue
         matches[index] = tuple(
             expected_index for expected_index, expectation in enumerate(expectations)
-            if _action_covers(expectation, action.action, action.parameters, plan, discovery)
+            if _action_covers(expectation, action.action, action.parameters, plan, discovery, index)
             and (expectation.kind != "no_error" or not any(
                 later.action not in _ASSERTION_ACTIONS for later in plan.steps[index + 1:]
             ))
@@ -398,6 +431,12 @@ def _expectation_kind(clause: str) -> str | None:
     # A positive error-message assertion proves the opposite of this result.
     if has_error_absence_requirement(clause):
         return "no_error"
+    if _REQUIRED_FIELD_ERRORS.search(clause):
+        return "required_field_errors" if _VISIBLE.search(clause) else None
+    if _SUBMISSION_BLOCKED.search(clause):
+        if re.search(r"\b(?:server|database|transaction|persisted)\b", clause, re.I):
+            return None
+        return "submission_blocked"
     if _HIDDEN.search(clause):
         return "hidden"
     if _DISABLED.search(clause):
@@ -417,6 +456,8 @@ def _expectation_kind(clause: str) -> str | None:
     if _URL.search(clause):
         return "url"
     if _VISIBLE.search(clause):
+        if re.search(r"\bform\b", clause, re.I) and not _TEXT.search(clause):
+            return "form_visible"
         return "visible"
     if _LOADED.search(clause):
         return "loaded"
@@ -433,7 +474,12 @@ def _action_covers(
     parameters: dict,
     plan: QATestPlan | None,
     discovery: DiscoveryResult | None = None,
+    action_index: int = 0,
 ) -> bool:
+    if expectation.kind == "submission_blocked":
+        return _blocked_submission_match(plan, discovery, action_index)
+    if expectation.kind == "required_field_errors":
+        return _required_errors_match(plan, discovery, action_index)
     allowed = {
         "no_error": {"assert_hidden"},
         "hidden": {"assert_hidden"},
@@ -446,12 +492,17 @@ def _action_covers(
         "url": {"assert_url"},
         "title": {"assert_title"},
         "visible": {"assert_visible", "assert_text_contains"},
+        "form_visible": {"assert_visible"},
         "loaded": {"assert_page_loaded", "assert_url"},
         "text": {"assert_text_contains", "assert_visible"},
         "result": {"assert_text_contains", "assert_visible"},
     }.get(expectation.kind, set())
     if action not in allowed:
         return False
+    if expectation.kind == "form_visible":
+        record = _observed_records(discovery).get(parameters.get("selector"), {})
+        if not (record.get("tag") == "form" or record.get("role") == "form"):
+            return False
 
     if action == "assert_page_loaded":
         if expectation.kind == "loaded":
@@ -470,7 +521,10 @@ def _action_covers(
     if expectation.kind == "no_error":
         # Input selectors from the action's context cannot stand in for the
         # error subject. Locator identity is checked separately by Discovery.
-        return "error" in evidence_tokens
+        if "error" not in evidence_tokens:
+            return False
+        return _input_absence_matches(plan, discovery, action_index,
+                                      require_input=_input_acceptance_without_error(expectation.clause))
     if any(
         exact.casefold() in evidence.casefold()
         for exact in expectation.exact_values
@@ -510,7 +564,7 @@ def _discovered_assertion_subject(
     selector = parameters.get("selector")
     asserted_text = parameters.get("expected_text")
     records = []
-    for key in ("visible_text_elements", "state_elements", "interactive_elements", "inputs", "buttons", "links", "headings"):
+    for key in ("visible_text_elements", "state_elements", "forms", "interactive_elements", "inputs", "buttons", "links", "headings"):
         items = discovery.snapshot.get(key)
         if isinstance(items, (list, tuple)):
             records.extend(item for item in items if isinstance(item, dict))
@@ -544,7 +598,126 @@ def _discovered_assertion_subject(
                 continue
             if isinstance(value, str):
                 evidence.append(value)
+        if record.get("error_for"):
+            # Explicit aria-errormessage relationships establish error meaning,
+            # including opaque IDs; role=alert alone does not.
+            evidence.append("error")
     return " ".join(evidence)
+
+
+def _input_acceptance_without_error(clause: str) -> bool:
+    absence = _NO_ERROR.search(clause)
+    if absence is None:
+        return False
+    remaining = (clause[:absence.start()] + clause[absence.end():]).strip(" ,.;")
+    return _INPUT_ACCEPTANCE.fullmatch(remaining) is not None
+
+
+def _observed_records(discovery: DiscoveryResult | None) -> dict[str, dict]:
+    if discovery is None:
+        return {}
+    records = {item.selector: item.model_dump() for item in discovery.interactive_elements} if discovery.status == DiscoveryStatus.SUCCESS else {}
+    for key in ("forms", "interactive_elements", "state_elements", "visible_text_elements", "headings", "inputs", "buttons"):
+        for item in discovery.snapshot.get(key, []):
+            if isinstance(item, dict) and isinstance(item.get("selector"), str):
+                records[item["selector"]] = {**records.get(item["selector"], {}), **item}
+    return records
+
+
+def _input_absence_matches(plan: QATestPlan, discovery: DiscoveryResult | None, index: int, *, require_input: bool) -> bool:
+    records = _observed_records(discovery)
+    changed = [i for i, item in enumerate(plan.steps[:index])
+               if item.action in {"fill", "check", "uncheck", "select_option"}
+               or (item.action == "click" and records.get(item.parameters.get("selector"), {}).get("input_type") == "radio")]
+    if not changed:
+        return not require_input
+    filled = [plan.steps[i].parameters.get("selector") for i in changed]
+    checks = {item.parameters.get("selector") for item in plan.steps[max(changed) + 1:]
+              if item.action == "assert_hidden"}
+    linked_errors = {selector for control in filled
+                     for selector in records.get(control, {}).get("error_selectors", ())
+                     if selector in records and control in records[selector].get("error_for", ())}
+    if not linked_errors <= checks:
+        return False
+    owners = {records.get(selector, {}).get("form_selector") for selector in filled}
+    owners.discard(None)
+    owners.discard("")
+    if not owners:
+        # Legacy bounded snapshots have no form relationships. Selector
+        # grounding still requires the actual observed error identity.
+        return True
+    error = records.get(plan.steps[index].parameters.get("selector"), {})
+    return (len(owners) == 1 and error.get("form_selector") in owners
+            and all(records.get(selector, {}).get("form_selector") in owners for selector in filled))
+
+
+def _submitted_form(plan: QATestPlan | None, discovery: DiscoveryResult | None):
+    if plan is None:
+        return None
+    records = _observed_records(discovery)
+    mutations = [(index, item) for index, item in enumerate(plan.steps) if item.action not in _ASSERTION_ACTIONS]
+    if not mutations:
+        return None
+    index, action = mutations[-1]
+    control = records.get(action.parameters.get("selector"), {})
+    if action.action != "click" or control.get("button_type", control.get("input_type")) != "submit":
+        return None
+    form = control.get("form_selector")
+    if not form or form not in records or not (records[form].get("tag") == "form" or records[form].get("role") == "form"):
+        return None
+    return index, form, records
+
+
+def _state_subject(record: dict, discovery: DiscoveryResult, subject: str) -> bool:
+    text = _discovered_assertion_subject("assert_visible", {"selector": record.get("selector")}, discovery)
+    return subject in _semantic_tokens(text)
+
+
+def _blocked_submission_match(plan: QATestPlan, discovery: DiscoveryResult | None, index: int) -> bool:
+    submitted = _submitted_form(plan, discovery)
+    if submitted is None:
+        return False
+    submit_index, form, records = submitted
+    errors, confirmations = set(), set()
+    for assertion_index, item in enumerate(plan.steps[submit_index + 1:], submit_index + 1):
+        record = records.get(item.parameters.get("selector"), {})
+        if record.get("form_selector") != form:
+            continue
+        if item.action == "assert_visible" and _state_subject(record, discovery, "error"):
+            errors.add(assertion_index)
+        if item.action == "assert_hidden" and _state_subject(record, discovery, "confirmation"):
+            confirmations.add(assertion_index)
+    return bool(errors and confirmations and index in errors | confirmations)
+
+
+def _required_error_controls(plan: QATestPlan | None, discovery: DiscoveryResult | None):
+    submitted = _submitted_form(plan, discovery)
+    if submitted is None:
+        return None
+    _, form, records = submitted
+    required = [record for record in records.values() if record.get("required") is True and record.get("form_selector") == form]
+    count = records[form].get("required_field_count")
+    if type(count) is not int or count <= 0 or count != len(required):
+        return None
+    verified = []
+    for control in required:
+        errors = [selector for selector in control.get("error_selectors", ())
+                  if selector in records and control["selector"] in records[selector].get("error_for", ())]
+        if not errors:
+            return None
+        verified.append({**control, "error_selectors": errors})
+    return submitted, verified
+
+
+def _required_errors_match(plan: QATestPlan, discovery: DiscoveryResult | None, index: int) -> bool:
+    capability = _required_error_controls(plan, discovery)
+    if capability is None:
+        return False
+    (submit_index, _, _), required = capability
+    checks = {i: action.parameters.get("selector") for i, action in enumerate(plan.steps)
+              if i > submit_index and action.action == "assert_visible"}
+    return (index in checks and any(checks[index] in control["error_selectors"] for control in required)
+            and all(set(control["error_selectors"]) & set(checks.values()) for control in required))
 
 
 def _plan_url_matches(

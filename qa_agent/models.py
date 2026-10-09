@@ -139,6 +139,9 @@ class InteractiveElement(BaseModel):
     button_type: str = ""
     option_labels: tuple[str, ...] = ()
     has_value: bool | None = None
+    form_selector: str = ""
+    required: bool | None = None
+    error_selectors: tuple[str, ...] = ()
 
 
 class LocatorIdentityEntry(BaseModel):
