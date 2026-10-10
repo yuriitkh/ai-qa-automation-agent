@@ -105,13 +105,15 @@ def classify_assertions(
                                 allow_atomic_requirements=len(requirements) > 1,
                             )
                             else AssertionGrounding.INFERRED)
+            elif _text_assertion_has_input_target(action, discovery):
+                category = AssertionGrounding.INFERRED
             elif any(
                 _required_value(action.action, value, requirements)
                 for value in values
             ):
                 category = AssertionGrounding.REQUIREMENT_GROUNDED
             elif any(
-                _observed_value(action.action, value, observation_texts)
+                _observed_value(action.action, value, _assertion_observation_texts(action, discovery, observation_texts))
                 for value in values
             ):
                 category = AssertionGrounding.OBSERVATION_GROUNDED
@@ -145,21 +147,17 @@ def validate_assertion_grounding(
         discovery,
         requirement_context=requirement_context,
     )
-    from qa_agent.input_value_assertions import input_value_grounding_reason
     issues = [
         PlanValidationIssue(
             code="UNGROUNDED_ASSERTION",
             path=f"steps[{entry.step_index}].parameters",
             message=(
-                "An exact assertion value is not stated in the TestCase requirement "
-                "or supported by deterministic page evidence. Use a structural "
-                "assertion unless the exact value is required or observed."
+                "The exact assertion lacks a supported action/target identity or authoritative "
+                "requirement/target-bound evidence. Use a structural assertion only for a generic-state "
+                "requirement. For a required exact message, clarify the original requirement "
+                "or collect target-bound evidence; do not invent or replace the message."
             ),
-            reason_code=(input_value_grounding_reason(
-                             plan, entry.step_index, discovery, (test_step.description, test_step.expected),
-                             requirement_context=requirement_context,
-                             allow_atomic_requirements=len(_requirement_texts(test_step, requirement_context)) > 1,
-                         ) if plan.steps[entry.step_index].action == 'assert_value' else None),
+            reason_code=_grounding_failure_reason(plan, entry.step_index, test_step, discovery, requirement_context),
         )
         for entry in entries
         if entry.category == AssertionGrounding.INFERRED
@@ -167,6 +165,53 @@ def validate_assertion_grounding(
     if issues:
         raise PlanValidationError(issues)
     return entries
+
+
+def _grounding_failure_reason(plan, index, step, discovery, requirement_context):
+    action = plan.steps[index]
+    if action.action == 'assert_value':
+        from qa_agent.input_value_assertions import input_value_grounding_reason
+        return input_value_grounding_reason(
+            plan, index, discovery, (step.description, step.expected),
+            requirement_context=requirement_context,
+            allow_atomic_requirements=len(_requirement_texts(step, requirement_context)) > 1,
+        )
+    if _text_assertion_has_input_target(action, discovery):
+        return 'ASSERTION_TARGET_MISMATCH'
+    # This is source provenance, not an inference about the product or provider.
+    atomic = (step.name, step.description, step.expected)
+    if (requirement_context and _requirement_context_covers_step(requirement_context, atomic)
+            and any(_required_value(action.action, value, atomic)
+                    for field in _EXACT_ASSERTION_VALUES.get(action.action, ())
+                    if isinstance(value := action.parameters.get(field), str) and value.strip())):
+        return 'OUTPUT_VALUE_ONLY_IN_STEP'
+    return 'OUTPUT_VALUE_NOT_GROUNDED'
+
+
+def _text_assertion_has_input_target(action, discovery):
+    from qa_agent.generation_context import observed_controls
+    control = observed_controls(discovery).get(action.parameters.get('selector'))
+    return (action.action in {'assert_visible', 'assert_text_contains'} and control is not None
+            and control.tag in {'input', 'textarea'})
+
+
+def _assertion_observation_texts(action, discovery, observations):
+    if action.action not in {'assert_visible', 'assert_text_contains'}:
+        return observations
+    selector = action.parameters.get('selector')
+    if not selector:
+        return observations
+    # Text elsewhere on the page does not establish a selected node's output.
+    records = []
+    for key in ('headings', 'links', 'buttons', 'visible_text_elements', 'state_elements'):
+        collection = discovery.snapshot.get(key)
+        if isinstance(collection, (list, tuple)):
+            records.extend(item for item in collection if isinstance(item, dict))
+    if discovery.status == DiscoveryStatus.SUCCESS:
+        records.extend(item.model_dump() for item in discovery.interactive_elements)
+    return tuple(item['text'] for item in records
+                 if item.get('selector') == selector and item.get('visible') is not False
+                 and item.get('tag') not in {'input', 'textarea'} and isinstance(item.get('text'), str))
 
 
 def _requirement_texts(

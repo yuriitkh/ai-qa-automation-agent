@@ -138,7 +138,7 @@ _RESULT = re.compile(
     re.I,
 )
 
-_QUOTED = re.compile(r"[\"'“”‘’]([^\"'“”‘’]{2,})[\"'“”‘’]")
+_QUOTED = re.compile(r'''"([^"]*)"|'([^']*)'|“([^”]*)”|‘([^’]*)’''')
 _WORD = re.compile(r"[a-z0-9]+", re.I)
 _STOP_WORDS = frozenset({
     "a", "an", "the", "and", "or", "but", "not", "no", "without", "to", "of", "in", "on", "at",
@@ -355,16 +355,16 @@ def _expectations(test_step: TestStep) -> tuple[_Expectation, ...] | None:
         kind = _expectation_kind(clause)
         if kind is None:
             return None
-        exact_values = tuple(match.group(1).strip() for match in _QUOTED.finditer(clause))
+        exact_values = _quoted_values(clause)
         # Actions can name a different element from the expected result.
         tokens = _subject_tokens(clause)
         expectations.append(_Expectation(kind, clause, frozenset(tokens), exact_values))
-        if kind == "required_field_errors" and _SUBMISSION_BLOCKED.search(clause):
+        if kind == "required_field_errors" and _SUBMISSION_BLOCKED.search(_mask_quoted(clause)):
             # Two sentences (or a semicolon) can express both states without
             # an 'and'. Per-field errors alone cannot erase the blocked result.
             expectations.append(_Expectation("submission_blocked", clause, frozenset(), ()))
         if kind == "no_error":
-            absence = _NO_ERROR.search(clause)
+            absence = _NO_ERROR.search(_mask_quoted(clause))
             # 'No errors are displayed' describes only absence. In contrast,
             # 'Confirmation is displayed without error' also requires the
             # confirmation assertion; negation must not erase that state.
@@ -374,17 +374,30 @@ def _expectations(test_step: TestStep) -> tuple[_Expectation, ...] | None:
                 if other_kind is not None and not _input_acceptance_without_error(clause):
                     expectations.append(_Expectation(
                         other_kind, remaining, frozenset(_subject_tokens(remaining)),
-                        tuple(match.group(1).strip() for match in _QUOTED.finditer(remaining)),
+                        _quoted_values(remaining),
                     ))
     return tuple(expectations)
 
 
+def _quoted_values(text: str) -> tuple[str, ...]:
+    return tuple(next(value for value in match.groups() if value is not None).strip()
+                 for match in _QUOTED.finditer(text))
+
+
+def _mask_quoted(text: str) -> str:
+    # Preserve offsets; a message's punctuation and words are data, not state
+    # instructions or clause boundaries.
+    return _QUOTED.sub(lambda match: "\0" * len(match.group()), text)
+
+
 def _result_clauses(expected: str) -> list[str]:
-    return [
-        clause.strip(" .;\t")
-        for clause in re.split(r"\s+\b(?:and|but|also)\b\s+", expected, flags=re.I)
-        if clause.strip(" .;\t")
-    ]
+    boundaries = re.finditer(r"\s+\b(?:and|but|also)\b\s+", _mask_quoted(expected), flags=re.I)
+    clauses, start = [], 0
+    for boundary in boundaries:
+        clauses.append(expected[start:boundary.start()])
+        start = boundary.end()
+    clauses.append(expected[start:])
+    return [clause.strip(" .;\t") for clause in clauses if clause.strip(" .;\t")]
 
 
 def _subject_tokens(clause: str) -> set[str]:
@@ -430,11 +443,12 @@ def assertion_subject_matches(
 
 
 def _expectation_kind(clause: str) -> str | None:
+    clause = _mask_quoted(clause)
     # Negation takes precedence over words such as 'error' or 'displayed'.
     # A positive error-message assertion proves the opposite of this result.
     if has_error_absence_requirement(clause):
         return "no_error"
-    unquoted = _QUOTED.sub(' ', clause)
+    unquoted = clause
     if (re.search(r"\b(?:all|every|each)\s+(?:(?:the|required|form)\s+)*(?:fields?|inputs?)\b", unquoted, re.I)
             and re.search(r"\b(?:contains?|values?|matches?|equals?|present|visible|displayed|shown|entered|filled)\b", unquoted, re.I)
             and not _REQUIRED_FIELD_ERRORS.search(clause)):
@@ -519,6 +533,11 @@ def _action_covers(
     }.get(expectation.kind, set())
     if action not in allowed:
         return False
+    if action in {'assert_visible', 'assert_text_contains'} and _observed_records(discovery).get(
+        parameters.get('selector'), {}
+    ).get('tag') in {'input', 'textarea'} and parameters.get('expected_text') is not None:
+        # These actions inspect innerText, not a text control's DOM value.
+        return False
     if expectation.kind == "input_value":
         from qa_agent.input_value_assertions import input_value_subject_matches
         return input_value_subject_matches(expectation.clause, plan, action_index, discovery)
@@ -548,6 +567,13 @@ def _action_covers(
             return False
         return _input_absence_matches(plan, discovery, action_index,
                                       require_input=_input_acceptance_without_error(expectation.clause))
+    if expectation.exact_values and expectation.kind in {'visible', 'text', 'result'}:
+        asserted = parameters.get('expected_text')
+        # Semantic subject overlap cannot stand in for a required literal, or
+        # make a conflicting message count as verification of the exact result.
+        return isinstance(asserted, str) and all(
+            exact.casefold() in asserted.casefold() for exact in expectation.exact_values if exact
+        )
     if any(
         exact.casefold() in evidence.casefold()
         for exact in expectation.exact_values

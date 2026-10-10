@@ -32,6 +32,7 @@ REASON_CODES = frozenset({
     'UNSUPPORTED_EXPECTED_RESULT', 'INVALID_STRUCTURED_OUTPUT', 'OUTPUT_TRUNCATED',
     'PROVIDER_UNAVAILABLE', 'PROVIDER_RATE_LIMITED', 'BROWSER_PRECONDITION_FAILED',
     'SELECTOR_NOT_FOUND', 'BROWSER_ACTION_FAILED', 'UNKNOWN',
+    'OUTPUT_VALUE_ONLY_IN_STEP', 'OUTPUT_VALUE_NOT_GROUNDED',
 })
 MAX_EVENTS = 128
 MAX_OPTIONAL_BYTES = 32768
@@ -138,7 +139,8 @@ def _failure_reasons(error):
                     'INVALID_PLAN_STRUCTURE': 'INVALID_STRUCTURED_OUTPUT'}
         return [dict(**safe_validation_issues([issue])[0],
                      reason_code=issue.reason_code or fallback.get(issue.code, 'UNKNOWN'),
-                     root_cause_known=bool(issue.reason_code or issue.code in fallback))
+                     root_cause_known=(issue.reason_code != 'UNKNOWN' and
+                                       bool(issue.reason_code or issue.code in fallback)))
                 for issue in error.issues[:8]]
     if isinstance(error, RetryableLLMError):
         category = error.category

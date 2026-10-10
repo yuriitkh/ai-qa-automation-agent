@@ -38,6 +38,17 @@ classified without saving their values. Unknown exception text is never used to
 infer an exact cause. Browser action failures without established precondition
 or missing-target evidence retain an unknown underlying cause.
 
+For output text assertions, `OUTPUT_VALUE_ONLY_IN_STEP` means the literal occurs
+only in an atomic TestStep while a related original TestCase description remains
+authoritative. Generated/elaborated step text cannot upgrade that description.
+Clarify the original requirement with confirmed wording, or supply deterministic
+evidence at the asserted target. `OUTPUT_VALUE_NOT_GROUNDED` means neither the
+authoritative requirement nor the supplied target-bound observations support
+the output literal. These codes describe validation evidence, not proof of an AI
+or product defect. An unavailable historical candidate remains `UNKNOWN`;
+explicit `UNKNOWN` also keeps `root_cause_known` false. Exact-message requirements
+cannot be replaced with structural visibility checks.
+
 **Export Diagnostics** provides JSON or an in-memory ZIP containing only
 `diagnostics.json` and `summary.txt`. Downloads are available for an operation,
 Run, or current progress job. UUID-based filenames and fixed archive members
