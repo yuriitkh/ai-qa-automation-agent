@@ -4,6 +4,7 @@ import argparse
 import json
 import re
 import logging
+import socket
 from secrets import token_urlsafe, compare_digest
 import mimetypes
 from dataclasses import dataclass, field
@@ -292,7 +293,10 @@ class LocalWebApplication:
 
     def _valid_control_request(self, body, headers, *, max_bytes=_MAX_FORM_BODY_BYTES) -> bool:
         request_headers = {key.lower(): value for key, value in (headers or {}).items()}
-        form, error = _parse_form_body(body, max_bytes=max_bytes)
+        form, error = _parse_form_body(
+            body, max_bytes=max_bytes, include_csrf=True,
+            allow_repeated_fields={"test_case_id", "case", "suite"},
+        )
         if error:
             return False
         token = request_headers.get("x-qa-csrf", form.get("_csrf", [""])[0])
@@ -301,12 +305,8 @@ class LocalWebApplication:
         if request_headers.get("sec-fetch-site") == "cross-site":
             return False
         host = request_headers.get("host")
-        if host:
-            try:
-                if urlsplit("http://" + host).hostname not in {"localhost", "127.0.0.1", "::1"}:
-                    return False
-            except ValueError:
-                return False
+        if host and not _valid_request_host(host):
+            return False
         origin = request_headers.get("origin")
         if origin and (not host or origin != "http://" + host):
             return False
@@ -386,11 +386,22 @@ class LocalWebApplication:
         )
 
     def handle(self, method: str, target: str, body: bytes | str | None = None, *, headers=None) -> WebResponse:
-        parsed = urlsplit(target)
+        try:
+            parsed = urlsplit(target)
+        except ValueError:
+            return WebResponse.json(400, '{"error":"Invalid request target."}')
+        # Trusted callers follow redirect Locations including UI anchors. Browsers
+        # never transmit those fragments; reject them on actual HTTP requests.
+        if not target.startswith("/") or target.startswith("//") or parsed.netloc or (parsed.fragment and headers is not None):
+            return WebResponse.json(400, '{"error":"Invalid request target."}')
         path = parsed.path
         query = parse_qs(parsed.query)
         parts = path.strip("/").split("/")
         if method.upper() == "POST":
+            # Headers distinguish HTTP dispatch from trusted in-process callers.
+            # Every network mutation, including exports, requires the page token.
+            if headers is not None and not self._valid_control_request(body, headers, max_bytes=_request_body_limit(parts)):
+                return WebResponse.json(403, '{"error":"Request validation failed. Refresh this page and retry."}')
             protected = parts[-1:] in (["stop"], ["preferences"]) or (parts[:2] == ["settings", "reliability"] and parts[-1:] == ["cancel"]) or parts == ['settings', 'diagnostics']
             definition_edit = (len(parts) == 3 and parts[0] == "test-cases" and parts[2] == "edit") or (len(parts) == 4 and parts[:2] == ["test-cases", "review"] and parts[3] in {"save", "cancel", "regenerate"})
             recovery_edit = len(parts) == 8 and parts[0] == 'test-cases' and parts[2:4] == ['automation', 'steps'] and parts[5] == 'recovery'
@@ -5017,6 +5028,13 @@ class LocalWebApplication:
         current: str | None = None,
         breadcrumbs: list[tuple[str, str]] | None = None,
     ) -> str:
+        def protect_form(match):
+            form = match.group(0)
+            if not re.search(r'\bmethod\s*=\s*[\"\']post[\"\']', match.group(1), re.I) or re.search(r'\bname\s*=\s*[\"\']_csrf[\"\']', form):
+                return form
+            return match.group(1) + f'<input type="hidden" name="_csrf" value="{escape_html(self._csrf_token)}">' + match.group(2)
+
+        body = re.sub(r'(<form\b[^>]*>)(.*?</form>)', protect_form, body, flags=re.I | re.S)
         nav_items = []
         links = [("Dashboard", "/"), ("Test Cases", "/test-cases"), ("Export", "/export"), ("Drafts", "/drafts"), ("Runs", "/runs"), ("System Health", "/system/health")]
         if self._test_suites is not None:
@@ -5168,56 +5186,113 @@ def create_application(
     )
 
 
+def _valid_request_host(value: str, *, port: int | None = None) -> bool:
+    """Accept unambiguous loopback authorities, never DNS-rebinding names."""
+    if not value or any(character.isspace() for character in value):
+        return False
+    try:
+        parsed = urlsplit("http://" + value)
+        request_port = parsed.port
+        return (
+            parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+            and parsed.username is None and parsed.password is None
+            and not parsed.path and not parsed.query and not parsed.fragment
+            and (port is None or (request_port if request_port is not None else 80) == port)
+        )
+    except ValueError:
+        return False
+
+
+def _request_body_limit(parts: list[str]) -> int:
+    if parts == ["drafts"] or (len(parts) == 3 and parts[0] == "drafts") or parts in (["test-cases", "manual"], ["test-cases", "manual", "prepare"]) or (len(parts) == 3 and parts[0] == "test-cases" and parts[2] == "edit"):
+        return _MAX_MANUAL_FORM_BODY_BYTES
+    if len(parts) == 8 and parts[0] == "test-cases" and parts[2:4] == ["automation", "steps"] and parts[5] == "recovery":
+        return 64 * 1024
+    if len(parts) == 4 and parts[:2] == ["test-cases", "review"] and parts[3] in {"save", "regenerate"}:
+        return _MAX_DRAFT_SAVE_BODY_BYTES
+    if parts == ["test-cases", "generate"]:
+        return _MAX_AUTHORING_FORM_BODY_BYTES
+    if parts == ["test-cases", "export"]:
+        return 64 * 1024
+    return _MAX_FORM_BODY_BYTES
+
+
 def create_http_server(
     application: LocalWebApplication,
     host: str = "127.0.0.1",
     port: int = 8000,
 ) -> ThreadingHTTPServer:
     class Handler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:
-            response = application.handle("GET", self.path)
+        def _valid_headers(self) -> bool:
+            hosts = self.headers.get_all("Host", [])
+            if len(hosts) != 1 or not _valid_request_host(hosts[0], port=self.server.server_port):
+                self.close_connection = True
+                self._send(WebResponse.json(403, '{"error":"Local same-origin requests only."}'))
+                return False
+            # Duplicate security headers cannot be collapsed into a trusted value.
+            if any(len(self.headers.get_all(name, [])) > 1 for name in ("Origin", "X-QA-CSRF", "Sec-Fetch-Site")):
+                self.close_connection = True
+                self._send(WebResponse.json(400, '{"error":"Ambiguous request headers."}'))
+                return False
+            return True
+
+        def _dispatch(self, method: str, body=None) -> None:
+            try:
+                response = application.handle(method, self.path, body, headers=dict(self.headers))
+            except Exception:
+                # Exceptions may carry API credentials, submitted data or local paths.
+                # Never send or log their contents at the HTTP boundary.
+                response = WebResponse.json(500, '{"error":"The request could not be completed."}')
             self._send(response)
 
+        def do_GET(self) -> None:
+            if self._valid_headers():
+                self._dispatch("GET")
+
         def log_message(self, format: str, *args) -> None:
-            if should_suppress_successful_progress_log(
-                getattr(self, "command", ""), self.path,
-                getattr(self, "_response_status", None),
-            ):
-                return
-            super().log_message(format, *args)
+            try:
+                if should_suppress_successful_progress_log(
+                    getattr(self, "command", ""), self.path,
+                    getattr(self, "_response_status", None),
+                ):
+                    return
+            except ValueError:
+                pass
+            # Request targets and error arguments can contain user data or tokens.
+            command = getattr(self, "command", "HTTP")
+            super().log_message("%s %s", command if command in {"GET", "POST"} else "HTTP", getattr(self, "_response_status", "-"))
 
         def do_POST(self) -> None:
-            try:
-                content_length = int(self.headers.get("Content-Length", "0"))
-            except ValueError:
-                content_length = 8193
-            request_path = urlsplit(self.path).path.strip("/").split("/")
-            if request_path == ["drafts"] or (
-                len(request_path) == 3 and request_path[0] == "drafts"
-            ) or request_path == ["test-cases", "manual"] or (
-                len(request_path) == 3 and request_path[0] == "test-cases" and request_path[2] == "edit"
-            ) or request_path == ["test-cases", "manual", "prepare"]:
-                max_body_bytes = _MAX_MANUAL_FORM_BODY_BYTES
-            elif len(request_path) == 8 and request_path[0] == 'test-cases' and request_path[2:4] == ['automation', 'steps'] and request_path[5] == 'recovery':
-                max_body_bytes = 64 * 1024
-            elif (
-                len(request_path) == 4
-                and request_path[:2] == ["test-cases", "review"]
-                and request_path[3] in {"save", "regenerate"}
-            ):
-                max_body_bytes = _MAX_DRAFT_SAVE_BODY_BYTES
-            elif request_path == ["test-cases", "generate"]:
-                max_body_bytes = _MAX_AUTHORING_FORM_BODY_BYTES
-            elif request_path == ["test-cases", "export"]:
-                max_body_bytes = 64 * 1024
-            else:
-                max_body_bytes = _MAX_FORM_BODY_BYTES
-            if content_length < 0 or content_length > max_body_bytes:
+            if not self._valid_headers():
+                return
+            lengths = self.headers.get_all("Content-Length", [])
+            if self.headers.get_all("Transfer-Encoding", []) or len(lengths) != 1 or not lengths[0].isascii() or not lengths[0].isdecimal():
                 self.close_connection = True
-                body = b"x" * (max_body_bytes + 1)
-            else:
+                self._send(WebResponse.json(400, '{"error":"Invalid request framing."}'))
+                return
+            try:
+                content_length = int(lengths[0])
+                request_path = urlsplit(self.path).path.strip("/").split("/")
+            except ValueError:
+                self.close_connection = True
+                self._send(WebResponse.json(400, '{"error":"Invalid request."}'))
+                return
+            max_body_bytes = _request_body_limit(request_path)
+            if content_length > max_body_bytes:
+                self.close_connection = True
+                self._send(WebResponse.json(413, '{"error":"The request was too large."}'))
+                return
+            try:
                 body = self.rfile.read(content_length)
-            self._send(application.handle("POST", self.path, body, headers=dict(self.headers)))
+            except (TimeoutError, OSError):
+                self.close_connection = True
+                self._send(WebResponse.json(408, '{"error":"Request body timed out."}'))
+                return
+            if len(body) != content_length:
+                self.close_connection = True
+                self._send(WebResponse.json(400, '{"error":"Incomplete request body."}'))
+                return
+            self._dispatch("POST", body)
 
         def _send(self, response: WebResponse) -> None:
             self._response_status = response.status
@@ -5227,14 +5302,26 @@ def create_http_server(
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header(
                 "Content-Security-Policy",
-                "default-src 'self'; style-src 'unsafe-inline'; img-src 'self'; object-src 'none'",
+                "default-src 'self'; style-src 'unsafe-inline'; img-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
             )
+            self.send_header("Cache-Control", "no-store")
+            # no-referrer makes Chromium navigation POSTs send Origin: null.
+            # same-origin preserves local form origins without external referrers.
+            self.send_header("Referrer-Policy", "same-origin")
+            self.send_header("X-Frame-Options", "DENY")
             for name, value in response.headers.items():
                 self.send_header(name, value)
             self.end_headers()
             self.wfile.write(response.body)
 
     class ApplicationHTTPServer(ThreadingHTTPServer):
+        address_family = socket.AF_INET6 if ":" in host else socket.AF_INET
+
+        def get_request(self):
+            connection, address = super().get_request()
+            connection.settimeout(10)
+            return connection, address
+
         def server_close(self) -> None:
             try:
                 super().server_close()
@@ -5480,6 +5567,7 @@ def _parse_form_body(
     *,
     max_bytes: int = _MAX_FORM_BODY_BYTES,
     allow_repeated_fields: set[str] | None = None,
+    include_csrf: bool = False,
 ) -> tuple[dict[str, list[str]], str | None]:
     if isinstance(body, bytes):
         try:
@@ -5488,7 +5576,7 @@ def _parse_form_body(
             return {}, "The request was not valid form data."
     else:
         form_body = body or ""
-    if len(form_body) > max_bytes:
+    if len(form_body.encode("utf-8")) > max_bytes:
         return {}, "The request was too large."
     try:
         values = parse_qs(
@@ -5503,6 +5591,8 @@ def _parse_form_body(
     allowed_repeated = allow_repeated_fields or set()
     if any(len(items) != 1 and key not in allowed_repeated for key, items in values.items()):
         return {}, "The request contained ambiguous form fields."
+    if not include_csrf:
+        values.pop("_csrf", None)
     return values, None
 
 
@@ -5912,6 +6002,16 @@ def _inline_invalid_attrs(error_id: str, error: str | None) -> str:
 
 
 _UI_JAVASCRIPT = r"""
+// Dynamic POST forms receive the same token as server-rendered forms.
+document.addEventListener('submit', (event) => {
+  const form = event.target;
+  const token = document.querySelector('meta[name="qa-csrf-token"]')?.content;
+  if (form instanceof HTMLFormElement && form.method.toLowerCase() === 'post' && token && !form.querySelector('[name="_csrf"]')) {
+    const input = document.createElement('input');
+    input.type = 'hidden'; input.name = '_csrf'; input.value = token;
+    form.append(input);
+  }
+}, true);
 (() => {
   document.querySelectorAll('[data-structured-editor]').forEach((form) => {
     const payload = form.querySelector('[data-step-payload]');

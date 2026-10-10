@@ -59,7 +59,7 @@ class PersistedTestCaseBrowserFlowTests(unittest.TestCase):
                     "POST",
                     f"/test-cases/{test_case.id}/run",
                     body="workflow=REGRESSION",
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    headers={"Content-Type": "application/x-www-form-urlencoded", "X-QA-CSRF": application._csrf_token},
                 )
                 response = connection.getresponse()
                 self.assertEqual(response.status, 303)

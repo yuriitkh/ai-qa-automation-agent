@@ -244,7 +244,10 @@ def test_browser_run_stop_waits_for_action_and_owner_cleanup_and_freezes_policy(
             assert record.evidence_policy.mode.value == 'FAILURES_ONLY'
             assert record.cookie_consent.policy.value == 'AUTO_HANDLE'
             assert policies[:2] == [('AUTO_HANDLE','FAILURES_ONLY')]*2
-            response = page.request.post(f'{origin}/test-cases/{case.id}/run', form={'workflow':'REGRESSION'}, max_redirects=0)
+            response = page.request.post(f'{origin}/test-cases/{case.id}/run', form={
+                'workflow': 'REGRESSION',
+                '_csrf': page.locator('meta[name="qa-csrf-token"]').get_attribute('content'),
+            }, max_redirects=0)
             assert response.status == 303
             next_job = response.headers['location'].rsplit('/',1)[-1]
             finished = eventually(lambda: app._progress_store.get(next_job), lambda snapshot: snapshot.finished_at is not None)

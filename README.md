@@ -1,5 +1,44 @@
 # AI QA Agent
 
+## Demo v0.1.0 quick start
+
+Local, single-user QA demo: author and review TestCases, generate gated browser
+plans, approve exact versions, validate with Playwright, inspect reports and
+export standalone automation. This is a demo release preparation, not commercial
+production readiness. Python **3.13** is the supported and locally verified runtime.
+
+From a local checkout in PowerShell:
+
+```powershell
+py -3.13 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python -m playwright install chromium
+Copy-Item .env.example .env
+New-Item -ItemType Directory -Force .runtime/demo-v0.1.0 | Out-Null
+python -m qa_agent.demo --database .runtime/demo-v0.1.0/demo.sqlite3 --demo-base-url http://127.0.0.1:8000/demo-target/registration
+python -m qa_agent.web --database .runtime/demo-v0.1.0/demo.sqlite3 --evidence-directory .runtime/demo-v0.1.0/evidence --host 127.0.0.1 --port 8000
+```
+
+Open <http://127.0.0.1:8000>; the browser fixture is at
+<http://127.0.0.1:8000/demo-target/registration>. Use a new demo directory to keep
+existing data separate. Seeded history is synthetic; it does not prove a browser
+run passed. No API key is needed to browse it. `.env` is a template for environment
+configuration and is **not automatically loaded**; see the installation guide.
+
+Run the complete offline suite in another activated terminal:
+
+```powershell
+python -m pytest -q --ignore=tests/integration/test_openrouter.py --deselect=tests/test_browser_discovery.py::BrowserDiscoveryTests::test_selenium_disabled_input_visible_text_selector_matches_its_element
+```
+
+See [installation, architecture, workflows, limitations and demo checklist](docs/DEMO_V0_1_0.md),
+[release notes](docs/RELEASE_NOTES_v0.1.0.md), and
+[M5 verification record](docs/M5_SECURITY_CI_DEMO.md).
+Live LLM generation reliability, TypeScript exporter runtime and C# exporter
+runtime are **NOT TESTED** for this release preparation. Python export is tested
+against isolated local browser fixtures.
+
 ## Run outcomes and reports
 
 Run Progress, Run Details, TestCase history, suite summaries and dashboard counts
@@ -275,13 +314,14 @@ Seed a small set of safe demonstration runs, then launch the UI against the
 same database:
 
 ```powershell
-python -m qa_agent.demo --database .\qa_agent.db
-python -m qa_agent.web --database .\qa_agent.db
+python -m qa_agent.demo --database .runtime/demo-v0.1.0/demo.sqlite3
+python -m qa_agent.web --database .runtime/demo-v0.1.0/demo.sqlite3 --evidence-directory .runtime/demo-v0.1.0/evidence
 ```
 
 Open <http://127.0.0.1:8000>. The seed includes an executable local
-registration TestCase at `/demo-target/registration`; its deliberate missing
-confirmation assertion demonstrates a real browser failure and screenshot.
+registration TestCase at `/demo-target/registration`. Its seeded outcomes are
+synthetic examples. Live execution can expose incomplete assertions and fixture
+limitations; only a newly recorded browser run supplies execution evidence.
 Re-running the seed skips existing demo run IDs and preserves other run history.
 
 ### Live execution progress

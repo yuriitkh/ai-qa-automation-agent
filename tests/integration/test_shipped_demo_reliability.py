@@ -36,7 +36,7 @@ def test_shipped_registration_script_runs_under_actual_csp(tmp_path):
         try:
             page = browser.new_page()
             response = page.goto(origin + "/demo-target/registration")
-            assert response.headers["content-security-policy"] == "default-src 'self'; style-src 'unsafe-inline'; img-src 'self'; object-src 'none'"
+            assert response.headers["content-security-policy"] == "default-src 'self'; style-src 'unsafe-inline'; img-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
             assert page.locator("script:not([src])").count() == 0
             script = page.request.get(origin + "/assets/demo-registration.js")
             assert script.status == 200 and script.headers["content-type"].startswith("application/javascript")
