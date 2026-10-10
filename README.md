@@ -391,9 +391,12 @@ package an executable or install dependencies.
 
 ### Portable automation, code export, and Test Suites
 
-Open a saved TestCase with a complete set of automation plans and use its
-**Export** panel to download a versioned Portable TestPlan JSON file or ordinary
-Playwright source for Python, TypeScript, or C#. Exports use the currently saved
+Open **Export**, select saved TestCases or Test Suites, and download a versioned
+Portable TestPlan JSON file or a standalone Playwright project for Python,
+TypeScript, or C#. Project downloads require current approved automation,
+successful Browser Validation and **Automation Ready** status. Existing legacy
+approval rules are preserved. Single-file source routes remain available for
+review and explicitly label that source as review-only. Exports use the currently saved
 TestPlanVersion for each TestStep. Export is deterministic and local: it does
 not call an LLM, regenerate automation, or require the AI QA Agent runtime in
 the generated tests. The source preserves the saved Playwright locator strings
@@ -402,8 +405,8 @@ Portable JSON includes the TestCase name, base URL, preconditions, ordered
 segments, and exact plan versions; it omits the original authoring scenario and
 provider data.
 
-From **Test Cases**, select multiple rows and choose Portable JSON or one
-Playwright language to download a ZIP project. A Test Suite is an organizational
+Use the **Export** workspace to select multiple cases and choose Portable JSON or
+one Playwright language to download a ZIP project. A Test Suite is an organizational
 group with an explicit member order; create one from **Test Suites**, then add,
 remove, reorder, or export its saved TestCases. ZIP files contain a README,
 portable plan copies, a manifest with TestCase and plan-version provenance, and
@@ -414,9 +417,61 @@ Portable TestPlan JSON is versioned and currently export-only. Import is not
 implemented in this milestone. Export requires a valid saved plan for every
 TestStep; a partial TestCase remains executable through the existing Automation
 workflow but cannot be exported as a complete source project.
-Portable JSON retains each TestStep failure policy. Generated source is one
-standard Playwright test per TestCase, so the target test framework controls
-whether later actions run after a failed assertion.
+Generated source is one test per TestCase. TestSteps in the same segment share a
+page; segments share a browser context. `CONTINUE` records the failure and runs
+the next TestStep; `BLOCK_REST` fails immediately. Recorded failures always fail
+the exported test. Unsupported actions or parameters fail export explicitly.
+
+Standalone project layouts preserve the existing language directories:
+
+```text
+Python                         TypeScript                  C# (NUnit)
+requirements.txt               package.json                AIQAAgent.Export.sln
+pytest.ini                     playwright.config.ts        csharp/AIQAAgent.Export.csproj
+python/tests/conftest.py        tsconfig.json               csharp/export.runsettings
+python/tests/test_tc_*.py       typescript/tests/*.spec.ts  csharp/*Tests.cs
+.github/workflows/tests.yml
+```
+
+Each ZIP also contains `README.md`, `export-manifest.json`, and `portable/*.testplan.json`.
+The manifest records export eligibility separately from standalone execution,
+which it labels `NOT_TESTED`; running the target framework reports results normally. ZIP bytes
+are deterministic for the same saved versions and installed dependency versions;
+`generated_at` is the latest selected version's timestamp.
+
+Python uses installed pytest/Playwright versions and its own browser fixtures,
+without a pytest plugin dependency. TypeScript pins Playwright Test to the
+installed upstream Playwright version and needs no separate TypeScript compiler.
+C# retains the established NUnit package versions and Playwright's `PageTest`
+browser lifecycle. Dependencies are never downloaded during export.
+
+After unpacking and installing the documented dependencies and browser, run
+`python -m pytest -q`, `npx playwright test`, or `dotnet test` from the project root.
+Set `BASE_URL` to an HTTP(S) origin to replace the original TestCase origin while
+preserving URL paths, queries, fragments, and navigation to other origins. Python
+and TypeScript accept `BROWSER=chromium|firefox|webkit` and `HEADLESS=true|false`;
+C# uses NUnit runsettings and `dotnet test -- Playwright.BrowserName=firefox
+Playwright.LaunchOptions.Headless=false`. `TIMEOUT_MS` or the individual
+`ACTION_TIMEOUT_MS`, `ASSERTION_TIMEOUT_MS`, and `NAVIGATION_TIMEOUT_MS` variables
+configure positive millisecond timeouts. TypeScript also supports `TEST_TIMEOUT_MS`.
+The generated READMEs include installation and CI commands; Python includes a
+minimal standalone GitHub Actions workflow. No service is contacted by exporting it.
+
+CLI export uses the same exporter, reads a temporary snapshot of the selected
+database, makes no provider requests, and refuses to overwrite an output file:
+
+```powershell
+python -m qa_agent export --database .\saved.sqlite3 --test-case TC-0001 --format python --output .\standalone.zip
+python -m qa_agent export --database .\saved.sqlite3 --test-case TC-0001 --format python --source-review --output .\test_review.py
+```
+
+Repeat `--test-case` for bulk projects. Review source requires one case. Export
+rejects local paths, credential-bearing URLs, known configured secrets, credential
+field values and recognizable credential literals, including in portable metadata.
+It fails without echoing those values rather than changing saved inputs/assertions.
+Use secret-free plans and review the test data: an arbitrary unlabeled value cannot
+always be distinguished from ordinary test data. Preconditions remain documented
+in portable JSON; the exporter does not invent account setup or authentication.
 
 ### System Readiness
 
