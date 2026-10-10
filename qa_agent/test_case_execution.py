@@ -161,7 +161,7 @@ class TestCaseExecutionService:
                 )
             )
         )
-        needs_candidate_review = any(self._candidate_review_required(version_id) for _, _, version_id in versions)
+        needs_candidate_review = any(self._requires_candidate_review(version_id) for _, _, version_id in versions)
         if needs_candidate_review and (
             self._test_case_review is None
             or self._test_case_review.record(test_case.id) is None
@@ -228,7 +228,7 @@ class TestCaseExecutionService:
             AutomationStatus.AUTOMATION_FAILED,
         }:
             return "Generate or repair automation for the current TestCase before adding it to a Suite Run."
-        needs_candidate_review = any(self._candidate_review_required(item.test_plan_version_id) for item in selected_versions.selections)
+        needs_candidate_review = any(self._requires_candidate_review(item.test_plan_version_id) for item in selected_versions.selections)
         if needs_candidate_review and (
             self._test_case_review is None or self._test_case_review.record(test_case.id) is None
         ):
@@ -246,6 +246,10 @@ class TestCaseExecutionService:
         if record.approved_plan_fingerprint != fingerprint:
             return "Approve the current saved automation for Validation before running the suite."
         return None
+
+    def _requires_candidate_review(self, version_id):
+        version = self._plan_store.get_version(version_id)
+        return bool(version and version.manual_recovery) or self._candidate_review_required(version_id)
 
     def run(
         self,

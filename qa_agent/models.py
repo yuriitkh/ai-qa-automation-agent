@@ -391,6 +391,12 @@ class AssertionGroundingEntry(BaseModel):
     covered_expectation_indexes: tuple[int, ...] = ()
 
 
+class ManualRecoverySource(BaseModel):
+    model_config = ConfigDict(frozen=True, extra='forbid')
+    operation_id: UUID
+    previous_version_id: UUID | None = None
+
+
 class TestPlanVersion(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -407,6 +413,7 @@ class TestPlanVersion(BaseModel):
     # It is separate from QATestPlan so the canonical executable/export format
     # remains unchanged. Missing metadata is valid for legacy and edited plans.
     locator_identity: tuple[LocatorIdentityEntry, ...] | None = None
+    manual_recovery: ManualRecoverySource | None = None
 
     @model_validator(mode="after")
     def validate_assertion_grounding_indexes(self) -> "TestPlanVersion":

@@ -609,9 +609,10 @@ class QATestPipeline:
                 generated_plans.append(generated_plan)
                 supervisor = getattr(self._plan_generator, "supervisor", None)
                 candidate = supervisor.requires_review(plan_version.id) if supervisor else None
-                if candidate is not None and not self._candidate_review_approved(test_case):
-                    review = AutomationReviewRequired(candidate.id)
-                    emit_progress_event(ExecutionEventType.RELIABILITY_READY_FOR_REVIEW, step=test_step, message=str(review), reliability_operation_id=candidate.id)
+                if (candidate is not None or plan_version.manual_recovery is not None) and not self._candidate_review_approved(test_case):
+                    operation_id = candidate.id if candidate else plan_version.manual_recovery.operation_id
+                    review = AutomationReviewRequired(operation_id)
+                    emit_progress_event(ExecutionEventType.RELIABILITY_READY_FOR_REVIEW, step=test_step, message=str(review), reliability_operation_id=operation_id)
                     raise PipelineStageError("automation review", str(review)) from review
                 execution_outcome = self._execute_plan(
                     test_step, plan_version, trace,

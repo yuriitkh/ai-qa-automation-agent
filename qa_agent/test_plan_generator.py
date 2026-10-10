@@ -106,6 +106,12 @@ class LLMTestPlanGenerator(TestPlanGenerator):
         repairing = False
         def request(action, error):
             nonlocal previous_candidate, repairing
+            operation = current_reliability_operation()
+            if operation and operation.supervisor.recovery_store is not None and not operation.record.attempts:
+                try:
+                    operation.supervisor.recovery_store.prepare(operation.record, test_step, discovery_result, requirement_context, step_context)
+                except Exception:
+                    pass
             repairing = error is not None
             request_task = self._build_repair_task(task, error.issues) if isinstance(error, PlanValidationError) else (
                 task + "\nReturn a complete valid JSON plan matching the supplied schema. Preserve all original actions, requirements, assertions and locator identities. Do not invent values or selectors."
@@ -131,6 +137,8 @@ class LLMTestPlanGenerator(TestPlanGenerator):
             except PlanValidationError as error:
                 from qa_agent.diagnostic_mode import DiagnosticLevel, enabled
                 operation = current_reliability_operation()
+                if operation:
+                    operation.capture_recovery(value)
                 if operation and enabled(operation.record.settings.diagnostic_level, DiagnosticLevel.DEBUG):
                     try:
                         from qa_agent.candidate_diagnostics import rejected_candidate_diagnostics

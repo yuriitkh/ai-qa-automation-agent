@@ -406,6 +406,13 @@ class ReliabilityOperation:
         except Exception:
             pass
 
+    def capture_recovery(self, candidate):
+        try:
+            if self.supervisor.recovery_store is not None and self.record.outcome == 'RUNNING':
+                self.supervisor.recovery_store.capture(self.record, candidate)
+        except Exception:
+            pass  # Recovery availability must never change generation or its gates.
+
     @property
     def remaining_seconds(self):
         return max(0.0, self.deadline - time.monotonic())
@@ -565,10 +572,11 @@ class ReliabilityOperation:
 
 
 class AutomationReliabilitySupervisor:
-    def __init__(self, repository=None, *, timeout_seconds: float = OVERALL_TIMEOUT_SECONDS, max_inflight: int = 4):
+    def __init__(self, repository=None, *, timeout_seconds: float = OVERALL_TIMEOUT_SECONDS, max_inflight: int = 4, recovery_store=None):
         if timeout_seconds <= 0 or timeout_seconds > OVERALL_TIMEOUT_SECONDS:
             raise ValueError("Generation time limit must be positive and no more than 60 seconds.")
         self.repository = ResilientReliabilityRepository(repository or InMemoryReliabilityRepository())
+        self.recovery_store = recovery_store
         self.timeout_seconds = timeout_seconds
         self._capacity = BoundedSemaphore(max_inflight)
         self._active: dict[UUID, tuple[ReliabilityOperation, Any]] = {}
@@ -706,6 +714,11 @@ class AutomationReliabilitySupervisor:
             record.finished_at = datetime.now(timezone.utc)
             record.elapsed_ms = max(0, int((time.monotonic() - operation.started) * 1000))
             try:
+                if record.outcome == 'READY_FOR_REVIEW' and self.recovery_store is not None:
+                    try:
+                        self.recovery_store.discard(record.id)
+                    except Exception:
+                        pass
                 self.repository.save(record)
                 try:
                     self.repository.prune_diagnostics()

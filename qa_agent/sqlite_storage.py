@@ -268,6 +268,8 @@ class SQLitePlanStore(_SQLiteStorage):
                 connection.execute(
                     "ALTER TABLE test_plan_versions ADD COLUMN locator_identity_json TEXT"
                 )
+            if "manual_recovery_json" not in columns:
+                connection.execute("ALTER TABLE test_plan_versions ADD COLUMN manual_recovery_json TEXT")
             # Migrate the one current version from databases created by the
             # previous schema. Earlier versions cannot be reconstructed.
             connection.execute(
@@ -318,6 +320,7 @@ class SQLitePlanStore(_SQLiteStorage):
                     plan_version.qa_test_plan.model_dump_json(),
                     _grounding_json(plan_version),
                     _locator_identity_json(plan_version),
+                    plan_version.manual_recovery.model_dump_json() if plan_version.manual_recovery else None,
                 )
                 actual = (
                     by_id["test_step_id"], by_id["test_plan_id"],
@@ -326,6 +329,7 @@ class SQLitePlanStore(_SQLiteStorage):
                     by_id["qa_test_plan_json"],
                     by_id["assertion_grounding_json"],
                     by_id["locator_identity_json"],
+                    by_id["manual_recovery_json"],
                 )
                 if actual != expected:
                     raise ValueError("A TestPlanVersion ID cannot be reused for different content.")
@@ -342,8 +346,8 @@ class SQLitePlanStore(_SQLiteStorage):
                     INSERT INTO test_plan_versions (
                         version_id, test_step_id, test_plan_id, version_number,
                         created_at, origin, qa_test_plan_json, assertion_grounding_json,
-                        locator_identity_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        locator_identity_json, manual_recovery_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         str(plan_version.id), str(test_step_id), str(test_plan.id),
@@ -352,6 +356,7 @@ class SQLitePlanStore(_SQLiteStorage):
                         plan_version.qa_test_plan.model_dump_json(),
                         _grounding_json(plan_version),
                         _locator_identity_json(plan_version),
+                        plan_version.manual_recovery.model_dump_json() if plan_version.manual_recovery else None,
                     ),
                 )
             connection.execute(
@@ -438,6 +443,7 @@ class SQLitePlanStore(_SQLiteStorage):
                 json.loads(row["locator_identity_json"])
                 if row["locator_identity_json"] else None
             ),
+            manual_recovery=json.loads(row['manual_recovery_json']) if row['manual_recovery_json'] else None,
         )
 
 

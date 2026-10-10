@@ -202,6 +202,7 @@ class LocalWebApplication:
         readiness_service: SystemReadinessService | None = None,
         reliability: AutomationReliabilitySupervisor | None = None,
         execution_preferences=None,
+        recovery_discovery=None,
     ) -> None:
         self._csrf_token = token_urlsafe(32)
         self._execution_preferences = execution_preferences or (SQLiteExecutionPreferences(database_path) if database_path is not None else InMemoryExecutionPreferences())
@@ -223,6 +224,12 @@ class LocalWebApplication:
         self._provider_router = provider_router
         self._llm_usage = llm_usage
         self._reliability = reliability
+        from qa_agent.manual_recovery import ManualRecoveryStore
+        from qa_agent.browser_discovery import capture_discovery_result
+        self._recovery_store = (reliability.recovery_store or ManualRecoveryStore()) if reliability else ManualRecoveryStore()
+        self._recovery_discovery = recovery_discovery or capture_discovery_result
+        if reliability:
+            reliability.recovery_store = self._recovery_store
         self._test_suites = test_suites or TestSuiteService(
             InMemoryTestSuiteRepository(), test_cases
         )
@@ -386,6 +393,9 @@ class LocalWebApplication:
         if method.upper() == "POST":
             protected = parts[-1:] in (["stop"], ["preferences"]) or (parts[:2] == ["settings", "reliability"] and parts[-1:] == ["cancel"]) or parts == ['settings', 'diagnostics']
             definition_edit = (len(parts) == 3 and parts[0] == "test-cases" and parts[2] == "edit") or (len(parts) == 4 and parts[:2] == ["test-cases", "review"] and parts[3] in {"save", "cancel", "regenerate"})
+            recovery_edit = len(parts) == 8 and parts[0] == 'test-cases' and parts[2:4] == ['automation', 'steps'] and parts[5] == 'recovery'
+            if recovery_edit and not self._valid_control_request(body, headers, max_bytes=64 * 1024):
+                return WebResponse.json(403, json.dumps({'error': 'Request validation failed. Refresh this page and retry.'}))
             if (protected or definition_edit) and not self._valid_control_request(body, headers, max_bytes=_MAX_MANUAL_FORM_BODY_BYTES if definition_edit else _MAX_FORM_BODY_BYTES):
                 return WebResponse.json(403, json.dumps({"error": "Request validation failed. Refresh this page and retry."}))
             if parts[-1:] == ["stop"]:
@@ -564,6 +574,8 @@ class LocalWebApplication:
         if len(parts) == 4 and parts[0] == "test-cases" and parts[2:] == ["automation", "edit"]:
             test_case_id = _parse_uuid(parts[1])
             return self._automation_editor_page(test_case_id, query) if test_case_id else self._not_found("TestCase not found")
+        if len(parts) == 7 and parts[0] == 'test-cases' and parts[2:4] == ['automation', 'steps'] and parts[5] == 'recovery':
+            return self._recovery_page(parts[1], parts[4], parts[6])
         if (
             len(parts) == 7 and parts[0] == "test-cases"
             and parts[2:4] == ["automation", "steps"]
@@ -604,6 +616,8 @@ class LocalWebApplication:
         return self._not_found("Page not found")
 
     def _handle_post(self, parts: list[str], body: bytes | str | None) -> WebResponse:
+        if len(parts) == 8 and parts[0] == 'test-cases' and parts[2:4] == ['automation', 'steps'] and parts[5] == 'recovery':
+            return self._handle_recovery(parts[1], parts[4], parts[6], parts[7], body)
         if parts == ["settings", "reliability"] and self._reliability is not None:
             return self._handle_reliability_settings(body)
         if parts == ['settings', 'diagnostics'] and self._reliability is not None:
@@ -914,6 +928,7 @@ class LocalWebApplication:
             step["evidence_links"] = []
             step["generation_decisions"] = []
             step['generation_failures'] = []
+            step['recovery_actions'] = []
             step["observation"] = None
             step.setdefault("action_failure", None)
             if saved_step:
@@ -998,6 +1013,9 @@ class LocalWebApplication:
                                 'operation_id': str(operation_id), 'failed_gate': failed_gate,
                                 'reason_codes': [reason['reason_code'] for reason in last['failure_reasons']] or ['UNKNOWN'],
                             })
+                            recovery = self._recovery_link(record)
+                            if recovery:
+                                step['recovery_actions'].append(recovery)
                     except Exception:
                         pass
         if persisted:
@@ -1153,6 +1171,9 @@ class LocalWebApplication:
                 f'<p class="progress-failure">Failed gate: {esc(item["failed_gate"])} · Failure reason: {esc(", ".join(item["reason_codes"]))}</p>'
                 for item in step['generation_failures']
             )
+            decisions += ''.join(f'<p><a href="{esc(item["url"])}">{esc(item["label"])}</a>'
+                + ('' if item['candidate_available'] else ' · The historical candidate is unavailable; start with an empty draft.') + '</p>'
+                for item in step['recovery_actions'])
             step_rows.append(
                 '<li class="progress-step"><span class="progress-symbol" aria-hidden="true">'
                 + ('✓' if step["display_status"] == 'Passed' else '○') + '</span><span>'
@@ -1631,7 +1652,10 @@ class LocalWebApplication:
         field_errors: dict[str, str] | None = None,
         error_message: str | None = None,
         status: int = 200,
+        recovery_entry=None,
+        recovery_record=None,
     ) -> WebResponse:
+        from qa_agent.generation_context import observed_controls
         test_case = self._test_cases.get(test_case_id) if self._test_cases is not None else None
         if test_case is None:
             return self._not_found("TestCase not found")
@@ -1647,7 +1671,7 @@ class LocalWebApplication:
                 "Automation editor unavailable",
                 self._empty_state("Automation editor unavailable", "No saved plan store is configured."),
             ))
-        if self._automation_lifecycle.status(test_case) == AutomationStatus.NEEDS_UPDATE:
+        if recovery_entry is None and self._automation_lifecycle.status(test_case) == AutomationStatus.NEEDS_UPDATE:
             return WebResponse.html(409, self._page("Automation needs update", '<p>Generate updated automation before editing plans for this definition.</p>' + f'<a href="/test-cases/{test_case.id}/plans">View saved plans</a>'))
 
         query = query or {}
@@ -1666,6 +1690,8 @@ class LocalWebApplication:
 
         sections: list[str] = []
         for step in test_case.steps:
+            if recovery_entry is not None and step.id != recovery_entry.step.id:
+                continue
             version = self._plan_store.find(step.id)
             test_plan = self._plan_store.find_test_plan(step.id)
             if version is not None and (test_plan is None or test_plan.id != version.test_plan_id):
@@ -1680,6 +1706,14 @@ class LocalWebApplication:
                 state_url = submitted_values.get("plan_url", "")
                 expected_version = submitted_values.get("expected_version", "0")
                 actions = _automation_submitted_actions(submitted_values)
+            elif recovery_entry is not None:
+                raw = recovery_entry.draft or recovery_entry.candidate or {}
+                segment = next((item for item in test_case.segments if step in item.steps), None)
+                raw_url = raw.get('url') if isinstance(raw.get('url'), str) else ''
+                state_url = raw_url or (recovery_entry.discovery.url if recovery_entry.discovery else None) or (segment.base_url if segment else None) or test_case.base_url or ''
+                expected_version = str(version.version if version else 0)
+                actions = [{'type': row.get('action', ''), 'parameters': row.get('parameters', {}) if isinstance(row.get('parameters'), dict) else {}}
+                           for row in raw.get('steps', []) if isinstance(row, dict)]
             elif version is not None:
                 state_url = version.qa_test_plan.url
                 expected_version = str(version.version)
@@ -1739,6 +1773,45 @@ class LocalWebApplication:
                 + '<button class="button primary" type="submit">Save automation</button>'
                 + f'<a class="button" href="/test-cases/{test_case.id}">Cancel</a></div></form>'
             )
+            if recovery_entry is None and version is not None and version.manual_recovery:
+                source_id = version.manual_recovery.operation_id
+                binding = self._recovery_binding(str(test_case.id), str(step.id), str(source_id))
+                if binding:
+                    context = self._recovery_entry(*binding)
+                    target = f'/test-cases/{test_case.id}/automation/steps/{step.id}/recovery/{source_id}'
+                    form = form.replace(f'/test-cases/{test_case.id}/automation/steps/{step.id}/save', target + '/save')
+                    form = form.replace('<input type="hidden" name="expected_version"',
+                        f'<input type="hidden" name="_csrf" value="{self._csrf_token}"><input type="hidden" name="recovery_revision" value="{context.revision}"><input type="hidden" name="expected_version"', 1)
+                    state += '<p>Validated manual recovery. Further edits run all recovery Quality Gates and require new approval.</p>'
+                else:
+                    form = '<p>Recovery operation metadata is unavailable. This manual version is read-only until its recovery source can be reviewed.</p>'
+            if recovery_entry is not None:
+                base = f'/test-cases/{test_case.id}/automation/steps/{step.id}/recovery/{recovery_entry.operation_id}'
+                form = form.replace(f'/test-cases/{test_case.id}/automation/steps/{step.id}/save', base + '/save')
+                form = form.replace('<input type="hidden" name="expected_version"',
+                    f'<input type="hidden" name="_csrf" value="{self._csrf_token}"><input type="hidden" name="recovery_revision" value="{recovery_entry.revision}"><input type="hidden" name="expected_version"', 1)
+                form = form.replace('<button class="button primary" type="submit">Save automation</button>',
+                    f'<button class="button" type="submit" formaction="{base}/validate">Validate locally</button>'
+                    '<button class="button primary" type="submit">Save validated manual version</button>'
+                    f'<button class="button" type="submit" formaction="{base}/discard" formnovalidate>Discard recovery draft</button>'
+                    f'<button class="button" type="submit" formaction="{base}/discover" formnovalidate>Capture Browser Discovery</button>')
+                source = 'User-edited draft' if recovery_entry.draft is not None else 'AI-generated rejected candidate' if recovery_entry.candidate else 'Empty manual recovery draft'
+                state = f'<p><strong>{source}</strong> · Unapproved; cannot execute or become Automation Ready.</p>'
+                if not recovery_entry.candidate:
+                    state += '<p>The historical candidate is unavailable, expired, discarded, oversized, or predates recovery. This empty draft invents no actions or selectors.</p>'
+                state += '<p>Credentials and password-field values are removed from recovery data. Local recovery does not request an LLM.</p>'
+                from qa_agent.redaction import redact_diagnostic
+                state += f'<p>Original requirements: {escape_html(redact_diagnostic(step.description))}<br>Expected result: {escape_html(redact_diagnostic(step.expected))}</p>'
+                if recovery_record and recovery_record.attempts:
+                    from qa_agent.diagnostic_export import operation_data
+                    attempt = operation_data(recovery_record)['attempts'][-1]
+                    failed = next((name for name, result in attempt['quality_gates'].items() if result == 'FAILED'), 'provider_request' if attempt['provider_status'] == 'FAILED' else 'unknown')
+                    codes = ', '.join(item['reason_code'] for item in attempt['failure_reasons'])
+                    state += f'<p>Failed gate: {escape_html(failed)} · Failure reason: {escape_html(codes or "UNKNOWN")}</p>'
+                state += f'<a href="/settings/reliability/{recovery_entry.operation_id}">Inspect safe generation diagnostics</a>'
+                controls = observed_controls(recovery_entry.discovery) if recovery_entry.discovery else {}
+                state += '<details><summary>Captured Discovery selectors</summary><ul>' + ''.join(f'<li><code>{escape_html(redact_secrets(selector))}</code></li>' for selector in controls) + '</ul></details>'
+                coverage_html = ''
             history = self._plan_store.list_versions(step.id)
             history_html = _automation_history_html(test_case, step.id, version, history)
             sections.append(
@@ -1753,11 +1826,156 @@ class LocalWebApplication:
             + f'<a class="button" href="/test-cases/{test_case.id}">Back to TestCase</a></div>'
             + ''.join(sections)
         )
-        return WebResponse.html(status, self._page(
+        response = WebResponse.html(status, self._page(
             "Edit Automation", content, current="Test Cases",
             breadcrumbs=[("Dashboard", "/"), ("Test Cases", "/test-cases"),
                          (test_case.name, f"/test-cases/{test_case.id}")],
         ))
+        return WebResponse(response.status, response.content_type, response.body, {'Cache-Control': 'no-store', 'Referrer-Policy': 'same-origin'}) if recovery_entry is not None else response
+
+    def _recovery_binding(self, case_text, step_text, operation_text):
+        case_id, step_id, operation_id = (_parse_uuid(value) for value in (case_text, step_text, operation_text))
+        case = self._test_cases.get(case_id) if case_id and self._test_cases else None
+        step = next((item for item in case.steps if item.id == step_id), None) if case else None
+        record = self._reliability.repository.get(operation_id) if self._reliability and operation_id else None
+        if not case or not step or not record or record.test_case_id != case.id or record.test_step_id != step.id or record.outcome != 'NEEDS_ATTENTION':
+            return None
+        return case, step, record
+
+    def _recovery_entry(self, case, step, record):
+        from qa_agent.manual_recovery import recovery_step_context
+        entry = self._recovery_store.get(record.id, case.id, step.id)
+        entry = entry or self._recovery_store.empty(record.id, case, step)
+        if not entry.requirement_context:
+            entry.requirement_context = case.description
+        if entry.step_context is None:
+            entry.step_context = recovery_step_context(case, step)
+        return entry
+
+    def _recovery_is_current(self, entry, case, step):
+        if entry.step != step or entry.requirement_context and entry.requirement_context != case.description:
+            return False
+        if entry.step_context:
+            from qa_agent.manual_recovery import recovery_step_context
+            expected = recovery_step_context(case, step)
+            if entry.step_context.segment_order != expected.segment_order or entry.step_context.previous_steps != expected.previous_steps or entry.step_context.remaining_steps != expected.remaining_steps:
+                return False
+            current = {item.id: item for item in case.steps}
+            if any(current.get(item.id) != item for item in (*entry.step_context.previous_steps, *entry.step_context.remaining_steps)):
+                return False
+        return True
+
+    def _recovery_page(self, case_text, step_text, operation_text):
+        try:
+            bound = self._recovery_binding(case_text, step_text, operation_text)
+            if not bound:
+                return self._not_found('Recovery candidate not found')
+            case, step, record = bound
+            entry = self._recovery_entry(case, step, record)
+            if not self._recovery_is_current(entry, case, step):
+                return WebResponse.html(409, self._page('Recovery needs attention', '<p>The original TestCase requirements changed. Discard this draft and review the current definition.</p>'))
+            return self._automation_editor_page(case.id, recovery_entry=entry, recovery_record=record)
+        except Exception:
+            return WebResponse.html(503, self._page('Recovery unavailable', '<p>Temporary recovery storage is unavailable. No plan was changed.</p>'))
+
+    def _handle_recovery(self, case_text, step_text, operation_text, action, body):
+        from qa_agent.manual_recovery import RecoveryUnavailable, recovery_validation, safe_recovery_form
+        from qa_agent.models import ManualRecoverySource
+        if action not in {'validate', 'save', 'discard', 'discover'}:
+            return self._not_found('Recovery action not found')
+        try:
+            bound = self._recovery_binding(case_text, step_text, operation_text)
+            if not bound:
+                return self._not_found('Recovery candidate not found')
+            case, step, record = bound
+            if self._test_case_review.status(case.id) != TestCaseReviewStatus.APPROVED or self._plan_store is None:
+                return WebResponse.html(409, self._page('Review required', '<p>Approve the TestCase and configure a plan store before recovering automation.</p>'))
+            entry = self._recovery_entry(case, step, record)
+            form, parse_error = _parse_form_body(body, max_bytes=64 * 1024)
+            if parse_error or any(len(items) != 1 for items in form.values()):
+                return WebResponse.html(400, self._page('Invalid recovery form', '<p>Submit one bounded value per recovery field.</p>'))
+            values = {key: items[0] for key, items in form.items()}
+            values.pop('_csrf', None)
+            try:
+                revision = int(values.pop('recovery_revision'))
+            except (KeyError, ValueError):
+                raise RecoveryUnavailable('Reload the recovery draft before editing.')
+            if revision != entry.revision:
+                raise RecoveryUnavailable('This recovery draft changed. Reload before editing.')
+            if action == 'discard':
+                self._recovery_store.discard(record.id)
+                return WebResponse.redirect(f'/settings/reliability/{record.id}')
+            if not self._recovery_is_current(entry, case, step):
+                raise RecoveryUnavailable('Original TestCase requirements changed. Discard this draft and review the current definition.')
+            if action == 'discover':
+                segment = next(item for item in case.segments if any(s.id == step.id for s in item.steps))
+                target = (segment.base_url or case.base_url or (entry.discovery.url if entry.discovery else None))
+                from qa_agent.automation_editor import _valid_http_url
+                if not target or not _valid_http_url(target):
+                    return self._automation_editor_page(case.id, recovery_entry=entry, recovery_record=record,
+                        error_message='Needs Attention: the TestCase needs a safe target URL before Browser Discovery.', status=400)
+                try:
+                    discovery = self._recovery_discovery(target)
+                    if discovery.url != target:
+                        raise ValueError('Unrelated Discovery')
+                    self._recovery_store.update(entry, revision, discovery=discovery)
+                except Exception:
+                    return self._automation_editor_page(case.id, recovery_entry=entry, recovery_record=record,
+                        error_message='Browser Discovery could not be retained. No plan was changed.', status=503)
+                return WebResponse.redirect(f'/test-cases/{case.id}/automation/steps/{step.id}/recovery/{record.id}')
+            try:
+                expected_version = int(values.get('expected_version', ''))
+            except ValueError:
+                raise RecoveryUnavailable('Reload the editor before saving this plan.')
+            current = self._plan_store.find(step.id)
+            if expected_version != (current.version if current else 0):
+                raise RecoveryUnavailable('The current plan changed. Reload and review the latest version.')
+            safe_values = safe_recovery_form(entry, values)
+            raw_draft = {'url': safe_values.get('plan_url', ''), 'steps': [dict(action=row['type'], parameters=row['parameters']) for row in _automation_submitted_actions(safe_values)]}
+            entry = self._recovery_store.update(entry, revision, draft=raw_draft)
+            try:
+                from qa_agent.test_case_quality import quality_issues
+                if quality_issues(case):
+                    raise AutomationEditorError({'actions': 'Needs Attention: the original TestCase requirements are incomplete. Review the definition before recovery.'})
+                edited, grounding = recovery_validation(entry, values)
+            except AutomationEditorError as error:
+                return self._automation_editor_page(case.id, submitted_step_id=step.id, submitted_values=safe_values,
+                    field_errors=error.field_errors, recovery_entry=entry, recovery_record=record, status=400)
+            if action == 'validate':
+                return self._automation_editor_page(case.id, submitted_step_id=step.id, submitted_values=safe_values,
+                    recovery_entry=entry, recovery_record=record,
+                    error_message='Locally validated manual draft. All mandatory Quality Gates passed. No version is saved or approved.')
+            test_plan = self._plan_store.find_test_plan(step.id)
+            if current and (not test_plan or current.test_plan_id != test_plan.id):
+                raise RecoveryUnavailable('The saved plan relationship changed. Reload before saving.')
+            test_plan = test_plan or TestPlan(test_step_id=step.id, name=step.name)
+            version = TestPlanVersion(test_plan_id=test_plan.id, version=expected_version + 1,
+                origin=PlanVersionOrigin.HUMAN_EDITED, qa_test_plan=edited, assertion_grounding=grounding,
+                manual_recovery=ManualRecoverySource(operation_id=record.id, previous_version_id=current.id if current else None))
+            def save_current():
+                latest = self._plan_store.find(step.id)
+                if (latest.id if latest else None) != (current.id if current else None) or self._test_cases.get(case.id) != case:
+                    raise RecoveryUnavailable('The current plan or original TestCase changed during validation. Reload before saving.')
+                self._plan_store.save(step.id, version, test_plan=test_plan)
+            self._recovery_store.commit(entry, save_current)
+            if has_complete_plans(case, self._plan_store):
+                self._automation_lifecycle.mark_automation_completed(case)
+            return WebResponse.redirect(f'/test-cases/{case.id}/automation/edit?saved=1&step={step.id}')
+        except RecoveryUnavailable as error:
+            return WebResponse.html(409, self._page('Recovery needs attention', f'<p>{escape_html(str(error))}</p>'))
+        except Exception:
+            return WebResponse.html(503, self._page('Recovery unavailable', '<p>Recovery could not complete. Review saved versions before retrying; no existing version was overwritten.</p>'))
+
+    def _recovery_link(self, record):
+        if record.outcome != 'NEEDS_ATTENTION' or record.test_case_id is None or self._test_cases is None or self._plan_store is None:
+            return None
+        case = self._test_cases.get(record.test_case_id)
+        if case is None or not any(step.id == record.test_step_id for step in case.steps):
+            return None
+        entry = self._recovery_store.get(record.id, case.id, record.test_step_id)
+        return {'label': 'Edit rejected candidate' if entry and entry.candidate else 'Create manual recovery draft',
+                'url': f'/test-cases/{case.id}/automation/steps/{record.test_step_id}/recovery/{record.id}',
+                'candidate_available': bool(entry and entry.candidate)}
 
     def _automation_version_view(self, test_case_id: UUID, step_id: UUID, version_id: UUID) -> WebResponse:
         test_case = self._test_cases.get(test_case_id) if self._test_cases is not None else None
@@ -1787,6 +2005,9 @@ class LocalWebApplication:
                 expected_result_coverage(step, version)
             )
             + f'<section class="panel"><p>Plan URL: <code>{escape_html(_safe_automation_url_display(version.qa_test_plan.url))}</code></p>'
+            + (f'<p>Validated manual recovery · Source operation: <a href="/settings/reliability/{version.manual_recovery.operation_id}">{version.manual_recovery.operation_id}</a>'
+               + (f' · Previous version ID: {version.manual_recovery.previous_version_id}' if version.manual_recovery.previous_version_id else '')
+               + ' · Explicit approval is required before Browser Validation.</p>' if version.manual_recovery else '')
             + f'<ol>{actions}</ol></section>'
             + (f'<p class="muted">This is the current version.</p>' if current and current.id == version.id else '<p class="muted">Read-only historical version.</p>')
             + f'<div class="actions"><a class="button" href="/test-cases/{test_case.id}/automation/edit">Back to Automation Editor</a>'
@@ -1842,6 +2063,10 @@ class LocalWebApplication:
             )
 
         current = self._plan_store.find(step.id)
+        if current is not None and current.manual_recovery is not None:
+            return WebResponse.html(409, self._page('Manual recovery review required',
+                '<p>Edit this manual version through its recovery form so all Quality Gates run again.</p>'
+                + f'<a href="/test-cases/{test_case.id}/automation/steps/{step.id}/recovery/{current.manual_recovery.operation_id}">Open recovery editor</a>'))
         current_number = current.version if current is not None else 0
         if current_number != expected_version:
             return self._automation_editor_page(
@@ -4762,6 +4987,11 @@ class LocalWebApplication:
                 actions += f'<a class="button" href="/test-cases/{record.test_case_id}/automation/steps/{record.test_step_id}/versions/{version.id}">View saved candidate v{version.version}</a>'
         if record.outcome == "RUNNING":
             actions += f'<form method="post" action="/settings/reliability/{record.id}/cancel"><input type="hidden" name="_csrf" value="{self._csrf_token}"><button class="button" type="submit">Cancel generation</button></form>'
+        recovery = self._recovery_link(record)
+        if recovery:
+            actions += f'<a class="button" href="{esc(recovery["url"])}">{esc(recovery["label"])}</a>'
+            if not recovery['candidate_available']:
+                actions += '<p>The historical candidate is unavailable. An empty recovery draft invents no actions or selectors.</p>'
         content = (
             '<header class="page-heading"><h1>Automation generation operation</h1>' + f'<p>{esc(record.id)}</p><p>{esc(record.outcome.replace("_", " ").title())}</p></header>'
             + '<p>Generation quality is separate from human approval and Browser Validation. No product PASS is inferred.</p>'
@@ -4966,6 +5196,8 @@ def create_http_server(
                 len(request_path) == 3 and request_path[0] == "test-cases" and request_path[2] == "edit"
             ) or request_path == ["test-cases", "manual", "prepare"]:
                 max_body_bytes = _MAX_MANUAL_FORM_BODY_BYTES
+            elif len(request_path) == 8 and request_path[0] == 'test-cases' and request_path[2:4] == ['automation', 'steps'] and request_path[5] == 'recovery':
+                max_body_bytes = 64 * 1024
             elif (
                 len(request_path) == 4
                 and request_path[:2] == ["test-cases", "review"]
@@ -6494,6 +6726,12 @@ _UI_JAVASCRIPT = r"""
       });
       (step.generation_failures || []).forEach((failure) => {
         content.append(textNode('p', `Failed gate: ${failure.failed_gate} · Failure reason: ${failure.reason_codes.join(', ')}`, 'progress-failure'));
+      });
+      (step.recovery_actions || []).forEach((recovery) => {
+        const line = document.createElement('p');
+        line.append(localLink(recovery.url, recovery.label));
+        if (!recovery.candidate_available) line.append(document.createTextNode(' · The historical candidate is unavailable; start with an empty draft.'));
+        content.append(line);
       });
       if (step.observation) content.append(textNode('p', `Observed: ${step.observation}`));
       if (step.action_failure) {

@@ -150,7 +150,8 @@ class TestCaseReviewService:
     def validation_approved_for(self, test_case: TestCase) -> bool:
         record = self.record(test_case.id)
         if record is None:
-            return True
+            return not any(version and version.manual_recovery for version in
+                           (self._plan_store.find(step.id) for step in test_case.steps))
         return (
             record.status == TestCaseReviewStatus.APPROVED
             and record.approved_plan_fingerprint is not None

@@ -93,6 +93,8 @@ def attach_provider_candidate_summary(failure, raw):
     from qa_agent.reliability import current_reliability_operation
     from qa_agent.diagnostic_mode import DiagnosticLevel, enabled
     operation = current_reliability_operation()
+    if operation:
+        operation.capture_recovery(data)
     if operation and not enabled(operation.record.settings.diagnostic_level, DiagnosticLevel.DEBUG):
         return
     failure.rejected_actions = provider_schema_summary(data)
