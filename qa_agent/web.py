@@ -238,7 +238,7 @@ class LocalWebApplication:
             InMemoryTestCaseReviewRepository(), plan_store or InMemoryPlanStore()
         )
         self._testplan_exports = (
-            TestPlanExportService(test_cases, plan_store)
+            TestPlanExportService(test_cases, plan_store, lifecycle=self._automation_lifecycle, review=self._test_case_review)
             if test_cases is not None and plan_store is not None else None
         )
         self._background_runs = (
@@ -2981,7 +2981,7 @@ class LocalWebApplication:
         if self._testplan_exports is None:
             return status, False, "The saved automation exporter is unavailable."
         try:
-            self._testplan_exports.get(test_case.id)
+            self._testplan_exports.get_verified(test_case.id)
         except TestPlanExportError as error:
             reason = "; ".join(dict.fromkeys(blocker.reason for blocker in error.blockers)) or str(error)
             return status, False, reason
@@ -3175,7 +3175,8 @@ class LocalWebApplication:
                 return _download_response(content.encode("utf-8"), filename, "text/plain; charset=utf-8")
             if target.endswith("-zip"):
                 language = target.removesuffix("-zip")
-                exportable = self._testplan_exports.get(test_case_id)
+                exportable = (self._testplan_exports.get(test_case_id) if language == "portable"
+                              else self._testplan_exports.get_verified(test_case_id))
                 if language == "portable":
                     content = portable_zip([exportable])
                     filename = f"{exportable.test_case.public_id or 'testcase'}-portable.zip"
@@ -3726,7 +3727,8 @@ class LocalWebApplication:
             blockers = []
             for case_id in ids:
                 try:
-                    exports.append(self._testplan_exports.get(case_id))
+                    exports.append(self._testplan_exports.get(case_id) if target == "portable"
+                                   else self._testplan_exports.get_verified(case_id))
                 except TestPlanExportError as error:
                     if not error.blockers:
                         raise

@@ -58,6 +58,9 @@ def build_pipeline(
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run one CLI invocation and return the process exit code."""
+    arguments = list(argv) if argv is not None else sys.argv[1:]
+    if arguments and arguments[0] == "export":
+        return _export_main(arguments[1:])
     parser = _build_parser()
     try:
         args = parser.parse_args(argv)
@@ -93,6 +96,77 @@ def main(argv: Sequence[str] | None = None) -> int:
         if result.test_run.status == ExecutionStatus.PASSED
         else EXIT_FAILED
     )
+
+
+def _export_main(argv: Sequence[str]) -> int:
+    """Export through the shared service, using a read-only database snapshot."""
+    import sqlite3
+    import tempfile
+    from qa_agent.automation_lifecycle import AutomationLifecycleService
+    from qa_agent.test_case_review import TestCaseReviewService
+    from qa_agent.testplan_export import TestPlanExportService, TestPlanExportError
+
+    parser = argparse.ArgumentParser(prog="qa_agent export", description="Export saved automation offline without provider requests.")
+    parser.add_argument("--database", required=True, type=Path)
+    parser.add_argument("--test-case", action="append", required=True, help="saved public ID or UUID; repeat for multiple cases")
+    parser.add_argument("--format", choices=["portable", "python", "typescript", "csharp"], required=True)
+    parser.add_argument("--output", required=True, type=Path, help="new ZIP file; existing files are never overwritten")
+    parser.add_argument("--source-review", action="store_true", help="export one source file for review, without claiming verified automation")
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as error:
+        return error.code if isinstance(error.code, int) else EXIT_USAGE
+    try:
+        database = args.database.expanduser().resolve(strict=True)
+        output = args.output.expanduser().resolve()
+        if output.exists():
+            raise TestPlanExportError("Output already exists; choose a new file.")
+        # Repository constructors perform migrations. Apply those only to this
+        # temporary copy, never to the user's source database.
+        with tempfile.TemporaryDirectory(prefix="qa-export-") as directory:
+            snapshot = Path(directory) / "snapshot.sqlite3"
+            source = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)
+            destination = sqlite3.connect(snapshot)
+            try:
+                source.backup(destination)
+            finally:
+                destination.close()
+                source.close()
+            storage = create_sqlite_storage(snapshot)
+            service = TestPlanExportService(
+                storage.test_case_repository, storage.plan_store,
+                lifecycle=AutomationLifecycleService(storage.automation_lifecycle_repository, storage.plan_store),
+                review=TestCaseReviewService(storage.test_case_review_repository, storage.plan_store),
+            )
+            ids = []
+            for key in args.test_case:
+                case = storage.test_case_repository.get_by_public_id(key)
+                if case is None:
+                    try:
+                        case = storage.test_case_repository.get(UUID(key))
+                    except ValueError:
+                        pass
+                if case is None:
+                    raise TestPlanExportError("TestCase not found.")
+                ids.append(case.id)
+            if args.source_review:
+                if len(ids) != 1 or args.format == "portable":
+                    raise TestPlanExportError("Source review requires one TestCase and a source language.")
+                content, _ = service.source(ids[0], args.format)
+                data = content.encode("utf-8")
+            else:
+                data, _ = service.bulk_zip(ids, args.format)
+        # Exclusive creation also prevents an overwrite race after generation.
+        with output.open("xb") as handle:
+            handle.write(data)
+        print(f"Exported {'REVIEW_ONLY source' if args.source_review else args.format + ' project'}: {output}")
+        return EXIT_PASSED
+    except TestPlanExportError as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return EXIT_FAILED
+    except (OSError, sqlite3.Error, ValueError):
+        print("ERROR: Export could not be completed safely; check database, selection and output.", file=sys.stderr)
+        return EXIT_FAILED
 
 
 def _handle_pipeline_error(

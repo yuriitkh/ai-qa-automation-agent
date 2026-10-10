@@ -210,6 +210,7 @@ class TestSuiteWebTests(unittest.TestCase):
         self.assertIn("@media(max-width:640px){.suite-member", html)
 
     def test_bulk_selection_returns_zip_and_rejects_invalid_ids(self):
+        self._validate_for_export()
         body = urlencode([("test_case_id", str(self.case.id)), ("target", "python")])
         response = self.app.handle("POST", "/test-cases/export", body)
         self.assertEqual(response.status, 200)
@@ -287,6 +288,7 @@ class TestSuiteWebTests(unittest.TestCase):
         self.assertEqual(self.suites.member_ids(UUID(suite_id)), [])
 
     def test_suite_export_uses_member_order_and_zip_target(self):
+        self._validate_for_export()
         suite = self.suites.create("Smoke", "Local")
         self.suites.add_member(suite.id, self.case.id)
         response = self.app.handle("GET", f"/test-suites/{suite.id}/export?format=typescript")
@@ -296,6 +298,19 @@ class TestSuiteWebTests(unittest.TestCase):
             self.assertIn('"language": "typescript"', manifest)
             self.assertIn('"suite": "Smoke"', manifest)
             self.assertTrue(any(name.endswith(".spec.ts") for name in archive.namelist()))
+
+    def _validate_for_export(self):
+        step = self.case.steps[0]
+        step.expected = "The page loads."
+        self.cases.save(self.case)
+        version = self.plans.find(step.id)
+        plan = version.qa_test_plan.model_copy(update={"steps": [
+            *version.qa_test_plan.steps, QATestStep(action="assert_page_loaded"),
+        ]})
+        self.plans.save(step.id, version.model_copy(update={"id": uuid4(), "version": 2, "qa_test_plan": plan}),
+                        test_plan=self.plans.find_test_plan(step.id))
+        self.app._automation_lifecycle.mark_automation_completed(self.case)
+        self.app._automation_lifecycle.mark_validation_completed(self.case, True)
 
     def test_missing_automation_has_actionable_suite_export_response(self):
         empty = _case("No plan <script>alert</script>")

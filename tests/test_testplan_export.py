@@ -166,7 +166,7 @@ class TestPlanExportTests(unittest.TestCase):
         compile(source, "exported_test.py", "exec")
         for fragment in (
             "page.goto(", "page.wait_for_load_state(", "to_have_title(",
-            "to_have_text(re.compile(", f".click(timeout={ACTION_TIMEOUT_MS})", ".fill(", "to_be_hidden(",
+            "to_have_text(re.compile(", f'.click(timeout=export_timeout("ACTION_TIMEOUT_MS", {ACTION_TIMEOUT_MS}))', ".fill(", "to_be_hidden(",
             "to_have_url(", "select_option(label=",
             "to_be_checked(", "not_to_be_checked(", "option:checked",
             ".check(timeout=", ".uncheck(timeout=", "to_be_enabled(", "to_be_disabled(",
@@ -180,7 +180,7 @@ class TestPlanExportTests(unittest.TestCase):
         source = typescript_source(self.service.get(self.case.id))
         for fragment in (
             "import { test, expect }", "await page.goto(", "waitForLoadState(",
-            "toHaveTitle(", "toHaveText(", f".click({{ timeout: {ACTION_TIMEOUT_MS} }})", ".fill(",
+            "toHaveTitle(", "toHaveText(", f'.click({{ timeout: exportTimeout("ACTION_TIMEOUT_MS", {ACTION_TIMEOUT_MS}) }})', ".fill(",
             "toBeHidden(", "toHaveURL(", "selectOption(", "toHaveText(new RegExp(",
             "toBeChecked(", "not.toBeChecked(", "option:checked",
             ".check({ timeout:", ".uncheck({ timeout:", "toBeEnabled(", "toBeDisabled(",
@@ -194,7 +194,7 @@ class TestPlanExportTests(unittest.TestCase):
             "Microsoft.Playwright.NUnit", "[Test]", "await page.GotoAsync(",
             "WaitForLoadStateAsync(", "ToHaveTitleAsync(", "InnerTextAsync()",
             ".ClickAsync(", ".FillAsync(", "ToBeHiddenAsync(", "ToHaveURLAsync(",
-            "SelectOptionAsync(", "GetByText(", "option:checked",
+            "SelectOptionAsync(", "option:checked",
             "ToBeCheckedAsync(", ".Not.ToBeCheckedAsync(",
             ".CheckAsync(", ".UncheckAsync(", "ToBeEnabledAsync(",
         ):
@@ -207,19 +207,17 @@ class TestPlanExportTests(unittest.TestCase):
         ts = typescript_source(exportable)
         cs = csharp_source(exportable)
 
-        self.assertIn(f".click(timeout={ACTION_TIMEOUT_MS})", py)
-        self.assertIn(f".click({{ timeout: {ACTION_TIMEOUT_MS} }})", ts)
-        self.assertIn(f".ClickAsync(new() {{ Timeout = {ACTION_TIMEOUT_MS} }})", cs)
+        self.assertIn(f'.click(timeout=export_timeout("ACTION_TIMEOUT_MS", {ACTION_TIMEOUT_MS}))', py)
+        self.assertIn(f'.click({{ timeout: exportTimeout("ACTION_TIMEOUT_MS", {ACTION_TIMEOUT_MS}) }})', ts)
+        self.assertIn(f'.ClickAsync(new() {{ Timeout = ExportTimeout("ACTION_TIMEOUT_MS", {ACTION_TIMEOUT_MS}) }})', cs)
         self.assertNotIn("expect_navigation", py)
         self.assertNotIn("wait_for_load_state('load', timeout=10000)", py)
         self.assertNotIn("waitForLoadState('load', { timeout: 10000 })", ts)
         self.assertNotIn("Timeout = 10000", cs)
-        self.assertIn(f"timeout={ASSERTION_TIMEOUT_MS}", py)
-        self.assertIn(f"timeout: {ASSERTION_TIMEOUT_MS}", ts)
-        self.assertIn(f"Timeout = {ASSERTION_TIMEOUT_MS}", cs)
-        self.assertIn(f"timeout={NAVIGATION_TIMEOUT_MS}", py)
-        self.assertIn(f"timeout: {NAVIGATION_TIMEOUT_MS}", ts)
-        self.assertIn(f"Timeout = {NAVIGATION_TIMEOUT_MS}", cs)
+        for name, value in (("ASSERTION_TIMEOUT_MS", ASSERTION_TIMEOUT_MS), ("NAVIGATION_TIMEOUT_MS", NAVIGATION_TIMEOUT_MS)):
+            self.assertIn(f'timeout=export_timeout("{name}", {value})', py)
+            self.assertIn(f'timeout: exportTimeout("{name}", {value})', ts)
+            self.assertIn(f'Timeout = ExportTimeout("{name}", {value})', cs)
 
     def test_text_semantics_remain_exact_or_contains_across_targets(self):
         exportable = self.service.get(self.case.id)
@@ -235,9 +233,9 @@ class TestPlanExportTests(unittest.TestCase):
         self.assertIn("to_have_text(re.compile(", py)
         self.assertIn("toHaveText(new RegExp(", ts)
         self.assertIn("ToHaveTextAsync(new Regex(", cs)
-        self.assertIn("exact=False", py)
-        self.assertIn("exact: false", ts)
-        self.assertIn("Exact = false", cs)
+        self.assertNotIn("get_by_text(", py)
+        self.assertNotIn("getByText(", ts)
+        self.assertNotIn("GetByText(", cs)
 
     def test_locators_and_special_characters_are_escaped_without_strategy_changes(self):
         source = python_source(self.service.get(self.case.id))

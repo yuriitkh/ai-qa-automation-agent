@@ -7,8 +7,8 @@ import json
 import re
 import unicodedata
 import zipfile
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, replace
+from importlib.metadata import version as installed_version
 from pathlib import PurePosixPath
 from typing import Callable
 from urllib.parse import parse_qsl, urlsplit
@@ -24,10 +24,17 @@ from qa_agent.execution_semantics import (
 from qa_agent.plan_store import PlanStore
 from qa_agent.test_case_repository import TestCaseRepository
 from qa_agent.test_plan_validation import PlanValidationError, validate_executable_plan
+from qa_agent.automation_lifecycle import (
+    AutomationLifecycleService, AutomationStatus, definition_fingerprint,
+    plan_fingerprint, plan_fingerprint_for_versions,
+)
+from qa_agent.test_case_review import TestCaseReviewService, TestCaseReviewStatus
+from qa_agent.redaction import redact_secrets
+from qa_agent.export_templates import PYTHON_RUNTIME, PYTHON_CONFTEST, TYPESCRIPT_RUNTIME, CSHARP_RUNTIME, PYTHON_CI
 
 
 PORTABLE_SCHEMA_VERSION = 1
-EXPORT_FORMAT_VERSION = "1.0"
+EXPORT_FORMAT_VERSION = "1.1"
 
 
 @dataclass(frozen=True)
@@ -68,6 +75,7 @@ class SavedStepPlan:
 class ExportableTestCase:
     test_case: TestCase
     plans: tuple[SavedStepPlan, ...]
+    verification: str = "REVIEW_ONLY"
 
 
 def _plans_for_case(test_case: TestCase, plan_store: PlanStore) -> ExportableTestCase:
@@ -103,14 +111,9 @@ def _plans_for_case(test_case: TestCase, plan_store: PlanStore) -> ExportableTes
                 validate_executable_plan(version.qa_test_plan)
             except PlanValidationError as error:
                 if any(issue.code == "UNSUPPORTED_ACTION" for issue in error.issues):
-                    action_name = next(
-                        (item.action for item in version.qa_test_plan.steps
-                         if item.action not in QATestStep.ACTION_PARAMETER_FIELDS),
-                        "unknown",
-                    )
                     raise TestPlanExportError(
                         f"Cannot export {test_case.public_id or test_case.name}: "
-                        f"step {step.order + 1} uses unsupported action {action_name!r}."
+                        f"step {step.order + 1} uses an unsupported action."
                     ) from error
                 raise TestPlanExportError(
                     f"Cannot export {test_case.public_id or test_case.name}: "
@@ -216,7 +219,7 @@ def _portable_segments(exportable: ExportableTestCase) -> list[dict]:
     return segments
 
 
-_WINDOWS_PATH = re.compile(r"(?i)(?:^|[\s=:'\"(])(?:[a-z]:[\\/]|\\\\[^\\/\s]+[\\/])")
+_WINDOWS_PATH = re.compile(r"(?i)(?<![a-z])(?:[a-z]:[\\/]|\\\\[^\\/\s]+[\\/])")
 _COMMON_POSIX_PATH = re.compile(r"(?:^|[\s=:'\"(])/(?:home|users|private|tmp|var|etc|mnt|workspace|root)/")
 
 
@@ -236,6 +239,40 @@ def _is_unsafe_export_value(value: str) -> bool:
         "token", "password", "secret", "authorization", "credential",
     }
     return any(key.casefold() in secret_query_keys for key, _ in parse_qsl(parsed.query, keep_blank_values=True))
+
+
+_SENSITIVE_FIELD = re.compile(r"(?i)password|passwd|pwd|api[_-]?key|token|secret|authorization|credential|cookie|session")
+_SECRET_LITERAL = re.compile(
+    r"(?i)\b(?:password|passwd|api[_-]?key|access[_-]?token|secret|authorization|cookie|session[_-]?token)\s*[=:]\s*[^\s,;<>]+"
+    r"|\bBearer\s+\S+|\bsk-[A-Za-z0-9_-]{16,}|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
+)
+
+
+def _validate_export_safety(exportable: ExportableTestCase, suite_name: str | None = None) -> None:
+    # Scan exactly what is serialized, including direct renderer callers. Fail
+    # instead of redacting executable data and thereby changing assertions.
+    strings = [suite_name or ""]
+    def collect(value):
+        if isinstance(value, str):
+            strings.append(value)
+        elif isinstance(value, dict):
+            for item in value.values():
+                collect(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+    collect(portable_testplan(exportable))
+    for value in strings:
+        embedded_urls = re.findall(r"https?://[^\s<>\"']+", value)
+        if _is_unsafe_export_value(value) or any(_is_unsafe_export_value(url) for url in embedded_urls):
+            raise TestPlanExportError("Export contains a local path or credential-bearing URL.")
+        if redact_secrets(value) != value or _SECRET_LITERAL.search(value):
+            raise TestPlanExportError("Export contains sensitive data; use a secret-free test plan.")
+    for saved in exportable.plans:
+        for action in saved.version.qa_test_plan.steps:
+            p = action.parameters
+            if any(p.get(key) for key in ("value", "expected", "expected_text")) and _SENSITIVE_FIELD.search(p.get("selector", "")):
+                raise TestPlanExportError("Export contains a credential field value; use a secret-free test plan.")
 
 
 def _contains_local_path_or_url_credentials(
@@ -328,9 +365,8 @@ def _emit_python(action: str, p: dict, i: int) -> list[str]:
         return [f"expect(page.locator({_python_string(p['selector'])})).to_have_value({_python_string(p['expected'])}, timeout={ASSERTION_TIMEOUT_MS})"]
     if action == "assert_text_contains":
         target = f"page.locator({_python_string(p['selector'])})" if p.get("selector") else "page.locator('body')"
-        expected = _python_string(_normalized_expected(p["expected_text"]))
         pattern = _python_string(".*" + _regex_escape(_normalized_expected(p["expected_text"])) + ".*")
-        return [f"target_{i} = {target}", f"expect(target_{i}.get_by_text({expected}, exact=False)).to_be_visible(timeout={ASSERTION_TIMEOUT_MS})", f"expect(target_{i}).to_have_text(re.compile({pattern}, re.DOTALL), use_inner_text=True, timeout={ASSERTION_TIMEOUT_MS})"]
+        return [f"target_{i} = {target}", f"expect(target_{i}).to_be_visible(timeout={ASSERTION_TIMEOUT_MS})", f"expect(target_{i}).to_have_text(re.compile({pattern}, re.DOTALL), use_inner_text=True, timeout={ASSERTION_TIMEOUT_MS})"]
     if action == "assert_checked":
         return [f"expect(page.locator({_python_string(p['selector'])})).to_be_checked(timeout={ASSERTION_TIMEOUT_MS})"]
     if action == "assert_unchecked":
@@ -406,9 +442,8 @@ def _emit_typescript(action: str, p: dict, i: int) -> list[str]:
         return [f"await expect(page.locator({_js_string(p['selector'])})).toHaveValue({_js_string(p['expected'])}, {{ timeout: {ASSERTION_TIMEOUT_MS} }});"]
     if action == "assert_text_contains":
         target = f"page.locator({_js_string(p['selector'])})" if p.get("selector") else "page.locator('body')"
-        expected = _js_string(_normalized_expected(p["expected_text"]))
         pattern = _js_string(".*" + _regex_escape(_normalized_expected(p["expected_text"])) + ".*")
-        return [f"const target_{i} = {target};", f"await expect(target_{i}.getByText({expected}, {{ exact: false }})).toBeVisible({{ timeout: {ASSERTION_TIMEOUT_MS} }});", f"await expect(target_{i}).toHaveText(new RegExp({pattern}, 's'), {{ useInnerText: true, timeout: {ASSERTION_TIMEOUT_MS} }});"]
+        return [f"const target_{i} = {target};", f"await expect(target_{i}).toBeVisible({{ timeout: {ASSERTION_TIMEOUT_MS} }});", f"await expect(target_{i}).toHaveText(new RegExp({pattern}, 's'), {{ useInnerText: true, timeout: {ASSERTION_TIMEOUT_MS} }});"]
     if action == "assert_checked":
         return [f"await expect(page.locator({_js_string(p['selector'])})).toBeChecked({{ timeout: {ASSERTION_TIMEOUT_MS} }});"]
     if action == "assert_unchecked":
@@ -480,9 +515,8 @@ def _emit_csharp(action: str, p: dict, i: int) -> list[str]:
         return [f"await Expect(page.Locator({_csharp_string(p['selector'])})).ToHaveValueAsync({_csharp_string(p['expected'])}, new() {{ Timeout = {ASSERTION_TIMEOUT_MS} }});"]
     if action == "assert_text_contains":
         target = f"page.Locator({_csharp_string(p['selector'])})" if p.get("selector") else 'page.Locator("body")'
-        expected = _csharp_string(_normalized_expected(p["expected_text"]))
         pattern = _csharp_string(".*" + _regex_escape(_normalized_expected(p["expected_text"])) + ".*")
-        return [f"var target_{i} = {target};", f"await Expect(target_{i}.GetByText({expected}, new() {{ Exact = false }})).ToBeVisibleAsync(new() {{ Timeout = {ASSERTION_TIMEOUT_MS} }});", f"await Expect(target_{i}).ToHaveTextAsync(new Regex({pattern}, RegexOptions.Singleline), new() {{ UseInnerText = true, Timeout = {ASSERTION_TIMEOUT_MS} }});"]
+        return [f"var target_{i} = {target};", f"await Expect(target_{i}).ToBeVisibleAsync(new() {{ Timeout = {ASSERTION_TIMEOUT_MS} }});", f"await Expect(target_{i}).ToHaveTextAsync(new Regex({pattern}, RegexOptions.Singleline), new() {{ UseInnerText = true, Timeout = {ASSERTION_TIMEOUT_MS} }});"]
     if action == "assert_checked":
         return [f"await Expect(page.Locator({_csharp_string(p['selector'])})).ToBeCheckedAsync(new() {{ Timeout = {ASSERTION_TIMEOUT_MS} }});"]
     if action == "assert_unchecked":
@@ -559,7 +593,12 @@ _ALLOWED_EXPORT_PARAMETERS = {
 
 
 def _validate_action_parameters(exportable: ExportableTestCase) -> None:
+    _validate_export_safety(exportable)
     for saved in exportable.plans:
+        try:
+            validate_executable_plan(saved.version.qa_test_plan)
+        except PlanValidationError as error:
+            raise TestPlanExportError("The saved automation plan is invalid or contains an unsupported action.") from error
         for action in saved.version.qa_test_plan.steps:
             if action.action not in ACTION_EXPORT_HANDLERS:
                 raise TestPlanExportError(
@@ -593,7 +632,7 @@ def _csharp_identifier(name: str) -> str:
     return value
 
 
-def _code_for(exportable: ExportableTestCase, language: str) -> str:
+def _code_for(exportable: ExportableTestCase, language: str, *, identifier: str | None = None) -> str:
     _validate_action_parameters(exportable)
     handlers_index = {"python": 0, "typescript": 1, "csharp": 2}.get(language)
     if handlers_index is None:
@@ -601,20 +640,23 @@ def _code_for(exportable: ExportableTestCase, language: str) -> str:
     lines: list[str]
     case = exportable.test_case
     if language == "python":
-        lines = ["import re", "import pytest", "from playwright.sync_api import Page, expect", "", "", f"def {_python_function_name(case.name)}(page: Page) -> None:"]
+        lines = ["# Saved source for review; consult the project manifest for validation status.", "import re", "import pytest", "from playwright.sync_api import Page, expect", PYTHON_RUNTIME, "", f"def {_python_function_name(case.name)}(page: Page) -> None:", "    errors = []"]
     elif language == "typescript":
-        lines = ["import { test, expect } from '@playwright/test';", "", "", f"test({_js_string(_ts_test_name(case.name))}, async ({{ page }}) => {{"]
+        lines = ["// Saved source for review; consult the project manifest for validation status.", "import { test, expect } from '@playwright/test';", TYPESCRIPT_RUNTIME, "", f"test({_js_string(_ts_test_name(case.name))}, async ({{ page }}) => {{", "    const errors: string[] = [];"]
     else:
-        class_name = _csharp_identifier(case.name) + "Tests"
+        class_name = (identifier or _csharp_identifier(case.name)) + "Tests"
         method_name = _csharp_identifier(case.name) + "Test"
-        lines = ["using System.Text.RegularExpressions;", "using System.Threading.Tasks;", "using Microsoft.Playwright;", "using Microsoft.Playwright.NUnit;", "using NUnit.Framework;", "", "[TestFixture]", f"public class {class_name} : PageTest", "{"]
-        lines.extend(["    [Test]", f"    public async Task {method_name}()", "    {"])
-    indent = "    " if language != "python" else "    "
+        lines = ["// Saved source for review; consult the project manifest for validation status.", "using System.Text.RegularExpressions;", "using System.Threading.Tasks;", "using Microsoft.Playwright;", "using Microsoft.Playwright.NUnit;", "using NUnit.Framework;", "", "[TestFixture]", f"public class {class_name} : PageTest", "{"]
+        lines.append(CSHARP_RUNTIME)
+        lines.extend(["    [Test]", f"    public async Task {method_name}()", "    {", "        var errors = new System.Collections.Generic.List<string>();"])
+    indent = "    "
     if language == "csharp":
         indent = "        "
     action_index = 0
     active_segment = None
+    source_base = case.base_url or exportable.plans[0].version.qa_test_plan.url
     for saved in exportable.plans:
+        new_segment = saved.segment_order != active_segment
         if saved.segment_order != active_segment:
             active_segment = saved.segment_order
             segment_label = f"Execution segment {active_segment + 1}"
@@ -626,16 +668,41 @@ def _code_for(exportable: ExportableTestCase, language: str) -> str:
                 lines.extend([f"        // {segment_label}", "        var page = await Page.Context.NewPageAsync();"])
             else:
                 lines.extend([f"        // {segment_label}", "        page = await page.Context.NewPageAsync();"])
+        lines.append(indent + ("try:" if language == "python" else "try {"))
+        if new_segment and saved.version.qa_test_plan.steps[0].action != "navigate":
+            target = saved.segment_base_url or case.base_url
+            if not target:
+                raise TestPlanExportError("State-dependent execution requires a configured segment URL or an explicit navigation action.")
+            emitted = ACTION_EXPORT_HANDLERS["navigate"][handlers_index]("navigate", {"url": target}, action_index)
+            lines.extend(indent + "    " + line for line in _configured_lines(emitted, "navigate", {"url": target}, language, source_base))
         for step in saved.version.qa_test_plan.steps:
             action_index += 1
             handler = ACTION_EXPORT_HANDLERS[step.action][handlers_index]
             emitted = handler(step.action, step.parameters, action_index)
-            lines.extend(indent + line for line in emitted)
+            lines.extend(indent + "    " + line for line in _configured_lines(emitted, step.action, step.parameters, language, source_base))
+        label = f"Step {saved.step_order + 1} (plan v{saved.version.version})"
+        if language == "python":
+            lines.extend([indent + "except Exception as error:", indent + f"    errors.append({_python_string(label)} + ': ' + str(error))"])
+            if saved.failure_policy == "BLOCK_REST":
+                lines.append(indent + "    raise")
+        elif language == "typescript":
+            lines.extend([indent + "} catch (error) {", indent + f"    errors.push({_js_string(label)} + ': ' + String(error));"])
+            if saved.failure_policy == "BLOCK_REST":
+                lines.append(indent + "    throw error;")
+            lines.append(indent + "}")
+        else:
+            lines.extend([indent + "} catch (System.Exception error) {", indent + f"    errors.Add({_csharp_string(label)} + \": \" + error.ToString());"])
+            if saved.failure_policy == "BLOCK_REST":
+                lines.append(indent + "    throw;")
+            lines.append(indent + "}")
     if language == "typescript":
+        lines.append("    if (errors.length) throw new Error(errors.join('\\n'));")
         lines.extend(["});", ""])
     elif language == "csharp":
+        lines.append('        if (errors.Count > 0) Assert.Fail(string.Join("\\n", errors));')
         lines.extend(["    }", "}", ""])
     else:
+        lines.extend(["    if errors:", "        pytest.fail('\\n'.join(errors), pytrace=False)"])
         lines.append("")
     if language == "python":
         source = "\n".join(lines)
@@ -645,6 +712,31 @@ def _code_for(exportable: ExportableTestCase, language: str) -> str:
             raise TestPlanExportError("The generated Python source is invalid.") from error
         return source
     return "\n".join(lines)
+
+
+def _configured_lines(lines: list[str], action: str, p: dict, language: str, source_base: str) -> list[str]:
+    quote = {"python": _python_string, "typescript": _js_string, "csharp": _csharp_string}[language]
+    url_helper = {"python": "export_url", "typescript": "exportUrl", "csharp": "ExportUrl"}[language]
+    timeout_helper = {"python": "export_timeout", "typescript": "exportTimeout", "csharp": "ExportTimeout"}[language]
+    result = []
+    for line in lines:
+        if action in {"navigate", "assert_url"}:
+            value = p["url" if action == "navigate" else "expected"]
+            line = line.replace(quote(value), f"{url_helper}({quote(value)}, {quote(source_base)})", 1)
+        # Canonical handlers retain shared timing defaults; generated runtimes
+        # permit explicit overrides without silently dropping plan parameters.
+        timeout_name = "NAVIGATION_TIMEOUT_MS" if action in {"navigate", "assert_page_loaded"} else ("ASSERTION_TIMEOUT_MS" if action.startswith("assert_") else "ACTION_TIMEOUT_MS")
+        default = NAVIGATION_TIMEOUT_MS if timeout_name == "NAVIGATION_TIMEOUT_MS" else ASSERTION_TIMEOUT_MS if timeout_name == "ASSERTION_TIMEOUT_MS" else ACTION_TIMEOUT_MS
+        pattern = rf"(timeout=|timeout: |Timeout = ){default}\b"
+        # Only rewrite generated argument tokens, never selector/input/expected
+        # string literals that happen to contain text such as timeout=5000.
+        fragments = re.split(r'''("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')''', line)
+        line = "".join(
+            fragment if index % 2 else re.sub(pattern, lambda m: m[1] + f"{timeout_helper}({quote(timeout_name)}, {default})", fragment)
+            for index, fragment in enumerate(fragments)
+        )
+        result.append(line)
+    return result
 
 
 def python_source(exportable: ExportableTestCase) -> str:
@@ -669,7 +761,7 @@ def _slug(value: str) -> str:
 
 
 def safe_basename(test_case: TestCase, used: set[str] | None = None) -> str:
-    prefix = (test_case.public_id or "TC").casefold()
+    prefix = _slug(test_case.public_id or "TC")
     candidate = f"{prefix}_{_slug(test_case.name)}"
     if used is not None:
         base = candidate
@@ -683,7 +775,7 @@ def safe_basename(test_case: TestCase, used: set[str] | None = None) -> str:
 
 def _zip_info(path: str) -> zipfile.ZipInfo:
     normalized = PurePosixPath(path)
-    if normalized.is_absolute() or ".." in normalized.parts or "" in normalized.parts:
+    if normalized.is_absolute() or ".." in normalized.parts or "\\" in path or ":" in path or "\x00" in path:
         raise TestPlanExportError("Generated archive path is not safe.")
     info = zipfile.ZipInfo(str(normalized), date_time=(1980, 1, 1, 0, 0, 0))
     info.compress_type = zipfile.ZIP_DEFLATED
@@ -691,34 +783,62 @@ def _zip_info(path: str) -> zipfile.ZipInfo:
     return info
 
 
-def _project_readme(language: str) -> str:
+def _project_readme(language: str, exports: list[ExportableTestCase]) -> str:
     commands = {
-        "python": "python -m pip install -r requirements.txt\npython -m playwright install chromium\npytest",
+        "python": "python -m pip install -r requirements.txt\npython -m playwright install chromium\npython -m pytest -q",
         "typescript": "npm install\nnpx playwright install chromium\nnpx playwright test",
-        "csharp": "dotnet test csharp/AIQAAgent.Export.csproj",
+        "csharp": "dotnet restore\ndotnet build\npwsh csharp/bin/Debug/net8.0/playwright.ps1 install chromium\ndotnet test",
     }
     return (
         "# AI QA Agent Playwright export\n\n"
         "These tests were generated deterministically from saved, versioned TestPlans. "
         "They do not call AI QA Agent or an LLM at runtime.\n\n"
+        + ("Export eligibility: APPROVED_AND_BROWSER_VALIDATED for the exact saved versions. "
+           "This records prior Browser Validation, not a standalone execution result.\n\n"
+           if all(item.verification == "APPROVED_AND_BROWSER_VALIDATED" for item in exports)
+           else "REVIEW_ONLY: this source project is not verified automation. Review, approve and Browser Validate its saved versions before using it as verified automation.\n\n")
+        +
         f"## {language.title()}\n\n"
         "Install the listed dependencies and browser on your own machine before running:\n\n"
         "```text\n" + commands[language] + "\n```\n\n"
         "Selectors are preserved as Playwright locator strings from the saved plan. "
-        "Review test data and target URLs before execution.\n"
+        "Review test data and target URLs before execution.\n\n"
+        "## Configuration and CI\n\n"
+        "By default URLs are the exact saved targets. Set BASE_URL to an http(s) origin "
+        "(no credentials, path, query or fragment) to replace the TestCase base origin; "
+        "paths, queries, fragments and navigation to other origins are preserved. "
+        "URL assertions use the same explicit substitution.\n\n"
+        "TIMEOUT_MS overrides action/assertion/navigation timeouts. ACTION_TIMEOUT_MS, "
+        "ASSERTION_TIMEOUT_MS and NAVIGATION_TIMEOUT_MS override each individually; "
+        "all must be positive integers. Browser state is shared across TestSteps in a segment "
+        "and browser context across segments; each TestCase has an isolated context. "
+        "CONTINUE records failures and continues with the next TestStep; BLOCK_REST stops immediately. "
+        "Any recorded failure fails the test.\n\n"
+        + ("BROWSER=chromium|firefox|webkit; HEADLESS=true|false (default true). "
+           "Install the selected browser first.\n\n" if language != "csharp" else
+           "NUnit uses csharp/export.runsettings. For browser/headed execution use "
+           "`dotnet test -- Playwright.BrowserName=firefox Playwright.LaunchOptions.Headless=false`. "
+           "Install the selected browser first.\n\n")
+        + ("The included GitHub Actions workflow installs Chromium and runs pytest. "
+           "Set the repository BASE_URL variable to a reachable test target or start your local fixture in CI.\n"
+           if language == "python" else "CI: run the installation/build/browser commands above, then "
+           + ("`npx playwright test`; its exit code fails CI.\n" if language == "typescript" else "`dotnet test`; its exit code fails CI.\n"))
     )
 
 
 def _project_files(language: str, exports: list[ExportableTestCase], *, suite_name: str | None = None) -> dict[str, bytes]:
     used: set[str] = set()
     portable_used: set[str] = set()
-    files: dict[str, bytes] = {"README.md": _project_readme(language).encode("utf-8")}
+    for exportable in exports:
+        _validate_action_parameters(exportable)
+        _validate_export_safety(exportable, suite_name)
+    files: dict[str, bytes] = {"README.md": _project_readme(language, exports).encode("utf-8")}
     manifest_cases = []
     extension = {"python": ".py", "typescript": ".spec.ts", "csharp": "Tests.cs"}[language]
     for exportable in exports:
         case = exportable.test_case
         base = safe_basename(case, used)
-        file_name = base + extension if language != "csharp" else _csharp_identifier(case.name) + extension
+        file_name = ("test_" + base.replace("-", "_") if language == "python" else base) + extension if language != "csharp" else _csharp_identifier(base) + extension
         # C# class/file names can collide after normalization; make those deterministic too.
         if language == "csharp":
             class_base = file_name
@@ -729,12 +849,12 @@ def _project_files(language: str, exports: list[ExportableTestCase], *, suite_na
             used.add(file_name.casefold())
         if language == "python":
             content = python_source(exportable)
-            root = "python/"
+            root = "python/tests/"
         elif language == "typescript":
             content = typescript_source(exportable)
-            root = "typescript/"
+            root = "typescript/tests/"
         else:
-            content = csharp_source(exportable)
+            content = _code_for(exportable, "csharp", identifier=file_name.removesuffix(extension))
             root = "csharp/"
         files[root + file_name] = content.encode("utf-8")
         portable_name = safe_basename(case, portable_used) + ".testplan.json"
@@ -744,24 +864,39 @@ def _project_files(language: str, exports: list[ExportableTestCase], *, suite_na
             "name": case.name,
             "source_file": root + file_name,
             "portable_file": "portable/" + portable_name,
+            "verification": exportable.verification,
             "plan_versions": [
                 {
                     "step_order": item.step_order,
                     "version": item.version.version,
+                    "version_id": str(item.version.id),
                     "provenance": item.version.origin.value if item.version.origin else None,
                 }
                 for item in exportable.plans
             ],
         })
     if language == "python":
-        files["requirements.txt"] = b"pytest>=8\nplaywright>=1.40\npytest-playwright>=0.4\n"
+        files["requirements.txt"] = f"pytest=={installed_version('pytest')}\nplaywright=={installed_version('playwright')}\n".encode()
+        files["pytest.ini"] = b"[pytest]\ntestpaths = python/tests\npython_files = test_*.py\n"
+        files["python/tests/conftest.py"] = PYTHON_CONFTEST.encode()
+        files[".github/workflows/tests.yml"] = PYTHON_CI.encode()
     elif language == "typescript":
         files["package.json"] = (json.dumps({
             "private": True,
             "scripts": {"test": "playwright test"},
-            "devDependencies": {"@playwright/test": "^1.40.0", "typescript": "^5.0.0"},
+            "devDependencies": {"@playwright/test": installed_version('playwright')},
         }, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
-        files["playwright.config.ts"] = b"import { defineConfig } from '@playwright/test';\nexport default defineConfig({ testDir: './typescript' });\n"
+        files["playwright.config.ts"] = (
+            "import { defineConfig } from '@playwright/test';\n"
+            "const browser = process.env.BROWSER ?? 'chromium';\n"
+            "if (!['chromium', 'firefox', 'webkit'].includes(browser)) throw new Error('Invalid BROWSER');\n"
+            "const headless = (process.env.HEADLESS ?? 'true').toLowerCase();\n"
+            "if (!['true', 'false', '1', '0'].includes(headless)) throw new Error('Invalid HEADLESS');\n"
+            "const testTimeout = Number(process.env.TEST_TIMEOUT_MS ?? 120000);\n"
+            "if (!Number.isInteger(testTimeout) || testTimeout <= 0) throw new Error('Invalid TEST_TIMEOUT_MS');\n"
+            "export default defineConfig({ testDir: './typescript/tests', timeout: testTimeout, retries: 0, "
+            "use: { browserName: browser as 'chromium' | 'firefox' | 'webkit', headless: ['true', '1'].includes(headless) } });\n"
+        ).encode()
         files["tsconfig.json"] = b'{\n  "compilerOptions": { "target": "ES2020", "module": "commonjs", "strict": true },\n  "include": ["typescript/**/*.ts", "playwright.config.ts"]\n}\n'
     else:
         files["csharp/AIQAAgent.Export.csproj"] = (
@@ -772,9 +907,25 @@ def _project_files(language: str, exports: list[ExportableTestCase], *, suite_na
             '    <PackageReference Include="NUnit3TestAdapter" Version="4.5.0" />\n'
             '  </ItemGroup>\n</Project>\n'
         ).encode("utf-8")
+        files["csharp/AIQAAgent.Export.csproj"] = files["csharp/AIQAAgent.Export.csproj"].replace(
+            b"<Nullable>enable</Nullable>", b"<Nullable>enable</Nullable>\n    <RunSettingsFilePath>$(MSBuildProjectDirectory)/export.runsettings</RunSettingsFilePath>"
+        )
+        files["csharp/export.runsettings"] = b'<RunSettings><Playwright><BrowserName>chromium</BrowserName><LaunchOptions><Headless>true</Headless></LaunchOptions></Playwright></RunSettings>\n'
+        files["AIQAAgent.Export.sln"] = (
+            'Microsoft Visual Studio Solution File, Format Version 12.00\n'
+            'Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AIQAAgent.Export", "csharp/AIQAAgent.Export.csproj", "{641D16E0-4D79-4AD8-97FD-D49534A80C50}"\nEndProject\n'
+            'Global\nGlobalSection(SolutionConfigurationPlatforms) = preSolution\nDebug|Any CPU = Debug|Any CPU\nRelease|Any CPU = Release|Any CPU\nEndGlobalSection\n'
+            'GlobalSection(ProjectConfigurationPlatforms) = postSolution\n'
+            '{641D16E0-4D79-4AD8-97FD-D49534A80C50}.Debug|Any CPU.ActiveCfg = Debug|Any CPU\n'
+            '{641D16E0-4D79-4AD8-97FD-D49534A80C50}.Debug|Any CPU.Build.0 = Debug|Any CPU\n'
+            '{641D16E0-4D79-4AD8-97FD-D49534A80C50}.Release|Any CPU.ActiveCfg = Release|Any CPU\n'
+            '{641D16E0-4D79-4AD8-97FD-D49534A80C50}.Release|Any CPU.Build.0 = Release|Any CPU\n'
+            'EndGlobalSection\nEndGlobal\n'
+        ).encode()
     manifest = {
         "format_version": EXPORT_FORMAT_VERSION,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": _snapshot_timestamp(exports),
+        "standalone_execution": "NOT_TESTED",
         "language": language,
         "framework": {"python": "pytest + Playwright", "typescript": "Playwright Test", "csharp": "NUnit + Microsoft.Playwright"}[language],
         "suite": suite_name,
@@ -808,13 +959,14 @@ def portable_zip(exports: list[ExportableTestCase], *, suite_name: str | None = 
     ).encode("utf-8")}
     cases = []
     for exportable in exports:
+        _validate_export_safety(exportable, suite_name)
         case = exportable.test_case
         filename = safe_basename(case, used) + ".testplan.json"
         files["portable/" + filename] = portable_json(exportable).encode("utf-8")
         cases.append({"public_id": case.public_id, "name": case.name, "file": "portable/" + filename})
     files["export-manifest.json"] = (json.dumps({
         "format_version": EXPORT_FORMAT_VERSION,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": _snapshot_timestamp(exports),
         "language": "portable-json",
         "suite": suite_name,
         "test_cases": cases,
@@ -826,18 +978,52 @@ def portable_zip(exports: list[ExportableTestCase], *, suite_name: str | None = 
     return output.getvalue()
 
 
+def _snapshot_timestamp(exports: list[ExportableTestCase]) -> str:
+    """Stable snapshot time, rather than a wall clock that changes ZIP bytes."""
+    return max(item.version.created_at for export in exports for item in export.plans).isoformat()
+
+
 class TestPlanExportService:
     """Load exact current saved versions and render offline exports."""
 
-    def __init__(self, test_cases: TestCaseRepository, plan_store: PlanStore) -> None:
+    def __init__(self, test_cases: TestCaseRepository, plan_store: PlanStore, *,
+                 lifecycle: AutomationLifecycleService | None = None,
+                 review: TestCaseReviewService | None = None) -> None:
         self._test_cases = test_cases
         self._plan_store = plan_store
+        self._lifecycle = lifecycle
+        self._review = review
 
     def get(self, test_case_id) -> ExportableTestCase:
         test_case = self._test_cases.get(test_case_id)
         if test_case is None:
             raise TestPlanExportError("TestCase not found.")
         return _plans_for_case(test_case, self._plan_store)
+
+    def get_verified(self, test_case_id) -> ExportableTestCase:
+        exportable = self.get(test_case_id)
+        case = exportable.test_case
+        if self._lifecycle is None or self._review is None:
+            raise TestPlanExportError("Verified project export requires approval and Browser Validation metadata.")
+        selected = plan_fingerprint_for_versions(case, {item.test_step_id: item.version.id for item in exportable.plans})
+        def eligible():
+            current = self._test_cases.get(case.id)
+            return (
+                current is not None
+                and definition_fingerprint(current) == definition_fingerprint(case)
+                and plan_fingerprint(case, self._plan_store) == selected
+                and self._review.status(case.id) == TestCaseReviewStatus.APPROVED
+                and self._review.validation_approved_for(case)
+                and self._lifecycle.status(case) == AutomationStatus.AUTOMATION_READY
+            )
+        if not eligible():
+            raise TestPlanExportError("Verified project export requires current approved, Browser Validated Automation Ready plans.")
+        _validate_action_parameters(exportable)
+        # Readiness helpers use current versions. Check again after validation
+        # so a version/definition change during selection cannot bless a draft.
+        if not eligible():
+            raise TestPlanExportError("Saved automation changed during export; review and validate its current versions.")
+        return replace(exportable, verification="APPROVED_AND_BROWSER_VALIDATED")
 
     def get_many(self, test_case_ids: list, *, preserve_order: bool = False) -> list[ExportableTestCase]:
         if not test_case_ids:
@@ -860,6 +1046,8 @@ class TestPlanExportService:
             raise TestPlanExportError("Choose Python, TypeScript, or C# for source export.")
         extension = {"python": ".py", "typescript": ".spec.ts", "csharp": "Tests.cs"}[language]
         basename = safe_basename(exportable.test_case)
+        if language == "python":
+            basename = "test_" + basename.replace("-", "_")
         return generator(exportable), basename + extension
 
     def bulk_zip(self, test_case_ids: list, target: str) -> tuple[bytes, str]:
@@ -869,5 +1057,6 @@ class TestPlanExportService:
         language = {"python": "python", "typescript": "typescript", "csharp": "csharp"}.get(target)
         if language is None:
             raise TestPlanExportError("Choose Portable JSON, Python, TypeScript, or C# export.")
+        exports = [self.get_verified(item.test_case.id) for item in exports]
         return project_zip(language, exports), f"ai-qa-{language}-project.zip"
 
