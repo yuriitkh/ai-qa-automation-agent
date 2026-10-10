@@ -31,6 +31,7 @@ from qa_agent.run_history import RunHistoryService, WorkflowType
 from qa_agent.run_context import RunContext
 from qa_agent.test_case_execution import RunUnavailableError, TestCaseExecutionService
 from qa_agent.llm_usage import llm_usage_scope
+from qa_agent.diagnostic_mode import DiagnosticLevel, diagnostic_scope
 
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,7 @@ class BackgroundRunService:
         *,
         max_workers: int = 4,
         max_pending: int = 16,
+        diagnostic_settings=None,
     ) -> None:
         if max_workers < 1:
             raise ValueError("max_workers must be positive.")
@@ -54,6 +56,7 @@ class BackgroundRunService:
             raise ValueError("max_pending cannot be negative.")
         self._run_service = run_service
         self._run_history = run_history
+        self._diagnostic_settings = diagnostic_settings
         self.progress_store = progress_store or ExecutionProgressStore()
         self._executor = ThreadPoolExecutor(
             max_workers=max_workers,
@@ -182,7 +185,11 @@ class BackgroundRunService:
             progress_id,
             RunContext(),
         )
-        with active_execution_progress(reporter):
+        try:
+            level = self._diagnostic_settings().diagnostic_level if self._diagnostic_settings else None
+        except Exception:
+            level = DiagnosticLevel.NORMAL
+        with diagnostic_scope(level), active_execution_progress(reporter):
             reporter.emit(
                 ExecutionEventType.RUN_STARTED,
                 message="Run started.",

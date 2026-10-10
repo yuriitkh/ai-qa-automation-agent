@@ -14,7 +14,7 @@ from .errors import (
     provider_http_failure,
 )
 from .json_schema import qa_test_plan_schema
-from .usage_metadata import capture_gemini_usage
+from .usage_metadata import capture_gemini_usage, mark_provider_request
 
 
 def _raise_for_gemini_error(error: Exception, operation: str) -> None:
@@ -111,6 +111,7 @@ class GeminiProvider(LLMProvider):
                 "mime_type": "application/json",
                 "schema": qa_test_plan_schema(),
             }
+            mark_provider_request()
             interaction = self._client.interactions.create(
                 model=self._model,
                 input=(
@@ -208,6 +209,7 @@ class GeminiProvider(LLMProvider):
         if self._client is None:
             raise NonRetryableLLMError("Gemini provider is unavailable.")
         try:
+            mark_provider_request()
             response = self._client.interactions.create(
                 model=self._model,
                 input=("Return only structured candidate navigation paths and interactive elements "
@@ -228,6 +230,7 @@ class GeminiProvider(LLMProvider):
         if self._client is None:
             raise NonRetryableLLMError("Gemini provider is unavailable.")
         try:
+            mark_provider_request()
             response = self._client.interactions.create(
                 model=self._model,
                 input=prompt,

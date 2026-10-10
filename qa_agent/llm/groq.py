@@ -13,7 +13,7 @@ from .errors import (
     provider_http_failure,
 )
 from .json_schema import normalize_strict_json_schema, qa_test_plan_schema
-from .usage_metadata import capture_openai_usage
+from .usage_metadata import capture_openai_usage, capture_response_http_status, mark_provider_request
 
 
 class GroqProvider(LLMProvider):
@@ -168,6 +168,7 @@ class GroqProvider(LLMProvider):
             prompt, self._response_schema(), "qa_test_plan", 8192
         )
         try:
+            mark_provider_request()
             response = httpx.post(
                 self._endpoint,
                 headers={"Authorization": f"Bearer {api_key}"},
@@ -186,6 +187,7 @@ class GroqProvider(LLMProvider):
                 safe_detail="Provider unavailable",
             ) from error
 
+        capture_response_http_status(getattr(response, 'status_code', None))
         if response.is_error:
             raise provider_http_failure(
                 "Groq", response.status_code,
@@ -223,6 +225,7 @@ class GroqProvider(LLMProvider):
             prompt, schema, "ai_discovery_result", self._max_output_tokens
         )
         try:
+            mark_provider_request()
             response = httpx.post(self._endpoint,
                 headers={"Authorization": f"Bearer {api_key}"}, json=payload, timeout=provider_timeout(self._timeout_seconds))
         except httpx.TimeoutException as error:
@@ -235,6 +238,7 @@ class GroqProvider(LLMProvider):
                 "Groq transport request failed.", category="PROVIDER_UNAVAILABLE",
                 safe_detail="Provider unavailable",
             ) from error
+        capture_response_http_status(getattr(response, 'status_code', None))
         if response.is_error:
             raise provider_http_failure(
                 "Groq", response.status_code,
@@ -262,6 +266,7 @@ class GroqProvider(LLMProvider):
             prompt, schema, schema_name, self._max_output_tokens
         )
         try:
+            mark_provider_request()
             response = httpx.post(
                 self._endpoint,
                 headers={"Authorization": f"Bearer {api_key}"},
@@ -278,6 +283,7 @@ class GroqProvider(LLMProvider):
                 "Groq transport request failed.", category="PROVIDER_UNAVAILABLE",
                 safe_detail="Provider unavailable",
             ) from error
+        capture_response_http_status(getattr(response, 'status_code', None))
         if response.is_error:
             raise provider_http_failure(
                 "Groq", response.status_code,

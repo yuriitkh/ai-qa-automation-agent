@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from qa_agent.cookie_consent import CookieConsentRecord, current_cookie_consent_record
 from qa_agent.evidence_policy import EvidencePolicy, EvidenceScope, current_evidence_policy
 from qa_agent.execution_repository import ExecutionRepository
+from qa_agent.diagnostic_mode import DiagnosticLevel, current_diagnostic_level
 from qa_agent.models import (
     Execution,
     ExecutionStatus,
@@ -135,6 +136,7 @@ class RunHistoryRecord(BaseModel):
     executions: list[HistoryExecutionReference] = Field(default_factory=list)
     run_context_safe: dict[str, dict[str, Any]] = Field(default_factory=dict)
     trace_id: UUID | None = None
+    diagnostic_level: DiagnosticLevel | None = None
 
     @classmethod
     def from_completed_run(
@@ -294,6 +296,7 @@ class RunHistoryRecord(BaseModel):
             ],
             run_context_safe=safe_context,
             trace_id=trace_id,
+            diagnostic_level=current_diagnostic_level(),
         )
 
 

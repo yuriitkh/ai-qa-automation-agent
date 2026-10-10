@@ -12,6 +12,7 @@ from qa_agent.llm.router import LLMRouter
 from qa_agent.models import TestStep as Step
 from qa_agent.test_plan_generator import LLMTestPlanGenerator
 from qa_agent.test_plan_validation import PlanValidationError, PlanValidationIssue
+from qa_agent.reliability import ReliabilitySettings
 from tests.test_generation_reliability import action, observed_registration, plan
 from tests.test_registration_coverage import RegistrationProvider
 
@@ -45,6 +46,7 @@ def run_generation(step, proposed, context=None):
 
 def reject_generation(step, proposed, context=None, code='UNGROUNDED_ASSERTION'):
     generator = LLMTestPlanGenerator(LLMRouter([RegistrationProvider([proposed])]))
+    generator.supervisor.repository.save_settings(ReliabilitySettings(diagnostic_level='DEBUG'))
     with pytest.raises(PlanValidationError) as caught:
         generator.generate_with_plan(step, observed_registration(), requirement_context=context)
     assert caught.value.issues[0].code == code

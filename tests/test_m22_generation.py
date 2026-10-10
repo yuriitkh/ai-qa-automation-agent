@@ -10,10 +10,18 @@ from qa_agent.llm.errors import RetryableLLMError
 from qa_agent.llm.router import LLMRouter
 from qa_agent.models import QATestPlan, TestStep as Step
 from qa_agent.reliability import ReliabilitySettings
+from qa_agent.diagnostic_mode import DiagnosticLevel
 from qa_agent.test_plan_generator import LLMTestPlanGenerator
 from qa_agent.test_plan_validation import PlanValidationError
 from tests.test_generation_reliability import URL, action, observed_registration, generate, reject, plan
 from tests.test_registration_coverage import RegistrationProvider
+
+
+def diagnostic_generator(*args):
+    generator = LLMTestPlanGenerator(*args)
+    settings = generator.supervisor.repository.settings()
+    generator.supervisor.repository.save_settings(settings.model_copy(update={'diagnostic_level': DiagnosticLevel.DEBUG}))
+    return generator
 
 
 def input_step():
@@ -52,7 +60,7 @@ def test_rejected_candidate_has_value_free_bounded_gate_diagnostics():
     candidate = plan(action('fill', '#password', value='private-password-value'),
                      action('assert_unchecked', '#form-error'))
     provider = RegistrationProvider([candidate])
-    generator = LLMTestPlanGenerator(LLMRouter([provider]))
+    generator = diagnostic_generator(LLMRouter([provider]))
     with pytest.raises(PlanValidationError):
         generator.generate_with_plan(input_step(), observed_registration())
     record = generator.supervisor.repository.list_records()[0]
@@ -171,8 +179,8 @@ def test_rejected_diagnostics_retain_initial_and_targeted_repair_without_approve
                 expected='Entered data is accepted without validation errors.', order=0)
     candidates = [plan(action('fill', '#email', value='private-test-input')),
                   plan(action('fill', '#email', value='private-test-input'), action('assert_unchecked', '#form-error'))]
-    generator = LLMTestPlanGenerator(LLMRouter([RegistrationProvider(candidates)]))
-    generator.supervisor.repository.save_settings(ReliabilitySettings(automatic_plan_repair=True))
+    generator = diagnostic_generator(LLMRouter([RegistrationProvider(candidates)]))
+    generator.supervisor.repository.save_settings(ReliabilitySettings(automatic_plan_repair=True, diagnostic_level='DEBUG'))
     with pytest.raises(PlanValidationError):
         generator.generate_with_plan(step, observed_registration())
     record = generator.supervisor.repository.list_records()[0]
@@ -240,7 +248,7 @@ def test_structured_failures_fall_back_without_retrying_or_saving_raw_response(f
             client.return_value.chat.completions.create.return_value = response
         else:
             client.return_value.chat.completions.create.side_effect = Unsupported('private-provider-body')
-        generator = LLMTestPlanGenerator(LLMRouter([first, second]))
+        generator = diagnostic_generator(LLMRouter([first, second]))
         generator.generate_with_plan(step, observed_registration())
         client.return_value.chat.completions.create.assert_called_once()
     record = generator.supervisor.repository.list_records()[0]
@@ -267,7 +275,7 @@ def test_schema_rejection_inside_real_adapter_retains_safe_action_and_parameter_
         provider = (OpenAICompatibleProvider('openrouter', 'UNUSED', 'fake-model', api_key='fake-key') if adapter == 'openrouter'
                     else GeminiProvider(api_key='fake-key', model='fake-model') if adapter == 'gemini'
                     else GroqProvider(api_key='fake-key', model='fake-model'))
-        generator = LLMTestPlanGenerator(LLMRouter([provider]))
+        generator = diagnostic_generator(LLMRouter([provider]))
         with pytest.raises(RetryableLLMError):
             generator.generate_with_plan(input_step(), observed_registration())
     record = generator.supervisor.repository.list_records()[0]
@@ -350,7 +358,7 @@ def test_rejected_diagnostics_persist_and_render_without_changing_historical_ope
                            (str(historical.id), historical.started_at.isoformat(), original))
     candidate = plan(action('fill', '#email', value='private-input'), action('assert_unchecked', '#form-error'))
     supervisor = AutomationReliabilitySupervisor(repo)
-    generator = LLMTestPlanGenerator(LLMRouter([RegistrationProvider([candidate])]), supervisor)
+    generator = diagnostic_generator(LLMRouter([RegistrationProvider([candidate])]), supervisor)
     with pytest.raises(PlanValidationError):
         generator.generate_with_plan(input_step(), observed_registration())
     record = next(r for r in repo.list_records() if r.id != historical.id)

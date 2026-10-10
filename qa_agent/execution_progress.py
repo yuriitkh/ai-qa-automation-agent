@@ -1397,6 +1397,7 @@ class ExecutionProgressReporter:
                     code=issue.code,
                     path=self.safe_text(issue.path),
                     message=self.safe_text(issue.message),
+                    reason_code=issue.reason_code,
                 )
                 for issue in validation_issues
             ),
@@ -1429,6 +1430,9 @@ class ExecutionProgressReporter:
                         "request_kind": attempt.request_kind.value,
                         "status": attempt.outcome.value,
                     }
+                    if getattr(attempt, 'reliability_operation_id', None):
+                        row['reliability_operation_id'] = str(attempt.reliability_operation_id)
+                        row['provider_attempt_index'] = getattr(attempt, 'attempt_index', None)
                     if attempt.model:
                         row["model"] = self.safe_text(attempt.model)
                     if attempt.duration_ms is not None:

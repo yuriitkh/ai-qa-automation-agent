@@ -50,6 +50,7 @@ def capture_provider_usage() -> Iterator[ProviderUsageCapture]:
 
 def capture_openai_usage(response_or_usage: Any) -> ProviderTokenUsage | None:
     """Capture OpenAI-compatible ``usage`` fields from an object or mapping."""
+    capture_response_structure(response_or_usage)
     usage = _field(response_or_usage, "usage")
     if usage is None:
         usage = response_or_usage
@@ -65,6 +66,7 @@ def capture_openai_usage(response_or_usage: Any) -> ProviderTokenUsage | None:
 
 def capture_gemini_usage(response_or_usage: Any) -> ProviderTokenUsage | None:
     """Capture Gemini Interactions/usage metadata using known field variants."""
+    capture_response_structure(response_or_usage)
     usage = _field(response_or_usage, "usage")
     if usage is None:
         usage = _field(response_or_usage, "usage_metadata")
@@ -127,3 +129,50 @@ def _set_current_usage(usage: ProviderTokenUsage | None) -> None:
     capture = _CURRENT_CAPTURE.get()
     if capture is not None:
         capture.usage = usage
+
+
+def capture_response_structure(response):
+    """Inspect known SDK fields without retaining any provider content."""
+    try:
+        from qa_agent.reliability import current_reliability_operation
+        from qa_agent.diagnostic_mode import DiagnosticLevel, enabled
+        operation = current_reliability_operation()
+        if operation is None or not enabled(operation.record.settings.diagnostic_level, DiagnosticLevel.DEBUG):
+            return
+        choices = _field(response, 'choices')
+        first = choices[0] if isinstance(choices, (list, tuple)) and choices else None
+        finish = _field(first, 'finish_reason') or _field(response, 'finish_reason') or _field(response, 'status')
+        metadata = {'finish_reason': finish}
+        if isinstance(finish, str) and finish in {'length', 'MAX_TOKENS', 'incomplete'}:
+            metadata['truncated'] = True
+        elif isinstance(finish, str) and finish in {'stop', 'STOP', 'completed'}:
+            metadata['truncated'] = False
+        if enabled(operation.record.settings.diagnostic_level, DiagnosticLevel.TRACE):
+            content = _field(_field(first, 'message'), 'content') or _field(response, 'output_text')
+            if isinstance(content, str):
+                metadata['response_chars'] = len(content)
+        operation.capture_response_metadata(metadata)
+    except Exception:
+        pass
+
+
+def capture_response_http_status(status):
+    """Retain only a known HTTP status, never headers or response content."""
+    try:
+        from qa_agent.reliability import current_reliability_operation
+        operation = current_reliability_operation()
+        if operation is not None:
+            operation.capture_response_metadata({'http_status': status})
+    except Exception:
+        pass
+
+
+def mark_provider_request():
+    """Adapters mark a request attempt; routing alone cannot prove transmission."""
+    try:
+        from qa_agent.reliability import current_reliability_operation
+        operation = current_reliability_operation()
+        if operation and operation.record.outcome == 'RUNNING' and operation.record.attempts:
+            operation.record.attempts[-1].request_sent = True
+    except Exception:
+        pass

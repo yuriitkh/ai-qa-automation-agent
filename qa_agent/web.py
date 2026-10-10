@@ -235,7 +235,8 @@ class LocalWebApplication:
             if test_cases is not None and plan_store is not None else None
         )
         self._background_runs = (
-            BackgroundRunService(run_service, run_history, self._progress_store)
+            BackgroundRunService(run_service, run_history, self._progress_store,
+                                 diagnostic_settings=(lambda: self._reliability.effective_settings()[0]) if self._reliability else None)
             if run_service is not None else None
         )
         self._readiness_service = readiness_service
@@ -383,7 +384,7 @@ class LocalWebApplication:
         query = parse_qs(parsed.query)
         parts = path.strip("/").split("/")
         if method.upper() == "POST":
-            protected = parts[-1:] in (["stop"], ["preferences"]) or (parts[:2] == ["settings", "reliability"] and parts[-1:] == ["cancel"])
+            protected = parts[-1:] in (["stop"], ["preferences"]) or (parts[:2] == ["settings", "reliability"] and parts[-1:] == ["cancel"]) or parts == ['settings', 'diagnostics']
             definition_edit = (len(parts) == 3 and parts[0] == "test-cases" and parts[2] == "edit") or (len(parts) == 4 and parts[:2] == ["test-cases", "review"] and parts[3] in {"save", "cancel", "regenerate"})
             if (protected or definition_edit) and not self._valid_control_request(body, headers, max_bytes=_MAX_MANUAL_FORM_BODY_BYTES if definition_edit else _MAX_FORM_BODY_BYTES):
                 return WebResponse.json(403, json.dumps({"error": "Request validation failed. Refresh this page and retry."}))
@@ -468,6 +469,14 @@ class LocalWebApplication:
             return WebResponse.html(200, self._usage_analytics_page(query))
         if path == "/settings/reliability" and self._reliability is not None:
             return WebResponse.html(200, self._reliability_page(query))
+        if path == '/settings/diagnostics' and self._reliability is not None:
+            return WebResponse.html(200, self._diagnostic_mode_page(query))
+        if len(parts) == 4 and parts[:2] == ['settings', 'reliability'] and parts[3] in {'diagnostics.json', 'diagnostics.zip'}:
+            return self._export_diagnostics('operation', parts[2], parts[3].split('.')[-1])
+        if len(parts) == 3 and parts[0] == 'runs' and parts[2] in {'diagnostics.json', 'diagnostics.zip'}:
+            return self._export_diagnostics('run', parts[1], parts[2].split('.')[-1])
+        if len(parts) == 4 and parts[:2] == ['api', 'progress'] and parts[3] in {'diagnostics.json', 'diagnostics.zip'}:
+            return self._export_diagnostics('progress', parts[2], parts[3].split('.')[-1])
         if len(parts) == 3 and parts[:2] == ["settings", "reliability"] and self._reliability is not None:
             operation_id = _parse_uuid(parts[2])
             return self._reliability_operation_page(operation_id) if operation_id else self._not_found("Generation operation not found")
@@ -536,7 +545,7 @@ class LocalWebApplication:
                     evidence_url=lambda step, attempt, evidence, index: self._evidence_url_if_available(
                         detail, run_id, step, attempt, evidence, index
                     ),
-                ),
+                ).replace('</main>', self._diagnostic_export_links(f'/runs/{run_id}') + '</main>', 1),
             )
         if len(parts) == 4 and parts[0] == "runs" and parts[2] == "plans":
             run_id, version_id = _parse_uuid(parts[1]), _parse_uuid(parts[3])
@@ -597,6 +606,8 @@ class LocalWebApplication:
     def _handle_post(self, parts: list[str], body: bytes | str | None) -> WebResponse:
         if parts == ["settings", "reliability"] and self._reliability is not None:
             return self._handle_reliability_settings(body)
+        if parts == ['settings', 'diagnostics'] and self._reliability is not None:
+            return self._handle_diagnostic_settings(body)
         if len(parts) == 4 and parts[:2] == ["settings", "reliability"] and parts[3] == "cancel" and self._reliability is not None:
             operation_id = _parse_uuid(parts[2])
             if operation_id is None or not self._reliability.cancel(operation_id):
@@ -902,6 +913,7 @@ class LocalWebApplication:
             saved_step = report_steps.get(UUID(step["id"]))
             step["evidence_links"] = []
             step["generation_decisions"] = []
+            step['generation_failures'] = []
             step["observation"] = None
             step.setdefault("action_failure", None)
             if saved_step:
@@ -972,6 +984,22 @@ class LocalWebApplication:
                     "label": f"Generation decisions — Step {number}: {name}",
                     "url": f"/settings/reliability/{operation_id}",
                 })
+                if match:
+                    try:
+                        from qa_agent.diagnostic_export import operation_data
+                        record = self._reliability.repository.get(operation_id)
+                        if (record and record.outcome == 'NEEDS_ATTENTION' and record.attempts
+                                and str(record.test_step_id) == step['id']
+                                and record.test_case_id in {None, snapshot.test_case_id}):
+                            last = operation_data(record)['attempts'][-1]
+                            failed_gate = next((gate for gate, status in last['quality_gates'].items() if status == 'FAILED'),
+                                               'provider_request' if last['provider_status'] == 'FAILED' else 'unknown')
+                            step['generation_failures'].append({
+                                'operation_id': str(operation_id), 'failed_gate': failed_gate,
+                                'reason_codes': [reason['reason_code'] for reason in last['failure_reasons']] or ['UNKNOWN'],
+                            })
+                    except Exception:
+                        pass
         if persisted:
             payload["actions"].insert(0, {"label": "View Run Details", "url": f"/runs/{persisted.run_id}"})
         if payload["summary"]["outcome"] == "INFRASTRUCTURE_ERROR":
@@ -1121,6 +1149,10 @@ class LocalWebApplication:
                 f'<span class="muted"><a href="{esc(item["url"])}">{esc(item["label"])}</a></span>'
                 for item in step["generation_decisions"]
             )
+            decisions += ''.join(
+                f'<p class="progress-failure">Failed gate: {esc(item["failed_gate"])} · Failure reason: {esc(", ".join(item["reason_codes"]))}</p>'
+                for item in step['generation_failures']
+            )
             step_rows.append(
                 '<li class="progress-step"><span class="progress-symbol" aria-hidden="true">'
                 + ('✓' if step["display_status"] == 'Passed' else '○') + '</span><span>'
@@ -1161,7 +1193,8 @@ class LocalWebApplication:
             + ''.join(
                 f'<p><a href="{esc(item["url"])}">{esc(item["label"])}</a></p>'
                 for item in payload["generation_decisions"]
-            ) + '</div></section>'
+            ) + '</div>'
+            + self._diagnostic_export_links(f'/api/progress/{progress_id}') + '</section>'
             + '<details class="panel technical-details" data-progress-developer-details><summary>Developer details</summary>'
             + '<div data-progress-diagnostics>' + self._progress_diagnostics_html(payload['diagnostic_stages'], payload['provider_diagnostics']) + '</div></details></div>'
             + '<p class="muted" data-progress-notice aria-live="polite"></p>'
@@ -4532,6 +4565,7 @@ class LocalWebApplication:
             f'<a href="/settings/providers"{providers_current}>AI Providers</a>'
             f'<a href="/settings/usage"{usage_current}>AI Usage</a>'
             + (f'<a href="/settings/reliability"{reliability_current}>Automation Reliability</a>' if self._reliability is not None else '')
+            + (f'<a href="/settings/diagnostics"' + (' aria-current="page"' if active == 'diagnostics' else '') + '>Diagnostic Mode</a>' if self._reliability is not None else '')
             + '</nav>'
         )
 
@@ -4546,12 +4580,102 @@ class LocalWebApplication:
         settings = ReliabilitySettings(
             **{key: values[key] == "on" for key in fields - {"max_total_attempts"}},
             max_total_attempts=int(values["max_total_attempts"]),
+            diagnostic_level=self._reliability.effective_settings()[0].diagnostic_level,
         )
         try:
-            self._reliability.repository.save_settings(settings)
+            self._reliability.repository.update_reliability_settings(settings)
         except Exception:
             return WebResponse.html(503, self._page("Automation Reliability", '<p>Reliability settings could not be saved. Review local storage in System Health.</p>'))
         return WebResponse.redirect("/settings/reliability?saved=1")
+
+    def _diagnostic_mode_page(self, query, *, error=None):
+        from qa_agent.diagnostic_mode import DiagnosticLevel, LEVEL_DESCRIPTIONS, RETENTION_DAYS, MAX_RETAINED_OPERATIONS
+        settings, unavailable = self._reliability.effective_settings()
+        options = ''.join(f'<option value="{level.value}"' + (' selected' if settings.diagnostic_level == level else '') + f'>{level.value}</option>' for level in DiagnosticLevel)
+        explanations = ''.join(f'<li><strong>{level.value}</strong>: {escape_html(description)}</li>' for level, description in LEVEL_DESCRIPTIONS.items())
+        notice = ('Storage is unavailable or invalid. The safe effective fallback is NORMAL; changes have not been persisted.' if unavailable else 'Settings saved. New operations use this level.' if query.get('saved') == ['1'] else 'Active operations retain their recorded level. TRACE is opt-in.')
+        return self._page('Diagnostic Mode', '<header class="page-heading"><h1>Diagnostic Mode</h1></header>'
+            + self._settings_tabs('diagnostics') + f'<p class="notice">{escape_html(notice)}</p>'
+            + (f'<p class="notice danger">{escape_html(error)}</p>' if error else '')
+            + f'<section class="panel"><p>Current effective level: <strong>{settings.diagnostic_level.value}</strong></p>'
+            + '<form method="post" action="/settings/diagnostics">'
+            + f'<input type="hidden" name="_csrf" value="{self._csrf_token}"><label>Diagnostic level<select name="level">{options}</select></label>'
+            + '<button class="button primary" type="submit">Save Diagnostic Mode</button></form>'
+            + f'<ul>{explanations}</ul><p>Optional metadata is retained for {RETENTION_DAYS} days and at most {MAX_RETAINED_OPERATIONS} recent operations. Mandatory audit and Run/Plan history are preserved.</p>'
+            + '<p>Private prompts, responses, full DOM, credentials and form values are never collected by Diagnostic Mode. Export JSON or ZIP from Generation Decisions or Run Progress without another provider request.</p></section>', current='Settings')
+
+    def _handle_diagnostic_settings(self, body):
+        from qa_agent.diagnostic_mode import DiagnosticLevel
+        form, error = _parse_form_body(body)
+        form.pop('_csrf', None)
+        if error or set(form) != {'level'} or len(form['level']) != 1:
+            return WebResponse.html(400, self._diagnostic_mode_page({}, error='Choose exactly one diagnostic level.'))
+        try:
+            level = DiagnosticLevel(form['level'][0])
+        except ValueError:
+            return WebResponse.html(400, self._diagnostic_mode_page({}, error='Choose OFF, NORMAL, DEBUG or TRACE.'))
+        settings, unavailable = self._reliability.effective_settings()
+        if unavailable:
+            return WebResponse.html(503, self._diagnostic_mode_page({}, error='Diagnostic settings could not be persisted. Review local storage in System Health.'))
+        try:
+            self._reliability.repository.update_diagnostic_level(level)
+        except Exception:
+            return WebResponse.html(503, self._diagnostic_mode_page({}, error='Diagnostic settings could not be persisted. The saved level is unchanged.'))
+        return WebResponse.redirect('/settings/diagnostics?saved=1')
+
+    def _diagnostic_export_links(self, base):
+        if self._reliability is None:
+            return ''
+        return ('<div class="actions">' + ''.join(
+            f'<a class="button" href="{escape_html(base)}/diagnostics.{format}">Export Diagnostics ({format.upper()})</a>'
+            for format in ('json', 'zip')) + '</div>')
+
+    def _export_diagnostics(self, scope, identifier, format):
+        from qa_agent.diagnostic_export import diagnostic_report, diagnostic_download
+        if self._reliability is None:
+            return self._not_found('Diagnostic records unavailable')
+        identity = _parse_uuid(identifier) if scope != 'progress' else None
+        if scope != 'progress' and identity is None:
+            return self._not_found('Diagnostic record not found')
+        try:
+            records, runs, run_id = [], [], None
+            if scope == 'operation':
+                record = self._reliability.repository.get(identity)
+                if record is None:
+                    return self._not_found('Generation operation not found')
+                records = [record]
+                if record.test_case_id and record.candidate_version_id:
+                    for run in self._run_history.list_for_test_case(record.test_case_id, limit=100):
+                        references = [ref for ref in run.executions if ref.test_step_id == record.test_step_id and ref.test_plan_version_id == record.candidate_version_id]
+                        if references:
+                            runs.append((run, references))
+            elif scope == 'run':
+                run = self._run_history.get(identity)
+                if run is None:
+                    return self._not_found('Run not found')
+                run_id = run.run_id
+                runs = [(run, run.executions)]
+                pinned = {(ref.test_step_id, ref.test_plan_version_id) for ref in run.executions}
+                records = [record for record in self._reliability.repository.list_records()
+                           if record.test_case_id == run.test_case_id and (record.test_step_id, record.candidate_version_id) in pinned]
+            else:
+                snapshot = self._progress_store.get(identifier)
+                if snapshot is None:
+                    return self._not_found('Progress diagnostics unavailable')
+                for operation_id in dict.fromkeys(event.reliability_operation_id for event in snapshot.events if event.reliability_operation_id):
+                    record = self._reliability.repository.get(operation_id)
+                    if record and record.test_case_id in {None, snapshot.test_case_id}:
+                        records.append(record)
+                run = self._run_history.get(snapshot.final_run_id) if snapshot.final_run_id else None
+                if run and run.test_case_id == snapshot.test_case_id:
+                    run_id = run.run_id
+                    runs = [(run, run.executions)]
+                identity = run_id or (records[0].id if records else snapshot.test_case_id)
+            report = diagnostic_report(records, runs, run_id=run_id)
+            filename, content_type, content = diagnostic_download(report, identity, format)
+            return WebResponse(200, content_type, content, {'Content-Disposition': f'attachment; filename="{filename}"', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff'})
+        except Exception:
+            return WebResponse.json(503, json.dumps({'error': 'Diagnostics could not be exported. No provider request was made.'}))
 
     def _reliability_page(self, query: dict, *, error: str | None = None) -> str:
         settings = self._reliability.repository.settings()
@@ -4605,20 +4729,30 @@ class LocalWebApplication:
         if record is None:
             return self._not_found("Generation operation not found")
         esc = escape_html
+        from qa_agent.diagnostic_export import operation_data
+        public = operation_data(record)
         rows = []
-        for attempt in record.attempts:
+        for attempt, safe_attempt in zip(record.attempts, public['attempts']):
+            failed_gate = next((gate for gate, status in safe_attempt['quality_gates'].items() if status == 'FAILED'),
+                               safe_attempt['candidate_metadata'].get('failed_gate') if safe_attempt['candidate_metadata'] else
+                               'provider_request' if safe_attempt['provider_status'] == 'FAILED' else None)
+            reasons = ', '.join(reason['reason_code'] for reason in safe_attempt['failure_reasons']) or ('UNKNOWN' if attempt.status == 'REJECTED' else '')
             rows.append(
                 f'<li><h3>Attempt {attempt.index} — {esc(attempt.action.replace("_", " ").title())}</h3>'
-                + f'<p>{esc(attempt.status.replace("_", " ").title())} · {esc(attempt.reason)}</p>'
-                + (f'<p>Provider: {esc(attempt.provider)}</p>' if attempt.provider else '')
-                + (f'<p>Model: {esc(attempt.model)}</p>' if attempt.model else '')
+                + f'<p>{esc(attempt.status.replace("_", " ").title())}</p>'
+                + f'<p>Provider response: {esc(safe_attempt["provider_status"])} · Plan decision: {esc(attempt.status)}</p>'
+                + (f'<p>Provider: {esc(safe_attempt["provider"])}</p>' if safe_attempt['provider'] else '')
+                + (f'<p>Model: {esc(safe_attempt["model"])}</p>' if safe_attempt['model'] else '')
+                + (f'<p>Failed gate: {esc(failed_gate)} · Failure reason: {esc(reasons)}</p>' if failed_gate or reasons else '')
+                + ('<p>Exact root cause unknown. The saved metadata does not establish a more specific cause.</p>' if any(not reason['root_cause_known'] for reason in safe_attempt['failure_reasons']) else '')
+                + (f'<p>Candidate metadata: {esc(safe_attempt["candidate_metadata_availability"])}</p>' if attempt.status == 'REJECTED' else '')
                 + (f'<p>Provider request duration: {esc(format_duration(attempt.duration_ms))}</p>' if attempt.duration_ms is not None else '')
                 + (f'<p>Structured response: {esc(attempt.structured_response_code)}</p>' if attempt.structured_response_code else '')
                 + ('<h4>Rejected candidate diagnostics</h4><p>Selectors and requirement clauses are represented by hashes; no input values are retained.</p><pre>'
-                   + esc(json.dumps(attempt.candidate_diagnostics, indent=2)) + '</pre>' if attempt.candidate_diagnostics else '')
-                + '<details class="technical-details"><summary>Developer details</summary><pre>' + esc(attempt.model_dump_json(indent=2)) + '</pre></details></li>'
+                   + esc(json.dumps(safe_attempt['candidate_metadata'], indent=2)) + '</pre>' if safe_attempt['candidate_metadata'] else '')
+                + '<details class="technical-details"><summary>Developer details</summary><pre>' + esc(json.dumps(safe_attempt, indent=2)) + '</pre></details></li>'
             )
-        decisions = ''.join(f'<li>{esc(format_timestamp(item.timestamp))} · {esc(item.action)} · {esc(item.reason)}</li>' for item in record.decisions)
+        decisions = ''.join(f'<li>{esc(item["timestamp"])} · {esc(item["action"])} · {esc(item["reason"])}</li>' for item in public['decisions'])
         actions = '<a class="button" href="/settings/reliability">Back to Automation Reliability</a>'
         case = self._test_cases.get(record.test_case_id) if self._test_cases is not None and record.test_case_id else None
         if case is not None and any(step.id == record.test_step_id for step in case.steps):
@@ -4632,9 +4766,14 @@ class LocalWebApplication:
             '<header class="page-heading"><h1>Automation generation operation</h1>' + f'<p>{esc(record.id)}</p><p>{esc(record.outcome.replace("_", " ").title())}</p></header>'
             + '<p>Generation quality is separate from human approval and Browser Validation. No product PASS is inferred.</p>'
             + '<div class="actions">' + actions + '</div><section class="panel"><h2>Effective settings for this operation</h2><pre>' + esc(record.settings.model_dump_json(indent=2)) + '</pre></section>'
+            + f'<p>TestStep ID: {esc(record.test_step_id)} · Diagnostic level: {esc(public["effective_level"])}</p>'
+            + self._diagnostic_export_links(f'/settings/reliability/{record.id}')
             + '<section class="panel"><h2>Attempts</h2><ol>' + ''.join(rows) + '</ol></section>'
-            + '<section class="panel"><h2>Effective provider order</h2><pre>' + esc(json.dumps(record.effective_provider_order, indent=2)) + '</pre></section>'
+            + '<section class="panel"><h2>Effective provider order</h2><pre>' + esc(json.dumps(public['effective_provider_order'], indent=2)) + '</pre></section>'
             + '<section class="panel"><h2>Recovery decisions</h2><ol>' + decisions + '</ol></section>'
+            + '<details class="panel technical-details"><summary>Diagnostic chronology</summary><pre>'
+            + esc(json.dumps(public['events'], indent=2)) + '</pre>'
+            + ('<p>Optional metadata is unavailable at this level, expired, or predates Diagnostic Mode. Its absence is not successful verification.</p>' if public['optional_metadata_unavailable'] else '') + '</details>'
         )
         return WebResponse.html(200, self._page("Automation generation operation", content, current="Settings"))
 
@@ -4654,6 +4793,8 @@ class LocalWebApplication:
             links.append(("AI Usage", "/settings/usage"))
         if self._provider_settings is not None:
             links.append(("Settings", "/settings/providers"))
+        elif self._reliability is not None:
+            links.append(('Settings', '/settings/diagnostics'))
         for label, href in links:
             current_attribute = ' aria-current="page"' if label == current else ""
             nav_items.append(
@@ -6350,6 +6491,9 @@ _UI_JAVASCRIPT = r"""
       (step.generation_decisions || []).forEach((decision) => {
         const line = document.createElement('span'); line.className = 'muted';
         line.append(localLink(decision.url, decision.label)); content.append(line);
+      });
+      (step.generation_failures || []).forEach((failure) => {
+        content.append(textNode('p', `Failed gate: ${failure.failed_gate} · Failure reason: ${failure.reason_codes.join(', ')}`, 'progress-failure'));
       });
       if (step.observation) content.append(textNode('p', `Observed: ${step.observation}`));
       if (step.action_failure) {

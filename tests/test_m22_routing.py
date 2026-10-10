@@ -11,7 +11,7 @@ from qa_agent.execution_progress import ExecutionProgressReporter, ExecutionProg
 from qa_agent.execution_trace import ExecutionTraceRecorder, RequestKind, ProviderAttemptOutcome, active_trace_recorder
 from qa_agent.llm.errors import RetryableLLMError
 from qa_agent.provider_settings import ProviderSettingsRepository, ProviderSettingsService
-from qa_agent.reliability import SQLiteReliabilityRepository, AutomationReliabilitySupervisor
+from qa_agent.reliability import SQLiteReliabilityRepository, AutomationReliabilitySupervisor, ReliabilitySettings
 from qa_agent.run_history import InMemoryRunHistoryRepository, RunHistoryService
 from qa_agent.test_plan_generator import LLMTestPlanGenerator
 from qa_agent.web import LocalWebApplication
@@ -43,6 +43,7 @@ def test_web_saved_priority_is_actual_generation_order_and_unavailable_is_not_a_
                                        environment=environment, provider_factory=factory)
     router = settings.create_router()
     supervisor = AutomationReliabilitySupervisor(SQLiteReliabilityRepository(database))
+    supervisor.repository.save_settings(ReliabilitySettings(diagnostic_level='DEBUG'))
     app = LocalWebApplication(RunHistoryService(InMemoryRunHistoryRepository()),
                               provider_settings=settings, provider_router=router, reliability=supervisor)
     try:

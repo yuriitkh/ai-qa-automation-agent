@@ -105,7 +105,7 @@ class LLMRouter:
         if not isinstance(model, str) or not model:
             model = getattr(provider, "_model", None)
         http_status = (
-            getattr(error, "status_code", None) if error is not None else None
+            (getattr(error, 'http_status', None) or getattr(error, "status_code", None)) if error is not None else None
         )
         record_safely(
             recorder,
@@ -118,6 +118,8 @@ class LLMRouter:
             http_status=http_status if isinstance(http_status, int) else None,
             duration_ms=elapsed_ms(started) if started is not None else None,
             is_selected=is_selected,
+            reliability_operation_id=(current_reliability_operation().record.id if current_reliability_operation() else None),
+            attempt_index=(len(current_reliability_operation().record.attempts) or None if current_reliability_operation() and outcome != ProviderAttemptOutcome.UNAVAILABLE else None),
         )
 
     def _invoke_provider_attempt(
@@ -341,15 +343,22 @@ class LLMRouter:
         self._selected_provider_name = None
         configured = list(self._providers)
         available = [bool(provider.is_available) for provider in configured]
-        operation.record.effective_provider_order = [
-            {'priority': index, 'provider': _safe_metadata(self._provider_observability_name(provider)), 'available': enabled}
-            for index, (provider, enabled) in enumerate(zip(configured, available), 1)
-        ]
+        from qa_agent.diagnostic_mode import DiagnosticLevel, enabled as diagnostic_enabled
+        if diagnostic_enabled(operation.record.settings.diagnostic_level, DiagnosticLevel.DEBUG):
+            operation.record.effective_provider_order = [
+                {'priority': index, 'provider': _safe_metadata(self._provider_observability_name(provider)), 'available': enabled}
+                for index, (provider, enabled) in enumerate(zip(configured, available), 1)
+            ][:32]
+        operation.diagnostic('REQUEST_STRUCTURE', minimum=DiagnosticLevel.TRACE,
+                             request_chars=len(task), snapshot_chars=len(page_snapshot))
         operation.supervisor.repository.save(operation.record)
         for provider, enabled in zip(configured, available):
             if enabled:
                 providers.append(provider)
             else:
+                operation.diagnostic('PROVIDER_SKIPPED', minimum=DiagnosticLevel.DEBUG,
+                                     provider=self._provider_observability_name(provider), available=False,
+                                     request_sent=False, status='SKIPPED', reason_code='PROVIDER_UNAVAILABLE')
                 self._record_provider_attempt(provider, RequestKind.TEST_PLAN, ProviderAttemptOutcome.UNAVAILABLE)
         if not providers:
             raise ReliabilityStopped("NO_PROVIDER")

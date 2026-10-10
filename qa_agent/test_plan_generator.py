@@ -129,8 +129,14 @@ class LLMTestPlanGenerator(TestPlanGenerator):
                 if repairing and original is not None:
                     self._validate_repair_preserves_actions(original, value)
             except PlanValidationError as error:
-                from qa_agent.candidate_diagnostics import rejected_candidate_diagnostics
-                error.candidate_diagnostics = rejected_candidate_diagnostics(value, test_step, discovery_result, error)
+                from qa_agent.diagnostic_mode import DiagnosticLevel, enabled
+                operation = current_reliability_operation()
+                if operation and enabled(operation.record.settings.diagnostic_level, DiagnosticLevel.DEBUG):
+                    try:
+                        from qa_agent.candidate_diagnostics import rejected_candidate_diagnostics
+                        error.candidate_diagnostics = rejected_candidate_diagnostics(value, test_step, discovery_result, error)
+                    except Exception:
+                        pass
                 raise
             return validated
 
@@ -189,25 +195,41 @@ class LLMTestPlanGenerator(TestPlanGenerator):
         requirement_context: str | None = None,
         step_context: StepGenerationContext | None = None,
     ) -> tuple[QATestPlan, tuple[AssertionGroundingEntry, ...]]:
+        import time
+        from qa_agent.diagnostic_mode import DiagnosticLevel, record_diagnostic, discovery_metadata, enabled
+        def gate(name, call):
+            started = time.perf_counter()
+            try:
+                result = call()
+            except Exception:
+                record_diagnostic('QUALITY_GATE', minimum=DiagnosticLevel.TRACE,
+                                  stage=name, status='FAILED', duration_ms=int((time.perf_counter() - started) * 1000))
+                raise
+            record_diagnostic('QUALITY_GATE', minimum=DiagnosticLevel.TRACE,
+                              stage=name, status='PASSED', duration_ms=int((time.perf_counter() - started) * 1000))
+            return result
+        operation = current_reliability_operation()
+        if operation and enabled(operation.record.settings.diagnostic_level, DiagnosticLevel.DEBUG):
+            record_diagnostic('DISCOVERY', minimum=DiagnosticLevel.DEBUG, **discovery_metadata(discovery_result))
         check_cancelled()
-        executable_plan = validate_executable_plan(value)
+        executable_plan = gate('schema_and_actions', lambda: validate_executable_plan(value))
         check_cancelled()
-        LLMTestPlanGenerator._validate_discovery_capabilities(
-            executable_plan, discovery_result, test_step
-        )
+        gate('locator_identity', lambda: LLMTestPlanGenerator._validate_discovery_capabilities(
+            executable_plan, discovery_result, test_step))
         check_cancelled()
-        LLMTestPlanGenerator._validate_locator_identity(executable_plan, discovery_result)
+        gate('locator_identity', lambda: LLMTestPlanGenerator._validate_locator_identity(executable_plan, discovery_result))
         check_cancelled()
-        grounding = validate_assertion_grounding(
+        grounding = gate('assertion_grounding', lambda: validate_assertion_grounding(
             executable_plan,
             test_step,
             discovery_result,
             requirement_context=requirement_context,
-        )
+        ))
         check_cancelled()
-        validate_expected_result_coverage(test_step, executable_plan, discovery=discovery_result)
+        coverage = gate('expected_result_coverage', lambda: validate_expected_result_coverage(test_step, executable_plan, discovery=discovery_result))
+        record_diagnostic('COVERAGE', minimum=DiagnosticLevel.DEBUG, coverage=coverage.status.value)
         check_cancelled()
-        validate_step_boundaries(executable_plan, test_step, discovery_result, step_context)
+        gate('step_boundaries', lambda: validate_step_boundaries(executable_plan, test_step, discovery_result, step_context))
         return executable_plan, grounding
 
     @staticmethod
@@ -427,7 +449,9 @@ class LLMTestPlanGenerator(TestPlanGenerator):
                     )])
             if element is None and step.action in {"select_option", "assert_selected", "check", "uncheck", "assert_checked", "assert_unchecked", "assert_value"}:
                 raise PlanValidationError([PlanValidationIssue(code="ACTION_TARGET_MISMATCH", path=path,
-                    message="This action requires a control type established by deterministic Discovery.")])
+                    message="This action requires a control type established by deterministic Discovery.",
+                    reason_code='UNSUPPORTED_INPUT_CONTROL' if step.action == 'assert_value' else
+                                'ASSERTION_TARGET_MISMATCH' if step.action.startswith('assert_') else None)])
             if element is None:
                 continue
             kinds = {element.kind.casefold(), element.tag.casefold(), element.role.casefold(), element.input_type.casefold()}
@@ -436,6 +460,7 @@ class LLMTestPlanGenerator(TestPlanGenerator):
                 raise PlanValidationError([PlanValidationIssue(
                     code="ACTION_TARGET_MISMATCH", path=path,
                     message="ASSERT_VALUE must target a discovered text input or textarea.",
+                    reason_code='UNSUPPORTED_INPUT_CONTROL',
                 )])
             if step.action == "select_option" and "select" not in kinds:
                 raise PlanValidationError([PlanValidationIssue(
@@ -463,12 +488,14 @@ class LLMTestPlanGenerator(TestPlanGenerator):
                         code="ACTION_TARGET_MISMATCH",
                         path=path,
                         message="ASSERT_SELECTED does not target a radio or select control supported by Discovery.",
+                        reason_code='ASSERTION_TARGET_MISMATCH',
                     )])
             if step.action in {"check", "uncheck", "assert_checked", "assert_unchecked"} and "checkbox" not in kinds:
                 raise PlanValidationError([PlanValidationIssue(
                     code="ACTION_TARGET_MISMATCH",
                     path=path,
                     message=f"{step.action.upper()} must target a discovered checkbox control.",
+                    reason_code='ASSERTION_TARGET_MISMATCH' if step.action.startswith('assert_') else None,
                 )])
 
 

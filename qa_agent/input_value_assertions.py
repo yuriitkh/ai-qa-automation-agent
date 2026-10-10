@@ -126,17 +126,28 @@ def input_value_subject_matches(clause, plan, index, discovery):
 
 def input_value_is_grounded(plan, index, discovery, requirements, *, requirement_context=None,
                             allow_atomic_requirements=False):
+    return input_value_grounding_reason(
+        plan, index, discovery, requirements, requirement_context=requirement_context,
+        allow_atomic_requirements=allow_atomic_requirements,
+    ) is None
+
+
+def input_value_grounding_reason(plan, index, discovery, requirements, *, requirement_context=None,
+                                allow_atomic_requirements=False):
+    """Use the grounding decision's exact branches; never retain a literal."""
     assertion = plan.steps[index]
     selector, value = assertion.parameters.get('selector'), assertion.parameters.get('expected')
     control = _control(discovery, selector)
     if control is None or not isinstance(value, str):
-        return False
+        return 'UNSUPPORTED_INPUT_CONTROL' if control is None else 'UNKNOWN'
     # A generated fill is not evidence on its own. It must use a literal in
     # an explicit input instruction naming this observed control.
     prior = [action for action in plan.steps[:index]
              if action.parameters.get('selector') == selector and not action.action.startswith('assert_')]
-    if not prior or prior[-1].action != 'fill' or prior[-1].parameters.get('value') != value:
-        return False
+    if not prior or prior[-1].action != 'fill':
+        return 'MISSING_PRECEDING_FILL'
+    if prior[-1].parameters.get('value') != value:
+        return 'FILL_ASSERT_VALUE_MISMATCH'
     from qa_agent.generation_context import observed_controls
     other_inputs = [item for item in observed_controls(discovery).values()
                     if item.selector != selector and item.tag in {'input', 'textarea'}]
@@ -153,13 +164,25 @@ def input_value_is_grounded(plan, index, discovery, requirements, *, requirement
         if has_instruction:
             # Even an unresolved original input instruction is authoritative.
             # Atomic elaboration cannot supply a missing or conflicting value.
-            if invalid or unspecified or original != {value} or value in restrictions:
-                return False
-            if ambiguous or allowed - original or value in forbidden:
-                return False
-            return True
+            if value in restrictions or value in forbidden:
+                return 'PROHIBITED_INPUT_VALUE'
+            if invalid:
+                return 'AMBIGUOUS_INPUT_BINDING'
+            if len(original) > 1 or (original and allowed - original):
+                return 'CONFLICTING_REQUIREMENT_VALUES'
+            if unspecified or original != {value}:
+                return 'VALUE_NOT_DECLARED_IN_REQUIREMENT'
+            if ambiguous:
+                return 'AMBIGUOUS_INPUT_BINDING'
+            return None
         if not allow_atomic_requirements:
             # Related original scenarios cannot gain specificity from generated
             # step wording, even when they contain no parsed input instruction.
-            return False
-    return not ambiguous and allowed == {value} and value not in forbidden
+            return 'VALUE_NOT_DECLARED_IN_REQUIREMENT'
+    if value in forbidden:
+        return 'PROHIBITED_INPUT_VALUE'
+    if ambiguous:
+        return 'AMBIGUOUS_INPUT_BINDING'
+    if len(allowed) > 1:
+        return 'CONFLICTING_REQUIREMENT_VALUES'
+    return None if allowed == {value} else 'VALUE_NOT_DECLARED_IN_REQUIREMENT'

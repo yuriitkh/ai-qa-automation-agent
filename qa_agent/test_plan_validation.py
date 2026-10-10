@@ -2,7 +2,7 @@
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 from qa_agent.models import QATestPlan, QATestStep
 
@@ -35,6 +35,13 @@ class PlanValidationIssue(BaseModel):
     ]
     path: str
     message: str
+    reason_code: str | None = None
+
+    @field_validator('reason_code')
+    @classmethod
+    def safe_reason_code(cls, value):
+        from qa_agent.diagnostic_mode import REASON_CODES
+        return value if isinstance(value, str) and value in REASON_CODES else None
 
 
 class PlanValidationError(ValueError):

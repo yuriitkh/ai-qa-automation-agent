@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from contextvars import ContextVar, copy_context
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import BoundedSemaphore, Event, RLock, Thread
 from typing import Any, Callable, Literal
@@ -19,6 +19,12 @@ from qa_agent.llm.errors import NonRetryableLLMError, RetryableLLMError, categor
 from qa_agent.llm_usage import current_llm_usage_context, OP_GENERATE_AUTOMATION_PLAN
 from qa_agent.redaction import redact_diagnostic
 from qa_agent.test_plan_validation import PlanValidationError
+from qa_agent.diagnostic_mode import (
+    DiagnosticLevel, DiagnosticEvent, MAX_EVENTS, enabled, structural_metadata,
+    bound_optional, expired, clear_optional, failure_reasons,
+    MAX_RETAINED_OPERATIONS, RETENTION_DAYS,
+    current_diagnostic_level,
+)
 
 OVERALL_TIMEOUT_SECONDS = 60.0
 PROVIDER_TIMEOUT_SECONDS = 30.0
@@ -32,6 +38,7 @@ class ReliabilitySettings(BaseModel):
     provider_fallback: StrictBool = True
     automatic_plan_repair: StrictBool = False
     max_total_attempts: int = Field(default=2, strict=True, ge=1, le=3)
+    diagnostic_level: DiagnosticLevel = DiagnosticLevel.NORMAL
 
 
 class ReliabilityAttempt(BaseModel):
@@ -52,6 +59,10 @@ class ReliabilityAttempt(BaseModel):
     estimated_cost_usd: float | None = None
     candidate_diagnostics: dict[str, Any] | None = None
     structured_response_code: str | None = None
+    provider_status: Literal['SUCCESS', 'FAILED', 'UNKNOWN'] = 'UNKNOWN'
+    request_sent: bool | None = None
+    failure_reasons: list[dict[str, Any]] = Field(default_factory=list)
+    provider_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ReliabilityDecision(BaseModel):
@@ -78,6 +89,11 @@ class ReliabilityRecord(BaseModel):
     repaired: bool = False
     final_category: str | None = None
     effective_provider_order: list[dict[str, Any]] = Field(default_factory=list)
+    diagnostic_level: DiagnosticLevel | None = None
+    diagnostic_events: list[DiagnosticEvent] = Field(default_factory=list)
+    diagnostic_events_omitted: int = 0
+    diagnostics_expired: bool = False
+    diagnostic_storage_fallback: bool = False
 
 
 class InMemoryReliabilityRepository:
@@ -94,9 +110,25 @@ class InMemoryReliabilityRepository:
         with self._lock:
             self._settings = ReliabilitySettings.model_validate(settings.model_dump())
 
+    def update_diagnostic_level(self, level):
+        with self._lock:
+            self._settings = self._settings.model_copy(update={'diagnostic_level': DiagnosticLevel(level)})
+
+    def update_reliability_settings(self, settings):
+        with self._lock:
+            self._settings = ReliabilitySettings.model_validate(settings.model_dump()).model_copy(
+                update={'diagnostic_level': self._settings.diagnostic_level})
+
     def save(self, record: ReliabilityRecord) -> None:
         with self._lock:
-            self._records[record.id] = record.model_copy(deep=True)
+            self._records[record.id] = bound_optional(record)
+
+    def prune_diagnostics(self, now=None):
+        now = now or datetime.now(timezone.utc)
+        with self._lock:
+            for position, record in enumerate(sorted(self._records.values(), key=lambda item: item.started_at, reverse=True)):
+                if expired(record, position, now):
+                    clear_optional(record)
 
     def get(self, operation_id: UUID) -> ReliabilityRecord | None:
         with self._lock:
@@ -117,6 +149,8 @@ class SQLiteReliabilityRepository:
         with self._connect() as connection:
             connection.execute("CREATE TABLE IF NOT EXISTS automation_reliability_settings (id INTEGER PRIMARY KEY CHECK(id = 1), settings_json TEXT NOT NULL)")
             connection.execute("CREATE TABLE IF NOT EXISTS automation_reliability_operations (id TEXT PRIMARY KEY, started_at TEXT NOT NULL, record_json TEXT NOT NULL)")
+            connection.execute('CREATE INDEX IF NOT EXISTS reliability_started_at ON automation_reliability_operations(started_at DESC, id)')
+            connection.execute("CREATE INDEX IF NOT EXISTS reliability_optional_retention ON automation_reliability_operations(json_extract(record_json, '$.diagnostics_expired'), started_at) WHERE json_extract(record_json, '$.diagnostic_level') IS NOT NULL")
             # Preserve room for an established three-provider chain on first migration.
             providers = set()
             tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
@@ -145,12 +179,46 @@ class SQLiteReliabilityRepository:
         with self._connect() as connection:
             connection.execute("UPDATE automation_reliability_settings SET settings_json = ? WHERE id = 1", (validated.model_dump_json(),))
 
+    def update_diagnostic_level(self, level):
+        level = DiagnosticLevel(level)
+        with self._connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            row = connection.execute('SELECT settings_json FROM automation_reliability_settings WHERE id=1').fetchone()
+            settings = ReliabilitySettings.model_validate_json(row[0])
+            settings = settings.model_copy(update={'diagnostic_level': level})
+            connection.execute('UPDATE automation_reliability_settings SET settings_json=? WHERE id=1', (settings.model_dump_json(),))
+
+    def update_reliability_settings(self, settings):
+        validated = ReliabilitySettings.model_validate(settings.model_dump())
+        with self._connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            row = connection.execute('SELECT settings_json FROM automation_reliability_settings WHERE id=1').fetchone()
+            current = ReliabilitySettings.model_validate_json(row[0])
+            validated = validated.model_copy(update={'diagnostic_level': current.diagnostic_level})
+            connection.execute('UPDATE automation_reliability_settings SET settings_json=? WHERE id=1', (validated.model_dump_json(),))
+
     def save(self, record: ReliabilityRecord) -> None:
         with self._connect() as connection:
             connection.execute(
                 "INSERT INTO automation_reliability_operations VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET record_json = excluded.record_json",
-                (str(record.id), record.started_at.isoformat(), record.model_dump_json()),
+                (str(record.id), record.started_at.isoformat(), bound_optional(record).model_dump_json()),
             )
+
+    def prune_diagnostics(self, now=None):
+        now = now or datetime.now(timezone.utc)
+        with self._connect() as connection:
+            rows = connection.execute("""SELECT id, record_json FROM automation_reliability_operations
+                WHERE json_extract(record_json, '$.diagnostic_level') IS NOT NULL
+                AND json_extract(record_json, '$.diagnostics_expired') = 0
+                AND json_extract(record_json, '$.outcome') != 'RUNNING'
+                AND (started_at < ? OR id NOT IN (
+                    SELECT id FROM automation_reliability_operations ORDER BY started_at DESC, id LIMIT ?))""",
+                ((now - timedelta(days=RETENTION_DAYS)).isoformat(), MAX_RETAINED_OPERATIONS)).fetchall()
+            for operation_id, data in rows:
+                record = ReliabilityRecord.model_validate_json(data)
+                clear_optional(record)
+                connection.execute('UPDATE automation_reliability_operations SET record_json=? WHERE id=?',
+                                   (record.model_dump_json(), operation_id))
 
     def get(self, operation_id: UUID) -> ReliabilityRecord | None:
         with self._connect() as connection:
@@ -161,6 +229,54 @@ class SQLiteReliabilityRepository:
         with self._connect() as connection:
             rows = connection.execute("SELECT record_json FROM automation_reliability_operations ORDER BY started_at DESC, id").fetchall()
         return [ReliabilityRecord.model_validate_json(row[0]) for row in rows]
+
+
+class ResilientReliabilityRepository:
+    """Use the same record model/repository in memory when diagnostics storage fails.
+
+    Settings saves still fail visibly; no successful persistence is invented.
+    The fallback never influences gates, retries, plan approval or product outcomes.
+    """
+    def __init__(self, repository):
+        self.primary = repository
+        self.fallback = InMemoryReliabilityRepository()
+
+    def __getattr__(self, name):
+        return getattr(self.primary, name)
+
+    def save(self, record):
+        try:
+            self.primary.save(record)
+        except Exception:
+            record.diagnostic_storage_fallback = True
+            self.fallback.save(record)
+        else:
+            with self.fallback._lock:
+                self.fallback._records.pop(record.id, None)
+
+    def get(self, operation_id):
+        fallback = self.fallback.get(operation_id)
+        if fallback is not None:
+            return fallback
+        try:
+            return self.primary.get(operation_id)
+        except Exception:
+            return None
+
+    def list_records(self):
+        try:
+            records = {record.id: record for record in self.primary.list_records()}
+        except Exception:
+            records = {}
+        records.update({record.id: record for record in self.fallback.list_records()})
+        return sorted(records.values(), key=lambda record: record.started_at, reverse=True)
+
+    def prune_diagnostics(self):
+        self.fallback.prune_diagnostics()
+        try:
+            self.primary.prune_diagnostics()
+        except Exception:
+            pass
 
 
 class ReliabilityStopped(RuntimeError):
@@ -268,6 +384,28 @@ class ReliabilityOperation:
         self.usage = None
         self.cost = None
 
+    def diagnostic(self, kind, *, minimum=DiagnosticLevel.NORMAL, **metadata):
+        """Optional recording is best-effort; it cannot affect generation decisions."""
+        try:
+            if not enabled(self.record.settings.diagnostic_level, minimum) or self.record.outcome != 'RUNNING':
+                return
+            event = DiagnosticEvent(timestamp=datetime.now(timezone.utc), kind=kind,
+                                    attempt_index=len(self.record.attempts) or None,
+                                    metadata=structural_metadata(metadata))
+            if len(self.record.diagnostic_events) >= MAX_EVENTS:
+                self.record.diagnostic_events.pop(0)
+                self.record.diagnostic_events_omitted += 1
+            self.record.diagnostic_events.append(event)
+        except Exception:
+            pass
+
+    def capture_response_metadata(self, metadata):
+        try:
+            if self.record.outcome == 'RUNNING' and self.record.attempts and enabled(self.record.settings.diagnostic_level, DiagnosticLevel.DEBUG):
+                self.record.attempts[-1].provider_metadata.update(structural_metadata(metadata))
+        except Exception:
+            pass
+
     @property
     def remaining_seconds(self):
         return max(0.0, self.deadline - time.monotonic())
@@ -307,6 +445,7 @@ class ReliabilityOperation:
         if not self.supervisor._capacity.acquire(blocking=False):
             raise ReliabilityStopped("INFRASTRUCTURE_ERROR")
         self.record.attempts.append(attempt)
+        self.diagnostic('PROVIDER_REQUEST_STARTED', provider=attempt.provider, model=attempt.model)
         try:
             self.supervisor.repository.save(self.record)
         except Exception:
@@ -351,26 +490,37 @@ class ReliabilityOperation:
             if "error" in returned:
                 raise returned["error"]
         except BaseException as error:
+            attempt.provider_status = 'FAILED'
+            attempt.failure_reasons = failure_reasons(error)
+            self.capture_response_metadata(dict(http_status=getattr(error, 'http_status', None),
+                                                provider_error_code=getattr(error, 'provider_error_code', None)))
             attempt.status = "CANCELLED" if classify_failure(error) == "CANCELLED" else "REJECTED"
             attempt.error_category = classify_failure(error)
+            if attempt.error_category == 'INVALID_RESPONSE' and attempt.provider_metadata.get('truncated') is True:
+                attempt.failure_reasons = [{'reason_code': 'OUTPUT_TRUNCATED', 'root_cause_known': True}]
             code = getattr(error, "provider_error_code", None)
-            if attempt.error_category == 'INVALID_RESPONSE' or code in {"output_token_limit", "missing_structured_response", "invalid_json", "invalid_schema_response"}:
+            if (enabled(self.record.settings.diagnostic_level, DiagnosticLevel.DEBUG)
+                    and (attempt.error_category == 'INVALID_RESPONSE' or code in {"output_token_limit", "missing_structured_response", "invalid_json", "invalid_schema_response"})):
                 attempt.structured_response_code = code if code in {"output_token_limit", "missing_structured_response", "invalid_json", "invalid_schema_response"} else None
-                from qa_agent.candidate_diagnostics import rejected_candidate_diagnostics, safe_action_summary, safe_validation_issues
-                step = self.supervisor.active_step(self.record.id)
-                if step is not None:
-                    diagnostics = rejected_candidate_diagnostics(None, step, None, error)
-                    summary = getattr(error, 'rejected_actions', None)
-                    if code == 'invalid_schema_response' and isinstance(summary, dict):
-                        diagnostics.update(safe_action_summary(summary))
-                        diagnostics['validation_issues'] = safe_validation_issues(summary.get('validation_issues'))
-                        diagnostics['failed_gate'] = 'provider_response_schema'
-                    else:
-                        diagnostics['candidate_unavailable'] = True
-                    diagnostics['coverage_evaluated'] = False
-                    attempt.candidate_diagnostics = diagnostics
+                try:
+                    from qa_agent.candidate_diagnostics import rejected_candidate_diagnostics, safe_action_summary, safe_validation_issues
+                    step = self.supervisor.active_step(self.record.id)
+                    if step is not None:
+                        diagnostics = rejected_candidate_diagnostics(None, step, None, error)
+                        summary = getattr(error, 'rejected_actions', None)
+                        if code == 'invalid_schema_response' and isinstance(summary, dict):
+                            diagnostics.update(safe_action_summary(summary))
+                            diagnostics['validation_issues'] = safe_validation_issues(summary.get('validation_issues'))
+                            diagnostics['failed_gate'] = 'provider_response_schema'
+                        else:
+                            diagnostics['candidate_unavailable'] = True
+                        diagnostics['coverage_evaluated'] = False
+                        attempt.candidate_diagnostics = diagnostics
+                except Exception:
+                    pass  # Optional diagnostics must preserve the original provider failure.
             raise
         else:
+            attempt.provider_status = 'SUCCESS'
             attempt.status = "QUALITY_PENDING"
             return returned["value"]
         finally:
@@ -379,6 +529,9 @@ class ReliabilityOperation:
             if done.is_set() and self.usage is not None:
                 attempt.input_tokens, attempt.output_tokens = self.usage.input_tokens, self.usage.output_tokens
                 attempt.estimated_cost_usd = self.cost
+            self.diagnostic('PROVIDER_RESPONSE', **(attempt.provider_metadata | dict(
+                status=attempt.provider_status, duration_ms=attempt.duration_ms,
+                input_tokens=attempt.input_tokens, output_tokens=attempt.output_tokens)))
             self.supervisor.repository.save(self.record)
 
     def capture_usage(self, usage, cost):
@@ -415,11 +568,18 @@ class AutomationReliabilitySupervisor:
     def __init__(self, repository=None, *, timeout_seconds: float = OVERALL_TIMEOUT_SECONDS, max_inflight: int = 4):
         if timeout_seconds <= 0 or timeout_seconds > OVERALL_TIMEOUT_SECONDS:
             raise ValueError("Generation time limit must be positive and no more than 60 seconds.")
-        self.repository = repository or InMemoryReliabilityRepository()
+        self.repository = ResilientReliabilityRepository(repository or InMemoryReliabilityRepository())
         self.timeout_seconds = timeout_seconds
         self._capacity = BoundedSemaphore(max_inflight)
         self._active: dict[UUID, tuple[ReliabilityOperation, Any]] = {}
         self._lock = RLock()
+
+    def effective_settings(self):
+        try:
+            return self.repository.settings(), False
+        except Exception:
+            # Safe defaults disable retries/repair and optional DEBUG/TRACE data.
+            return ReliabilitySettings(), True
 
     def active_step(self, operation_id):
         with self._lock:
@@ -465,8 +625,12 @@ class AutomationReliabilitySupervisor:
         usage_context = current_llm_usage_context(OP_GENERATE_AUTOMATION_PLAN)
         record = ReliabilityRecord(
             test_step_id=step.id, test_case_id=UUID(usage_context.related_test_case_id) if usage_context.related_test_case_id else None,
-            settings=self.repository.settings(), started_at=datetime.now(timezone.utc),
+            settings=self.effective_settings()[0], started_at=datetime.now(timezone.utc),
         )
+        record.diagnostic_level = record.settings.diagnostic_level
+        if current_diagnostic_level() is not None:
+            record.settings = record.settings.model_copy(update={'diagnostic_level': current_diagnostic_level()})
+            record.diagnostic_level = record.settings.diagnostic_level
         self.repository.save(record)
         control = current_cancellation()
         operation = ReliabilityOperation(self, record, cancellation or (control.event if control is not None and control.parent is None else Event()))
@@ -475,6 +639,7 @@ class AutomationReliabilitySupervisor:
         with self._lock:
             self._active[record.id] = (operation, step)
         token = _ACTIVE_OPERATION.set(operation)
+        operation.diagnostic('OPERATION_STARTED')
         repair_error = None
         try:
             if not step.description.strip() or not step.expected.strip():
@@ -501,6 +666,7 @@ class AutomationReliabilitySupervisor:
                     if record.attempts and record.attempts[-1].status == "QUALITY_PENDING":
                         attempt = record.attempts[-1]
                         attempt.candidate_diagnostics = getattr(error, 'candidate_diagnostics', None)
+                        attempt.failure_reasons = failure_reasons(error)
                         attempt.status, attempt.error_category = ("CANCELLED" if category == "CANCELLED" else "REJECTED"), category
                         failed_gate = gate_for_category(category)
                         if category == "UNSAFE_REPAIR":
@@ -509,6 +675,8 @@ class AutomationReliabilitySupervisor:
                             for name in QUALITY_GATES:
                                 attempt.quality_gates[name] = "FAILED" if name == failed_gate else "PASSED" if QUALITY_GATES.index(name) < QUALITY_GATES.index(failed_gate) else "NOT_RUN"
                     self.repository.save(record)
+                    operation.diagnostic('CANDIDATE_REJECTED', status='REJECTED', reason_code=(
+                        record.attempts[-1].failure_reasons[0]['reason_code'] if record.attempts and record.attempts[-1].failure_reasons else 'UNKNOWN'))
                     if self._repair_allowed(operation, error, step):
                         operation.check()
                         operation.decision("TARGETED_REPAIR", category, safe_reason(category))
@@ -539,6 +707,10 @@ class AutomationReliabilitySupervisor:
             record.elapsed_ms = max(0, int((time.monotonic() - operation.started) * 1000))
             try:
                 self.repository.save(record)
+                try:
+                    self.repository.prune_diagnostics()
+                except Exception:
+                    pass
             finally:
                 _ACTIVE_OPERATION.reset(token)
                 with self._lock:

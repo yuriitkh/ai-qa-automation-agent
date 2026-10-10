@@ -36,6 +36,20 @@ class ActionFailureDiagnostic(BaseModel):
     evidence_indexes: tuple[int, ...] = ()
     classification: Literal["PRODUCT_FAILURE", "AUTOMATION_DRIFT", "AUTOMATION_EXECUTION_ERROR", "INFRASTRUCTURE_ERROR"] | None = None
 
+    @computed_field
+    @property
+    def reason_code(self) -> str:
+        if self.page_open is False:
+            return 'BROWSER_PRECONDITION_FAILED'
+        if self.target_count == 0:
+            return 'SELECTOR_NOT_FOUND'
+        return 'BROWSER_ACTION_FAILED'
+
+    @computed_field
+    @property
+    def root_cause_known(self) -> bool:
+        return self.page_open is False or self.target_count == 0
+
     @field_validator("selector_identity")
     @classmethod
     def safe_identity(cls, value):

@@ -15,7 +15,7 @@ from .errors import (
     provider_http_failure,
 )
 from .json_schema import normalize_strict_json_schema, qa_test_plan_schema
-from .usage_metadata import capture_openai_usage
+from .usage_metadata import capture_openai_usage, mark_provider_request
 from ..reliability import current_reliability_operation, provider_timeout
 
 
@@ -81,6 +81,7 @@ class OpenAICompatibleProvider(LLMProvider):
         try:
             limits = {"max_retries": 0} if current_reliability_operation() is not None or current_cancellation() is not None else {}
             client = OpenAI(api_key=api_key, base_url=self.base_url, timeout=provider_timeout(self.timeout_seconds), **limits)
+            mark_provider_request()
             response = client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],

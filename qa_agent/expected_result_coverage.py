@@ -281,6 +281,8 @@ def validate_expected_result_coverage(
                 code="EXPECTED_RESULT_NOT_COVERED",
                 path="steps",
                 message=f"{coverage.safe_message} {guidance}",
+                reason_code=('UNSUPPORTED_EXPECTED_RESULT' if coverage.status == ExpectedResultCoverageStatus.UNKNOWN
+                             else 'EXPECTED_RESULT_NOT_COVERED'),
             )
         ])
     return coverage

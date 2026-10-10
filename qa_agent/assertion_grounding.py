@@ -145,6 +145,7 @@ def validate_assertion_grounding(
         discovery,
         requirement_context=requirement_context,
     )
+    from qa_agent.input_value_assertions import input_value_grounding_reason
     issues = [
         PlanValidationIssue(
             code="UNGROUNDED_ASSERTION",
@@ -154,6 +155,11 @@ def validate_assertion_grounding(
                 "or supported by deterministic page evidence. Use a structural "
                 "assertion unless the exact value is required or observed."
             ),
+            reason_code=(input_value_grounding_reason(
+                             plan, entry.step_index, discovery, (test_step.description, test_step.expected),
+                             requirement_context=requirement_context,
+                             allow_atomic_requirements=len(_requirement_texts(test_step, requirement_context)) > 1,
+                         ) if plan.steps[entry.step_index].action == 'assert_value' else None),
         )
         for entry in entries
         if entry.category == AssertionGrounding.INFERRED

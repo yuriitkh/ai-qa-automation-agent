@@ -140,6 +140,8 @@ class ProviderAttemptTrace(BaseModel):
     is_selected: bool = False
     # Future: populated once providers expose token usage.
     token_usage: dict[str, int] | None = None
+    reliability_operation_id: UUID | None = None
+    attempt_index: int | None = None
 
 
 class PlanCacheTrace(BaseModel):
@@ -409,6 +411,8 @@ class ExecutionTraceRecorder:
         duration_ms: int | None = None,
         is_selected: bool = False,
         token_usage: dict[str, int] | None = None,
+        reliability_operation_id: UUID | None = None,
+        attempt_index: int | None = None,
     ) -> None:
         step = self._current_step
         if step is None:
@@ -424,6 +428,8 @@ class ExecutionTraceRecorder:
             duration_ms=duration_ms,
             is_selected=is_selected,
             token_usage=token_usage,
+            reliability_operation_id=reliability_operation_id,
+            attempt_index=attempt_index,
         ))
 
     def record_plan_generation(

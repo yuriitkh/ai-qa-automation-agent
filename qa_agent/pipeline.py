@@ -31,6 +31,7 @@ from qa_agent.execution_trace import (
     record_safely,
 )
 from qa_agent.llm_usage import OP_DISCOVERY, llm_usage_scope
+from qa_agent.diagnostic_mode import current_diagnostic_level, diagnostic_scope
 from qa_agent.models import (
     DiscoveryResult,
     DiscoveryStatus,
@@ -190,7 +191,13 @@ class QATestPipeline:
         trace = self._create_trace_recorder(task)
         case_runner = self._plan_execution.new_test_case_runner()
         cleanup_outcome = None
-        with active_trace_recorder(trace):
+        level = current_diagnostic_level()
+        try:
+            if level is None:
+                level = self._plan_generator.supervisor.effective_settings()[0].diagnostic_level
+        except Exception:
+            pass
+        with diagnostic_scope(level), active_trace_recorder(trace):
             try:
                 try:
                     result = self._run(
