@@ -103,9 +103,10 @@ def rejected_candidate_diagnostics(value, step, discovery, error):
     except PlanValidationError:
         candidate = None
     coverage = expected_result_coverage(step, candidate, discovery=discovery)
-    matches = assertion_subject_matches(step, candidate, discovery=discovery) if candidate is not None else {}
+    matches = (assertion_subject_matches(step, candidate, discovery=discovery)
+               if candidate is not None and coverage.verification_required else {})
     covered = {i for indexes in matches.values() for i in indexes}
-    clauses = _expectations(step)
+    clauses = _expectations(step) if coverage.verification_required else ()
     clause_rows = ([{'index': i, 'kind': clause.kind, 'clause_hash': _hash(clause.clause), 'covered': i in covered}
                     for i, clause in enumerate(clauses[:MAX_CLAUSES])] if clauses is not None else
                    [{'index': i, 'kind': _expectation_kind(clause) or 'UNKNOWN',

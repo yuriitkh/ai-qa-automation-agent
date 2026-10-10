@@ -99,7 +99,11 @@ def classify_assertions(
             if action.action == "assert_value":
                 from qa_agent.input_value_assertions import input_value_is_grounded
                 category = (AssertionGrounding.REQUIREMENT_GROUNDED
-                            if input_value_is_grounded(plan, index, discovery, (*requirements, test_step.description))
+                            if input_value_is_grounded(
+                                plan, index, discovery, (test_step.description, test_step.expected),
+                                requirement_context=requirement_context,
+                                allow_atomic_requirements=len(requirements) > 1,
+                            )
                             else AssertionGrounding.INFERRED)
             elif any(
                 _required_value(action.action, value, requirements)

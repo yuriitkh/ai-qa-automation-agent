@@ -433,6 +433,11 @@ def _expectation_kind(clause: str) -> str | None:
     if has_error_absence_requirement(clause):
         return "no_error"
     unquoted = _QUOTED.sub(' ', clause)
+    if (re.search(r"\b(?:all|every|each)\s+(?:(?:the|required|form)\s+)*(?:fields?|inputs?)\b", unquoted, re.I)
+            and re.search(r"\b(?:contains?|values?|matches?|equals?|present|visible|displayed|shown|entered|filled)\b", unquoted, re.I)
+            and not _REQUIRED_FIELD_ERRORS.search(clause)):
+        # A collective requirement cannot bind to just one named input.
+        return None
     if (re.search(r"\b(?:field|input)\b.*\b(?:contains?|value|matches?|equals?)\b", clause, re.I)
             and not re.search(r'\b(?:error|message|confirmation|notification|alert|warning|notice)\b', unquoted, re.I)):
         return "input_value"
@@ -461,6 +466,13 @@ def _expectation_kind(clause: str) -> str | None:
     if _URL.search(clause):
         return "url"
     if _VISIBLE.search(clause):
+        if re.search(
+            r"\bform\s+fields?\b|\b(?:entered|provided|input)\s+(?:data|values?)\b.*\b(?:fields?|inputs?)\b",
+            unquoted, re.I,
+        ):
+            # Presence in inputs is not visibility of the containing form.
+            # Collective value retention has no safe per-control binding here.
+            return None
         if re.search(r"\bform\b", clause, re.I) and not _TEXT.search(clause):
             return "form_visible"
         return "visible"

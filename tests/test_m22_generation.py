@@ -123,13 +123,13 @@ def test_input_literal_grounding_cannot_justify_other_values_outputs_or_controls
     reject(step, plan(*actions), discovery, code)
 
 
-def test_explicit_atomic_input_instruction_survives_general_case_context_and_periods():
+def test_explicit_atomic_input_instruction_survives_unrelated_case_context_and_periods():
     step = input_step()
     step.description = "Enter 'test.user@example.test' into the email field."
     candidate = plan(action('fill', '#email', value='test.user@example.test'),
                      action('assert_value', '#email', expected='test.user@example.test'))
     result = LLMTestPlanGenerator(LLMRouter([RegistrationProvider([candidate])])).generate_with_plan(
-        step, observed_registration(), requirement_context='Validate the registration workflow with invalid email.')
+        step, observed_registration(), requirement_context='Exercise a retry after generation failure.')
     assert result.test_plan_version.assertion_grounding[0].category.value == 'REQUIREMENT_GROUNDED'
 
 
