@@ -64,6 +64,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;max-width:100%}figure{margin:.7r
 .progress-step>span:last-child{min-width:0;overflow-wrap:anywhere}.progress-step strong{display:block;overflow-wrap:anywhere}.progress-failure{display:block;color:#8d2519;margin-top:.2rem;overflow-wrap:anywhere}
 .progress-symbol{font-size:1.1rem;font-weight:700}
 .progress-step-state,.progress-step .muted{display:block;margin-top:.2rem;font-size:.9rem}
+[data-progress-unassigned-decisions]{overflow-wrap:anywhere}
 .progress-result[hidden]{display:none}
 [data-progress-result-content]{display:block}
 [data-progress-result-content] p{margin:.6rem 0}

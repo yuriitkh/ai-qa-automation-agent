@@ -270,3 +270,53 @@ def test_observation_or_generated_fill_without_declared_data_cannot_ground_an_in
     discovery.snapshot['visible_text_elements'] = [{'text': 'invalid-email', 'selector': '#example'}]
     entries = classify_assertions(proposed, input_step(), discovery)
     assert entries[0].category.value == 'INFERRED'
+
+
+def two_input_candidate(second_value='synthetic-password', second_expected=None):
+    """Synthetic values and selectors; historical diagnostics do not retain them."""
+    return plan(action('fill', '#email', value='invalid-email'),
+                action('fill', '#password', value=second_value),
+                action('assert_value', '#email', expected='invalid-email'),
+                action('assert_value', '#password', expected=second_value if second_expected is None else second_expected),
+                action('assert_hidden', '#registration-success'))
+
+
+@pytest.mark.parametrize('description', [
+    'Enter an invalid email address and valid data in the other required fields.',
+    'Enter an invalid email address. Enter "synthetic-password" into the password field.',
+])
+def test_tc0046_second_value_cannot_be_grounded_by_its_matching_fill_or_elaboration(description):
+    step = input_step(description, 'The entered details are present in the form.')
+    proposed = two_input_candidate()
+    entries = classify_assertions(proposed, step, observed_registration(), requirement_context=ORIGINAL)
+    assert [(item.step_index, item.category.value) for item in entries[:2]] == [
+        (2, 'REQUIREMENT_GROUNDED'), (3, 'INFERRED'),
+    ]
+    attempt = reject_generation(step, proposed, ORIGINAL)
+    assert attempt.quality_gates['assertion_grounding'] == 'FAILED'
+    assert attempt.quality_gates['expected_result_coverage'] == 'NOT_RUN'
+    assert attempt.candidate_diagnostics['validation_issues'] == [
+        {'code': 'UNGROUNDED_ASSERTION', 'path': 'steps[3].parameters'},
+    ]
+    assert attempt.candidate_diagnostics['coverage'] == 'NO_VERIFICATION_REQUIRED'
+    assert attempt.candidate_diagnostics['requirement_clauses'] == []
+    assert 'synthetic-password' not in json.dumps(attempt.candidate_diagnostics)
+
+
+def test_two_original_input_declarations_allow_both_exact_matching_assertions():
+    context = ORIGINAL + ' Enter "synthetic-password" into the password field.'
+    run_generation(input_step(expected='The entered details are present in the form.'),
+                   two_input_candidate(), context)
+
+
+@pytest.mark.parametrize('context,expected', [
+    (ORIGINAL + ' Enter "synthetic-password" into password.', 'different-password'),
+    (ORIGINAL + ' Enter "synthetic-password" into password. Never use "synthetic-password" in password.', 'synthetic-password'),
+    (ORIGINAL + ' Enter "synthetic-password" into password. Enter "conflicting-password" into password.', 'synthetic-password'),
+])
+def test_second_input_keeps_equality_restrictions_and_original_conflict_protections(context, expected):
+    attempt = reject_generation(input_step(expected='The entered details are present in the form.'),
+                                two_input_candidate(second_expected=expected), context)
+    assert attempt.candidate_diagnostics['validation_issues'] == [
+        {'code': 'UNGROUNDED_ASSERTION', 'path': 'steps[3].parameters'},
+    ]

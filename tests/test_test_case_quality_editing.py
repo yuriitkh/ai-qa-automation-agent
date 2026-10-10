@@ -365,6 +365,9 @@ def test_successful_provider_rejected_gate_progress_is_safe_and_links_operation(
         assert unavailable.calls == 0 and provider.calls == 1
         assert secret not in json.dumps(snapshot.to_public_dict())
         payload_data = app._progress_payload(snapshot)
-        assert any(action["url"].startswith('/settings/reliability/') for action in payload_data["actions"])
+        links = payload_data["generation_decisions"] + [
+            link for item in payload_data["steps"] for link in item["generation_decisions"]
+        ]
+        assert any(link["url"].startswith('/settings/reliability/') for link in links)
         assert b"Developer details" in app.handle("GET", f"/runs/progress/{progress_id}").body
     finally: app.close()

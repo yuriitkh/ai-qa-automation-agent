@@ -901,6 +901,7 @@ class LocalWebApplication:
         for step in payload["steps"]:
             saved_step = report_steps.get(UUID(step["id"]))
             step["evidence_links"] = []
+            step["generation_decisions"] = []
             step["observation"] = None
             step.setdefault("action_failure", None)
             if saved_step:
@@ -936,10 +937,41 @@ class LocalWebApplication:
             else:
                 step["plan_url"] = None
         payload["actions"] = [{"label": "Open TestCase", "url": f"/test-cases/{snapshot.test_case_id}"}]
+        payload["generation_decisions"] = []
         if self._reliability is not None:
-            operation_ids = dict.fromkeys(event.reliability_operation_id for event in snapshot.events if event.reliability_operation_id)
-            for operation_id in operation_ids:
-                payload["actions"].append({"label": "Generation decisions", "url": f"/settings/reliability/{operation_id}"})
+            operation_events = {}
+            for event in snapshot.events:
+                if event.reliability_operation_id:
+                    operation_events.setdefault(event.reliability_operation_id, []).append(event)
+            numbered_steps = list(enumerate(payload["steps"], start=1))
+            for operation_id, events in operation_events.items():
+                # Prefer stable IDs over order metadata, including when a later
+                # event supplies the association missing from the first event.
+                match = next((
+                    (number, step) for event in events for number, step in numbered_steps
+                    if event.step_id is not None and str(event.step_id) == step["id"]
+                ), None)
+                if match is None:
+                    match = next((
+                        (number, step) for event in events for number, step in numbered_steps
+                        if event.step_id is None and event.step_order == step["order"]
+                        and sum(item["order"] == event.step_order for _, item in numbered_steps) == 1
+                    ), None)
+                if match:
+                    number, step = match
+                    name = step["name"].strip() or "Unnamed TestStep"
+                    links = step["generation_decisions"]
+                else:
+                    event = max(events, key=lambda item: (
+                        item.step_order is not None, bool(item.step_name), item.step_id is not None,
+                    ))
+                    number = event.step_order + 1 if event.step_order is not None and event.step_order >= 0 else "?"
+                    name = (event.step_name or "").strip() or "TestStep unavailable"
+                    links = payload["generation_decisions"]
+                links.append({
+                    "label": f"Generation decisions — Step {number}: {name}",
+                    "url": f"/settings/reliability/{operation_id}",
+                })
         if persisted:
             payload["actions"].insert(0, {"label": "View Run Details", "url": f"/runs/{persisted.run_id}"})
         if payload["summary"]["outcome"] == "INFRASTRUCTURE_ERROR":
@@ -1085,6 +1117,10 @@ class LocalWebApplication:
                 f'<a href="{esc(item["url"])}" target="_blank" rel="noopener">Open full-size evidence · {esc(item["label"])}</a><br>'
                 for item in step["evidence_links"]
             )
+            decisions = ''.join(
+                f'<span class="muted"><a href="{esc(item["url"])}">{esc(item["label"])}</a></span>'
+                for item in step["generation_decisions"]
+            )
             step_rows.append(
                 '<li class="progress-step"><span class="progress-symbol" aria-hidden="true">'
                 + ('✓' if step["display_status"] == 'Passed' else '○') + '</span><span>'
@@ -1092,6 +1128,7 @@ class LocalWebApplication:
                 + f'<span class="progress-step-state">{esc(step["display_status"])}</span>'
                 + (f'<span class="muted">Automation {esc(step["automation_state"].lower())}</span>' if step["automation_state"] and step["automation_state"] != 'Failed' else '')
                 + f'<span class="muted">{plan}</span>'
+                + decisions
                 + (f'<span>Observed: {esc(step["observation"])}</span>' if step["observation"] else '')
                 + (f'<details><summary>Action failure details</summary><pre>{esc(json.dumps(step["action_failure"], indent=2))}</pre></details>' if step.get("action_failure") else '')
                 + (f'<span class="progress-evidence">Screenshot evidence captured ({step["evidence_count"]})</span>' if step["evidence_count"] else '')
@@ -1120,7 +1157,11 @@ class LocalWebApplication:
             + '><h2>Result summary</h2><div data-progress-result-content>' + result + '</div>' + retry + '</section>'
             + f'<div class="progress-live" data-progress-id="{esc(progress_id)}">'
             + '<section class="panel"><h2>Completed and pending steps</h2><ol class="progress-steps" id="progress-steps">'
-            + ''.join(step_rows) + '</ol></section>'
+            + ''.join(step_rows) + '</ol><div data-progress-unassigned-decisions>'
+            + ''.join(
+                f'<p><a href="{esc(item["url"])}">{esc(item["label"])}</a></p>'
+                for item in payload["generation_decisions"]
+            ) + '</div></section>'
             + '<details class="panel technical-details" data-progress-developer-details><summary>Developer details</summary>'
             + '<div data-progress-diagnostics>' + self._progress_diagnostics_html(payload['diagnostic_stages'], payload['provider_diagnostics']) + '</div></details></div>'
             + '<p class="muted" data-progress-notice aria-live="polite"></p>'
@@ -6306,6 +6347,10 @@ _UI_JAVASCRIPT = r"""
         const plan = localLink(step.plan_url, `Plan version v${step.plan_version}`);
         const line = document.createElement('span'); line.className = 'muted'; line.append(plan); content.append(line);
       } else content.append(textNode('span', 'No saved TestPlan available.', 'muted'));
+      (step.generation_decisions || []).forEach((decision) => {
+        const line = document.createElement('span'); line.className = 'muted';
+        line.append(localLink(decision.url, decision.label)); content.append(line);
+      });
       if (step.observation) content.append(textNode('p', `Observed: ${step.observation}`));
       if (step.action_failure) {
         const details = document.createElement('details');
@@ -6318,6 +6363,12 @@ _UI_JAVASCRIPT = r"""
         link.target = '_blank'; link.rel = 'noopener'; content.append(link, document.createElement('br'));
       });
       row.append(icon, content); stepsList.append(row);
+    });
+    const unassignedDecisions = document.querySelector('[data-progress-unassigned-decisions]');
+    unassignedDecisions.replaceChildren();
+    (snapshot.generation_decisions || []).forEach((decision) => {
+      const line = document.createElement('p');
+      line.append(localLink(decision.url, decision.label)); unassignedDecisions.append(line);
     });
 
     if (snapshot.finished) {
